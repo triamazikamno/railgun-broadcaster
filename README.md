@@ -5,10 +5,19 @@ A Rust implementation of a RAILGUN broadcaster that relays private transactions 
 ## Features
 
 - **Private Transaction Broadcasting**: Relay RAILGUN shielded transactions to Ethereum
+- **Does not require 0zk seed phrase**: Uses view-only 0zk private key
 - **Multi-Chain Support**: Configure multiple EVM chains simultaneously
 - **MEV/Sandwich attack protection**: Integration with Flashbots, Bloxroute, and private RPCs
 - **Dynamic Fee Management**: On-chain oracle based price feeds with configurable refresh intervals
 - **Proof of Innocence (POI)**: Optional integration with RAILGUN's POI system
+
+## Status
+Project is under active development; breaking changes may occur.
+
+### TODO
+- [ ] Add optional auto top-up from 0zk wallet (with implication of storing seed phrase)
+- [ ] Notifications to Telegram/Discord/Matrix/Email
+- [ ] Add Tor support for all external requests
 
 ## Prerequisites
 
