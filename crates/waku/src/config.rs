@@ -13,7 +13,7 @@ pub struct NodeConfig {
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
-            connection_cap: 20,
+            connection_cap: 12,
             dial_concurrency: 16,
             peer_exchange_peers_per_query: 60,
             request_timeout: Duration::from_secs(10),

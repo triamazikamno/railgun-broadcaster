@@ -101,8 +101,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    let waku_client =
-        Arc::new(Client::new(cfg.nwaku_url.clone(), cfg.additional_waku_peers).wrap_err("create waku relay client")?);
+    let waku_client = Arc::new(Client::new(&cfg.waku).wrap_err("create waku relay client")?);
     let snark_prover = Arc::new(Prover::new().await.wrap_err("create snark prover")?);
 
     let poi_verifier = cfg.poi_rpc.as_ref().map(|poi_rpc| {

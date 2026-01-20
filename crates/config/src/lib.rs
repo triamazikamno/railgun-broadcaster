@@ -7,11 +7,23 @@ use url::Url;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    pub nwaku_url: Option<String>,
     pub chains: Vec<Chain>,
     pub required_poi_list: Vec<FixedBytes<32>>,
     pub poi_rpc: Option<Url>,
-    pub additional_waku_peers: Vec<AdditionalWakuPeer>,
+    pub waku: Waku,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Waku {
+    pub nwaku_url: Option<String>,
+    #[serde(default)]
+    pub direct_peers: Vec<AdditionalWakuPeer>,
+    pub dns_enr_trees: Option<Vec<String>>,
+    pub doh_endpoint: Option<String>,
+    pub cluster_id: Option<u32>,
+    pub max_peers: Option<usize>,
+    pub peer_connection_timeout: Option<humantime_serde::Serde<Duration>>,
 }
 
 #[derive(Deserialize)]

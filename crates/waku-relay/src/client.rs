@@ -2,7 +2,6 @@ use crate::error::ClientError;
 use crate::msg::Message;
 use base64::Engine;
 use base64::engine::general_purpose;
-use config::AdditionalWakuPeer;
 use lru::LruCache;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -26,26 +25,36 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(
-        nwaku_url: Option<String>,
-        additional_waku_peers: Vec<AdditionalWakuPeer>,
-    ) -> Result<Self, ClientError> {
+    pub fn new(cfg: &config::Waku) -> Result<Self, ClientError> {
         let mut config = WakuConfig::default();
-        // TODO: make it configurable
-        config.node.connection_cap = 12;
+        if let Some(dns_enr_trees) = &cfg.dns_enr_trees {
+            config.discovery.enr_trees.clone_from(dns_enr_trees);
+        }
+        if let Some(doh_endpoint) = &cfg.doh_endpoint {
+            config.discovery.doh_endpoint.clone_from(doh_endpoint);
+        }
+        if let Some(cluster_id) = cfg.cluster_id {
+            config.cluster_id = cluster_id;
+        }
+        if let Some(max_peers) = cfg.max_peers {
+            config.node.connection_cap = max_peers;
+        }
+        if let Some(request_timeout) = cfg.peer_connection_timeout {
+           config.node.request_timeout = request_timeout.into_inner();
+        }
         let waku = Arc::new(WakuNode::spawn(config).map_err(ClientError::SpawnNode)?);
         waku.add_additional_peers(
-            additional_waku_peers
-                .into_iter()
+            cfg.direct_peers
+                .iter()
                 .map(|peer| {
                     Ok(DiscoveredPeer {
                         peer_id: parse_peer_id(&peer.peer_id)
                             .map_err(|_| ClientError::ParsePeerId)?,
                         addrs: peer
                             .addrs
-                            .into_iter()
+                            .iter()
                             .map(|addr| {
-                                parse_multiaddr(&addr).map_err(|_| ClientError::ParseMultiaddr)
+                                parse_multiaddr(addr).map_err(|_| ClientError::ParseMultiaddr)
                             })
                             .collect::<Result<Vec<_>, ClientError>>()?,
                     })
@@ -54,7 +63,7 @@ impl Client {
         );
         Ok(Self {
             http_client: reqwest::Client::new(),
-            nwaku_url,
+            nwaku_url: cfg.nwaku_url.clone(),
             waku_fleet: waku,
         })
     }
