@@ -142,7 +142,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 cargo build --release
 
 # Run the broadcaster
-./target/release/broadcaster --cfg config.yaml
+./target/release/railgun-broadcaster --cfg config.yaml
 ```
 
 ### Logs
