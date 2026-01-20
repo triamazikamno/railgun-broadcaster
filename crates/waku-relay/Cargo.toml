@@ -1,0 +1,21 @@
+[package]
+name = "waku-relay"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+alloy = { workspace = true }
+base64 = { version = "0.22" }
+lru = { version = "0.16" }
+reqwest = { workspace = true, features = ["json"] }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time", "macros", "rt", "rt-multi-thread"] }
+tracing = { workspace = true }
+waku = { path = "../waku" }
+config = { path = "../config" }
+urlencoding = { version = "2" }
+
+[lints]
+workspace = true

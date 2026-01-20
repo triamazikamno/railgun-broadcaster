@@ -1,0 +1,24 @@
+[package]
+name = "railgun-broadcaster"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+eyre = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { version = "0.9" }
+structopt = { version = "0.3" }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
+tracing = { workspace = true }
+tracing-appender = { version = "0.2" }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "parking_lot"] }
+tracing-logfmt = { version = "0.3" }
+
+config = { path = "../../crates/config" }
+broadcaster-core = { path = "../../crates/core" }
+poi = { path = "../../crates/poi" }
+fees = { path = "../../crates/fees" }
+waku-relay = { path = "../../crates/waku-relay" }
+waku = { path = "../../crates/waku" }
+broadcaster-service = { path = "../../crates/service" }

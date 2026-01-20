@@ -1,0 +1,16 @@
+[package]
+name = "poi"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+alloy = { workspace = true }
+thiserror = { workspace = true }
+hex = { version = "0.4" }
+reqwest = { workspace = true, features = ["json"] }
+serde = { workspace = true }
+broadcaster-core = { path = "../core" }
+
+[lints]
+workspace = true

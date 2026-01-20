@@ -1,0 +1,56 @@
+[package]
+name = "waku"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync"] }
+tracing = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+
+bytes = "1"
+futures = "0.3"
+regex = "1"
+
+base64 = "0.22"
+data-encoding = "2"
+sha3 = "0.10"
+k256 = { version = "0.13", features = ["ecdsa"] }
+enr = { version = "0.13", features = ["ed25519", "k256"] }
+alloy-rlp = "0.3"
+
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "query"] }
+hickory-resolver = { version = "0.25", default-features = false, features = ["tokio", "system-config"] }
+
+prost = "0.14"
+async-trait = "0.1"
+unsigned-varint = { version = "0.8", features = ["futures"] }
+uuid = { version = "1", features = ["v4"] }
+parking_lot = "0.12"
+thiserror = "2"
+ahash = "0.8"
+lru = "0.16"
+
+libp2p = { version = "0.56", features = [
+  "tokio",
+  "tcp",
+  "dns",
+  "websocket",
+  "noise",
+  "yamux",
+  "identify",
+  "ping",
+  "request-response",
+  "quic",
+  "macros",
+  "secp256k1"
+] }
+libp2p-mplex = "0.43"
+
+[build-dependencies]
+prost-build = "0.14"
+
+[lints]
+workspace = true

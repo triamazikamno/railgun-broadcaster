@@ -1,0 +1,105 @@
+[workspace]
+members = [
+    "bins/broadcaster",
+    "crates/config",
+    "crates/core",
+    "crates/fees",
+    "crates/poi",
+    "crates/waku",
+    "crates/waku-relay",
+    "crates/tx-submit",
+    "crates/service",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.88"
+
+[workspace.dependencies]
+alloy = { version = "1", features = ["serde"] }
+eyre = "0.6"
+rand = "0.9"
+reqwest = { version = "0.13" }
+ruint = { version = "1.17", features = ["num-bigint"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = "1"
+tracing = "0.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+debug = true
+
+[workspace.lints]
+rust.unreachable_pub = "warn"
+rust.unused_must_use = "deny"
+rust.rust_2018_idioms = { level = "deny", priority = -1 }
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+perf = {level = "warn", priority = -1}
+pub_underscore_fields = "allow"
+branches_sharing_code = "warn"
+clear_with_drain = "warn"
+derive_partial_eq_without_eq = "warn"
+empty_line_after_outer_attr = "warn"
+equatable_if_let = "warn"
+imprecise_flops = "warn"
+iter_on_empty_collections = "warn"
+iter_with_drain = "warn"
+large_stack_frames = "warn"
+manual_clamp = "warn"
+mutex_integer = "warn"
+needless_pass_by_ref_mut = "warn"
+nonstandard_macro_braces = "warn"
+or_fun_call = "warn"
+path_buf_push_overwrite = "warn"
+read_zero_byte_vec = "warn"
+redundant_clone = "warn"
+suboptimal_flops = "warn"
+suspicious_operation_groupings = "warn"
+trailing_empty_array = "warn"
+trait_duplication_in_bounds = "warn"
+transmute_undefined_repr = "warn"
+trivial_regex = "warn"
+tuple_array_conversions = "warn"
+uninhabited_references = "warn"
+unused_peekable = "warn"
+unused_rounding = "warn"
+useless_let_if_seq = "warn"
+use_self = "warn"
+missing_const_for_fn = "warn"
+empty_line_after_doc_comments = "warn"
+iter_on_single_items = "warn"
+match_same_arms = "warn"
+doc_markdown = "warn"
+unnecessary_struct_initialization = "warn"
+string_lit_as_bytes = "warn"
+explicit_into_iter_loop = "warn"
+explicit_iter_loop = "warn"
+type_repetition_in_bounds = "warn"
+flat_map_option = "warn"
+manual_assert = "warn"
+manual_string_new = "warn"
+naive_bytecount = "warn"
+needless_bitwise_bool = "warn"
+zero_sized_map_values = "warn"
+single_char_pattern = "warn"
+needless_continue = "warn"
+enum_glob_use = "warn"
+iter_without_into_iter = "warn"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+too_many_lines = "allow"
+struct_excessive_bools = "allow"
+similar_names = "allow"
+too_many_arguments = "allow"
+cast_possible_wrap = "allow"
+cast_possible_truncation = "allow"
+struct_field_names = "allow"
+implicit_hasher = "allow"
+needless_lifetimes = "allow"
+fn_params_excessive_bools = "allow"

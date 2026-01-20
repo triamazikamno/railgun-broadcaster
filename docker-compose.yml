@@ -1,0 +1,58 @@
+services:
+  broadcaster:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
+        BUILD_DATE: ${BUILD_DATE:-unknown}
+    
+    # Tag image with git commit hash for traceability
+    image: railgun-broadcaster:${GIT_COMMIT:-latest}
+    
+    container_name: railgun-broadcaster
+    
+    # Run as non-root user (UID 1000)
+    user: "1000:1000"
+    
+    # Mount config as read-only volume
+    # Copy config.example.yaml to config.yaml and customize before running
+    volumes:
+      - ./config.yaml:/app/config/config.yaml:ro
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2.0'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
+    
+    # Environment variables (optional)
+    environment:
+      # Rust log level (trace, debug, info, warn, error)
+      - RUST_LOG=${RUST_LOG:-info}
+      # Rust backtrace on panic
+      - RUST_BACKTRACE=${RUST_BACKTRACE:-1}
+    
+    # Restart policy
+    restart: unless-stopped
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "pgrep", "-x", "broadcaster"]
+      interval: 30s
+      timeout: 10s
+      start_period: 5s
+      retries: 3
+    
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+    
+    network_mode: bridge

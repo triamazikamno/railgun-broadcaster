@@ -1,0 +1,22 @@
+[package]
+name = "fees"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+alloy = { workspace = true }
+ed25519-dalek = { version = "2" }
+thiserror = { version = "2" }
+moka = { version = "0.12", features = ["future"] }
+rand = { workspace = true }
+ruint = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+tracing = { workspace = true }
+config = { path = "../config" }
+broadcaster-core = { path = "../core" }
+
+[lints]
+workspace = true

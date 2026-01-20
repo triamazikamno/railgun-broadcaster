@@ -1,0 +1,34 @@
+[package]
+name = "broadcaster-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+alloy = { workspace = true }
+aes = "0.8"
+aes-gcm = "0.10"
+ark-bn254 = { version = "0.5" }
+ark-ed-on-bn254 = { version = "0.5" }
+ark-ff = { version = "0.5" }
+ark-groth16 = { version = "0.5" }
+bech32 = { version = "0.11" }
+curve25519-dalek = "4"
+ed25519-dalek = { version = "2" }
+getrandom = { version = "0.3" }
+hex = { version = "0.4" }
+openssl = { version = "0.10" }
+reqwest = { workspace = true, features = ["json"] }
+rmp-serde = { version = "1.3" }
+rs-poseidon = { git = "https://github.com/codex-storage/rs-poseidon.git", rev = "bdbb8ba2735406e6e7b747abd3bc6711d55370aa" }
+ruint = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+thiserror = { version = "2" }
+tracing = { workspace = true }
+typenum = "1.19"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+[lints]
+workspace = true
