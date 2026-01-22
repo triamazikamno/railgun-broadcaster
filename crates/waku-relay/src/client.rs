@@ -148,7 +148,7 @@ impl Client {
                                         }
                                     }
                                     Err(error) => {
-                                        tracing::warn!(%error, "failed to poll messages from nwaku");
+                                        tracing::warn!(?error, "failed to poll messages from nwaku");
                                     }
                                 }
                             }

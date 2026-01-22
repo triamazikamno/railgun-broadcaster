@@ -148,7 +148,8 @@ impl BroadcasterService {
         let multicall_contract = chain_cfg
             .multicall_contract
             .ok_or(BroadcasterServiceError::MissingMulticallContract)?;
-        let fee_bonus = uint!(1000000000000000000_U256) + U256::from(chain_cfg.fee_bonus * 1000.0) * uint!(10000000000000_U256);
+        let fee_bonus = uint!(1000000000000000000_U256)
+            + U256::from(chain_cfg.fee_bonus * 1000.0) * uint!(10000000000000_U256);
         let fees_manager = Arc::new(FeesManager::new(
             &chain_cfg.fees,
             fee_bonus,
@@ -223,7 +224,7 @@ impl BroadcasterService {
             loop {
                 interval.tick().await;
                 if let Err(error) = fees_manager.update_prices().await {
-                    error!(%error, "update prices failed");
+                    error!(?error, "update prices failed");
                 }
                 let reliability = {
                     let count_transact_requests = count_transact_requests.load(Ordering::Relaxed);
@@ -522,6 +523,13 @@ impl BroadcasterManager {
 
         let content_topics: Vec<String> = chain_ids
             .into_iter()
+            // .map(|chain_id| {
+            //     vec![
+            //         format!("/railgun/v2/0-{chain_id}-transact/json"),
+            //         format!("/railgun/v2/0-56-fees/json"),
+            //     ]
+            // })
+            // .flatten()
             .map(|chain_id| format!("/railgun/v2/0-{chain_id}-transact/json"))
             .collect();
 
@@ -535,10 +543,7 @@ impl BroadcasterManager {
 
             let topic = ContentTopic::from(msg.content_topic);
             match topic {
-                ContentTopic::Pong
-                | ContentTopic::Fees()
-                | ContentTopic::TransactResponse()
-                | ContentTopic::Noop => {}
+                ContentTopic::Pong | ContentTopic::TransactResponse() | ContentTopic::Noop | ContentTopic::Fees => {}
                 ContentTopic::Transact(chain_id) => {
                     match serde_json::from_slice::<TransactEnvelope>(msg.payload.as_slice()) {
                         Ok(payload) => {
