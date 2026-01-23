@@ -96,7 +96,7 @@ chains:
     identifier: rust-broadcaster
 
     # RPC endpoint for querying the chain
-    query_rpc: https://binance.llamarpc.com
+    query_rpc: https://bsc-dataseed1.bnbchain.org
 
     # List of tokens to accept fees in. Price should be expressed in tokens per Wei.
     # Chainlink oracles are supported. Oracle must return ETH/TOKEN price. If it returns TOKEN/ETH then `is_inversed` must be set to true.
@@ -131,7 +131,7 @@ chains:
     #   Flashbots and BloxrouteBackrunme in order to protect users from sandwich attacks and potentially
     #   earn a portion of profit from backrunning.
     submit_rpcs:
-      - !Normal https://binance.llamarpc.com
+      - !Normal https://bsc-dataseed1.bnbchain.org
       - !Private
         url: https://bsc.rpc.blxrbdn.com
         has_mev: true

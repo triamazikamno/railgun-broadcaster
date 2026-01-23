@@ -185,6 +185,19 @@ pub enum TxSubmitError {
     Decode(#[from] serde_json::Error),
 }
 
+impl TxSubmitError {
+    #[must_use]
+    pub fn is_tx_already_known(&self) -> bool {
+        matches!(self, Self::Provider { source, .. }
+            if source.as_error_resp().is_some_and(|resp| {
+                resp.message.contains("already known")
+                    || resp.message.contains("already in mempool")
+                    || resp.message.contains("invalid sequence")
+            })
+        )
+    }
+}
+
 impl TryFrom<Chain> for TxBroadcaster {
     type Error = BroadcasterInitError;
     fn try_from(cfg: Chain) -> Result<Self, Self::Error> {
@@ -281,7 +294,10 @@ impl TxBroadcaster {
                     }
                 }
                 Err(error) => {
-                    tracing::warn!("failed to broadcast tx to {}: {error}", rpc.name());
+                    if error.is_tx_already_known() {
+                        return Ok(None)
+                    }
+                    tracing::warn!("failed to broadcast tx to {}: {error:?}", rpc.name());
                     return Err(error);
                 }
             }
