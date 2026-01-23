@@ -193,6 +193,7 @@ impl TxSubmitError {
                 resp.message.contains("already known")
                     || resp.message.contains("already in mempool")
                     || resp.message.contains("invalid sequence")
+                    || resp.message.contains("nonce too low")
             })
         )
     }
@@ -285,6 +286,7 @@ impl TxBroadcaster {
             Queue::Private => ("private", &self.private_rpcs),
         };
         let mut result_tx_hash = None;
+        let mut result_error = None;
         for rpc in rpcs {
             match rpc.broadcast(&tx, additional_txs.as_ref()).await {
                 Ok(tx_hash) => {
@@ -295,13 +297,16 @@ impl TxBroadcaster {
                 }
                 Err(error) => {
                     if error.is_tx_already_known() {
-                        return Ok(None)
+                        continue;
                     }
                     tracing::warn!("failed to broadcast tx to {}: {error:?}", rpc.name());
-                    return Err(error);
+                    result_error = Some(error);
                 }
             }
         }
-        Ok(result_tx_hash)
+        match result_tx_hash {
+            Some(_) => Ok(result_tx_hash),
+            None => result_error.map_or(Ok(None), Err),
+        }
     }
 }
