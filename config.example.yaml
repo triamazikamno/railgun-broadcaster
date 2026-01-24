@@ -75,31 +75,15 @@ chains:
 
   # BSC
   - chain_id: 56
-
-    # View-only private key (0zk)
     viewing_privkey: 0x82a57...
-
-    # Private keys for EVM transaction senders. Hex format.
     evm_wallets:
       - 0xabcd1234...
-
-    # Fee bonus in %
     fee_bonus: 25
-
-    # How long posted fees will be valid for
     fees_ttl: 5m
-
-    # How often to refresh/publish fees
     fees_refresh_interval: 30s
-
-    # Optional identifier for this broadcaster. Wallets may or may not display it.
     identifier: rust-broadcaster
-
-    # RPC endpoint for querying the chain
     query_rpc: https://bsc-dataseed1.bnbchain.org
 
-    # List of tokens to accept fees in. Price should be expressed in tokens per Wei.
-    # Chainlink oracles are supported. Oracle must return ETH/TOKEN price. If it returns TOKEN/ETH then `is_inversed` must be set to true.
     fees:
       # BNB
       0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c: !Fixed 1000000000000000000
@@ -120,25 +104,88 @@ chains:
         addr: 0x0567F2323251f0Aab15c8dFb1967E4e8A7D42aeE
         token_decimals: 18
 
-    # List of RPC endpoints to submit transactions to.
-    # Rpc types supported:
-    # - Normal - regular JSON-RPC endpoint
-    # - Private - JSON-RPC endpoint that doesn't broadcast to mempool (i.e. Flashbots Protect)
-    # - Flashbots - Flashbots relay endpoint
-    # - BloxrouteBackrunme - Bloxroute Backrunme relay endpoint, requires API key
-    # Transactions without action_data will be sent to mempool (Normal RPCs).
-    # Transactions with action_data (potential Private Swap payload) will be submitted to Private,
-    #   Flashbots and BloxrouteBackrunme in order to protect users from sandwich attacks and potentially
-    #   earn a portion of profit from backrunning.
     submit_rpcs:
       - !Normal https://bsc-dataseed1.bnbchain.org
       - !Private
         url: https://bsc.rpc.blxrbdn.com
         has_mev: true
 
-    # Advanced configuration
     relay_adapt_contract: 0xf82d00fc51f730f42a00f85e74895a2849fff2dd
     multicall_contract: 0xcA11bde05977b3631167028862bE2a173976CA11
+
+  # Polygon
+  - chain_id: 137
+    viewing_privkey: 0x82a57...
+    evm_wallets:
+      - 0xabcd1234...
+    fee_bonus: 25
+    fees_ttl: 5m
+    fees_refresh_interval: 30s
+    identifier: rust-broadcaster
+    query_rpc: https://polygon-public.nodies.app
+    fees:
+      # WMATIC
+      0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270: !Fixed 1000000000000000000
+      # USDT
+      0xc2132d05d31c914a87c6611c10748aeb04b58e8f: !Oracle
+        addr: 0xAB594600376Ec9fD91F8e885dADF0CE036862dE0
+        token_decimals: 6
+      # USDC
+      0x2791bca1f2de4661ed88a30c99a7a9449aa84174: !Oracle
+        addr: 0xAB594600376Ec9fD91F8e885dADF0CE036862dE0
+        token_decimals: 6
+      # DAI
+      0x8f3cf7ad23cd3cadbd9735aff958023239c6a063: !Oracle
+        addr: 0xAB594600376Ec9fD91F8e885dADF0CE036862dE0
+        token_decimals: 18
+
+    submit_rpcs:
+      - !Normal https://poly.api.pocket.network
+      - !Normal https://polygon-public.nodies.app
+      - !Normal https://api.zan.top/polygon-mainnet
+    relay_adapt_contract: 0xF82d00fC51F730F42A00F85E74895a2849ffF2Dd
+    multicall_contract: 0xcA11bde05977b3631167028862bE2a173976CA11
+
+  # Arbitrum
+  - chain_id: 42161
+    viewing_privkey: 0x82a57...
+    evm_wallets:
+      - 0xabcd1234...
+    fee_bonus: 25
+    fees_ttl: 5m
+    fees_refresh_interval: 30s
+    identifier: rust-broadcaster
+    query_rpc: https://arb1.arbitrum.io/rpc
+    fees:
+      # WETH
+      0x82af49447d8a07e3bd95bd0d56f35241523fbab1: !Fixed 1000000000000000000
+      # USDT
+      0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9: !Oracle
+        addr: 0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612
+        token_decimals: 6
+      # USDC.e
+      0xff970a61a04b1ca14834a43f5de4533ebddb5cc8: !Oracle
+        addr: 0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612
+        token_decimals: 6
+      # USDC
+      0xaf88d065e77c8cc2239327c5edb3a432268e5831: !Oracle
+        addr: 0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612
+        token_decimals: 18
+      # DAI
+      0xda10009cbd5d07dd0cecc66161fc93d7c9000da1: !Oracle
+        addr: 0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612
+        token_decimals: 18
+      # WBTC
+      0x912ce59144191c1204e64559fe8253a0e49e6548: !Oracle
+        addr: 0xc5a90A6d7e4Af242dA238FFe279e9f2BA0c64B2e
+        is_inversed: true
+        token_decimals: 8
+
+    submit_rpcs:
+      - !Normal https://arb1.arbitrum.io/rpc
+    relay_adapt_contract: 0xB4F2d77bD12c6b548Ae398244d7FAD4ABCE4D89b
+    multicall_contract: 0xcA11bde05977b3631167028862bE2a173976CA11
+
 
 waku:
   # URL to a dedicated nwaku relay (optional)

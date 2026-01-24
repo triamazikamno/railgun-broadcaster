@@ -257,6 +257,13 @@ impl TryFrom<Chain> for TxBroadcaster {
             }
         }
 
+        if mev_rpcs.is_empty() {
+            mev_rpcs.clone_from(&mempool_rpcs);
+        }
+        if private_rpcs.is_empty() {
+            private_rpcs.clone_from(&mev_rpcs);
+        }
+
         Ok(Self {
             mev_rpcs,
             mempool_rpcs,
