@@ -222,7 +222,7 @@ impl<P: Provider + Clone> Manager<P> {
     }
 
     pub async fn convert_to_eth(&self, calldata: &ParsedTransactCalldata) -> U256 {
-        tracing::info!(token=?calldata.fee_token, amount=%calldata.fee_amount, "converting value to eth");
+        tracing::info!(token=?calldata.fee_token, amount=%calldata.fee_amount, "converting value to gas token");
         self.prices
             .read()
             .await

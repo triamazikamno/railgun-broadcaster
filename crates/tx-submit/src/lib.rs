@@ -297,7 +297,12 @@ impl TxBroadcaster {
         for rpc in rpcs {
             match rpc.broadcast(&tx, additional_txs.as_ref()).await {
                 Ok(tx_hash) => {
-                    tracing::info!("tx broadcasted to {}: {tx_hash:?}", rpc.name());
+                    match tx_hash {
+                        None => tracing::info!(rpc = rpc.name(), "tx broadcasted"),
+                        Some(tx_hash) => {
+                            tracing::info!(rpc = rpc.name(), ?tx_hash, "tx broadcasted");
+                        }
+                    }
                     if tx_hash.is_some() {
                         result_tx_hash = tx_hash;
                     }
@@ -306,7 +311,7 @@ impl TxBroadcaster {
                     if error.is_tx_already_known() {
                         continue;
                     }
-                    tracing::warn!("failed to broadcast tx to {}: {error:?}", rpc.name());
+                    tracing::warn!("failed to broadcast tx: {error:?}");
                     result_error = Some(error);
                 }
             }

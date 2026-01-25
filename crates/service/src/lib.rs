@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, debug, error, info, info_span, warn};
 use tx_submit::{Queue, TxBroadcaster};
 use waku_relay::client::{Client, PUBSUB_PATH};
 
@@ -303,7 +303,7 @@ impl BroadcasterService {
         let parsed_transact = parse_transact_calldata(req.params.data.as_ref(), &self.key)
             .map_err(HandleTransactError::Parse)?;
 
-        info!(?parsed_transact, "parsed transact");
+        info!(data=?parsed_transact, "parsed");
 
         if let Some(poi) = self.poi.as_ref() {
             poi.validate_all(&parsed_transact, &req.params).await?;
@@ -445,7 +445,9 @@ impl BroadcasterService {
                     }
                 }
             }
-        });
+        }
+            .instrument(info_span!("tx", chain_id))
+        );
     }
 }
 
@@ -543,7 +545,10 @@ impl BroadcasterManager {
 
             let topic = ContentTopic::from(msg.content_topic);
             match topic {
-                ContentTopic::Pong | ContentTopic::TransactResponse() | ContentTopic::Noop | ContentTopic::Fees => {}
+                ContentTopic::Pong
+                | ContentTopic::TransactResponse()
+                | ContentTopic::Noop
+                | ContentTopic::Fees => {}
                 ContentTopic::Transact(chain_id) => {
                     match serde_json::from_slice::<TransactEnvelope>(msg.payload.as_slice()) {
                         Ok(payload) => {
@@ -560,6 +565,7 @@ impl BroadcasterManager {
                                         payload.params.pubkey.0,
                                         &payload.params.encrypted_data,
                                     )
+                                    .instrument(info_span!("transact", chain_id))
                                     .await
                                     && !matches!(error, HandleTransactError::NotForUs)
                                 {
