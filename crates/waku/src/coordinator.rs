@@ -1,6 +1,6 @@
 use crate::config::{NodeConfig, WakuConfig};
 use crate::discovery;
-use crate::discovery::{DiscoveryConfig};
+use crate::discovery::DiscoveryConfig;
 use crate::error::WakuError;
 use crate::proto;
 use crate::proto::HashKey;
@@ -921,7 +921,9 @@ impl NodeInner {
             } else {
                 Err(batch.last_error.unwrap_or(WakuError::FilterRequestFailed))
             };
-            let _ = batch.waiter.send(outcome);
+            if let Err(err) = batch.waiter.send(outcome) {
+                debug!(?err, batch_id = %batch_id, "failed to send filter batch outcome");
+            }
         }
     }
 
@@ -942,7 +944,10 @@ impl NodeInner {
                 status_code: response.status_code,
                 status_desc: response.status_desc.clone(),
             }),
-            Err(_) => Err(WakuError::FilterRequestFailed),
+            Err(error) => {
+                debug!(%peer_id, ?error, "filter subscribe failed");
+                Err(WakuError::FilterRequestFailed)
+            }
         };
 
         match op {
@@ -979,7 +984,7 @@ impl NodeInner {
                     debug!(%peer_id, ?sub_id, "filter subscribe (peer) succeeded");
                 }
                 Err(error) => {
-                    warn!(%peer_id, ?sub_id, ?error, "filter subscribe (peer) failed");
+                    debug!(%peer_id, ?sub_id, ?error, "filter subscribe (peer) failed");
                 }
             },
         }

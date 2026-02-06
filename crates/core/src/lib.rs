@@ -1,4 +1,9 @@
+pub mod contracts;
 pub mod crypto;
+pub mod notes;
+pub mod provider;
+pub mod query_rpc_pool;
 pub mod serde_helpers;
 pub mod transact;
 pub mod transact_response;
+pub mod utxo;

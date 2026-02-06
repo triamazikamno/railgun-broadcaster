@@ -15,11 +15,13 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
 tracing = { workspace = true }
 
 broadcaster-core = { path = "../core" }
+railgun-wallet = {path = "../railgun-wallet"}
 config = { path = "../config" }
 fees = { path = "../fees" }
 poi = { path = "../poi" }
 tx-submit = { path = "../tx-submit" }
 waku-relay = { path = "../waku-relay" }
+sync-service = { path = "../sync-service" }
 
 [lints]
 workspace = true

@@ -1,16 +1,19 @@
+mod auto_refill;
+mod utxo_consolidation;
+
 use alloy::eips::Encodable2718;
 use alloy::network::{EthereumWallet, TransactionBuilder};
 use alloy::primitives::{Address, Bytes, ChainId, FixedBytes, TxHash, U256};
-use alloy::providers::fillers::{
-    BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
-};
-use alloy::providers::{Provider, ProviderBuilder, RootProvider};
+use alloy::providers::Provider;
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::k256::ecdsa::SigningKey;
-use alloy::signers::local::{LocalSigner, PrivateKeySigner};
+use alloy::signers::local::{LocalSigner, LocalSignerError, MnemonicBuilder, PrivateKeySigner};
 use alloy::transports::TransportErrorKind;
 use alloy::{hex, sol, uint};
-use broadcaster_core::crypto::railgun::{Address as RailgunAddress, PrivateKey, RailgunError};
+use broadcaster_core::crypto::railgun::{
+    Address as RailgunAddress, RailgunError, ShareableViewingKey,
+};
+use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use broadcaster_core::transact::{
     DecryptedTransact, ParsedTransactCalldata, TransactError, parse_transact_calldata,
     try_decrypt_transact_request,
@@ -18,7 +21,7 @@ use broadcaster_core::transact::{
 use broadcaster_core::transact_response::{
     build_transact_response_error, build_transact_response_txhash,
 };
-use config::Chain;
+use config::{Chain, Key};
 use fees::{FeesError, Manager as FeesManager};
 use poi::poi::Poi;
 use rand::seq::IndexedRandom;
@@ -31,8 +34,14 @@ use tracing::{Instrument, debug, error, info, info_span, warn};
 use tx_submit::{Queue, TxBroadcaster};
 use waku_relay::client::{Client, PUBSUB_PATH};
 
+use crate::auto_refill::{AutoRefillConfig, AutoRefillService};
+use crate::utxo_consolidation::{UtxoConsolidationConfig, UtxoConsolidationService};
 use poi::error::PoiError;
+use railgun_wallet::wallet_cache::wallet_cache_key;
+use railgun_wallet::{ProverService, WalletKeys};
 use serde::{Deserialize, Serialize};
+use sync_service::manager::SyncManagerError;
+use sync_service::{ChainConfig, ChainConfigDefaults, ChainKey, SyncManager, WalletConfig};
 use waku_relay::msg::ContentTopic;
 
 sol! {
@@ -66,16 +75,38 @@ pub enum HandleTransactError {
 pub enum BroadcasterServiceError {
     #[error("derive railgun address failed: {0}")]
     DeriveAddress(#[from] RailgunError),
+    #[error("sync manager failed: {0}")]
+    SyncManager(#[from] SyncManagerError),
     #[error("invalid viewing privkey")]
     InvalidViewingPrivkey,
     #[error("init tx broadcaster failed: {0}")]
     InitBroadcaster(#[from] tx_submit::BroadcasterInitError),
     #[error("missing multicall_contract")]
     MissingMulticallContract,
+    #[error("missing query_rpc endpoints")]
+    MissingQueryRpc,
     #[error("simulation failed: {0}")]
     SimulationFailed(#[from] alloy::transports::RpcError<TransportErrorKind>),
     #[error("failed to decode EVM private key: {0}")]
     DecodePrivateKey(#[from] alloy::signers::k256::ecdsa::signature::Error),
+    #[error("mnemonic signer failed: {0}")]
+    MnemonicSigner(#[from] LocalSignerError),
+    #[error("failed to derive keys: {0}")]
+    DeriveKeys(#[from] railgun_wallet::keys::KeyError),
+    #[error("railgun_contract is not defined for this chain")]
+    RailgunContractMissing,
+    #[error("finality_depth is not defined for this chain")]
+    FinalityDepthMissing,
+    #[error("anchor_interval is not defined for this chain")]
+    AnchorIntervalMissing,
+    #[error("archive_until_block is not defined for this chain")]
+    ArchiveUntilBlockMissing,
+    #[error("v2_start_block is not defined for this chain")]
+    V2StartBlockMissing,
+    #[error("legacy_shield_block is not defined for this chain")]
+    LegacyShieldBlockMissing,
+    #[error("deployment_block is not defined for this chain")]
+    DeploymentBlockMissing,
 }
 
 #[derive(Debug, Error)]
@@ -94,15 +125,22 @@ pub enum BroadcasterManagerError {
     Subscribe(#[from] waku_relay::ClientError),
 }
 
-type FeesProvider = FillProvider<
-    JoinFill<
-        alloy::providers::Identity,
-        JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
-    >,
-    RootProvider,
->;
+fn derive_evm_wallet_keys(
+    seed_phrase: &str,
+    count: usize,
+) -> Result<Vec<Bytes>, BroadcasterServiceError> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
 
-type FeesManagerClient = FeesManager<FeesProvider>;
+    let builder = MnemonicBuilder::from_phrase(seed_phrase);
+    (0..count)
+        .map(|index| {
+            let signer = builder.clone().index(index as u32)?.build()?;
+            Ok(Bytes::from(signer.to_bytes()))
+        })
+        .collect()
+}
 
 type ResponseSender = kanal::AsyncSender<(DecryptedTransact, ParsedTransactCalldata)>;
 type ResponseReceiver = kanal::AsyncReceiver<(DecryptedTransact, ParsedTransactCalldata)>;
@@ -114,14 +152,14 @@ pub struct BroadcasterService {
     tx: ResponseSender,
     rx: ResponseReceiver,
     broadcaster: Arc<TxBroadcaster>,
-    fees_manager: Arc<FeesManagerClient>,
+    fees_manager: Arc<FeesManager>,
     evm_wallets: Vec<(EthereumWallet, LocalSigner<SigningKey>)>,
     count_transact_requests: Arc<AtomicU32>,
     count_txs_landed: Arc<AtomicU32>,
     client: Arc<Client>,
     poi: Option<Arc<Poi>>,
     required_poi_list: Vec<FixedBytes<32>>,
-    rpc: RootProvider,
+    query_rpc_pool: Arc<QueryRpcPool>,
     relay_adapt_contract: Address,
     identifier: Option<String>,
     fees_refresh_interval: Duration,
@@ -129,22 +167,45 @@ pub struct BroadcasterService {
 }
 
 impl BroadcasterService {
-    pub fn new(
+    pub async fn new(
         chain_cfg: Chain,
         client: Arc<Client>,
         poi: Option<Arc<Poi>>,
         required_poi_list: Vec<FixedBytes<32>>,
+        sync_manager: Arc<SyncManager>,
+        prover: Arc<ProverService>,
+        query_rpc_cooldown: Duration,
     ) -> Result<Self, BroadcasterServiceError> {
         let (tx, rx) = kanal::bounded_async::<(DecryptedTransact, ParsedTransactCalldata)>(20);
         let count_transact_requests = Arc::new(AtomicU32::new(0));
         let count_txs_landed = Arc::new(AtomicU32::new(0));
-        let viewing_privkey: PrivateKey = chain_cfg.viewing_privkey.clone().into();
-        let addr = viewing_privkey.derive_address(None)?;
-        let key = viewing_privkey
-            .decode_vpriv()
-            .map_err(|_| BroadcasterServiceError::InvalidViewingPrivkey)?;
-        let broadcaster = Arc::new(TxBroadcaster::try_from(chain_cfg.clone())?);
-        let rpc = ProviderBuilder::new().connect_http(chain_cfg.query_rpc);
+        let derived_wallets = if let Key::Mnemonic(mnemonic) = &chain_cfg.key
+            && mnemonic.num_derived_evm_wallets > 0
+        {
+            derive_evm_wallet_keys(&mnemonic.seed_phrase, mnemonic.num_derived_evm_wallets)?
+        } else {
+            vec![]
+        };
+        let evm_wallets = chain_cfg
+            .evm_wallets
+            .iter()
+            .chain(derived_wallets.iter())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .map(|key| {
+                let signer = PrivateKeySigner::from(SigningKey::from_bytes(key.as_ref().into())?);
+                info!(addr=?signer.address(), "using EVM wallet");
+                Ok((EthereumWallet::from(signer.clone()), signer))
+            })
+            .collect::<Result<Vec<_>, BroadcasterServiceError>>()?;
+        let query_rpc_pool = Arc::new(QueryRpcPool::new(
+            chain_cfg.query_rpcs.clone(),
+            query_rpc_cooldown,
+        ));
+        let broadcaster = Arc::new(TxBroadcaster::try_from((
+            chain_cfg.clone(),
+            query_rpc_pool.clone(),
+        ))?);
         let multicall_contract = chain_cfg
             .multicall_contract
             .ok_or(BroadcasterServiceError::MissingMulticallContract)?;
@@ -153,17 +214,218 @@ impl BroadcasterService {
         let fees_manager = Arc::new(FeesManager::new(
             &chain_cfg.fees,
             fee_bonus,
-            rpc.clone(),
+            query_rpc_pool.clone(),
             multicall_contract,
+            chain_cfg.wrapped_native_token,
         ));
-        let evm_wallets = chain_cfg
-            .evm_wallets
-            .iter()
-            .map(|key| {
-                let signer = PrivateKeySigner::from(SigningKey::from_bytes(key.as_ref().into())?);
-                Ok((EthereumWallet::from(signer.clone()), signer))
-            })
-            .collect::<Result<Vec<_>, BroadcasterServiceError>>()?;
+
+        let (key, addr) = match &chain_cfg.key {
+            Key::ViewingPrivkey(key) => {
+                let viewing_key: ShareableViewingKey = key.clone().into();
+                let key = viewing_key
+                    .decode_viewing_private_key()
+                    .map_err(|_| BroadcasterServiceError::InvalidViewingPrivkey)?;
+                let addr = viewing_key.derive_address(None)?;
+                (key, addr)
+            }
+            Key::Mnemonic(mnemonic) => {
+                let config::MnemonicSettings {
+                    seed_phrase,
+                    init_block_number,
+                    auto_refill,
+                    utxo_consolidation,
+                    ..
+                } = mnemonic.as_ref();
+                let chain_id = chain_cfg.chain_id;
+                let wallet = WalletKeys::from_mnemonic(seed_phrase, 0)?;
+                let key = wallet.viewing.viewing_private_key;
+                let addr = wallet.viewing.derive_address(None)?;
+                let defaults = ChainConfigDefaults::for_chain(chain_id);
+                let railgun_contract = chain_cfg
+                    .sync
+                    .as_ref()
+                    .and_then(|sync| sync.railgun_contract)
+                    .or_else(|| defaults.as_ref().map(|config| config.contract))
+                    .ok_or(BroadcasterServiceError::RailgunContractMissing)?;
+                let finality_depth = chain_cfg
+                    .sync
+                    .as_ref()
+                    .and_then(|sync| sync.finality_depth)
+                    .or_else(|| defaults.as_ref().map(|config| config.finality_depth))
+                    .ok_or(BroadcasterServiceError::FinalityDepthMissing)?;
+                let anchor_interval = chain_cfg
+                    .sync
+                    .as_ref()
+                    .and_then(|sync| sync.anchor_interval)
+                    .or_else(|| defaults.as_ref().map(|config| config.anchor_interval))
+                    .ok_or(BroadcasterServiceError::AnchorIntervalMissing)?;
+                let anchor_retention = chain_cfg
+                    .sync
+                    .as_ref()
+                    .and_then(|sync| sync.anchor_retention)
+                    .or_else(|| defaults.as_ref().map(|config| config.anchor_retention))
+                    .unwrap_or(5);
+                let archive_until_block = chain_cfg
+                    .sync
+                    .as_ref()
+                    .and_then(|sync| sync.archive_until_block)
+                    .or_else(|| defaults.as_ref().map(|config| config.archive_until_block))
+                    .ok_or(BroadcasterServiceError::ArchiveUntilBlockMissing)?;
+                let v2_start_block = chain_cfg
+                    .sync
+                    .as_ref()
+                    .and_then(|sync| sync.v2_start_block)
+                    .or_else(|| defaults.as_ref().map(|config| config.v2_start_block))
+                    .ok_or(BroadcasterServiceError::V2StartBlockMissing)?;
+                let legacy_shield_block = chain_cfg
+                    .sync
+                    .as_ref()
+                    .and_then(|sync| sync.legacy_shield_block)
+                    .or_else(|| defaults.as_ref().map(|config| config.legacy_shield_block))
+                    .ok_or(BroadcasterServiceError::LegacyShieldBlockMissing)?;
+                let deployment_block = chain_cfg
+                    .sync
+                    .as_ref()
+                    .and_then(|sync| sync.deployment_block)
+                    .or_else(|| defaults.as_ref().map(|config| config.deployment_block))
+                    .ok_or(BroadcasterServiceError::DeploymentBlockMissing)?;
+                let quick_sync_endpoint = if chain_cfg
+                    .sync
+                    .as_ref()
+                    .is_some_and(|sync| sync.disable_quick_sync)
+                {
+                    None
+                } else {
+                    chain_cfg
+                        .sync
+                        .as_ref()
+                        .and_then(|sync| sync.quick_sync_endpoint.clone())
+                        .or_else(|| {
+                            defaults
+                                .as_ref()
+                                .and_then(|config| config.quick_sync_endpoint.clone())
+                        })
+                };
+                #[allow(clippy::redundant_closure_for_method_calls)]
+                let poll_interval = chain_cfg
+                    .sync
+                    .as_ref()
+                    .and_then(|sync| sync.poll_interval)
+                    .map_or(Duration::from_secs(15), |value| value.into_inner());
+                let block_range = chain_cfg
+                    .sync
+                    .as_ref()
+                    .and_then(|sync| sync.block_range)
+                    .unwrap_or(500);
+                let chain_config = ChainConfig {
+                    chain_id,
+                    contract: railgun_contract,
+                    rpcs: query_rpc_pool.clone(),
+                    archive_rpc_url: chain_cfg
+                        .sync
+                        .as_ref()
+                        .and_then(|sync| sync.archive_rpc_url.clone()),
+                    archive_until_block,
+                    deployment_block,
+                    v2_start_block,
+                    legacy_shield_block,
+                    block_range,
+                    poll_interval,
+                    finality_depth,
+                    quick_sync_endpoint,
+                    anchor_interval,
+                    anchor_retention,
+                };
+                let chain_service = sync_manager.add_chain(chain_config).await?;
+                let chain_key = ChainKey {
+                    chain_id,
+                    contract: railgun_contract,
+                };
+                let scan_keys = wallet.viewing;
+                let wallet_id = wallet.viewing.derive_address(None)?;
+                let cache_key = wallet_cache_key(wallet_id.as_ref(), chain_id, railgun_contract);
+                let wallet_cfg = WalletConfig {
+                    chain: chain_key,
+                    cache_key: cache_key.clone(),
+                    start_block: Some(*init_block_number),
+                    scan_keys,
+                };
+                let handle = sync_manager.add_wallet(wallet_cfg).await?;
+                if let Some(auto_refill) = auto_refill.clone() {
+                    let query_rpc_pool = query_rpc_pool.clone();
+                    let evm_wallets = evm_wallets.clone();
+                    let broadcaster = broadcaster.clone();
+                    let prover = prover.clone();
+                    let wallet = wallet.clone();
+                    let mut auto_refill_handle = handle.clone();
+                    let cache_key = cache_key.clone();
+                    let chain_handle = chain_service.handle();
+                    tokio::spawn(
+                        async move {
+                            auto_refill_handle.wait_until_ready().await;
+                            let cfg = AutoRefillConfig {
+                                chain_id,
+                                railgun_contract,
+                                relay_adapt_contract: chain_cfg.relay_adapt_contract,
+                                wrapped_native_token: chain_cfg.wrapped_native_token,
+                                wallet,
+                                wallet_handle: auto_refill_handle,
+                                chain_handle,
+                                auto_refill,
+                            };
+                            let auto_refill_service = AutoRefillService::new(
+                                cfg,
+                                evm_wallets,
+                                query_rpc_pool,
+                                broadcaster,
+                                prover,
+                            );
+                            info!(cache_key = cache_key, "wallet sync ready for auto-refill");
+                            auto_refill_service.run().await;
+                        }
+                        .instrument(info_span!("auto_refill")),
+                    );
+                }
+                if let Some(utxo_consolidation) = utxo_consolidation.clone() {
+                    let query_rpc_pool = query_rpc_pool.clone();
+                    let evm_wallets = evm_wallets.clone();
+                    let broadcaster = broadcaster.clone();
+                    let prover = prover.clone();
+                    let wallet = wallet.clone();
+                    let mut consolidation_handle = handle;
+                    let cache_key = cache_key.clone();
+                    let chain_handle = chain_service.handle();
+                    tokio::spawn(
+                        async move {
+                            consolidation_handle.wait_until_ready().await;
+                            let cfg = UtxoConsolidationConfig {
+                                chain_id,
+                                railgun_contract,
+                                relay_adapt_contract: chain_cfg.relay_adapt_contract,
+                                wallet,
+                                wallet_handle: consolidation_handle,
+                                chain_handle,
+                                settings: utxo_consolidation,
+                            };
+                            let consolidation_service = UtxoConsolidationService::new(
+                                cfg,
+                                evm_wallets,
+                                query_rpc_pool,
+                                broadcaster,
+                                prover,
+                            );
+                            info!(
+                                cache_key = cache_key,
+                                "wallet sync ready for utxo consolidation"
+                            );
+                            consolidation_service.run().await;
+                        }
+                        .instrument(info_span!("utxo_consolidation")),
+                    );
+                }
+                (key, addr)
+            }
+        };
 
         Ok(Self {
             chain_id: chain_cfg.chain_id,
@@ -179,7 +441,7 @@ impl BroadcasterService {
             client,
             poi,
             required_poi_list,
-            rpc: rpc.root().clone(),
+            query_rpc_pool,
             relay_adapt_contract: chain_cfg.relay_adapt_contract,
             identifier: chain_cfg.identifier,
             fees_refresh_interval: chain_cfg.fees_refresh_interval.into_inner(),
@@ -237,15 +499,18 @@ impl BroadcasterService {
                         (ratio * 100.0).round() / 100.0
                     }
                 };
-                let fee_expiration = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .expect("time went backwards")
-                    .as_millis()
-                    + fee_ttl.as_millis();
+                let fee_expiration = match SystemTime::now().duration_since(UNIX_EPOCH) {
+                    Ok(duration) => duration.as_millis().saturating_add(fee_ttl.as_millis()),
+                    Err(error) => {
+                        warn!(?error, "system time before unix epoch");
+                        continue;
+                    }
+                };
+                let fee_expiration = u64::try_from(fee_expiration).unwrap_or(u64::MAX);
                 let (fees_id, fees) = fees_manager.create_fees().await;
                 let fees = fees::Body {
                     fees,
-                    fee_expiration: fee_expiration as u64,
+                    fee_expiration,
                     fees_id,
                     railgun_address: railgun_address.clone(),
                     available_wallets,
@@ -258,9 +523,13 @@ impl BroadcasterService {
                 debug!(payload=?serde_json::to_string(&fees), "our fees");
                 match fees.into_signed_payload(key) {
                     Ok(payload) => {
-                        let (decoded_payload, is_valid) = payload
-                            .decode_and_verify()
-                            .expect("verify fees signature failed");
+                        let (decoded_payload, is_valid) = match payload.decode_and_verify() {
+                            Ok(result) => result,
+                            Err(error) => {
+                                warn!(?error, "verify fees signature failed");
+                                continue;
+                            }
+                        };
 
                         if is_valid {
                             match serde_json::to_string(&payload) {
@@ -315,7 +584,7 @@ impl BroadcasterService {
 
     pub fn spawn_tx_submitter(&self) {
         let rx = self.rx.clone();
-        let rpc = self.rpc.clone();
+        let query_rpc_pool = self.query_rpc_pool.clone();
         let count_transact_requests = self.count_transact_requests.clone();
         let count_txs_landed = self.count_txs_landed.clone();
         let fees_manager = self.fees_manager.clone();
@@ -354,14 +623,25 @@ impl BroadcasterService {
                         continue;
                     };
 
+                    let Some(provider_handle) = query_rpc_pool.random_provider() else {
+                        warn!("no query rpc available");
+                        continue;
+                    };
+                    let rpc = provider_handle.provider.clone();
+
                     let min_gas_price = decrypted_payload.params.min_gas_price.to();
-                    let gas_price = rpc
-                        .get_gas_price()
-                        .await
-                        .unwrap_or(min_gas_price)
-                        .max(min_gas_price)
-                        * 101
-                        / 100;
+                    let gas_price = match rpc.get_gas_price().await {
+                        Ok(gas_price) => gas_price.max(min_gas_price) * 101 / 100,
+                        Err(error) => {
+                            warn!(
+                                %error,
+                                rpc = %provider_handle.url,
+                                "fetch gas price failed",
+                            );
+                            query_rpc_pool.mark_bad_provider(&provider_handle);
+                            continue;
+                        }
+                    };
 
                     let tx_req = TransactionRequest::default()
                         .with_chain_id(chain_id)
@@ -369,15 +649,24 @@ impl BroadcasterService {
                         .with_to(decrypted_payload.params.to)
                         .with_input(decrypted_payload.params.data)
                         .with_gas_price(gas_price)
-                        .with_nonce(
-                            rpc.get_transaction_count(signer.address())
-                                .await
-                                .unwrap_or(0),
-                        );
+                        .with_nonce(match rpc.get_transaction_count(signer.address()).await {
+                            Ok(nonce) => nonce,
+                            Err(error) => {
+                                warn!(
+                                    %error,
+                                    rpc = %provider_handle.url,
+                                    "fetch nonce failed",
+                                );
+                                query_rpc_pool.mark_bad_provider(&provider_handle);
+                                continue;
+                            }
+                        });
                     if let Ok(gas) = rpc
                         .estimate_gas(tx_req.clone())
                         .await
-                        .inspect_err(|error| warn!(%error, "estimate gas failed"))
+                        .inspect_err(|error| {
+                            warn!(%error, rpc = %provider_handle.url, "estimate gas failed");
+                        })
                     {
                         let gas = gas + 100_000;
                         let tx_req = tx_req.with_gas_limit(gas);
@@ -398,9 +687,9 @@ impl BroadcasterService {
                                 &decrypted_payload.shared_key,
                                 "Gas cost is too high, please refresh and try again",
                             )
-                            .inspect_err(
-                                |error| error!(%error, "build error transact response failed"),
-                            ) && let Err(error) = client
+                                .inspect_err(
+                                    |error| error!(%error, "build error transact response failed"),
+                                ) && let Err(error) = client
                                 .publish(
                                     PUBSUB_PATH,
                                     &format!("/railgun/v2/0-{chain_id}-transact-response/json"),
@@ -430,14 +719,14 @@ impl BroadcasterService {
                                 &decrypted_payload.shared_key,
                                 tx_hash,
                             )
-                            .inspect_err(|error| error!(%error, "build transact response failed"))
+                                .inspect_err(|error| error!(%error, "build transact response failed"))
                                 && let Err(error) = client
-                                    .publish(
-                                        PUBSUB_PATH,
-                                        &format!("/railgun/v2/0-{chain_id}-transact-response/json"),
-                                        &transact_response,
-                                    )
-                                    .await
+                                .publish(
+                                    PUBSUB_PATH,
+                                    &format!("/railgun/v2/0-{chain_id}-transact-response/json"),
+                                    &transact_response,
+                                )
+                                .await
                             {
                                 error!(%error, "publish transact response failed");
                             }

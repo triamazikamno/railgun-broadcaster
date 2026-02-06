@@ -40,7 +40,7 @@ impl Client {
             config.node.connection_cap = max_peers;
         }
         if let Some(request_timeout) = cfg.peer_connection_timeout {
-           config.node.request_timeout = request_timeout.into_inner();
+            config.node.request_timeout = request_timeout.into_inner();
         }
         let waku = Arc::new(WakuNode::spawn(config).map_err(ClientError::SpawnNode)?);
         waku.add_additional_peers(
@@ -173,7 +173,7 @@ impl Client {
         content_topic: &str,
         json_payload_utf8: &[u8],
     ) -> Result<(), ClientError> {
-        tracing::debug!(payload=%String::from_utf8_lossy(json_payload_utf8), "publishing message");
+        tracing::trace!(payload=%String::from_utf8_lossy(json_payload_utf8), "publishing message");
         if let Err(error) = self
             .waku_fleet
             .lightpush_all(
@@ -215,6 +215,11 @@ impl Client {
     }
 }
 fn now_micros() -> u64 {
-    let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-    d.as_micros() as u64
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_micros() as u64,
+        Err(error) => {
+            tracing::warn!(?error, "system time before unix epoch");
+            0
+        }
+    }
 }

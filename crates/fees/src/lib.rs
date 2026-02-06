@@ -1,7 +1,9 @@
 use alloy::primitives::{Address, U256};
-use alloy::providers::Provider;
+use alloy::providers::{CallItem, Provider};
 use alloy::sol;
+use alloy::sol_types::SolCall;
 use broadcaster_core::crypto::railgun;
+use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use broadcaster_core::serde_helpers;
 use broadcaster_core::transact::ParsedTransactCalldata;
 use config::FeeRate;
@@ -11,6 +13,7 @@ use rand::distr::Alphanumeric;
 use ruint::uint;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -110,33 +113,36 @@ pub enum FeesError {
     Multicall(#[from] alloy::providers::MulticallError),
     #[error("invalid price: {value}")]
     InvalidPrice { value: String },
+    #[error("no query rpc available")]
+    NoQueryRpc,
 }
 
-struct OracleInstance<P: Provider> {
+struct OracleInstance {
     token_addr: Address,
     token_decimals: u8,
     is_inversed: bool,
-    instance: AggregatorInterface::AggregatorInterfaceInstance<P>,
+    addr: Address,
 }
 
-pub struct Manager<P: Provider> {
+pub struct Manager {
     prices: RwLock<HashMap<Address, U256>>,
     cache: moka::future::Cache<String, HashMap<Address, U256>>,
-    oracle_instances: Vec<OracleInstance<P>>,
+    oracle_instances: Vec<OracleInstance>,
     fee_bonus: U256,
-    rpc: P,
+    rpcs: Arc<QueryRpcPool>,
     multicall_addr: Address,
 }
 
-impl<P: Provider + Clone> Manager<P> {
+impl Manager {
     pub fn new(
         config: &HashMap<Address, FeeRate>,
         fee_bonus: U256,
-        rpc: P,
+        rpcs: Arc<QueryRpcPool>,
         multicall_addr: Address,
+        wrapped_native_token: Address,
     ) -> Self {
-        let mut oracle_instances = Vec::new();
-        let mut prices = HashMap::new();
+        let mut oracle_instances = Vec::with_capacity(config.len());
+        let mut prices = HashMap::with_capacity(config.len());
         for (token_addr, config) in config.clone() {
             match config {
                 FeeRate::Oracle {
@@ -148,10 +154,7 @@ impl<P: Provider + Clone> Manager<P> {
                         token_addr,
                         token_decimals,
                         is_inversed,
-                        instance: AggregatorInterface::AggregatorInterfaceInstance::new(
-                            addr,
-                            rpc.clone(),
-                        ),
+                        addr,
                     });
                 }
                 FeeRate::Fixed(val) => {
@@ -162,6 +165,7 @@ impl<P: Provider + Clone> Manager<P> {
                 }
             }
         }
+        prices.entry(wrapped_native_token).or_insert(fee_bonus);
         Self {
             prices: RwLock::new(prices),
             cache: moka::future::Cache::builder()
@@ -170,10 +174,11 @@ impl<P: Provider + Clone> Manager<P> {
             oracle_instances,
             fee_bonus,
             multicall_addr,
-            rpc,
+            rpcs,
         }
     }
 
+    #[must_use]
     pub async fn create_fees(&self) -> (String, HashMap<Address, U256>) {
         let fees = self.prices.read().await.clone();
         let fees_id: String = rand::rng()
@@ -185,14 +190,25 @@ impl<P: Provider + Clone> Manager<P> {
         (fees_id, fees)
     }
 
+    #[must_use]
     pub fn is_fees_id_valid(&self, fees_id: &str) -> bool {
         self.cache.contains_key(fees_id)
     }
 
     pub async fn update_prices(&self) -> Result<(), FeesError> {
-        let mut multicall = self.rpc.multicall().dynamic().address(self.multicall_addr);
+        let Some(rpc) = self.rpcs.random_provider() else {
+            return Err(FeesError::NoQueryRpc);
+        };
+        let mut multicall = rpc
+            .provider
+            .multicall()
+            .dynamic::<AggregatorInterface::latestAnswerCall>()
+            .address(self.multicall_addr);
         for oracle in &self.oracle_instances {
-            multicall = multicall.add_dynamic(oracle.instance.latestAnswer());
+            multicall = multicall.add_call_dynamic(CallItem::new(
+                oracle.addr,
+                AggregatorInterface::latestAnswerCall {}.abi_encode().into(),
+            ));
         }
         let results = multicall.try_aggregate(false).await?;
         for (oracle, res) in self.oracle_instances.iter().zip(results) {

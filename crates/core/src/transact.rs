@@ -1,22 +1,18 @@
-use aes_gcm::aead::AeadInPlace;
-use aes_gcm::{AesGcm, KeyInit, Nonce, Tag};
 use curve25519_dalek::edwards::CompressedEdwardsY;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha512};
 use std::collections::BTreeMap;
 use thiserror::Error;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
-use alloy::primitives::{Address, Bytes, FixedBytes, U256, keccak256};
-use alloy::sol;
-use alloy::sol_types::{SolCall, SolValue};
-use curve25519_dalek::scalar::Scalar;
-use openssl::symm::{Cipher, Crypter, Mode};
+use alloy::primitives::{Address, Bytes, FixedBytes, U256};
+use alloy::sol_types::SolCall;
 use ruint::uint;
 
+use crate::contracts::railgun::{ActionData, Transaction, relayCall, transactCall};
+use crate::crypto::aes_gcm::{AesGcmError, decrypt_in_place_16b_iv, split_iv_tag};
 use crate::crypto::poseidon::poseidon;
-
-type Aes256Gcm16 = AesGcm<aes::Aes256, typenum::U16>;
+use crate::crypto::shared_key::shared_symmetric_key;
 
 #[derive(Debug, Error)]
 pub enum TransactError {
@@ -24,8 +20,8 @@ pub enum TransactError {
     InvalidEd25519Pubkey,
     #[error("shared key error")]
     SharedKey,
-    #[error("aes key error")]
-    AesKey,
+    #[error(transparent)]
+    AesGcm(#[from] AesGcmError),
     #[error("ivtag must be 32 bytes, got {len}")]
     InvalidIvTag { len: usize },
     #[error("calldata too short: {len}")]
@@ -40,8 +36,6 @@ pub enum TransactError {
     PlaintextTooShort { len: usize },
     #[error("token hash invalid")]
     InvalidTokenHash,
-    #[error("openssl error: {0}")]
-    OpenSsl(#[from] openssl::error::ErrorStack),
     #[error("json parse error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("abi decode error: {0}")]
@@ -168,20 +162,17 @@ fn decrypt<T: serde::de::DeserializeOwned>(
     if ivtag.len() != 32 {
         return Err(TransactError::InvalidIvTag { len: ivtag.len() });
     }
-    let iv = &ivtag[..16];
-    let tag = &ivtag[16..];
+    let iv = ivtag[..16]
+        .try_into()
+        .map_err(|_| TransactError::InvalidIvTag { len: ivtag.len() })?;
+    let tag = ivtag[16..]
+        .try_into()
+        .map_err(|_| TransactError::InvalidIvTag { len: ivtag.len() })?;
 
-    let cipher = Aes256Gcm16::new_from_slice(shared_key).map_err(|_| TransactError::AesKey)?;
-    #[allow(deprecated)]
-    let nonce = Nonce::from_slice(iv);
-    #[allow(deprecated)]
-    let tag = Tag::from_slice(tag);
-
-    if cipher
-        .decrypt_in_place_detached(nonce, b"", &mut ct, tag)
-        .is_err()
-    {
-        return Ok(None);
+    match decrypt_in_place_16b_iv(shared_key, &iv, &tag, &mut ct) {
+        Ok(()) => {}
+        Err(AesGcmError::DecryptFailed) => return Ok(None),
+        Err(err) => return Err(err.into()),
     }
 
     tracing::debug!(ct=%String::from_utf8_lossy(&ct), "deserializing plaintext");
@@ -190,88 +181,16 @@ fn decrypt<T: serde::de::DeserializeOwned>(
     Ok(Some(params))
 }
 
-sol! {
-    struct G1Point { uint256 x; uint256 y; }
-    struct G2Point { uint256[2] x; uint256[2] y; }
-    struct SnarkProof { G1Point a; G2Point b; G1Point c; }
-
-    struct CommitmentCiphertext {
-        bytes32[4] ciphertext;
-        bytes32 blindedSenderViewingKey;
-        bytes32 blindedReceiverViewingKey;
-        bytes annotationData;
-        bytes memo;
-    }
-
-    struct BoundParams {
-        uint16 treeNumber;
-        uint72 minGasPrice;
-        uint8 unshield;
-        uint64 chainID;
-        address adaptContract;
-        bytes32 adaptParams;
-        CommitmentCiphertext[] commitmentCiphertext;
-    }
-
-    struct TokenData {
-        uint8 tokenType;
-        address tokenAddress;
-        uint256 tokenSubID;
-    }
-
-    struct CommitmentPreimage {
-        bytes32 npk;
-        TokenData token;
-        uint120 value;
-    }
-
-    struct Transaction {
-        SnarkProof proof;
-        bytes32 merkleRoot;
-        bytes32[] nullifiers;
-        bytes32[] commitments;
-        BoundParams boundParams;
-        CommitmentPreimage unshieldPreimage;
-    }
-
-    function transact(Transaction[] _transactions) payable;
-
-    #[derive(Debug)]
-    struct Call {
-        address to;
-        bytes data;
-        uint256 value;
-    }
-
-    #[derive(Debug)]
-    struct ActionData {
-        bytes31 random;
-        bool requireSuccess;
-        uint256 minGasLimit;
-        Call[] calls;
-    }
-    function relay(Transaction[] calldata _transactions, ActionData calldata _actionData) payable;
-}
-
-const SNARK_PRIME: U256 =
-    uint!(21888242871839275222246405745257275088548364400416034343698204186575808495617_U256);
-
 pub const MERKLE_ZERO_VALUE: U256 =
     uint!(2051258411002736885948763699317990061539314419500486054347250703186609807356_U256);
 
-fn pad_to_13_with_merkle_zero(mut v: Vec<U256>) -> Vec<U256> {
-    while v.len() < 13 {
+#[must_use]
+pub fn pad_with_merkle_zero(mut v: Vec<U256>, target: usize) -> Vec<U256> {
+    while v.len() < target {
         v.push(MERKLE_ZERO_VALUE);
     }
-    v.truncate(13);
+    v.truncate(target);
     v
-}
-
-fn hash_bound_params_v2(bound_params: &BoundParams) -> U256 {
-    let encoded = bound_params.abi_encode();
-    let h = keccak256(encoded);
-    let x = U256::from_be_bytes(*h);
-    x % SNARK_PRIME
 }
 
 fn compute_railgun_txid_v2(tx0: &Transaction) -> U256 {
@@ -287,60 +206,14 @@ fn compute_railgun_txid_v2(tx0: &Transaction) -> U256 {
         .map(|b| U256::from_be_bytes(b.0))
         .collect();
 
-    let nullifiers_hash = poseidon(pad_to_13_with_merkle_zero(nullifiers));
-    let commitments_hash = poseidon(pad_to_13_with_merkle_zero(commitments));
+    let nullifiers_hash = poseidon(pad_with_merkle_zero(nullifiers, 13));
+    let commitments_hash = poseidon(pad_with_merkle_zero(commitments, 13));
 
-    let bound_params_hash = hash_bound_params_v2(&tx0.boundParams);
-
-    poseidon(vec![nullifiers_hash, commitments_hash, bound_params_hash])
-}
-
-fn private_scalar_from_viewing_privkey(vpriv: &[u8; 32]) -> Scalar {
-    let h = Sha512::digest(vpriv);
-    let mut head = [0u8; 32];
-    head.copy_from_slice(&h[..32]);
-
-    head[0] &= 248;
-    head[31] &= 127;
-    head[31] |= 64;
-
-    Scalar::from_bytes_mod_order(head)
-}
-
-fn shared_symmetric_key(
-    vpriv: &[u8; 32],
-    blinded_sender_viewing_key: &[u8; 32],
-) -> Result<[u8; 32], TransactError> {
-    let scalar = private_scalar_from_viewing_privkey(vpriv);
-
-    let point = CompressedEdwardsY(*blinded_sender_viewing_key)
-        .decompress()
-        .ok_or(TransactError::InvalidEd25519Pubkey)?;
-
-    let shared_point = (point * scalar).compress().to_bytes();
-
-    let digest = Sha256::digest(shared_point);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&digest);
-    Ok(out)
-}
-
-fn aes_256_gcm_decrypt_16b_iv(
-    key: &[u8; 32],
-    iv16: &[u8; 16],
-    tag16: &[u8; 16],
-    ciphertext: &[u8],
-) -> Result<Vec<u8>, TransactError> {
-    let cipher = Cipher::aes_256_gcm();
-    let mut crypter = Crypter::new(cipher, Mode::Decrypt, key, Some(iv16))?;
-
-    crypter.set_tag(tag16)?;
-
-    let mut out = vec![0u8; ciphertext.len() + cipher.block_size()];
-    let n1 = crypter.update(ciphertext, &mut out)?;
-    let n2 = crypter.finalize(&mut out[n1..])?;
-    out.truncate(n1 + n2);
-    Ok(out)
+    poseidon(vec![
+        nullifiers_hash,
+        commitments_hash,
+        tx0.boundParams.hash(),
+    ])
 }
 
 #[derive(Debug)]
@@ -386,11 +259,7 @@ pub fn parse_transact_calldata(
         .first()
         .ok_or(TransactError::MissingCommitmentCiphertext)?;
 
-    let iv_tag_bytes = cc0.ciphertext[0].0;
-    let mut iv = [0u8; 16];
-    let mut tag = [0u8; 16];
-    iv.copy_from_slice(&iv_tag_bytes[..16]);
-    tag.copy_from_slice(&iv_tag_bytes[16..]);
+    let (iv, tag) = split_iv_tag(cc0.ciphertext[0].0);
 
     let mut ct = Vec::with_capacity(32 * 3 + cc0.memo.len());
     ct.extend_from_slice(&cc0.ciphertext[1].0);
@@ -399,20 +268,21 @@ pub fn parse_transact_calldata(
     ct.extend_from_slice(&cc0.memo);
 
     let blinded_sender = cc0.blindedSenderViewingKey.0;
-    let key = shared_symmetric_key(viewing_privkey, &blinded_sender)?;
+    let key = shared_symmetric_key(viewing_privkey, &blinded_sender)
+        .map_err(|_| TransactError::InvalidEd25519Pubkey)?;
 
-    let pt = aes_256_gcm_decrypt_16b_iv(&key, &iv, &tag, &ct)?;
+    decrypt_in_place_16b_iv(&key, &iv, &tag, &mut ct)?;
 
-    if pt.len() < 96 {
-        return Err(TransactError::PlaintextTooShort { len: pt.len() });
+    if ct.len() < 96 {
+        return Err(TransactError::PlaintextTooShort { len: ct.len() });
     }
 
-    let token_hash = &pt[32..64];
+    let token_hash = &ct[32..64];
     if token_hash[..12] != [0u8; 12] {
         return Err(TransactError::InvalidTokenHash);
     }
     let fee_token = Address::from_slice(&token_hash[12..32]);
-    let fee_amount = U256::from_be_slice(&pt[64 + 16..96]);
+    let fee_amount = U256::from_be_slice(&ct[64 + 16..96]);
 
     Ok(ParsedTransactCalldata {
         fee_token,

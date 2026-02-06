@@ -19,6 +19,8 @@ services:
     # Copy config.example.yaml to config.yaml and customize before running
     volumes:
       - ./config.yaml:/app/config/config.yaml:ro
+      # Persist local db and caches
+      - ./db:/app/db
     
     # Resource limits
     deploy:
