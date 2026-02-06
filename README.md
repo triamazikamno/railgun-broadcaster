@@ -65,7 +65,8 @@ See [config.example.yaml](config.example.yaml) for a complete annotated example.
 ### Sensitive Data in Configuration
 
 The following fields contain sensitive information:
-- `viewing_privkey`: RAILGUN view-only private key
+- `key: !ViewingPrivkey`: RAILGUN view-only private key
+- `key: !Mnemonic`: RAILGUN private key (seed phrase)
 - `evm_wallets`: Array of EVM private keys
 - `api_key`: Optional Bloxroute API key
 
