@@ -15,7 +15,7 @@ A Rust implementation of a RAILGUN broadcaster that relays private transactions 
 Project is under active development; breaking changes may occur.
 
 ### TODO
-- [ ] Add optional auto top-up from 0zk wallet (with implication of storing seed phrase)
+- [X] Add optional auto top-up from 0zk wallet (with implication of storing seed phrase)
 - [ ] Notifications to Telegram/Discord/Matrix/Email
 - [ ] Add Tor support for all external requests
 
@@ -43,12 +43,15 @@ cd railgun-broadcaster
 cp config.example.yaml config.yaml
 # Edit config.yaml with your settings (see Configuration section)
 
-# 3. Build and run with Docker Compose
+# 3. Create a persistent db directory
+mkdir -p db
+
+# 4. Build and run with Docker Compose
 export GIT_COMMIT=$(git rev-parse --short HEAD)
 export BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
 docker-compose up -d
 
-# 4. View logs
+# 5. View logs
 docker-compose logs -f broadcaster
 ```
 
@@ -62,7 +65,8 @@ See [config.example.yaml](config.example.yaml) for a complete annotated example.
 ### Sensitive Data in Configuration
 
 The following fields contain sensitive information:
-- `viewing_privkey`: RAILGUN view-only private key
+- `key: !ViewingPrivkey`: RAILGUN view-only private key
+- `key: !Mnemonic`: RAILGUN private key (seed phrase)
 - `evm_wallets`: Array of EVM private keys
 - `api_key`: Optional Bloxroute API key
 
@@ -71,6 +75,9 @@ The following fields contain sensitive information:
 ## Running with Docker
 
 ### Using Docker Compose (Recommended)
+
+`docker-compose.yml` mounts `./db` to `/app/db` so the local database and caches
+persist across restarts. Ensure `./db` exists and is writable by UID 1000.
 
 ```bash
 # Build with git commit tagging
@@ -103,10 +110,12 @@ docker build \
   .
 
 # Run the container
+mkdir -p db
 docker run -d \
   --name railgun-broadcaster \
   --user 1000:1000 \
   -v $(pwd)/config.yaml:/app/config/config.yaml:ro \
+  -v $(pwd)/db:/app/db \
   --restart unless-stopped \
   railgun-broadcaster:${GIT_COMMIT}
 

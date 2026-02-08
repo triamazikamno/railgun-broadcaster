@@ -1,2 +1,2 @@
-pub mod poi;
 pub mod error;
+pub mod poi;

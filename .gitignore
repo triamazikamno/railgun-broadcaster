@@ -24,3 +24,6 @@ secrets/
 *.crt
 .env
 .env.*
+
+db/
+artifacts/

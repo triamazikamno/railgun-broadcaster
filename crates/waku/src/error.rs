@@ -1,5 +1,5 @@
-use libp2p::noise;
 use crate::discovery::DiscoveryError;
+use libp2p::noise;
 
 /// Top-level error type for the Waku node public API.
 #[derive(Debug, thiserror::Error)]
@@ -26,7 +26,6 @@ pub enum WakuError {
     #[error("filter request failed")]
     FilterRequestFailed,
 }
-
 
 /// Errors that can occur during transport initialization.
 #[derive(Debug, thiserror::Error)]

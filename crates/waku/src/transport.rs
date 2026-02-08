@@ -1,4 +1,5 @@
 use crate::config::NodeConfig;
+use crate::error::TransportInitError;
 use crate::proto;
 use crate::protocols;
 use crate::protocols::filter::FilterPushAck;
@@ -21,7 +22,6 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error};
-use crate::error::TransportInitError;
 
 /// Internal request ID used by the coordinator to correlate responses.
 pub type ReqId = u64;

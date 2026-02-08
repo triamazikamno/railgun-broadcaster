@@ -5,7 +5,7 @@ use ark_bn254::{Bn254, Fq, Fq2, Fr, G1Affine, G2Affine};
 use ark_ff::PrimeField;
 use ark_groth16::{Groth16, PreparedVerifyingKey, Proof, VerifyingKey, prepare_verifying_key};
 
-use crate::transact::MERKLE_ZERO_VALUE;
+use crate::transact::pad_with_merkle_zero;
 use crate::transact::{PreTxPoi, SnarkJsProof};
 use alloy::primitives::U256;
 
@@ -55,6 +55,34 @@ struct VKeyJson {
 
     #[serde(rename = "IC")]
     pub ic: Vec<Vec<U256>>,
+}
+
+impl VKeyJson {
+    fn try_into_ark(&self) -> Result<VerifyingKey<Bn254>, SnarkProofError> {
+        if self.protocol.to_lowercase() != "groth16" {
+            return Err(SnarkProofError::UnsupportedProtocol {
+                protocol: self.protocol.clone(),
+            });
+        }
+
+        let alpha_g1 = g1_from_xyz(&self.vk_alpha_1)?;
+        let beta_g2 = g2_from_snarkjs_xy(&self.vk_beta_2)?;
+        let gamma_g2 = g2_from_snarkjs_xy(&self.vk_gamma_2)?;
+        let delta_g2 = g2_from_snarkjs_xy(&self.vk_delta_2)?;
+
+        let mut gamma_abc_g1 = Vec::with_capacity(self.ic.len());
+        for icp in &self.ic {
+            gamma_abc_g1.push(g1_from_xyz(icp)?);
+        }
+
+        Ok(VerifyingKey {
+            alpha_g1,
+            beta_g2,
+            gamma_g2,
+            delta_g2,
+            gamma_abc_g1,
+        })
+    }
 }
 
 const IPFS_GATEWAY: &str = "https://ipfs-lb.com";
@@ -184,64 +212,32 @@ fn g2_from_snarkjs_xy(v: &[Vec<U256>]) -> Result<G2Affine, SnarkProofError> {
     })
 }
 
-fn vkey_to_ark(vk: &VKeyJson) -> Result<VerifyingKey<Bn254>, SnarkProofError> {
-    if vk.protocol.to_lowercase() != "groth16" {
-        return Err(SnarkProofError::UnsupportedProtocol {
-            protocol: vk.protocol.clone(),
-        });
+impl SnarkJsProof {
+    fn try_into_ark(&self) -> Result<Proof<Bn254>, SnarkProofError> {
+        let a = {
+            let x = fq_from_dec(self.pi_a[0]);
+            let y = fq_from_dec(self.pi_a[1]);
+            let pa = G1Affine::new_unchecked(x, y);
+            if !pa.is_on_curve() || !pa.is_in_correct_subgroup_assuming_on_curve() {
+                return Err(SnarkProofError::InvalidProofA);
+            }
+            pa
+        };
+
+        let b = g2_from_snarkjs_pi_b(&self.pi_b)?;
+
+        let c = {
+            let x = fq_from_dec(self.pi_c[0]);
+            let y = fq_from_dec(self.pi_c[1]);
+            let pc = G1Affine::new_unchecked(x, y);
+            if !pc.is_on_curve() || !pc.is_in_correct_subgroup_assuming_on_curve() {
+                return Err(SnarkProofError::InvalidProofC);
+            }
+            pc
+        };
+
+        Ok(Proof { a, b, c })
     }
-
-    let alpha_g1 = g1_from_xyz(&vk.vk_alpha_1)?;
-    let beta_g2 = g2_from_snarkjs_xy(&vk.vk_beta_2)?;
-    let gamma_g2 = g2_from_snarkjs_xy(&vk.vk_gamma_2)?;
-    let delta_g2 = g2_from_snarkjs_xy(&vk.vk_delta_2)?;
-
-    let mut gamma_abc_g1 = Vec::with_capacity(vk.ic.len());
-    for icp in &vk.ic {
-        gamma_abc_g1.push(g1_from_xyz(icp)?);
-    }
-
-    Ok(VerifyingKey {
-        alpha_g1,
-        beta_g2,
-        gamma_g2,
-        delta_g2,
-        gamma_abc_g1,
-    })
-}
-
-fn proof_model_to_ark(proof: &SnarkJsProof) -> Result<Proof<Bn254>, SnarkProofError> {
-    let a = {
-        let x = fq_from_dec(proof.pi_a[0]);
-        let y = fq_from_dec(proof.pi_a[1]);
-        let pa = G1Affine::new_unchecked(x, y);
-        if !pa.is_on_curve() || !pa.is_in_correct_subgroup_assuming_on_curve() {
-            return Err(SnarkProofError::InvalidProofA);
-        }
-        pa
-    };
-
-    let b = g2_from_snarkjs_pi_b(&proof.pi_b)?;
-
-    let c = {
-        let x = fq_from_dec(proof.pi_c[0]);
-        let y = fq_from_dec(proof.pi_c[1]);
-        let pc = G1Affine::new_unchecked(x, y);
-        if !pc.is_on_curve() || !pc.is_in_correct_subgroup_assuming_on_curve() {
-            return Err(SnarkProofError::InvalidProofC);
-        }
-        pc
-    };
-
-    Ok(Proof { a, b, c })
-}
-
-fn pad_hex32(mut v: Vec<U256>, target: usize) -> Vec<U256> {
-    while v.len() < target {
-        v.push(MERKLE_ZERO_VALUE);
-    }
-    v.truncate(target);
-    v
 }
 
 fn pad_hex32_zero(mut v: Vec<U256>, target: usize) -> Vec<U256> {
@@ -261,7 +257,7 @@ fn build_poi_public_signals(
     poi_merkleroots: &[U256],
 ) -> Vec<Fr> {
     let bco = pad_hex32_zero(blinded_commitments_out.to_vec(), max_outputs);
-    let pmr = pad_hex32(poi_merkleroots.to_vec(), max_inputs);
+    let pmr = pad_with_merkle_zero(poi_merkleroots.to_vec(), max_inputs);
 
     let mut out = Vec::with_capacity(max_outputs + 1 + 1 + max_inputs);
 
@@ -294,7 +290,9 @@ impl Prover {
         max_outputs: usize,
     ) -> Result<PreparedVerifyingKey<Bn254>, SnarkProofError> {
         let vkey_json = fetch_poi_vkey_json(max_inputs, max_outputs).await?;
-        vkey_to_ark(&vkey_json).map(|vk| prepare_verifying_key(&vk))
+        vkey_json
+            .try_into_ark()
+            .map(|vk| prepare_verifying_key(&vk))
     }
 
     const fn pvk(&self, max_inputs: usize, max_outputs: usize) -> &PreparedVerifyingKey<Bn254> {
@@ -319,7 +317,7 @@ impl Prover {
 
         let pvk = self.pvk(max_inputs, max_outputs);
 
-        let proof = proof_model_to_ark(&proof_data.snark_proof)?;
+        let proof = proof_data.snark_proof.try_into_ark()?;
 
         let public_inputs = build_poi_public_signals(
             max_inputs,

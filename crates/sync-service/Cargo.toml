@@ -1,0 +1,21 @@
+[package]
+name = "sync-service"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+alloy = { workspace = true }
+alloy-provider = { workspace = true }
+alloy-rpc-types-eth = { workspace = true }
+alloy-transport = { workspace = true }
+broadcaster-core = { path = "../core" }
+local-db = { path = "../local-db" }
+merkletree = { path = "../merkletree" }
+railgun-wallet = { path = "../railgun-wallet" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio-util = "0.7"
+tracing = { workspace = true }
+url = { workspace = true }
+thiserror = { workspace = true }

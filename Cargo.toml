@@ -1,10 +1,15 @@
 [workspace]
 members = [
     "bins/broadcaster",
+    "bins/db-cli",
     "crates/config",
     "crates/core",
     "crates/fees",
+    "crates/local-db",
+    "crates/railgun-wallet",
+    "crates/merkletree",
     "crates/poi",
+    "crates/sync-service",
     "crates/waku",
     "crates/waku-relay",
     "crates/tx-submit",
@@ -17,16 +22,24 @@ edition = "2024"
 rust-version = "1.88"
 
 [workspace.dependencies]
-alloy = { version = "1", features = ["serde"] }
+alloy = { version = "1", features = ["serde", "signer-mnemonic"] }
+alloy-provider = "1"
+alloy-rpc-types-eth = "1"
+alloy-transport = "1"
 eyre = "0.6"
 rand = "0.9"
-reqwest = { version = "0.13" }
+reqwest = { version = "0.12" }
 ruint = { version = "1.17", features = ["num-bigint"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = "1"
 tracing = "0.1"
+url = "2"
+bytes = { version = "1.11" }
+byteorder = "1"
+rayon = { version = "1.11" }
+async-trait = "0.1"
 
 [profile.release]
 opt-level = 3
@@ -36,6 +49,11 @@ strip = true
 panic = "unwind"
 codegen-units = 8
 
+[profile.dev]
+debug = true
+panic = "abort"
+strip = "none"
+
 [workspace.lints]
 rust.unreachable_pub = "warn"
 rust.unused_must_use = "deny"
@@ -43,7 +61,7 @@ rust.rust_2018_idioms = { level = "deny", priority = -1 }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
-perf = {level = "warn", priority = -1}
+perf = { level = "warn", priority = -1 }
 pub_underscore_fields = "allow"
 branches_sharing_code = "warn"
 clear_with_drain = "warn"

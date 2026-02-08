@@ -3,9 +3,44 @@ chains:
   - chain_id: 1
 
     # View-only private key (0zk)
-    viewing_privkey: 0x82a57...
+    # key: !ViewingPrivkey 0x82a57...
+
+    # or mnemonic seed phrase
+    key: !Mnemonic
+      seed_phrase: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+      # The starting block number from which to search for unspent UTXOs
+      init_block_number: 24370000
+      # Number of EVM wallets to derive from the seed to use as senders (m/44'/60'/0'/0/{index})
+      num_derived_evm_wallets: 0
+      # Auto-refill EVM wallets by unshielding WETH and unwrapping to ETH when their balance falls below `min_amount`.
+      auto_refill:
+        # How often to check wallet balances
+        interval: 10m
+        # Skip refill if gas price is too high
+        max_gas_price: 0.5gwei
+        # Trigger refill when balance drops below this
+        min_amount: 0.1ether
+        # Amount to refill up to
+        target_amount: 0.2ether
+
+      # Consolidate UTXOs into larger notes when gas is cheap
+      utxo_consolidation:
+        # How often to check for consolidations
+        interval: 30m
+        # Skip consolidation if gas price is too high
+        max_gas_price: 0.5gwei
+        # Minimum number of UTXOs in a tree to start consolidation
+        min_utxos: 20
+        # Tokens eligible for consolidation
+        tokens:
+          - 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2
+          - 0xdAC17F958D2ee523a2206206994597C13D831ec7
+          - 0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48
+          - 0x6b175474e89094c44da98b954eedeac495271d0f
+          - 0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599
 
     # Private keys for EVM transaction senders. Hex format.
+    # Can be empty if `key` is set to Mnemonic and `num_derived_evm_wallets` is non-zero.
     evm_wallets:
       - 0xabcd1234...
 
@@ -21,14 +56,18 @@ chains:
     # Optional identifier for this broadcaster. Wallets may or may not display it.
     identifier: rust-broadcaster
 
-    # RPC endpoint for querying the chain
-    query_rpc: https://eth.llamarpc.com
+    # RPC endpoints for querying the chain
+    query_rpcs:
+      - https://eth.llamarpc.com
+      - https://ethereum-rpc.publicnode.com
+      - https://ethereum-public.nodies.app
+      - https://eth-mainnet.g.alchemy.com/v2/demo
 
     # List of tokens to accept fees in. Price should be expressed in tokens per Wei.
     # Chainlink oracles are supported. Oracle must return ETH/TOKEN price. If it returns TOKEN/ETH then `is_inversed` must be set to true.
     fees:
       # WETH
-      0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2: !Fixed 1000000000000000000
+      0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2: !Fixed "1ether"
       # USDT
       0xdAC17F958D2ee523a2206206994597C13D831ec7: !Oracle
         addr: 0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419
@@ -70,6 +109,8 @@ chains:
       #  api_key: <FILL_ME>
 
     # Advanced configuration
+    wrapped_native_token: 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2
+    railgun_contract: 0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9
     relay_adapt_contract: 0xAc9f360Ae85469B27aEDdEaFC579Ef2d052aD405
     multicall_contract: 0xcA11bde05977b3631167028862bE2a173976CA11
 
@@ -82,11 +123,18 @@ chains:
     fees_ttl: 5m
     fees_refresh_interval: 30s
     identifier: rust-broadcaster
-    query_rpc: https://bsc-dataseed1.bnbchain.org
-
+    query_rpcs:
+      - https://binance-smart-chain-public.nodies.app
+      - https://rpc-bsc.48.club
+      - https://binance.nodereal.io
+      - https://bsc-rpc.publicnode.com
+      - https://bsc-mainnet.public.blastapi.io
+      - https://api.zan.top/bsc-mainnet
+      - https://public-bsc.nownodes.io
+      - https://rpc.sentio.xyz/bsc
     fees:
       # BNB
-      0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c: !Fixed 1000000000000000000
+      0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c: !Fixed "1ether"
       # BSC-USD
       0x55d398326f99059ff775485246999027b3197955: !Oracle
         addr: 0x0567F2323251f0Aab15c8dFb1967E4e8A7D42aeE
@@ -110,6 +158,8 @@ chains:
         url: https://bsc.rpc.blxrbdn.com
         has_mev: true
 
+    wrapped_native_token: 0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c
+    railgun_contract: 0x590162bf4b50f6576a459b75309ee21d92178a10
     relay_adapt_contract: 0xf82d00fc51f730f42a00f85e74895a2849fff2dd
     multicall_contract: 0xcA11bde05977b3631167028862bE2a173976CA11
 
@@ -122,10 +172,11 @@ chains:
     fees_ttl: 5m
     fees_refresh_interval: 30s
     identifier: rust-broadcaster
-    query_rpc: https://polygon-public.nodies.app
+    query_rpcs:
+      - https://polygon-public.nodies.app
     fees:
       # WMATIC
-      0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270: !Fixed 1000000000000000000
+      0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270: !Fixed "1ether"
       # USDT
       0xc2132d05d31c914a87c6611c10748aeb04b58e8f: !Oracle
         addr: 0xAB594600376Ec9fD91F8e885dADF0CE036862dE0
@@ -143,6 +194,8 @@ chains:
       - !Normal https://poly.api.pocket.network
       - !Normal https://polygon-public.nodies.app
       - !Normal https://api.zan.top/polygon-mainnet
+    wrapped_native_token: 0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270
+    railgun_contract: 0x19b620929f97b7b990801496c3b361ca5def8c71
     relay_adapt_contract: 0xF82d00fC51F730F42A00F85E74895a2849ffF2Dd
     multicall_contract: 0xcA11bde05977b3631167028862bE2a173976CA11
 
@@ -155,10 +208,11 @@ chains:
     fees_ttl: 5m
     fees_refresh_interval: 30s
     identifier: rust-broadcaster
-    query_rpc: https://arb1.arbitrum.io/rpc
+    query_rpcs:
+      - https://arb1.arbitrum.io/rpc
     fees:
       # WETH
-      0x82af49447d8a07e3bd95bd0d56f35241523fbab1: !Fixed 1000000000000000000
+      0x82af49447d8a07e3bd95bd0d56f35241523fbab1: !Fixed "1ether"
       # USDT
       0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9: !Oracle
         addr: 0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612
@@ -183,9 +237,19 @@ chains:
 
     submit_rpcs:
       - !Normal https://arb1.arbitrum.io/rpc
+    wrapped_native_token: 0x82af49447d8a07e3bd95bd0d56f35241523fbab1
+    railgun_contract: 0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9
     relay_adapt_contract: 0xB4F2d77bD12c6b548Ae398244d7FAD4ABCE4D89b
     multicall_contract: 0xcA11bde05977b3631167028862bE2a173976CA11
 
+
+# Optional override for local db root.
+#db_dir: ./db
+
+# Optional admin API for online wallet resets.
+#admin:
+#  listen_addr: 127.0.0.1:3001
+#  token: "change-me"
 
 waku:
   # URL to a dedicated nwaku relay (optional)
@@ -213,6 +277,7 @@ waku:
     - peer_id: "16Uiu2HAkwNeQVY32bUrL1eM68ryMa48PXY5Bhfxfg9e2byYcc46m"
       addrs: [ "/dns4/prod.rootedinprivacy.com/tcp/30304/p2p/16Uiu2HAkwNeQVY32bUrL1eM68ryMa48PXY5Bhfxfg9e2byYcc46m", "/dns4/prod.rootedinprivacy.com/tcp/8000/wss/p2p/16Uiu2HAkwNeQVY32bUrL1eM68ryMa48PXY5Bhfxfg9e2byYcc46m" ]
 
+query_rpc_cooldown: 3m
 poi_rpc: https://ppoi.fdi.network
 required_poi_list:
   # Chainalysis OFAC Sanctions API

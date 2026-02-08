@@ -3,10 +3,12 @@ use alloy::providers::{Provider, ProviderBuilder, RootProvider};
 use alloy::signers::Signer;
 use alloy::signers::k256::ecdsa::{SigningKey, signature};
 use alloy::signers::local::{LocalSigner, PrivateKeySigner};
+use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use config::{Chain, Rpc};
 use reqwest::StatusCode;
 use reqwest::Url;
 use serde_json::json;
+use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Clone)]
@@ -17,7 +19,7 @@ enum RpcClient {
         http_client: reqwest::Client,
         signer: LocalSigner<SigningKey>,
         num_blocks: u64,
-        query_rpc: RootProvider,
+        query_rpc_pool: Arc<QueryRpcPool>,
     },
     BloxrouteBackrunme {
         url: Url,
@@ -30,7 +32,7 @@ impl RpcClient {
     async fn broadcast(
         &self,
         tx: &[u8],
-        additional_txs: Option<&Vec<Vec<u8>>>,
+        additional_txs: Option<&[Vec<u8>]>,
     ) -> Result<Option<TxHash>, TxSubmitError> {
         match self {
             Self::Regular(provider) => {
@@ -47,7 +49,7 @@ impl RpcClient {
                 signer,
                 num_blocks,
                 url,
-                query_rpc,
+                query_rpc_pool,
             } => {
                 #[derive(serde::Deserialize)]
                 struct Response {
@@ -62,12 +64,21 @@ impl RpcClient {
                 if let Some(additional_txs) = additional_txs {
                     txs.extend(additional_txs.iter().map(alloy::hex::encode_prefixed));
                 }
-                let block = query_rpc.get_block_number().await.map_err(|source| {
-                    TxSubmitError::Provider {
-                        queue: "flashbots",
-                        source,
-                    }
-                })?;
+                let Some(provider_handle) = query_rpc_pool.random_provider() else {
+                    return Err(TxSubmitError::NoQueryRpc);
+                };
+                let block =
+                    provider_handle
+                        .provider
+                        .get_block_number()
+                        .await
+                        .map_err(|source| {
+                            query_rpc_pool.mark_bad_provider(&provider_handle);
+                            TxSubmitError::Provider {
+                                queue: "flashbots",
+                                source,
+                            }
+                        })?;
                 for i in 1..=*num_blocks {
                     let bundle = json!({
                             "jsonrpc": "2.0",
@@ -79,10 +90,9 @@ impl RpcClient {
                           }]
 
                     });
+                    let payload = serde_json::to_vec(&bundle)?;
                     let signature = signer
-                        .sign_message(
-                            format!("0x{:x}", keccak256(bundle.clone().to_string())).as_bytes(),
-                        )
+                        .sign_message(format!("0x{:x}", keccak256(&payload)).as_bytes())
                         .await
                         .map_err(|source| TxSubmitError::Signer {
                             message: source.to_string(),
@@ -169,6 +179,8 @@ pub enum TxSubmitError {
         #[source]
         source: alloy::transports::TransportError,
     },
+    #[error("no query rpc available")]
+    NoQueryRpc,
     #[error("flashbots bundle error")]
     FlashbotsBundle {
         block: u64,
@@ -181,8 +193,8 @@ pub enum TxSubmitError {
     HttpStatus { status: StatusCode, body: String },
     #[error("signer error: {message}")]
     Signer { message: String },
-    #[error("decode error")]
-    Decode(#[from] serde_json::Error),
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 impl TxSubmitError {
@@ -199,12 +211,13 @@ impl TxSubmitError {
     }
 }
 
-impl TryFrom<Chain> for TxBroadcaster {
+impl TryFrom<(Chain, Arc<QueryRpcPool>)> for TxBroadcaster {
     type Error = BroadcasterInitError;
-    fn try_from(cfg: Chain) -> Result<Self, Self::Error> {
-        let mut mev_rpcs = Vec::new();
-        let mut mempool_rpcs = Vec::new();
-        let mut private_rpcs = Vec::new();
+    fn try_from((cfg, query_rpc_pool): (Chain, Arc<QueryRpcPool>)) -> Result<Self, Self::Error> {
+        let rpc_count = cfg.submit_rpcs.len();
+        let mut mev_rpcs = Vec::with_capacity(rpc_count);
+        let mut mempool_rpcs = Vec::with_capacity(rpc_count);
+        let mut private_rpcs = Vec::with_capacity(rpc_count);
         let signer = PrivateKeySigner::from(
             SigningKey::from_bytes(
                 cfg.evm_wallets
@@ -215,7 +228,6 @@ impl TryFrom<Chain> for TxBroadcaster {
             )
             .map_err(BroadcasterInitError::InitSignature)?,
         );
-        let query_rpc = ProviderBuilder::new().connect_http(cfg.query_rpc);
         for rpc in cfg.submit_rpcs {
             match rpc {
                 Rpc::Flashbots { url, num_blocks } => {
@@ -224,7 +236,7 @@ impl TryFrom<Chain> for TxBroadcaster {
                         http_client: reqwest::Client::new(),
                         signer: signer.clone(),
                         num_blocks,
-                        query_rpc: query_rpc.root().clone(),
+                        query_rpc_pool: query_rpc_pool.clone(),
                     };
                     private_rpcs.push(rpc.clone());
                     mempool_rpcs.push(rpc.clone());
@@ -295,7 +307,7 @@ impl TxBroadcaster {
         let mut result_tx_hash = None;
         let mut result_error = None;
         for rpc in rpcs {
-            match rpc.broadcast(&tx, additional_txs.as_ref()).await {
+            match rpc.broadcast(&tx, additional_txs.as_deref()).await {
                 Ok(tx_hash) => {
                     match tx_hash {
                         None => tracing::info!(rpc = rpc.name(), "tx broadcasted"),

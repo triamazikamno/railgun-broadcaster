@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 eyre = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { version = "0.9" }
 structopt = { version = "0.3" }
@@ -14,6 +15,7 @@ tracing = { workspace = true }
 tracing-appender = { version = "0.2" }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "parking_lot"] }
 tracing-logfmt = { version = "0.3" }
+axum = "0.7"
 
 config = { path = "../../crates/config" }
 broadcaster-core = { path = "../../crates/core" }
@@ -22,3 +24,7 @@ fees = { path = "../../crates/fees" }
 waku-relay = { path = "../../crates/waku-relay" }
 waku = { path = "../../crates/waku" }
 broadcaster-service = { path = "../../crates/service" }
+railgun-wallet = { path = "../../crates/railgun-wallet" }
+sync-service = { path = "../../crates/sync-service" }
+local-db = { path = "../../crates/local-db" }
+merkletree = { path = "../../crates/merkletree" }

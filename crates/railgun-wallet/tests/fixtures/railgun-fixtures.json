@@ -1,0 +1,152 @@
+{
+  "privateKey": "0x1111111111111111111111111111111111111111111111111111111111111111",
+  "mnemonic": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+  "mnemonicIndex": 0,
+  "address": "0zk1qy4v02p5zkq0zfpaxhz79j5tslrv8c44d80d8jr2fuecrtxlp8lemrv7j6fe3z53ll0jm7u592n0hr8elesd0xzv6y9jpdvsyln80m95jcxhvnmagfqg5p6e9mp",
+  "boundParams": {
+    "treeNumber": "0x1",
+    "minGasPrice": "0x0",
+    "unshield": "0x1",
+    "chainID": "0x1",
+    "adaptContract": "0x0000000000000000000000000000000000000000",
+    "adaptParams": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "commitmentCiphertext": [
+      {
+        "ciphertext": [
+          "0x1111111111111111111111111111111111111111111111111111111111111111",
+          "0x2222222222222222222222222222222222222222222222222222222222222222",
+          "0x3333333333333333333333333333333333333333333333333333333333333333",
+          "0x4444444444444444444444444444444444444444444444444444444444444444"
+        ],
+        "blindedSenderViewingKey": "0x5555555555555555555555555555555555555555555555555555555555555555",
+        "blindedReceiverViewingKey": "0x6666666666666666666666666666666666666666666666666666666666666666",
+        "annotationData": "0x",
+        "memo": "0x"
+      }
+    ]
+  },
+  "boundParamsHash": "0x122bc6278232ccce39b54d2e13de89978d51d3ca3528f21203d56184ad4a7e71",
+  "publicInputs": {
+    "merkleRoot": "0x1111",
+    "boundParamsHash": "0x122bc6278232ccce39b54d2e13de89978d51d3ca3528f21203d56184ad4a7e71",
+    "nullifiers": [
+      "0x2222",
+      "0x3333"
+    ],
+    "commitmentsOut": [
+      "0x4444",
+      "0x5555",
+      "0x6666"
+    ]
+  },
+  "privateInputs": {
+    "tokenAddress": "0x9999",
+    "publicKey": [
+      "0x289d7cf6b1e26d7953f3315f100bd112797f8e97a038ef75286ff1be362943af",
+      "0x260189c88a99e5996a2dd9266f7fd8de484d1ddee4820fca78bfd2cc72173a32"
+    ],
+    "randomIn": [
+      "0x7777",
+      "0x8888"
+    ],
+    "valueIn": [
+      "0x9999",
+      "0xaaaaa"
+    ],
+    "pathElements": [
+      "0xbbbb",
+      "0xbbcd",
+      "0xbbdd",
+      "0xbbee",
+      "0xbbff",
+      "0xcc00",
+      "0xcc11",
+      "0xcc22"
+    ],
+    "leavesIndices": [
+      "0x2",
+      "0x5"
+    ],
+    "nullifyingKey": "0x1234",
+    "npkOut": [
+      "0xcccc",
+      "0xdddd",
+      "0xeeee"
+    ],
+    "valueOut": [
+      "0x111",
+      "0x222",
+      "0x333"
+    ]
+  },
+  "signature": [
+    "0x2bdf6c48ad2e392ca88275cab20192332c3d083b1ec5837cccf316abfed9e6eb",
+    "0x23fc62308a14613ff6524882a5f952b88d3aae95d04bc09f6d6afe6a1aa15553",
+    "0x4adb8dd3efb48380d7ea67beee33e0258e19f61dc5a25899b89bf67360eca1b"
+  ],
+  "message": "0x26b69cf0258d2a372a91bf1afff3454527379e7111e2db0b7146fe9848fd72f8",
+  "formattedInputs": {
+    "merkleRoot": [
+      "0x1111"
+    ],
+    "boundParamsHash": [
+      "0x122bc6278232ccce39b54d2e13de89978d51d3ca3528f21203d56184ad4a7e71"
+    ],
+    "nullifiers": [
+      "0x2222",
+      "0x3333"
+    ],
+    "commitmentsOut": [
+      "0x4444",
+      "0x5555",
+      "0x6666"
+    ],
+    "token": [
+      "0x9999"
+    ],
+    "publicKey": [
+      "0x289d7cf6b1e26d7953f3315f100bd112797f8e97a038ef75286ff1be362943af",
+      "0x260189c88a99e5996a2dd9266f7fd8de484d1ddee4820fca78bfd2cc72173a32"
+    ],
+    "signature": [
+      "0x2bdf6c48ad2e392ca88275cab20192332c3d083b1ec5837cccf316abfed9e6eb",
+      "0x23fc62308a14613ff6524882a5f952b88d3aae95d04bc09f6d6afe6a1aa15553",
+      "0x4adb8dd3efb48380d7ea67beee33e0258e19f61dc5a25899b89bf67360eca1b"
+    ],
+    "randomIn": [
+      "0x7777",
+      "0x8888"
+    ],
+    "valueIn": [
+      "0x9999",
+      "0xaaaaa"
+    ],
+    "pathElements": [
+      "0xbbbb",
+      "0xbbcd",
+      "0xbbdd",
+      "0xbbee",
+      "0xbbff",
+      "0xcc00",
+      "0xcc11",
+      "0xcc22"
+    ],
+    "leavesIndices": [
+      "0x2",
+      "0x5"
+    ],
+    "nullifyingKey": [
+      "0x1234"
+    ],
+    "npkOut": [
+      "0xcccc",
+      "0xdddd",
+      "0xeeee"
+    ],
+    "valueOut": [
+      "0x111",
+      "0x222",
+      "0x333"
+    ]
+  }
+}

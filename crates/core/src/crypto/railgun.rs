@@ -19,6 +19,12 @@ impl Display for Address {
 
 pub type PublicKey = [u8; 32];
 
+#[derive(Debug, Clone, Copy)]
+pub struct AddressData {
+    pub master_public_key: U256,
+    pub viewing_public_key: PublicKey,
+}
+
 #[derive(Debug, Error)]
 pub enum RailgunError {
     #[error("bech32 decode failed: {0}")]
@@ -79,77 +85,152 @@ impl AsRef<str> for Address {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
-pub struct PrivateKey(Bytes);
+impl Address {
+    pub fn try_from_parts(
+        master_public_key: U256,
+        viewing_public_key: PublicKey,
+        chain: Option<(u8, u64)>,
+    ) -> Result<Self, RailgunError> {
+        let net = xor_railgun(network_id_bytes(chain));
 
-impl From<Bytes> for PrivateKey {
+        let mut payload = Vec::with_capacity(73);
+        payload.push(0x01);
+        payload.extend_from_slice(&master_public_key.to_be_bytes::<32>());
+        payload.extend_from_slice(&net);
+        payload.extend_from_slice(&viewing_public_key);
+
+        let hrp = Hrp::parse("0zk").map_err(|_| RailgunError::InvalidHrp)?;
+        let addr = bech32::encode::<Bech32m>(hrp, &payload)?;
+        Ok(Self(addr))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub struct ShareableViewingKey(Bytes);
+
+impl From<Bytes> for ShareableViewingKey {
     fn from(value: Bytes) -> Self {
         Self(value)
     }
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct ShareableViewingKeyData {
+struct ShareableViewingKeyPayload {
     #[serde(deserialize_with = "hex_array32::deserialize")]
     vpriv: [u8; 32],
     #[serde(deserialize_with = "hex_array32::deserialize")]
     spub: [u8; 32],
 }
 
-impl TryFrom<&PrivateKey> for ShareableViewingKeyData {
+impl TryFrom<&ShareableViewingKey> for ShareableViewingKeyPayload {
     type Error = RailgunError;
-    fn try_from(private_key: &PrivateKey) -> Result<Self, Self::Error> {
-        Ok(rmp_serde::from_slice(&private_key.0)?)
+    fn try_from(viewing_key: &ShareableViewingKey) -> Result<Self, Self::Error> {
+        Ok(rmp_serde::from_slice(&viewing_key.0)?)
     }
 }
 
-impl PrivateKey {
-    pub fn decode_vpriv(&self) -> Result<[u8; 32], RailgunError> {
-        Ok(ShareableViewingKeyData::try_from(self)?.vpriv)
+impl ShareableViewingKey {
+    pub fn decode_viewing_private_key(&self) -> Result<[u8; 32], RailgunError> {
+        Ok(ShareableViewingKeyPayload::try_from(self)?.vpriv)
     }
+
+    pub fn decode_viewing_key_data(&self) -> Result<ViewingKeyData, RailgunError> {
+        let key_data = ShareableViewingKeyPayload::try_from(self)?;
+        ViewingKeyData::from_packed_spending_public_key(key_data.vpriv, key_data.spub)
+    }
+
     pub fn derive_address(&self, chain: Option<(u8, u64)>) -> Result<Address, RailgunError> {
-        let key_data = ShareableViewingKeyData::try_from(self)?;
-
-        let viewing_pubkey = SigningKey::from_bytes(&key_data.vpriv)
-            .verifying_key()
-            .to_bytes();
-
-        let (spub_x, spub_y) = babyjub_unpack_point_circom(key_data.spub)?;
-
-        let nullifying = poseidon(vec![U256::from_be_slice(&key_data.vpriv)]);
-        let mpk = poseidon(vec![
-            U256::from_be_slice(spub_x.into_bigint().to_bytes_be().as_slice()),
-            U256::from_be_slice(spub_y.into_bigint().to_bytes_be().as_slice()),
-            nullifying,
-        ]);
-
-        let net = xor_railgun(network_id_bytes(chain));
-
-        let mut payload = Vec::with_capacity(73);
-        payload.push(0x01);
-        payload.extend_from_slice(mpk.to_be_bytes::<32>().as_slice());
-        payload.extend_from_slice(&net);
-        payload.extend_from_slice(&viewing_pubkey);
-
-        let hrp = Hrp::parse("0zk").map_err(|_| RailgunError::InvalidHrp)?;
-        let addr = bech32::encode::<Bech32m>(hrp, &payload)?;
-        Ok(Address(addr))
+        let key_data = self.decode_viewing_key_data()?;
+        key_data.derive_address(chain)
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ViewingKeyData {
+    pub viewing_private_key: [u8; 32],
+    pub viewing_public_key: PublicKey,
+    pub nullifying_key: U256,
+    pub master_public_key: U256,
+}
+
+impl ViewingKeyData {
+    #[must_use]
+    pub fn from_spending_public_key(
+        viewing_private_key: [u8; 32],
+        spending_public_key: [U256; 2],
+    ) -> Self {
+        let viewing_public_key = derive_viewing_public_key(&viewing_private_key);
+        let nullifying_key = derive_nullifying_key(&viewing_private_key);
+        let master_public_key = derive_master_public_key(spending_public_key, nullifying_key);
+        Self {
+            viewing_private_key,
+            viewing_public_key,
+            nullifying_key,
+            master_public_key,
+        }
+    }
+
+    pub fn from_packed_spending_public_key(
+        viewing_private_key: [u8; 32],
+        packed_spending_public_key: [u8; 32],
+    ) -> Result<Self, RailgunError> {
+        let spending_public_key = unpack_spending_public_key(packed_spending_public_key)?;
+        Ok(Self::from_spending_public_key(
+            viewing_private_key,
+            spending_public_key,
+        ))
+    }
+
+    #[must_use]
+    pub fn address_data(&self) -> AddressData {
+        AddressData::from(self)
+    }
+
+    pub fn derive_address(&self, chain: Option<(u8, u64)>) -> Result<Address, RailgunError> {
+        Address::try_from_parts(self.master_public_key, self.viewing_public_key, chain)
+    }
+}
+
+impl From<&ViewingKeyData> for AddressData {
+    fn from(value: &ViewingKeyData) -> Self {
+        Self {
+            master_public_key: value.master_public_key,
+            viewing_public_key: value.viewing_public_key,
+        }
+    }
+}
+
+#[must_use]
+pub fn derive_viewing_public_key(viewing_private_key: &[u8; 32]) -> PublicKey {
+    SigningKey::from_bytes(viewing_private_key)
+        .verifying_key()
+        .to_bytes()
+}
+
+#[must_use]
+pub fn derive_nullifying_key(viewing_private_key: &[u8; 32]) -> U256 {
+    poseidon(vec![U256::from_be_slice(viewing_private_key)])
+}
+
+#[must_use]
+pub fn derive_master_public_key(spending_public_key: [U256; 2], nullifying_key: U256) -> U256 {
+    poseidon(vec![
+        spending_public_key[0],
+        spending_public_key[1],
+        nullifying_key,
+    ])
+}
+
+#[must_use]
+pub fn pack_chain_id(chain_type: u8, chain_id: u64) -> u64 {
+    let id = chain_id & 0x00FF_FFFF_FFFF_FFFF;
+    (u64::from(chain_type) << 56) | id
 }
 
 fn network_id_bytes(chain: Option<(u8, u64)>) -> [u8; 8] {
     match chain {
         None => [0xffu8; 8], // ALL_CHAINS
-        Some((chain_type, chain_id)) => {
-            let mut out = [0u8; 8];
-            out[0] = chain_type;
-
-            // 7 bytes big-endian (uint56)
-            let id = chain_id & 0x00FF_FFFF_FFFF_FFFF;
-            let be = id.to_be_bytes(); // 8
-            out[1..8].copy_from_slice(&be[1..8]);
-            out
-        }
+        Some((chain_type, chain_id)) => pack_chain_id(chain_type, chain_id).to_be_bytes(),
     }
 }
 
@@ -187,4 +268,12 @@ fn babyjub_unpack_point_circom(packed: [u8; 32]) -> Result<(Fq, Fq), RailgunErro
     }
 
     Ok((x, y))
+}
+
+fn unpack_spending_public_key(packed: [u8; 32]) -> Result<[U256; 2], RailgunError> {
+    let (spub_x, spub_y) = babyjub_unpack_point_circom(packed)?;
+    Ok([
+        U256::from_be_slice(spub_x.into_bigint().to_bytes_be().as_slice()),
+        U256::from_be_slice(spub_y.into_bigint().to_bytes_be().as_slice()),
+    ])
 }

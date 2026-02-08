@@ -1,11 +1,9 @@
-use aes_gcm::aead::AeadInPlace;
-use aes_gcm::{AesGcm, KeyInit, Nonce};
 use serde::Serialize;
 use thiserror::Error;
 
 use alloy::primitives::{Bytes, TxHash};
 
-type Aes256Gcm16 = AesGcm<aes::Aes256, typenum::U16>;
+use crate::crypto::aes_gcm::{AesGcmError, encrypt_in_place_16b_iv};
 
 #[derive(Debug, Error)]
 pub enum ResponseError {
@@ -13,8 +11,8 @@ pub enum ResponseError {
     Serialize(#[from] serde_json::Error),
     #[error("getrandom failed")]
     GetRandom,
-    #[error("invalid aes key: {0}")]
-    InvalidKey(#[from] sha2::digest::InvalidLength),
+    #[error("invalid aes key")]
+    InvalidKey,
     #[error("encrypt failed")]
     Encrypt,
 }
@@ -24,22 +22,11 @@ fn encrypt_json_with_shared_key<T: Serialize>(
     payload: &T,
 ) -> Result<([u8; 32], Vec<u8>), ResponseError> {
     let mut pt = serde_json::to_vec(payload)?;
-
-    let mut iv = [0u8; 16];
-    getrandom::fill(&mut iv).map_err(|_| ResponseError::GetRandom)?;
-
-    let cipher = Aes256Gcm16::new_from_slice(shared_key)?;
-    #[allow(deprecated)]
-    let nonce = Nonce::from_slice(&iv);
-
-    let tag = cipher
-        .encrypt_in_place_detached(nonce, b"", &mut pt)
-        .map_err(|_| ResponseError::Encrypt)?;
-
-    let mut iv_tag = [0u8; 32];
-    iv_tag[..16].copy_from_slice(&iv);
-    iv_tag[16..].copy_from_slice(&tag);
-
+    let iv_tag = encrypt_in_place_16b_iv(shared_key, &mut pt).map_err(|err| match err {
+        AesGcmError::InvalidKey => ResponseError::InvalidKey,
+        AesGcmError::RandomFailed => ResponseError::GetRandom,
+        AesGcmError::EncryptFailed | AesGcmError::DecryptFailed => ResponseError::Encrypt,
+    })?;
     Ok((iv_tag, pt))
 }
 

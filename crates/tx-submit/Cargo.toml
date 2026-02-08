@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 alloy = { workspace = true }
+broadcaster-core = { path = "../core" }
 config = { path = "../config" }
 reqwest = { workspace = true, features = ["json"] }
 serde = { workspace = true }

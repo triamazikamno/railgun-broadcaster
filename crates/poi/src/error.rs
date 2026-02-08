@@ -1,6 +1,6 @@
 use alloy::primitives::FixedBytes;
-use thiserror::Error;
 use broadcaster_core::crypto::snark_proof::SnarkProofError;
+use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum PoiError {

@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 alloy = { workspace = true }
+alloy-dyn-abi = "1.5"
 serde = { workspace = true }
 humantime-serde = { version = "1" }
 url = { version = "2", features = ["serde"] }
