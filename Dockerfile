@@ -1,12 +1,12 @@
 # Stage 1: Planner - Analyze dependencies
-FROM rust:1.88-bookworm as planner
+FROM rust:1.89-bookworm as planner
 WORKDIR /app
 RUN cargo install cargo-chef
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
 # Stage 2: Cacher - Build dependencies only
-FROM rust:1.88-bookworm as cacher
+FROM rust:1.89-bookworm as cacher
 WORKDIR /app
 
 # Install build dependencies
@@ -21,7 +21,7 @@ COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 
 # Stage 3: Builder - Build the application
-FROM rust:1.88-bookworm as builder
+FROM rust:1.89-bookworm as builder
 WORKDIR /app
 
 # Install build dependencies
