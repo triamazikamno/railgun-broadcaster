@@ -19,7 +19,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 
 [workspace.dependencies]
 alloy = { version = "1", features = ["serde", "signer-mnemonic"] }
@@ -40,6 +40,10 @@ bytes = { version = "1.11" }
 byteorder = "1"
 rayon = { version = "1.11" }
 async-trait = "0.1"
+
+[patch.crates-io]
+wasmer-vm = { git = "https://github.com/triamazikamno/wasmer", rev = "d94b171d85bb5ff2aa7c4954a1921c9fb482be0c" }
+wasmer-types = { git = "https://github.com/triamazikamno/wasmer", rev = "d94b171d85bb5ff2aa7c4954a1921c9fb482be0c" }
 
 [profile.release]
 opt-level = 3
