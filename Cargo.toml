@@ -2,6 +2,7 @@
 members = [
     "bins/broadcaster",
     "bins/db-cli",
+    "bins/wallet-cli",
     "crates/config",
     "crates/core",
     "crates/fees",

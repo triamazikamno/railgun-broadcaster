@@ -433,8 +433,7 @@ impl<'a> TransactionPlanBuilder<'a> {
             UnshieldMode::Token => request.recipient,
             UnshieldMode::UnwrapBase => self.builder.relay_adapt_contract,
         };
-        let unshield_note =
-            Note::new_unshield(unshield_to, request.token_address, unshield_amount);
+        let unshield_note = Note::new_unshield(unshield_to, request.token_address, unshield_amount);
         outputs.push(unshield_note.clone());
 
         self.validate_signature_limit(outputs.len())?;
@@ -558,8 +557,12 @@ impl<'a> TransactionPlanBuilder<'a> {
 
         let receiver = self.wallet.address_data();
         let random = rand_array();
-        let output =
-            Note::new_change(receiver.master_public_key, self.token_address, total, random);
+        let output = Note::new_change(
+            receiver.master_public_key,
+            self.token_address,
+            total,
+            random,
+        );
 
         let ciphertext = NoteCiphertext::try_from_note(
             &output,

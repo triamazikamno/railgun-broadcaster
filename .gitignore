@@ -26,4 +26,6 @@ secrets/
 .env.*
 
 db/
+wallet_db/
+.opencode/
 artifacts/

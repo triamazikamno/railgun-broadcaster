@@ -8478,6 +8478,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "wallet-cli"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "broadcaster-core",
+ "eyre",
+ "local-db",
+ "merkletree",
+ "railgun-wallet",
+ "serde",
+ "serde_json",
+ "structopt",
+ "sync-service",
+ "tokio",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber 0.3.22",
+]
+
+[[package]]
 name = "want"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

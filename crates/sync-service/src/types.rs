@@ -37,6 +37,7 @@ pub struct ChainConfig {
 pub struct ChainConfigDefaults {
     pub chain_id: u64,
     pub contract: Address,
+    pub relay_adapt_contract: Address,
     pub rpc_url: Url,
     pub quick_sync_endpoint: Option<Url>,
     pub deployment_block: u64,
@@ -55,7 +56,11 @@ impl ChainConfigDefaults {
                 chain_id,
                 contract: Address::from_str("0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9")
                     .expect("valid railgun contract"),
-                rpc_url: Url::parse("https://eth.llamarpc.com").expect("valid ethereum rpc url"),
+                relay_adapt_contract: Address::from_str(
+                    "0xAc9f360Ae85469B27aEDdEaFC579Ef2d052aD405",
+                )
+                .expect("valid ethereum relay adapt contract"),
+                rpc_url: Url::parse("https://ethereum-public.nodies.app").expect("valid ethereum rpc url"),
                 quick_sync_endpoint: Some(
                     Url::parse("https://rail-squid.squids.live/squid-railgun-ethereum-v2/graphql")
                         .expect("valid ethereum quick sync endpoint"),
@@ -72,6 +77,10 @@ impl ChainConfigDefaults {
                 chain_id,
                 contract: Address::from_str("0x590162bf4b50f6576a459b75309ee21d92178a10")
                     .expect("valid railgun contract"),
+                relay_adapt_contract: Address::from_str(
+                    "0xf82d00fc51f730f42a00f85e74895a2849fff2dd",
+                )
+                .expect("valid bsc relay adapt contract"),
                 rpc_url: Url::parse("https://bsc.publicnode.com").expect("valid bsc rpc url"),
                 quick_sync_endpoint: Some(
                     Url::parse("https://rail-squid.squids.live/squid-railgun-bsc-v2/graphql")
@@ -89,6 +98,10 @@ impl ChainConfigDefaults {
                 chain_id,
                 contract: Address::from_str("0x19b620929f97b7b990801496c3b361ca5def8c71")
                     .expect("valid railgun contract"),
+                relay_adapt_contract: Address::from_str(
+                    "0xF82d00fC51F730F42A00F85E74895a2849ffF2Dd",
+                )
+                .expect("valid polygon relay adapt contract"),
                 rpc_url: Url::parse("https://rpc-mainnet.matic.quiknode.pro")
                     .expect("valid polygon rpc url"),
                 quick_sync_endpoint: Some(
@@ -107,6 +120,10 @@ impl ChainConfigDefaults {
                 chain_id,
                 contract: Address::from_str("0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9")
                     .expect("valid railgun contract"),
+                relay_adapt_contract: Address::from_str(
+                    "0xB4F2d77bD12c6b548Ae398244d7FAD4ABCE4D89b",
+                )
+                .expect("valid arbitrum relay adapt contract"),
                 rpc_url: Url::parse("https://rpc.ankr.com/arbitrum")
                     .expect("valid arbitrum rpc url"),
                 quick_sync_endpoint: Some(
