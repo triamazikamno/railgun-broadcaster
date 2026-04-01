@@ -73,6 +73,38 @@ impl TryFrom<&Address> for PublicKey {
     }
 }
 
+impl TryFrom<&Address> for AddressData {
+    type Error = RailgunError;
+    fn try_from(addr: &Address) -> Result<Self, Self::Error> {
+        let checked = CheckedHrpstring::new::<Bech32m>(&addr.0)?;
+
+        if checked.hrp().as_str() != "0zk" {
+            return Err(RailgunError::UnexpectedHrp(checked.hrp().to_string()));
+        }
+
+        let bytes: Vec<u8> = checked.byte_iter().collect();
+
+        if bytes.len() != 73 {
+            return Err(RailgunError::UnexpectedLength(bytes.len()));
+        }
+
+        let version = bytes[0];
+        if version != 1 {
+            return Err(RailgunError::UnsupportedVersion(version));
+        }
+
+        let master_public_key = U256::from_be_slice(&bytes[1..33]);
+
+        let mut vpk = [0u8; 32];
+        vpk.copy_from_slice(&bytes[41..73]);
+
+        Ok(Self {
+            master_public_key,
+            viewing_public_key: vpk,
+        })
+    }
+}
+
 impl From<&str> for Address {
     fn from(s: &str) -> Self {
         Self(s.to_string())

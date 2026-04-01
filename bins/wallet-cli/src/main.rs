@@ -3,14 +3,23 @@ use std::time::Duration;
 use std::{cmp::Ordering, path::PathBuf};
 
 use alloy::hex;
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, FixedBytes, U256};
+use alloy::providers::{Provider, ProviderBuilder};
+use alloy::sol_types::SolEvent;
+use broadcaster_core::contracts::railgun::Shield;
+use broadcaster_core::contracts::shield::{
+    build_approve_calldata, build_shield_calldata, derive_shield_private_key,
+};
+use broadcaster_core::crypto::railgun::{Address as RailgunAddress, AddressData};
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use eyre::{Result, WrapErr, eyre};
 use local_db::{DbConfig, DbStore};
+use poi::poi::PoiRpcClient;
 use railgun_wallet::artifacts::ArtifactSource;
 use railgun_wallet::tx::{UnshieldMode, UnshieldRequest};
 use railgun_wallet::wallet_cache::wallet_cache_key;
 use railgun_wallet::{ProverService, TransactionBuilder, WalletKeys};
+use reqwest::Url;
 use serde::Serialize;
 use structopt::StructOpt;
 use sync_service::{ChainConfig, ChainConfigDefaults, ChainKey, SyncManager, WalletConfig};
@@ -23,10 +32,15 @@ const DEFAULT_DB_PATH: &str = "db";
 const DEFAULT_QUERY_RPC_COOLDOWN: Duration = Duration::from_secs(5);
 const DEFAULT_BLOCK_RANGE: u64 = 500;
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(15);
+const DEFAULT_POI_RPC: &str = "https://ppoi.fdi.network";
+const DEFAULT_POI_LIST: &str = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88";
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "wallet-cli")]
 struct Options {
+    /// Override the default RPC URL for the chain
+    #[structopt(long, global = true)]
+    rpc_url: Option<Url>,
     #[structopt(subcommand)]
     command: Command,
 }
@@ -35,6 +49,8 @@ struct Options {
 enum Command {
     ListUtxos(ListUtxosOptions),
     Unshield(UnshieldOptions),
+    Shield(ShieldOptions),
+    SubmitShieldPoi(SubmitShieldPoiOptions),
 }
 
 #[derive(Debug, StructOpt)]
@@ -70,6 +86,37 @@ struct UnshieldOptions {
     unwrap: bool,
 }
 
+#[derive(Debug, StructOpt)]
+struct ShieldOptions {
+    #[structopt(long)]
+    chain_id: u64,
+    #[structopt(long)]
+    token: Address,
+    #[structopt(long)]
+    amount: String,
+    /// Recipient 0zk address (Bech32m)
+    #[structopt(long)]
+    recipient: String,
+    /// Sender's EVM private key (hex). Used to derive shieldPrivateKey.
+    #[structopt(long)]
+    private_key: String,
+}
+
+#[derive(Debug, StructOpt)]
+struct SubmitShieldPoiOptions {
+    #[structopt(long)]
+    chain_id: u64,
+    /// Confirmed shield transaction hash
+    #[structopt(long)]
+    tx_hash: String,
+    /// POI aggregator RPC endpoint
+    #[structopt(long)]
+    poi_rpc: Option<String>,
+    /// Required POI list keys (repeatable)
+    #[structopt(long)]
+    poi_list: Vec<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let options = Options::from_args();
@@ -87,15 +134,19 @@ async fn main() -> Result<()> {
                 ),
         )
         .init();
+    let rpc_url_override = options.rpc_url;
     match options.command {
-        Command::ListUtxos(opts) => run_list_utxos(opts).await,
-        Command::Unshield(opts) => run_unshield(opts).await,
+        Command::ListUtxos(opts) => run_list_utxos(opts, rpc_url_override).await,
+        Command::Unshield(opts) => run_unshield(opts, rpc_url_override).await,
+        Command::Shield(opts) => run_shield(opts).await,
+        Command::SubmitShieldPoi(opts) => run_submit_shield_poi(opts, rpc_url_override).await,
     }
 }
 
-async fn run_list_utxos(opts: ListUtxosOptions) -> Result<()> {
+async fn run_list_utxos(opts: ListUtxosOptions, rpc_url_override: Option<Url>) -> Result<()> {
     let chain_defaults = ChainConfigDefaults::for_chain(opts.chain_id)
         .ok_or_else(|| eyre!("unsupported chain id {0} for wallet-cli v1", opts.chain_id))?;
+    let rpc_url = rpc_url_override.unwrap_or_else(|| chain_defaults.rpc_url.clone());
 
     let db = Arc::new(
         DbStore::open(DbConfig {
@@ -105,10 +156,7 @@ async fn run_list_utxos(opts: ListUtxosOptions) -> Result<()> {
     );
     let sync_manager = Arc::new(SyncManager::new(db));
 
-    let query_rpc_pool = Arc::new(QueryRpcPool::new(
-        vec![chain_defaults.rpc_url.clone()],
-        DEFAULT_QUERY_RPC_COOLDOWN,
-    ));
+    let query_rpc_pool = Arc::new(QueryRpcPool::new(vec![rpc_url], DEFAULT_QUERY_RPC_COOLDOWN));
 
     let chain_key = ChainKey {
         chain_id: chain_defaults.chain_id,
@@ -213,12 +261,169 @@ struct UnshieldOutput {
     data: String,
 }
 
-async fn run_unshield(opts: UnshieldOptions) -> Result<()> {
+#[derive(Debug, Serialize)]
+struct TxOutput {
+    to: Address,
+    data: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ShieldOutput {
+    approve: TxOutput,
+    shield: TxOutput,
+}
+
+async fn run_shield(opts: ShieldOptions) -> Result<()> {
     let amount = U256::from_str_radix(&opts.amount, 10)
         .map_err(|e| eyre!("invalid amount '{}': {e}", opts.amount))?;
 
     let chain_defaults = ChainConfigDefaults::for_chain(opts.chain_id)
         .ok_or_else(|| eyre!("unsupported chain id {}", opts.chain_id))?;
+
+    // Parse recipient 0zk address
+    let railgun_addr = RailgunAddress::from(opts.recipient.as_str());
+    let addr_data =
+        AddressData::try_from(&railgun_addr).wrap_err("invalid recipient 0zk address")?;
+
+    // Parse sender private key
+    let pk_hex = opts
+        .private_key
+        .strip_prefix("0x")
+        .unwrap_or(&opts.private_key);
+    let pk_bytes: [u8; 32] = hex::decode(pk_hex)
+        .wrap_err("invalid private key hex")?
+        .try_into()
+        .map_err(|_| eyre!("private key must be 32 bytes"))?;
+
+    // Derive shield private key
+    let shield_private_key =
+        derive_shield_private_key(&pk_bytes).wrap_err("derive shield private key")?;
+
+    // Build approve calldata
+    let approve_data = build_approve_calldata(chain_defaults.contract, amount);
+
+    // Build shield calldata
+    let shield_data = build_shield_calldata(
+        addr_data.master_public_key,
+        &addr_data.viewing_public_key,
+        opts.token,
+        amount,
+        &shield_private_key,
+    )
+    .wrap_err("build shield calldata")?;
+
+    let output = ShieldOutput {
+        approve: TxOutput {
+            to: opts.token,
+            data: format!("0x{}", hex::encode(&approve_data)),
+        },
+        shield: TxOutput {
+            to: chain_defaults.contract,
+            data: format!("0x{}", hex::encode(&shield_data)),
+        },
+    };
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output).wrap_err("serialize output")?
+    );
+
+    Ok(())
+}
+
+async fn run_submit_shield_poi(
+    opts: SubmitShieldPoiOptions,
+    rpc_url_override: Option<Url>,
+) -> Result<()> {
+    let chain_defaults = ChainConfigDefaults::for_chain(opts.chain_id)
+        .ok_or_else(|| eyre!("unsupported chain id {}", opts.chain_id))?;
+    let rpc_url = rpc_url_override.unwrap_or_else(|| chain_defaults.rpc_url.clone());
+
+    let poi_rpc_url: Url = opts
+        .poi_rpc
+        .as_deref()
+        .unwrap_or(DEFAULT_POI_RPC)
+        .parse()
+        .wrap_err("invalid POI RPC URL")?;
+
+    let poi_list_keys: Vec<String> = if opts.poi_list.is_empty() {
+        vec![DEFAULT_POI_LIST.to_string()]
+    } else {
+        opts.poi_list
+    };
+
+    // Parse tx hash
+    let tx_hash_hex = opts.tx_hash.strip_prefix("0x").unwrap_or(&opts.tx_hash);
+    let tx_hash_bytes: [u8; 32] = hex::decode(tx_hash_hex)
+        .wrap_err("invalid tx hash hex")?
+        .try_into()
+        .map_err(|_| eyre!("tx hash must be 32 bytes"))?;
+    let tx_hash = FixedBytes::from(tx_hash_bytes);
+
+    // Fetch transaction receipt
+    let provider = ProviderBuilder::new().connect_http(rpc_url).erased();
+    let receipt = provider
+        .get_transaction_receipt(tx_hash)
+        .await
+        .wrap_err("fetch transaction receipt")?
+        .ok_or_else(|| eyre!("transaction {} not found", opts.tx_hash))?;
+
+    // Parse Shield events from receipt logs
+    let shield_events: Vec<Shield> = receipt
+        .inner
+        .logs()
+        .iter()
+        .filter_map(|log| Shield::decode_log(log.as_ref()).ok())
+        .map(|decoded| decoded.data)
+        .collect();
+
+    if shield_events.is_empty() {
+        return Err(eyre!(
+            "no Shield events found in transaction {}",
+            opts.tx_hash
+        ));
+    }
+
+    // Submit each commitment to POI aggregator
+    let poi_client = PoiRpcClient::new(poi_rpc_url);
+
+    for event in &shield_events {
+        for (i, preimage) in event.commitments.iter().enumerate() {
+            let commitment_hash = preimage.hash();
+            let commitment_hash_hex =
+                format!("0x{}", hex::encode(commitment_hash.to_be_bytes::<32>()));
+            let npk_hex = format!("0x{}", hex::encode(preimage.npk));
+
+            tracing::info!(
+                commitment = %commitment_hash_hex,
+                "submitting shield commitment to POI aggregator"
+            );
+
+            poi_client
+                .submit_single_commitment_proof(
+                    opts.chain_id,
+                    &commitment_hash_hex,
+                    &npk_hex,
+                    &format!("0x{}", hex::encode(tx_hash)),
+                    i,
+                    &poi_list_keys,
+                )
+                .await
+                .wrap_err("submit shield POI")?;
+        }
+    }
+
+    tracing::info!("shield POI submission complete");
+    Ok(())
+}
+
+async fn run_unshield(opts: UnshieldOptions, rpc_url_override: Option<Url>) -> Result<()> {
+    let amount = U256::from_str_radix(&opts.amount, 10)
+        .map_err(|e| eyre!("invalid amount '{}': {e}", opts.amount))?;
+
+    let chain_defaults = ChainConfigDefaults::for_chain(opts.chain_id)
+        .ok_or_else(|| eyre!("unsupported chain id {}", opts.chain_id))?;
+    let rpc_url = rpc_url_override.unwrap_or_else(|| chain_defaults.rpc_url.clone());
 
     let db = Arc::new(
         DbStore::open(DbConfig {
@@ -228,10 +433,7 @@ async fn run_unshield(opts: UnshieldOptions) -> Result<()> {
     );
     let sync_manager = Arc::new(SyncManager::new(db.clone()));
 
-    let query_rpc_pool = Arc::new(QueryRpcPool::new(
-        vec![chain_defaults.rpc_url.clone()],
-        DEFAULT_QUERY_RPC_COOLDOWN,
-    ));
+    let query_rpc_pool = Arc::new(QueryRpcPool::new(vec![rpc_url], DEFAULT_QUERY_RPC_COOLDOWN));
 
     let chain_key = ChainKey {
         chain_id: chain_defaults.chain_id,

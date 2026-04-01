@@ -105,6 +105,7 @@ impl Poi {
 }
 
 const POI_VALIDATE_MERKLEROOTS_METHOD: &str = "ppoi_validate_poi_merkleroots";
+const POI_SUBMIT_SINGLE_COMMITMENT_PROOFS_METHOD: &str = "ppoi_submitSingleCommitmentProofs";
 
 #[derive(Debug, Serialize)]
 struct JsonRpcReq<T> {
@@ -128,6 +129,32 @@ struct ValidatePOIMerklerootsParams {
     txid_version: String,
     list_key: String,
     poi_merkleroots: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SubmitSingleCommitmentProofsParams {
+    chain_type: String,
+    #[serde(rename = "chainID")]
+    chain_id: String,
+    txid_version: String,
+    single_commitment_proofs_data: Vec<SingleCommitmentProofData>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SingleCommitmentProofData {
+    commitment: String,
+    npk: String,
+    utxo_tree_in: u64,
+    utxo_batch_start_position_out: u64,
+    commitment_index: usize,
+    #[serde(rename = "blindedCommitment")]
+    blinded_commitment: String,
+    poi_merkleroots: Vec<String>,
+    txid: String,
+    railgun_tx_id: String,
+    list_keys: Vec<String>,
 }
 
 pub struct PoiRpcClient {
@@ -187,6 +214,60 @@ impl PoiRpcClient {
         let parsed: JsonRpcResp<bool> = resp.json().await.map_err(PoiRpcError::JsonDecode)?;
 
         Ok(parsed.result)
+    }
+
+    pub async fn submit_single_commitment_proof(
+        &self,
+        chain_id: u64,
+        commitment_hash: &str,
+        npk: &str,
+        tx_hash: &str,
+        commitment_index: usize,
+        list_keys: &[String],
+    ) -> Result<(), PoiRpcError> {
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let proof_data = SingleCommitmentProofData {
+            commitment: commitment_hash.to_string(),
+            npk: npk.to_string(),
+            utxo_tree_in: 0,
+            utxo_batch_start_position_out: 0,
+            commitment_index,
+            blinded_commitment: commitment_hash.to_string(),
+            poi_merkleroots: vec![],
+            txid: tx_hash.to_string(),
+            railgun_tx_id: tx_hash.to_string(),
+            list_keys: list_keys.to_vec(),
+        };
+
+        let req = JsonRpcReq {
+            jsonrpc: "2.0",
+            id,
+            method: POI_SUBMIT_SINGLE_COMMITMENT_PROOFS_METHOD,
+            params: SubmitSingleCommitmentProofsParams {
+                chain_type: "0".to_string(),
+                chain_id: chain_id.to_string(),
+                txid_version: "V2_PoseidonMerkle".to_string(),
+                single_commitment_proofs_data: vec![proof_data],
+            },
+        };
+
+        let resp = self
+            .http
+            .post(self.base_url.clone())
+            .json(&req)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(PoiRpcError::HttpStatus { status, body });
+        }
+
+        Ok(())
     }
 }
 const TREE_DEPTH: usize = 16;

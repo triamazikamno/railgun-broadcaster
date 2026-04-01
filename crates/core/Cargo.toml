@@ -19,6 +19,7 @@ curve25519-dalek = "4"
 ed25519-dalek = { version = "2" }
 getrandom = { version = "0.3" }
 hex = { version = "0.4" }
+k256 = { version = "0.13", features = ["ecdsa"] }
 rand = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 rmp-serde = { version = "1.3" }

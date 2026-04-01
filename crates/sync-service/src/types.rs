@@ -60,7 +60,8 @@ impl ChainConfigDefaults {
                     "0xAc9f360Ae85469B27aEDdEaFC579Ef2d052aD405",
                 )
                 .expect("valid ethereum relay adapt contract"),
-                rpc_url: Url::parse("https://ethereum-public.nodies.app").expect("valid ethereum rpc url"),
+                rpc_url: Url::parse("https://ethereum-public.nodies.app")
+                    .expect("valid ethereum rpc url"),
                 quick_sync_endpoint: Some(
                     Url::parse("https://rail-squid.squids.live/squid-railgun-ethereum-v2/graphql")
                         .expect("valid ethereum quick sync endpoint"),

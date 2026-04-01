@@ -96,11 +96,19 @@ sol! {
         uint256[] memo;
     }
 
+    struct ShieldRequest {
+        CommitmentPreimage preimage;
+        ShieldCiphertext ciphertext;
+    }
+
     function transact(Transaction[] _transactions) payable;
     function relay(Transaction[] _transactions, ActionData _actionData) payable;
+    function shield(ShieldRequest[] _shieldRequests);
 
     function unwrapBase(uint256 _amount);
     function transfer(TokenTransfer[] _transfers);
+
+    function approve(address spender, uint256 amount) returns (bool);
 
     event Transact(
         uint256 treeNumber,
