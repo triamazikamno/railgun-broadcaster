@@ -338,6 +338,44 @@ impl DbStore {
         Ok(())
     }
 
+    /// Atomically replace all UTXO entries for a wallet and update its
+    /// metadata in a single transaction. This prevents partial state if the
+    /// process is interrupted mid-write.
+    pub fn batch_store_wallet(
+        &self,
+        wallet_id: &str,
+        utxos: &[(String, Vec<u8>)],
+        meta: Option<&WalletMeta>,
+    ) -> Result<(), DbError> {
+        let prefix = wallet_unspent_prefix(wallet_id);
+        let range_end = format!("{prefix}~");
+        let txn = self.db.begin_write()?;
+        {
+            // Clear existing UTXOs
+            let mut unspent_table = txn.open_table(WALLET_UNSPENT_TABLE)?;
+            let keys: Vec<String> = unspent_table
+                .range(prefix.as_str()..range_end.as_str())?
+                .map(|entry| entry.map(|(key, _)| key.value().to_string()))
+                .collect::<Result<_, _>>()?;
+            for key in keys {
+                unspent_table.remove(key.as_str())?;
+            }
+            // Write new UTXOs
+            for (utxo_id, payload) in utxos {
+                let key = wallet_unspent_key(wallet_id, utxo_id);
+                unspent_table.insert(key.as_str(), payload.as_slice())?;
+            }
+            // Write metadata in the same transaction
+            if let Some(meta) = meta {
+                let data = encode(meta)?;
+                let mut meta_table = txn.open_table(WALLET_META_TABLE)?;
+                meta_table.insert(wallet_id, data.as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     pub fn list_wallet_unspent(&self, wallet_id: &str) -> Result<Vec<WalletUnspent>, DbError> {
         let prefix = wallet_unspent_prefix(wallet_id);
         let range_end = format!("{prefix}~");

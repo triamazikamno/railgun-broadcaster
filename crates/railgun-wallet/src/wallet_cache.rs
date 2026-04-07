@@ -97,22 +97,26 @@ impl WalletCacheDbExt for DbStore {
         last_scanned_block: Option<u64>,
         last_scanned_block_hash: Option<[u8; 32]>,
     ) -> Result<(), WalletCacheError> {
-        self.clear_wallet_unspent(wallet_id)?;
-        for utxo in utxos {
-            let cached = CachedUtxo::from(utxo);
-            let payload = rmp_serde::to_vec_named(&cached)?;
-            self.put_wallet_unspent(wallet_id, &cached.utxo_id(), &payload)?;
-        }
+        let utxo_entries: Vec<(String, Vec<u8>)> = utxos
+            .iter()
+            .map(|utxo| {
+                let cached = CachedUtxo::from(utxo);
+                let payload = rmp_serde::to_vec_named(&cached)?;
+                Ok((cached.utxo_id(), payload))
+            })
+            .collect::<Result<_, rmp_serde::encode::Error>>()?;
 
-        if let Some(last_scanned_block) = last_scanned_block {
-            let meta = WalletMeta {
-                last_scanned_block,
-                updated_at: now_epoch_secs()?,
-                last_scanned_block_hash,
-            };
-            self.put_wallet_meta(wallet_id, &meta)?;
-        }
+        let meta = last_scanned_block
+            .map(|block| {
+                Ok::<_, WalletCacheError>(WalletMeta {
+                    last_scanned_block: block,
+                    updated_at: now_epoch_secs()?,
+                    last_scanned_block_hash,
+                })
+            })
+            .transpose()?;
 
+        self.batch_store_wallet(wallet_id, &utxo_entries, meta.as_ref())?;
         Ok(())
     }
 

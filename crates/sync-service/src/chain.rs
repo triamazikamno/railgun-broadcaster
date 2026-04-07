@@ -27,6 +27,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::sync::{RwLock, broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info, warn};
@@ -141,15 +142,29 @@ impl ChainService {
         let rpc = rpcs
             .random_provider()
             .ok_or_else(|| ChainError::NoHealthyRpc)?;
-        if let Ok(head) = rpc.provider.get_block_number().await {
-            let safe_head = head
-                .saturating_sub(service.chain.finality_depth)
-                .max(service.chain.deployment_block);
-            if let Err(err) = service.head_tx.send(head) {
-                debug!(?err, head, "failed to send head update");
-            }
-            if let Err(err) = service.safe_head_tx.send(safe_head) {
-                debug!(?err, safe_head, "failed to send safe head update");
+        for attempt in 0..3u32 {
+            match rpc.provider.get_block_number().await {
+                Ok(head) => {
+                    let safe_head = head
+                        .saturating_sub(service.chain.finality_depth)
+                        .max(service.chain.deployment_block);
+                    if let Err(err) = service.head_tx.send(head) {
+                        debug!(?err, head, "failed to send head update");
+                    }
+                    if let Err(err) = service.safe_head_tx.send(safe_head) {
+                        debug!(?err, safe_head, "failed to send safe head update");
+                    }
+                    break;
+                }
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        attempt, "failed to fetch initial block number, retrying..."
+                    );
+                    if attempt < 2 {
+                        tokio::time::sleep(Duration::from_millis(500 * 2u64.pow(attempt))).await;
+                    }
+                }
             }
         }
 
@@ -256,7 +271,15 @@ impl ChainService {
 
         let safe_head = *self.safe_head_tx.borrow();
         let from_block = last_scanned.saturating_add(1).max(start_block);
-        if from_block <= safe_head {
+
+        // When safe_head has not been set yet (still 0) we cannot tell
+        // whether the wallet is caught up, so we always enqueue a backfill
+        // request and let the backfill loop wait for safe_head to become
+        // available.  This avoids prematurely marking the wallet as ready
+        // with stale cached data.
+        let needs_backfill = safe_head == 0 || from_block <= safe_head;
+
+        if needs_backfill {
             if self
                 .backfill_tx
                 .send(BackfillRequest::Add {
@@ -268,7 +291,12 @@ impl ChainService {
                 .await
                 .is_err()
             {
-                warn!(cache_key = %cfg.cache_key, "failed to enqueue backfill request");
+                warn!(cache_key = %cfg.cache_key, "backfill loop unavailable, sending done as fallback");
+                let _ = backfill_sender
+                    .send(BackfillEvent::Done {
+                        last_block: safe_head,
+                    })
+                    .await;
             }
         } else if let Err(err) = backfill_sender
             .send(BackfillEvent::Done {
@@ -439,30 +467,36 @@ fn spawn_head_poller(service: Arc<ChainService>, rpcs: Arc<QueryRpcPool>) {
     tokio::spawn(
         async move {
             loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    _ = tokio::time::sleep(service.chain.poll_interval) => {
-                        let Some(rpc) = rpcs.random_provider() else {
-                            warn!("no healthy rpc providers available");
-                            continue;
-                        };
-                        match rpc.provider.get_block_number().await {
-                            Ok(head) => {
-                                let safe_head = head.saturating_sub(service.chain.finality_depth)
-                                    .max(service.chain.deployment_block);
-                                if let Err(err) = service.head_tx.send(head) {
-                                    debug!(?err, head, "failed to send head update");
-                                }
-                                if let Err(err) = service.safe_head_tx.send(safe_head) {
-                                    debug!(?err, safe_head, "failed to send safe head update");
-                                }
-                            }
-                            Err(err) => {
-                                warn!(?err, "failed to fetch latest block");
-                                rpcs.mark_bad_provider(&rpc);
-                            }
+                // Poll first, then sleep.  This ensures the very first poll
+                // happens immediately instead of after a full poll_interval
+                // delay, which is critical for fast safe_head availability.
+                let Some(rpc) = rpcs.random_provider() else {
+                    warn!("no healthy rpc providers available");
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = tokio::time::sleep(service.chain.poll_interval) => { continue; }
+                    }
+                };
+                match rpc.provider.get_block_number().await {
+                    Ok(head) => {
+                        let safe_head = head
+                            .saturating_sub(service.chain.finality_depth)
+                            .max(service.chain.deployment_block);
+                        if let Err(err) = service.head_tx.send(head) {
+                            debug!(?err, head, "failed to send head update");
+                        }
+                        if let Err(err) = service.safe_head_tx.send(safe_head) {
+                            debug!(?err, safe_head, "failed to send safe head update");
                         }
                     }
+                    Err(err) => {
+                        warn!(?err, "failed to fetch latest block");
+                        rpcs.mark_bad_provider(&rpc);
+                    }
+                }
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep(service.chain.poll_interval) => {}
                 }
             }
         }
@@ -620,9 +654,9 @@ fn spawn_backfill_loop(
                     }
                     _ = safe_head_rx.changed() => {},
                 }
-            }
-            if cursors.is_empty() {
-                tokio::time::sleep(service.chain.poll_interval).await;
+                // Re-enter the loop immediately so that pending requests in
+                // backfill_rx are picked up without an unnecessary poll_interval
+                // delay.
                 continue;
             }
 
@@ -633,6 +667,17 @@ fn spawn_backfill_loop(
                 continue;
             };
             if from_block > safe_head {
+                if safe_head == 0 {
+                    // safe_head not yet available — the head poller hasn't
+                    // successfully fetched a block number yet.  Wait for it
+                    // instead of prematurely marking wallets as done.
+                    debug!("safe_head is 0, waiting for head poller before backfill");
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = safe_head_rx.changed() => { continue; }
+                    }
+                }
+                // safe_head > 0 and all cursors are past it — genuinely caught up.
                 let done_keys: Vec<String> = cursors.keys().cloned().collect();
                 for key in done_keys {
                     if let Some(cursor) = cursors.remove(&key)
