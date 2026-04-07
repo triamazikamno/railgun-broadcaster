@@ -26,8 +26,8 @@ const MAX_SIGNATURE_INPUTS: usize = 16;
 
 #[derive(Debug, Error)]
 pub enum BuildError {
-    #[error("no matching utxos for amount")]
-    InsufficientBalance,
+    #[error("no matching utxos for amount. max immediately spendable: {0}")]
+    InsufficientBalance(U256),
     #[error("utxos exceed circuit input limit")]
     TooManyInputs,
     #[error("inputs span multiple trees")]
@@ -276,7 +276,7 @@ impl<'a> TransactionPlanBuilder<'a> {
         token_address: Address,
     ) -> Result<Self, BuildError> {
         if inputs.is_empty() {
-            return Err(BuildError::InsufficientBalance);
+            return Err(BuildError::InsufficientBalance(U256::ZERO));
         }
         if inputs.len() > MAX_CIRCUIT_INPUTS {
             return Err(BuildError::TooManyInputs);
@@ -384,7 +384,7 @@ impl<'a> TransactionPlanBuilder<'a> {
     ) -> Result<UnshieldPlan, BuildError> {
         // Validate spend amount
         if !request.spend_up_to && total < request.amount {
-            return Err(BuildError::InsufficientBalance);
+            return Err(BuildError::InsufficientBalance(total));
         }
         let unshield_amount = if request.spend_up_to {
             total.min(request.amount)
@@ -392,7 +392,7 @@ impl<'a> TransactionPlanBuilder<'a> {
             request.amount
         };
         if unshield_amount.is_zero() {
-            return Err(BuildError::InsufficientBalance);
+            return Err(BuildError::InsufficientBalance(total));
         }
 
         let change = total - unshield_amount;
@@ -552,7 +552,7 @@ impl<'a> TransactionPlanBuilder<'a> {
     async fn build_transact(self) -> Result<TransactPlan, BuildError> {
         let total = self.total_value();
         if total.is_zero() {
-            return Err(BuildError::InsufficientBalance);
+            return Err(BuildError::InsufficientBalance(total));
         }
 
         let receiver = self.wallet.address_data();
@@ -679,7 +679,7 @@ fn select_utxos(
         }
     }
 
-    best.ok_or(BuildError::InsufficientBalance)
+    best.ok_or(BuildError::InsufficientBalance(U256::ZERO))
 }
 
 fn rand_array<const N: usize>() -> [u8; N] {
