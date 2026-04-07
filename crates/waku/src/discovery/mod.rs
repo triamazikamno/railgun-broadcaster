@@ -13,6 +13,8 @@ pub const SANDBOX_ENR_TREE: &str =
     "enrtree://AIRVQ5DDA4FFWLRBCHJWUWOO6X6S4ZTZ5B667LQ6AJU6PEYDLRD5O@sandbox.waku.nodes.status.im";
 pub const TEST_ENR_TREE: &str =
     "enrtree://AOGYWMBYOUIMOENHXCHILPKY3ZRFEULMFI4DOM442QSZ73TT2A7VI@test.waku.nodes.status.im";
+pub const RAILGUN_TREE: &str =
+    "enrtree://APMYHUVNQWHJNPI5L2KQ765EMCKUAMRWPUH3U2QIKPK6XEV3OW442@discovery.rootedinprivacy.com";
 
 #[derive(Debug, Clone)]
 pub struct DiscoveredPeer {
@@ -36,7 +38,7 @@ pub struct DiscoveryConfig {
 impl Default for DiscoveryConfig {
     fn default() -> Self {
         Self {
-            enr_trees: vec![SANDBOX_ENR_TREE.to_string(), TEST_ENR_TREE.to_string()],
+            enr_trees: vec![RAILGUN_TREE.to_string()],
             max_txt_queries_per_tree: 400,
             max_enrs_per_tree: 200,
             doh_endpoint: "https://cloudflare-dns.com/dns-query".to_string(),

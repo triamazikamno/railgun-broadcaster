@@ -165,6 +165,6 @@ async fn main() -> Result<()> {
         services.push(service);
     }
 
-    let manager = BroadcasterManager::new(services, waku_client);
+    let manager = BroadcasterManager::new(services, waku_client, cfg.trusted_signers);
     Ok(manager.run().await?)
 }

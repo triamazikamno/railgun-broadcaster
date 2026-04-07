@@ -1,8 +1,7 @@
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, address};
 use alloy_rpc_types_eth::Log;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use merkletree::wallet::WalletScanKeys;
@@ -41,6 +40,7 @@ pub struct ChainConfigDefaults {
     pub chain_id: u64,
     pub contract: Address,
     pub relay_adapt_contract: Address,
+    pub relay_adapt_7702_contract: Address,
     pub rpc_url: Url,
     pub quick_sync_endpoint: Option<Url>,
     pub deployment_block: u64,
@@ -57,12 +57,9 @@ impl ChainConfigDefaults {
         match chain_id {
             1 => Some(Self {
                 chain_id,
-                contract: Address::from_str("0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9")
-                    .expect("valid railgun contract"),
-                relay_adapt_contract: Address::from_str(
-                    "0xAc9f360Ae85469B27aEDdEaFC579Ef2d052aD405",
-                )
-                .expect("valid ethereum relay adapt contract"),
+                contract: address!("0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"),
+                relay_adapt_contract: address!("0xAc9f360Ae85469B27aEDdEaFC579Ef2d052aD405"),
+                relay_adapt_7702_contract: address!("0x2df3d82c06339387a4532c685daaf39a218cf56e"),
                 rpc_url: Url::parse("https://ethereum-public.nodies.app")
                     .expect("valid ethereum rpc url"),
                 quick_sync_endpoint: Some(
@@ -79,12 +76,9 @@ impl ChainConfigDefaults {
             }),
             56 => Some(Self {
                 chain_id,
-                contract: Address::from_str("0x590162bf4b50f6576a459b75309ee21d92178a10")
-                    .expect("valid railgun contract"),
-                relay_adapt_contract: Address::from_str(
-                    "0xf82d00fc51f730f42a00f85e74895a2849fff2dd",
-                )
-                .expect("valid bsc relay adapt contract"),
+                contract: address!("0x590162bf4b50f6576a459b75309ee21d92178a10"),
+                relay_adapt_contract: address!("0xf82d00fc51f730f42a00f85e74895a2849fff2dd"),
+                relay_adapt_7702_contract: address!("0x6fa84bc1587cc90978dc9535d4d38dc74fa4b522"),
                 rpc_url: Url::parse("https://bsc.publicnode.com").expect("valid bsc rpc url"),
                 quick_sync_endpoint: Some(
                     Url::parse("https://rail-squid.squids.live/squid-railgun-bsc-v2/graphql")
@@ -100,12 +94,9 @@ impl ChainConfigDefaults {
             }),
             137 => Some(Self {
                 chain_id,
-                contract: Address::from_str("0x19b620929f97b7b990801496c3b361ca5def8c71")
-                    .expect("valid railgun contract"),
-                relay_adapt_contract: Address::from_str(
-                    "0xF82d00fC51F730F42A00F85E74895a2849ffF2Dd",
-                )
-                .expect("valid polygon relay adapt contract"),
+                contract: address!("0x19b620929f97b7b990801496c3b361ca5def8c71"),
+                relay_adapt_contract: address!("0xF82d00fC51F730F42A00F85E74895a2849ffF2Dd"),
+                relay_adapt_7702_contract: address!("0x6fa84bc1587cc90978dc9535d4d38dc74fa4b522"),
                 rpc_url: Url::parse("https://rpc-mainnet.matic.quiknode.pro")
                     .expect("valid polygon rpc url"),
                 quick_sync_endpoint: Some(
@@ -122,12 +113,9 @@ impl ChainConfigDefaults {
             }),
             42161 => Some(Self {
                 chain_id,
-                contract: Address::from_str("0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9")
-                    .expect("valid railgun contract"),
-                relay_adapt_contract: Address::from_str(
-                    "0xB4F2d77bD12c6b548Ae398244d7FAD4ABCE4D89b",
-                )
-                .expect("valid arbitrum relay adapt contract"),
+                contract: address!("0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"),
+                relay_adapt_contract: address!("0xB4F2d77bD12c6b548Ae398244d7FAD4ABCE4D89b"),
+                relay_adapt_7702_contract: address!("0x6fa84bc1587cc90978dc9535d4d38dc74fa4b522"),
                 rpc_url: Url::parse("https://rpc.ankr.com/arbitrum")
                     .expect("valid arbitrum rpc url"),
                 quick_sync_endpoint: Some(

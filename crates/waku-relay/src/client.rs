@@ -12,7 +12,7 @@ use waku::proto::{HashKey, WakuMessage};
 use waku::types::{parse_multiaddr, parse_peer_id};
 use waku::{WakuConfig, WakuNode};
 
-pub const PUBSUB_PATH: &str = "/waku/2/rs/1/1";
+pub const PUBSUB_PATH: &str = "/waku/2/rs/5/1";
 const CACHE_SIZE: NonZeroUsize = match NonZeroUsize::new(500) {
     Some(n) => n,
     None => panic!("cache size must be non-zero"),

@@ -54,6 +54,8 @@ pub struct Body {
     pub version: String,
     #[serde(with = "serde_helpers::checksum_address")]
     pub relay_adapt: Address,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_adapt_7702: Option<Address>,
     #[serde(rename = "requiredPOIListKeys")]
     pub required_poi_list_keys: Vec<String>,
     pub reliability: f64,
@@ -131,6 +133,7 @@ pub struct Manager {
     fee_bonus: U256,
     rpcs: Arc<QueryRpcPool>,
     multicall_addr: Address,
+    trusted_fees: Arc<tokio::sync::Mutex<HashMap<String, HashMap<Address, U256>>>>,
 }
 
 impl Manager {
@@ -175,12 +178,26 @@ impl Manager {
             fee_bonus,
             multicall_addr,
             rpcs,
+            trusted_fees: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
     #[must_use]
     pub async fn create_fees(&self) -> (String, HashMap<Address, U256>) {
-        let fees = self.prices.read().await.clone();
+        let mut fees = self.prices.read().await.clone();
+        let trusted_fees = self.get_avg_trusted_signer_fees().await;
+        for (address, fee) in &mut fees {
+            let Some(trusted_fee) = trusted_fees.get(address) else {
+                continue;
+            };
+            let (max_fee, min_fee) = (trusted_fee * uint!(129_U256) / uint!(100_U256), trusted_fee * uint!(91_U256) / uint!(100_U256));
+            if !max_fee.is_zero() && *fee > max_fee {
+                *fee = max_fee;
+            }
+            if *fee < min_fee {
+                *fee = min_fee;
+            }
+        }
         let fees_id: String = rand::rng()
             .sample_iter(&Alphanumeric)
             .take(16)
@@ -210,33 +227,58 @@ impl Manager {
                 AggregatorInterface::latestAnswerCall {}.abi_encode().into(),
             ));
         }
-        let results = multicall.try_aggregate(false).await?;
-        for (oracle, res) in self.oracle_instances.iter().zip(results) {
-            match res {
-                Ok(val) => {
-                    let price = U256::try_from(val).map_err(|_| FeesError::InvalidPrice {
-                        value: val.to_string(),
-                    })?;
-                    let val = if oracle.is_inversed {
-                        uint!(10_U256).pow(U256::from(oracle.token_decimals)) * self.fee_bonus
-                            / price
-                    } else {
-                        price
-                            * uint!(10_U256).pow(U256::from(10 + oracle.token_decimals))
-                            * self.fee_bonus
-                            / uint!(1000000000000000000000000000000000000_U256)
-                    };
-                    tracing::debug!(?oracle.token_addr, %val, "updating price");
-                    self.prices.write().await.insert(oracle.token_addr, val);
+        match multicall.try_aggregate(false).await {
+            Ok(results) => {
+                for (oracle, res) in self.oracle_instances.iter().zip(results) {
+                    match res {
+                        Ok(val) => {
+                            let price =
+                                U256::try_from(val).map_err(|_| FeesError::InvalidPrice {
+                                    value: val.to_string(),
+                                })?;
+                            let val = if oracle.is_inversed {
+                                uint!(10_U256).pow(U256::from(oracle.token_decimals))
+                                    * self.fee_bonus
+                                    / price
+                            } else {
+                                price
+                                    * uint!(10_U256).pow(U256::from(10 + oracle.token_decimals))
+                                    * self.fee_bonus
+                                    / uint!(1000000000000000000000000000000000000_U256)
+                            };
+                            tracing::debug!(?oracle.token_addr, %val, "updating price");
+                            self.prices.write().await.insert(oracle.token_addr, val);
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                "failed to get price for {}: {error}",
+                                oracle.token_addr
+                            );
+                        }
+                    }
                 }
-                Err(error) => {
-                    tracing::warn!("failed to get price for {}: {error}", oracle.token_addr);
-                }
+            }
+            Err(error) => {
+                tracing::error!(%rpc.url, "failed to get prices: {error}");
+                return Err(FeesError::Multicall(error));
             }
         }
         Ok(())
     }
-
+    pub async fn handle_trusted_signer_fees(&self, railgun_address: String, fees: HashMap<Address, U256>) {
+        self.trusted_fees.lock().await.insert(railgun_address, fees);
+    }
+    async fn get_avg_trusted_signer_fees(&self) -> HashMap<Address, U256> {
+        let mut total_fees: HashMap<Address, U256> = HashMap::new();
+        let mut count: HashMap<Address, usize> = HashMap::new();
+        for fees in self.trusted_fees.lock().await.values() {
+            for (address, fee) in fees {
+                *total_fees.entry(*address).or_insert(U256::ZERO) += fee;
+                *count.entry(*address).or_insert(0) += 1;
+            }
+        }
+        total_fees.iter().map(|(address, total)| (*address, total / U256::from(count[address]))).collect()
+    }
     pub async fn convert_to_eth(&self, calldata: &ParsedTransactCalldata) -> U256 {
         tracing::info!(token=?calldata.fee_token, amount=%calldata.fee_amount, "converting value to gas token");
         self.prices

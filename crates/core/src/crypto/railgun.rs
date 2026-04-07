@@ -17,6 +17,12 @@ impl Display for Address {
     }
 }
 
+impl PartialEq<str> for Address {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
 pub type PublicKey = [u8; 32];
 
 #[derive(Debug, Clone, Copy)]

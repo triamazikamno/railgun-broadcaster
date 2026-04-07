@@ -111,6 +111,7 @@ chains:
     # Advanced configuration
     wrapped_native_token: 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2
     railgun_contract: 0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9
+    relay_adapt_7702_contract: 0x2df3d82c06339387a4532c685daaf39a218cf56e
     relay_adapt_contract: 0xAc9f360Ae85469B27aEDdEaFC579Ef2d052aD405
     multicall_contract: 0xcA11bde05977b3631167028862bE2a173976CA11
 
@@ -161,6 +162,7 @@ chains:
     wrapped_native_token: 0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c
     railgun_contract: 0x590162bf4b50f6576a459b75309ee21d92178a10
     relay_adapt_contract: 0xf82d00fc51f730f42a00f85e74895a2849fff2dd
+    relay_adapt_7702_contract: 0x6fa84bc1587cc90978dc9535d4d38dc74fa4b522
     multicall_contract: 0xcA11bde05977b3631167028862bE2a173976CA11
 
   # Polygon
@@ -197,6 +199,7 @@ chains:
     wrapped_native_token: 0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270
     railgun_contract: 0x19b620929f97b7b990801496c3b361ca5def8c71
     relay_adapt_contract: 0xF82d00fC51F730F42A00F85E74895a2849ffF2Dd
+    relay_adapt_7702_contract: 0x6fa84bc1587cc90978dc9535d4d38dc74fa4b522
     multicall_contract: 0xcA11bde05977b3631167028862bE2a173976CA11
 
   # Arbitrum
@@ -230,18 +233,28 @@ chains:
         addr: 0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612
         token_decimals: 18
       # WBTC
-      0x912ce59144191c1204e64559fe8253a0e49e6548: !Oracle
+      0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f: !Oracle
         addr: 0xc5a90A6d7e4Af242dA238FFe279e9f2BA0c64B2e
         is_inversed: true
         token_decimals: 8
-
+      # ARB
+      0x912ce59144191c1204e64559fe8253a0e49e6548: !Oracle
+        addr: 0xB72359B2dc04Ff363e094648DF78247c98297c20
+        token_decimals: 18
     submit_rpcs:
       - !Normal https://arb1.arbitrum.io/rpc
     wrapped_native_token: 0x82af49447d8a07e3bd95bd0d56f35241523fbab1
     railgun_contract: 0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9
     relay_adapt_contract: 0xB4F2d77bD12c6b548Ae398244d7FAD4ABCE4D89b
+    relay_adapt_7702_contract: 0x6fa84bc1587cc90978dc9535d4d38dc74fa4b522
     multicall_contract: 0xcA11bde05977b3631167028862bE2a173976CA11
 
+# Taken from https://www.railway.xyz/config/railway-config-v3.3.json
+trusted_signers:
+  - 0zk1qyjyhqjdkqd9qxusgj092ppxl92plvrk3s3cna9u73h5rwt0ghxvfrv7j6fe3z53l7lrzyqw5te7ku5v8fsrpeadzvpkudgawjv9dg08htj7z3mph5kd6dw50jc
+  - 0zk1qyzgh9ctuxm6d06gmax39xutjgrawdsljtv80lqnjtqp3exxayuf0rv7j6fe3z53laetcl9u3cma0q9k4npgy8c8ga4h6mx83v09m8ewctsekw4a079dcl5sw4k
+  - 0zk1qyqhtwaa9zj3ug9dmxhfedappvm509w7dr5lgadaehxz38w9u457mrv7j6fe3z53layes62mktxj5kd6reh2kxd39ds2gnpf6wphtw39y5g36lsvukeywfqa8y0
+  - 0zk1qy88aamk4dp3rn2dvfdu5u8vvtfs89vg8h6zyajr4g5mq0ykm28e0rv7j6fe3z53l7zpahc5w52u8juzg54ypn24slqsyy3dy57s5k3669dyg3jxyp6czxszfs7
 
 # Optional override for local db root.
 #db_dir: ./db
@@ -256,7 +269,7 @@ waku:
   #nwaku_url: <FILL_ME>
 
   # Waku cluster id
-  cluster_id: 1
+  cluster_id: 5
 
   # List of custom DNS-based enr trees to bootstrap the libp2p network.
   #  Leave commented out to use default bootstrap nodes.
@@ -273,9 +286,9 @@ waku:
   peer_connection_timeout: "10s"
 
   # List of direct peers to connect to. More peers may be discovered through Peer Exchange protocol.
-  direct_peers:
-    - peer_id: "16Uiu2HAkwNeQVY32bUrL1eM68ryMa48PXY5Bhfxfg9e2byYcc46m"
-      addrs: [ "/dns4/prod.rootedinprivacy.com/tcp/30304/p2p/16Uiu2HAkwNeQVY32bUrL1eM68ryMa48PXY5Bhfxfg9e2byYcc46m", "/dns4/prod.rootedinprivacy.com/tcp/8000/wss/p2p/16Uiu2HAkwNeQVY32bUrL1eM68ryMa48PXY5Bhfxfg9e2byYcc46m" ]
+  #direct_peers:
+  #  - peer_id: "16Uiu2HAkwNeQVY32bUrL1eM68ryMa48PXY5Bhfxfg9e2byYcc46m"
+  #    addrs: [ "/dns4/prod.rootedinprivacy.com/tcp/30304/p2p/16Uiu2HAkwNeQVY32bUrL1eM68ryMa48PXY5Bhfxfg9e2byYcc46m", "/dns4/prod.rootedinprivacy.com/tcp/8000/wss/p2p/16Uiu2HAkwNeQVY32bUrL1eM68ryMa48PXY5Bhfxfg9e2byYcc46m" ]
 
 query_rpc_cooldown: 3m
 poi_rpc: https://ppoi.fdi.network
