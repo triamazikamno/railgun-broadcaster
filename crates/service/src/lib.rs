@@ -25,7 +25,7 @@ use config::{Chain, Key};
 use fees::{FeesError, Manager as FeesManager};
 use poi::poi::Poi;
 use rand::seq::IndexedRandom;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -475,6 +475,7 @@ impl BroadcasterService {
         let required_poi_list = self.required_poi_list.clone();
         let railgun_address = self.addr.clone();
         let relay_adapt = self.relay_adapt_contract;
+        let relay_adapt_7702 = self.relay_adapt_7702_contract;
         let identifier = self.identifier.clone();
         let client = self.client.clone();
         let key = self.key;
@@ -483,84 +484,91 @@ impl BroadcasterService {
         let count_txs_landed = self.count_txs_landed.clone();
         let available_wallets = self.evm_wallets.len() as u32;
 
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(push_interval);
-            loop {
-                interval.tick().await;
-                if let Err(error) = fees_manager.update_prices().await {
-                    error!(?error, "update prices failed");
-                }
-                let reliability = {
-                    let count_transact_requests = count_transact_requests.load(Ordering::Relaxed);
-                    let count_txs_landed = count_txs_landed.load(Ordering::Relaxed);
-                    if count_transact_requests < 10 || count_transact_requests == count_txs_landed {
-                        0.99
-                    } else {
-                        let ratio =
-                            f64::from(count_txs_landed) / f64::from(count_transact_requests);
-                        (ratio * 100.0).round() / 100.0
+        tokio::spawn(
+            async move {
+                let mut interval = tokio::time::interval(push_interval);
+                loop {
+                    interval.tick().await;
+                    if let Err(error) = fees_manager.update_prices().await {
+                        error!(?error, "update prices failed");
                     }
-                };
-                let fee_expiration = match SystemTime::now().duration_since(UNIX_EPOCH) {
-                    Ok(duration) => duration.as_millis().saturating_add(fee_ttl.as_millis()),
-                    Err(error) => {
-                        warn!(?error, "system time before unix epoch");
-                        continue;
-                    }
-                };
-                let fee_expiration = u64::try_from(fee_expiration).unwrap_or(u64::MAX);
-                let (fees_id, fees) = fees_manager.create_fees().await;
-                let fees = fees::Body {
-                    fees,
-                    fee_expiration,
-                    fees_id,
-                    railgun_address: railgun_address.clone(),
-                    available_wallets,
-                    version: API_VERSION.to_string(),
-                    relay_adapt,
-                    required_poi_list_keys: required_poi_list.iter().map(hex::encode).collect(),
-                    reliability,
-                    identifier: identifier.clone(),
-                };
-                debug!(payload=?serde_json::to_string(&fees), "our fees");
-                match fees.into_signed_payload(key) {
-                    Ok(payload) => {
-                        let (decoded_payload, is_valid) = match payload.decode_and_verify() {
-                            Ok(result) => result,
-                            Err(error) => {
-                                warn!(?error, "verify fees signature failed");
-                                continue;
-                            }
-                        };
+                    let reliability = {
+                        let count_transact_requests =
+                            count_transact_requests.load(Ordering::Relaxed);
+                        let count_txs_landed = count_txs_landed.load(Ordering::Relaxed);
+                        if count_transact_requests < 10
+                            || count_transact_requests == count_txs_landed
+                        {
+                            1.0
+                        } else {
+                            let ratio =
+                                f64::from(count_txs_landed) / f64::from(count_transact_requests);
+                            (ratio * 100.0).round() / 100.0
+                        }
+                    };
+                    let fee_expiration = match SystemTime::now().duration_since(UNIX_EPOCH) {
+                        Ok(duration) => duration.as_millis().saturating_add(fee_ttl.as_millis()),
+                        Err(error) => {
+                            warn!(?error, "system time before unix epoch");
+                            continue;
+                        }
+                    };
+                    let fee_expiration = u64::try_from(fee_expiration).unwrap_or(u64::MAX);
+                    let (fees_id, fees) = fees_manager.create_fees().await;
+                    let fees = fees::Body {
+                        fees,
+                        fee_expiration,
+                        fees_id,
+                        railgun_address: railgun_address.clone(),
+                        available_wallets,
+                        version: API_VERSION.to_string(),
+                        relay_adapt,
+                        relay_adapt_7702,
+                        required_poi_list_keys: required_poi_list.iter().map(hex::encode).collect(),
+                        reliability,
+                        identifier: identifier.clone(),
+                    };
+                    debug!(payload=?serde_json::to_string(&fees), "our fees");
+                    match fees.into_signed_payload(key) {
+                        Ok(payload) => {
+                            let (decoded_payload, is_valid) = match payload.decode_and_verify() {
+                                Ok(result) => result,
+                                Err(error) => {
+                                    warn!(?error, "verify fees signature failed");
+                                    continue;
+                                }
+                            };
 
-                        if is_valid {
-                            match serde_json::to_string(&payload) {
-                                Ok(payload) => {
-                                    if let Err(error) = client
-                                        .publish(
-                                            PUBSUB_PATH,
-                                            &format!("/railgun/v2/0-{chain_id}-fees/json"),
-                                            payload.as_bytes(),
-                                        )
-                                        .await
-                                    {
-                                        warn!(%error, "publish fees failed");
+                            if is_valid {
+                                match serde_json::to_string(&payload) {
+                                    Ok(payload) => {
+                                        if let Err(error) = client
+                                            .publish(
+                                                PUBSUB_PATH,
+                                                &format!("/railgun/v2/0-{chain_id}-fees/json"),
+                                                payload.as_bytes(),
+                                            )
+                                            .await
+                                        {
+                                            warn!(%error, "publish fees failed");
+                                        }
+                                    }
+                                    Err(error) => {
+                                        error!(%error, "serialize fees failed");
                                     }
                                 }
-                                Err(error) => {
-                                    error!(%error, "serialize fees failed");
-                                }
+                            } else {
+                                warn!(?decoded_payload, "fees signature invalid");
                             }
-                        } else {
-                            warn!(?decoded_payload, "fees signature invalid");
                         }
-                    }
-                    Err(error) => {
-                        error!(%error, "sign fees failed");
+                        Err(error) => {
+                            error!(%error, "sign fees failed");
+                        }
                     }
                 }
             }
-        });
+            .instrument(info_span!("fees", chain_id)),
+        );
     }
 
     pub async fn handle_transact_request(
@@ -740,6 +748,15 @@ impl BroadcasterService {
             .instrument(info_span!("tx", chain_id))
         );
     }
+    pub async fn handle_trusted_signer_fees(
+        &self,
+        railgun_address: String,
+        fees: HashMap<Address, U256>,
+    ) {
+        self.fees_manager
+            .handle_trusted_signer_fees(railgun_address, fees)
+            .await;
+    }
 }
 
 async fn submit_tx(
@@ -797,13 +814,22 @@ struct TransactEnvelope {
 pub struct BroadcasterManager {
     services: Vec<BroadcasterService>,
     waku: Arc<Client>,
+    trusted_signers: HashSet<String>,
 }
 
 impl BroadcasterManager {
     /// Creates a new manager from pre-initialized services and a Waku client.
     #[must_use]
-    pub const fn new(services: Vec<BroadcasterService>, waku: Arc<Client>) -> Self {
-        Self { services, waku }
+    pub const fn new(
+        services: Vec<BroadcasterService>,
+        waku: Arc<Client>,
+        trusted_signers: HashSet<String>,
+    ) -> Self {
+        Self {
+            services,
+            waku,
+            trusted_signers,
+        }
     }
 
     /// Subscribes to Waku and runs the message processing loop.
@@ -816,14 +842,12 @@ impl BroadcasterManager {
 
         let content_topics: Vec<String> = chain_ids
             .into_iter()
-            // .map(|chain_id| {
-            //     vec![
-            //         format!("/railgun/v2/0-{chain_id}-transact/json"),
-            //         format!("/railgun/v2/0-56-fees/json"),
-            //     ]
-            // })
-            // .flatten()
-            .map(|chain_id| format!("/railgun/v2/0-{chain_id}-transact/json"))
+            .flat_map(|chain_id| {
+                vec![
+                    format!("/railgun/v2/0-{chain_id}-transact/json"),
+                    format!("/railgun/v2/0-{chain_id}-fees/json"),
+                ]
+            })
             .collect();
 
         let mut msg_rx = self.waku.subscribe(PUBSUB_PATH, content_topics).await?;
@@ -834,12 +858,38 @@ impl BroadcasterManager {
                 continue;
             };
 
-            let topic = ContentTopic::from(msg.content_topic);
+            let topic = ContentTopic::from(msg.content_topic.clone());
             match topic {
-                ContentTopic::Pong
-                | ContentTopic::TransactResponse()
-                | ContentTopic::Noop
-                | ContentTopic::Fees => {}
+                ContentTopic::Pong | ContentTopic::TransactResponse() | ContentTopic::Noop => {}
+                ContentTopic::Fees(chain_id) => {
+                    match serde_json::from_slice::<fees::Payload>(&msg.payload) {
+                        Ok(payload) => {
+                            match serde_json::from_slice::<fees::Body>(payload.data.as_ref()) {
+                                Ok(body) => {
+                                    if self.trusted_signers.contains(body.railgun_address.as_ref())
+                                    {
+                                        for service in &self.services {
+                                            if service.chain_id == chain_id {
+                                                service
+                                                    .handle_trusted_signer_fees(
+                                                        body.railgun_address.as_ref().to_string(),
+                                                        body.fees.clone(),
+                                                    )
+                                                    .await;
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    warn!("Failed to deserialize fees message: {error}");
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            warn!(%error, "parse fees failed");
+                        }
+                    }
+                }
                 ContentTopic::Transact(chain_id) => {
                     match serde_json::from_slice::<TransactEnvelope>(msg.payload.as_slice()) {
                         Ok(payload) => {

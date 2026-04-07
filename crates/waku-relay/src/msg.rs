@@ -8,7 +8,7 @@ pub struct Message {
 }
 
 pub enum ContentTopic {
-    Fees,
+    Fees(ChainId),
     Pong,
     TransactResponse(),
     Transact(ChainId),
@@ -26,8 +26,8 @@ impl From<String> for ContentTopic {
         }
 
         if value.ends_with("-fees/json") {
-            if extract_chain_id_from_fees_topic(&value).is_some() {
-                return Self::Fees;
+            if let Some(chain_id) = extract_chain_id_from_fees_topic(&value) {
+                return Self::Fees(chain_id);
             }
         } else if value.ends_with("-transact-response/json") {
             if extract_chain_id_from_fees_topic(&value).is_some() {

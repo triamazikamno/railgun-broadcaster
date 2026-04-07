@@ -1,6 +1,6 @@
 use alloy::primitives::{Address, Bytes, ChainId, FixedBytes, U256};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 use url::Url;
@@ -12,6 +12,7 @@ mod serde_helpers;
 pub struct Config {
     pub chains: Vec<Chain>,
     pub query_rpc_cooldown: humantime_serde::Serde<Duration>,
+    pub trusted_signers: HashSet<String>,
     pub required_poi_list: Vec<FixedBytes<32>>,
     pub poi_rpc: Option<Url>,
     pub waku: Waku,
