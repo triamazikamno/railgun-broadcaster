@@ -62,6 +62,7 @@ pub struct Chain {
     pub submit_rpcs: Vec<Rpc>,
     pub multicall_contract: Option<Address>,
     pub relay_adapt_contract: Address,
+    pub relay_adapt_7702_contract: Option<Address>,
     pub evm_wallets: Vec<Bytes>,
     pub identifier: Option<String>,
     pub sync: Option<SyncChainConfig>,

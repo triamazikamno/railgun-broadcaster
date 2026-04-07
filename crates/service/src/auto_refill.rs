@@ -183,6 +183,7 @@ impl AutoRefillService {
                     tree,
                     total = %pretty_number(&total, 18),
                     requested = %pretty_number(&refill_amount, 18),
+                    balance = %pretty_number(&balance, 18),
                     "auto-refill utxo summary",
                 );
             }

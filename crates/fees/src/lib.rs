@@ -54,6 +54,8 @@ pub struct Body {
     pub version: String,
     #[serde(with = "serde_helpers::checksum_address")]
     pub relay_adapt: Address,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_adapt_7702: Option<Address>,
     #[serde(rename = "requiredPOIListKeys")]
     pub required_poi_list_keys: Vec<String>,
     pub reliability: f64,
