@@ -20,6 +20,8 @@ pub struct QuickSyncConfig {
     pub start_block: u64,
     pub end_block: Option<u64>,
     pub page_size: NonZeroUsize,
+    /// Optional pre-configured HTTP client (e.g. with proxy support).
+    pub http_client: Option<reqwest::Client>,
 }
 
 impl Default for QuickSyncConfig {
@@ -32,6 +34,7 @@ impl Default for QuickSyncConfig {
             start_block: 0,
             end_block: None,
             page_size: DEFAULT_PAGE_SIZE,
+            http_client: None,
         }
     }
 }
@@ -48,9 +51,13 @@ pub async fn run_quick_sync(config: QuickSyncConfig) -> SyncResult<QuickSyncResu
         start_block,
         end_block,
         page_size,
+        http_client,
     } = config;
     let page_size_value = page_size.get();
-    let client = QuickSyncClient::new(endpoint);
+    let client = match http_client {
+        Some(c) => QuickSyncClient::with_http_client(endpoint, c),
+        None => QuickSyncClient::new(endpoint),
+    };
     let mut forest = MerkleForest::new();
 
     let mut total_commitments = 0usize;

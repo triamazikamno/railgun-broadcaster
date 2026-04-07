@@ -90,6 +90,8 @@ pub struct ArtifactSource {
     pub ipfs_hash: String,
     pub out_dir: PathBuf,
     pub metadata_dir: Option<PathBuf>,
+    /// Optional proxy URL for artifact downloads (e.g. `socks5h://127.0.0.1:9050`).
+    pub proxy: Option<Url>,
 }
 
 impl Default for ArtifactSource {
@@ -99,6 +101,7 @@ impl Default for ArtifactSource {
             ipfs_hash: DEFAULT_IPFS_HASH.to_string(),
             out_dir: PathBuf::from(ARTIFACTS_DIR),
             metadata_dir: None,
+            proxy: None,
         }
     }
 }
@@ -111,12 +114,19 @@ impl ArtifactSource {
             ipfs_hash,
             out_dir,
             metadata_dir: None,
+            proxy: None,
         }
     }
 
     #[must_use]
     pub fn with_cache_dir(mut self, path: PathBuf) -> Self {
         self.out_dir = path;
+        self
+    }
+
+    #[must_use]
+    pub fn with_proxy(mut self, proxy: Url) -> Self {
+        self.proxy = Some(proxy);
         self
     }
 
@@ -228,7 +238,22 @@ pub fn download_variant(
     })?;
 
     let urls = artifact_urls(source, variant)?;
-    let client = Client::new();
+    let client = {
+        let mut builder = Client::builder();
+        if let Some(proxy_url) = &source.proxy {
+            let proxy = reqwest::Proxy::all(proxy_url.as_str()).map_err(|source| {
+                ArtifactError::Download {
+                    source,
+                    url: proxy_url.clone(),
+                }
+            })?;
+            builder = builder.proxy(proxy);
+        }
+        builder.build().map_err(|source| ArtifactError::Download {
+            source,
+            url: urls.zkey.clone(),
+        })?
+    };
 
     let zkey_br = fetch_bytes(&client, &urls.zkey)?;
     let wasm_br = fetch_bytes(&client, &urls.wasm)?;

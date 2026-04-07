@@ -71,6 +71,13 @@ impl QuickSyncClient {
         }
     }
 
+    /// Creates a client that routes all traffic through the given
+    /// pre-configured [`reqwest::Client`] (e.g. one with a SOCKS proxy).
+    #[must_use]
+    pub const fn with_http_client(endpoint: Url, client: Client) -> Self {
+        Self { endpoint, client }
+    }
+
     pub(crate) async fn fetch_list<D>(
         &self,
         query: &str,

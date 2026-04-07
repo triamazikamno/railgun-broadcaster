@@ -363,6 +363,7 @@ impl MerkleForestDbExt for DbStore {
                 start_block: chain.deployment_block,
                 end_block: None,
                 page_size: DEFAULT_PAGE_SIZE,
+                http_client: chain.http_client.clone(),
             };
             match run_quick_sync(config).await {
                 Ok(result) => {

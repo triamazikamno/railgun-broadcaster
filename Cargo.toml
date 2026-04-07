@@ -29,7 +29,7 @@ alloy-rpc-types-eth = "1"
 alloy-transport = "1"
 eyre = "0.6"
 rand = "0.9"
-reqwest = { version = "0.12" }
+reqwest = { version = "0.12", features = ["socks"] }
 ruint = { version = "1.17", features = ["num-bigint"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

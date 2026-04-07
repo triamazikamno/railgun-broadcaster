@@ -31,6 +31,9 @@ pub struct ChainConfig {
     pub quick_sync_endpoint: Option<Url>,
     pub anchor_interval: u64,
     pub anchor_retention: usize,
+    /// Optional pre-configured HTTP client (e.g. with proxy support) for
+    /// quick-sync and other internal HTTP requests.
+    pub http_client: Option<reqwest::Client>,
 }
 
 #[derive(Debug, Clone)]

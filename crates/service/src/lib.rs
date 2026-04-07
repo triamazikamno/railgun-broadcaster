@@ -335,6 +335,7 @@ impl BroadcasterService {
                     quick_sync_endpoint,
                     anchor_interval,
                     anchor_retention,
+                    http_client: None,
                 };
                 let chain_service = sync_manager.add_chain(chain_config).await?;
                 let chain_key = ChainKey {

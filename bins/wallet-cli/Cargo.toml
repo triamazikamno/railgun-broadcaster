@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-alloy = { workspace = true, features = ["provider-http", "rpc-types"] }
+alloy = { workspace = true, features = ["provider-http", "rpc-types", "network", "signers"] }
 eyre = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

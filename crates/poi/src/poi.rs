@@ -173,6 +173,17 @@ impl PoiRpcClient {
         }
     }
 
+    /// Creates a client that routes all traffic through the given
+    /// pre-configured [`reqwest::Client`] (e.g. one with a SOCKS proxy).
+    #[must_use]
+    pub const fn with_http_client(base_url: Url, http: reqwest::Client) -> Self {
+        Self {
+            base_url,
+            http,
+            next_id: std::sync::atomic::AtomicU64::new(1),
+        }
+    }
+
     async fn validate_poi_merkleroots(
         &self,
         txid_version: &str,

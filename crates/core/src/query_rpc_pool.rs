@@ -42,6 +42,27 @@ impl QueryRpcPool {
         }
     }
 
+    /// Creates a pool that routes all RPC traffic through the given
+    /// pre-configured [`reqwest::Client`] (e.g. one with a SOCKS proxy).
+    #[must_use]
+    #[allow(clippy::needless_pass_by_value)] // Client is Arc-based; clone is cheap
+    pub fn with_http_client(urls: Vec<Url>, cooldown: Duration, client: reqwest::Client) -> Self {
+        let providers = urls
+            .into_iter()
+            .map(|url| ProviderEntry {
+                provider: ProviderBuilder::new()
+                    .connect_reqwest(client.clone(), url.clone())
+                    .erased(),
+                url,
+            })
+            .collect();
+        Self {
+            providers,
+            cooldown,
+            cooldowns: Mutex::new(HashMap::new()),
+        }
+    }
+
     #[must_use]
     pub fn random_provider(&self) -> Option<ProviderHandle> {
         if self.providers.is_empty() {

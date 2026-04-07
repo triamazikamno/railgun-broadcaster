@@ -7499,6 +7499,7 @@ dependencies = [
  "local-db",
  "merkletree",
  "railgun-wallet",
+ "reqwest 0.12.28",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",

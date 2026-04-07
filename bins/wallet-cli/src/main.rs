@@ -1,10 +1,16 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{cmp::Ordering, path::PathBuf};
 
+use alloy::eips::Encodable2718;
 use alloy::hex;
+use alloy::network::{EthereumWallet, TransactionBuilder as _};
 use alloy::primitives::{Address, FixedBytes, U256};
 use alloy::providers::{Provider, ProviderBuilder};
+use alloy::rpc::types::TransactionRequest;
+use alloy::signers::k256::ecdsa::SigningKey;
+use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolEvent;
 use broadcaster_core::contracts::railgun::Shield;
 use broadcaster_core::contracts::shield::{
@@ -41,6 +47,9 @@ struct Options {
     /// Override the default RPC URL for the chain
     #[structopt(long, global = true)]
     rpc_url: Option<Url>,
+    /// Route all HTTP traffic through a proxy (e.g. socks5h://127.0.0.1:9050 for Tor)
+    #[structopt(long, global = true)]
+    proxy: Option<Url>,
     #[structopt(subcommand)]
     command: Command,
 }
@@ -84,6 +93,10 @@ struct UnshieldOptions {
     /// Use UnwrapBase mode (WETH -> ETH via RelayAdapter)
     #[structopt(long)]
     unwrap: bool,
+    /// EVM private key (hex). When provided, signs and sends the tx on-chain
+    /// instead of printing calldata.
+    #[structopt(long)]
+    private_key: Option<String>,
 }
 
 #[derive(Debug, StructOpt)]
@@ -98,8 +111,15 @@ struct ShieldOptions {
     #[structopt(long)]
     recipient: String,
     /// Sender's EVM private key (hex). Used to derive shieldPrivateKey.
+    /// When --send is also provided, this key signs and submits transactions.
     #[structopt(long)]
     private_key: String,
+    /// Wrap ETH to WETH before shielding. --token must be the WETH address.
+    #[structopt(long)]
+    wrap: bool,
+    /// Sign and send transactions on-chain using the provided private key.
+    #[structopt(long)]
+    send: bool,
 }
 
 #[derive(Debug, StructOpt)]
@@ -135,15 +155,47 @@ async fn main() -> Result<()> {
         )
         .init();
     let rpc_url_override = options.rpc_url;
+    let http_client = build_http_client(options.proxy.as_ref())?;
     match options.command {
-        Command::ListUtxos(opts) => run_list_utxos(opts, rpc_url_override).await,
-        Command::Unshield(opts) => run_unshield(opts, rpc_url_override).await,
-        Command::Shield(opts) => run_shield(opts).await,
-        Command::SubmitShieldPoi(opts) => run_submit_shield_poi(opts, rpc_url_override).await,
+        Command::ListUtxos(opts) => run_list_utxos(opts, rpc_url_override, &http_client).await,
+        Command::Unshield(opts) => run_unshield(opts, rpc_url_override, &http_client).await,
+        Command::Shield(opts) => run_shield(opts, rpc_url_override, &http_client).await,
+        Command::SubmitShieldPoi(opts) => {
+            run_submit_shield_poi(opts, rpc_url_override, &http_client).await
+        }
     }
 }
 
-async fn run_list_utxos(opts: ListUtxosOptions, rpc_url_override: Option<Url>) -> Result<()> {
+/// Shared HTTP context built once from the `--proxy` flag and passed into
+/// every subcommand that issues network requests.
+struct HttpContext {
+    /// Async HTTP client (with optional proxy) for reqwest / alloy usage.
+    client: reqwest::Client,
+    /// Proxy URL, kept around for components that build their own client
+    /// (e.g. the blocking artifact downloader).
+    proxy_url: Option<Url>,
+}
+
+fn build_http_client(proxy: Option<&Url>) -> Result<HttpContext> {
+    let mut builder = reqwest::Client::builder();
+    if let Some(proxy_url) = proxy {
+        tracing::info!(%proxy_url, "routing all HTTP traffic through proxy");
+        let p = reqwest::Proxy::all(proxy_url.as_str())
+            .wrap_err_with(|| format!("invalid proxy URL {proxy_url}"))?;
+        builder = builder.proxy(p);
+    }
+    let client = builder.build().wrap_err("build HTTP client")?;
+    Ok(HttpContext {
+        client,
+        proxy_url: proxy.cloned(),
+    })
+}
+
+async fn run_list_utxos(
+    opts: ListUtxosOptions,
+    rpc_url_override: Option<Url>,
+    http: &HttpContext,
+) -> Result<()> {
     let chain_defaults = ChainConfigDefaults::for_chain(opts.chain_id)
         .ok_or_else(|| eyre!("unsupported chain id {0} for wallet-cli v1", opts.chain_id))?;
     let rpc_url = rpc_url_override.unwrap_or_else(|| chain_defaults.rpc_url.clone());
@@ -156,7 +208,11 @@ async fn run_list_utxos(opts: ListUtxosOptions, rpc_url_override: Option<Url>) -
     );
     let sync_manager = Arc::new(SyncManager::new(db));
 
-    let query_rpc_pool = Arc::new(QueryRpcPool::new(vec![rpc_url], DEFAULT_QUERY_RPC_COOLDOWN));
+    let query_rpc_pool = Arc::new(QueryRpcPool::with_http_client(
+        vec![rpc_url],
+        DEFAULT_QUERY_RPC_COOLDOWN,
+        http.client.clone(),
+    ));
 
     let chain_key = ChainKey {
         chain_id: chain_defaults.chain_id,
@@ -177,6 +233,7 @@ async fn run_list_utxos(opts: ListUtxosOptions, rpc_url_override: Option<Url>) -
         quick_sync_endpoint: chain_defaults.quick_sync_endpoint.clone(),
         anchor_interval: chain_defaults.anchor_interval,
         anchor_retention: chain_defaults.anchor_retention,
+        http_client: Some(http.client.clone()),
     };
     sync_manager
         .add_chain(chain_cfg)
@@ -212,19 +269,40 @@ async fn run_list_utxos(opts: ListUtxosOptions, rpc_url_override: Option<Url>) -
         other => other,
     });
 
+    // Accumulate per-token totals while building the UTXO list.
+    let mut totals_map: BTreeMap<Address, U256> = BTreeMap::new();
+
+    let utxo_outputs: Vec<UtxoOutput> = utxos
+        .into_iter()
+        .map(|utxo| {
+            let token_bytes = utxo.note.token_hash.to_be_bytes::<32>();
+            let token_addr = Address::from_slice(&token_bytes[12..32]);
+
+            *totals_map.entry(token_addr).or_default() += utxo.note.value;
+
+            UtxoOutput {
+                tree: utxo.tree,
+                position: utxo.position,
+                token: token_addr.to_checksum(None),
+                value: utxo.note.value.to_string(),
+            }
+        })
+        .collect();
+
+    let totals: Vec<TokenTotal> = totals_map
+        .into_iter()
+        .map(|(addr, total)| TokenTotal {
+            token: addr.to_checksum(None),
+            total: total.to_string(),
+        })
+        .collect();
+
     let output = ListUtxosOutput {
         chain_id: opts.chain_id,
         cache_key,
-        utxo_count: utxos.len(),
-        utxos: utxos
-            .into_iter()
-            .map(|utxo| UtxoOutput {
-                tree: utxo.tree,
-                position: utxo.position,
-                token_hash: u256_hex(utxo.note.token_hash),
-                value: u256_hex(utxo.note.value),
-            })
-            .collect(),
+        utxo_count: utxo_outputs.len(),
+        utxos: utxo_outputs,
+        totals,
     };
 
     println!(
@@ -239,8 +317,14 @@ async fn run_list_utxos(opts: ListUtxosOptions, rpc_url_override: Option<Url>) -
 struct UtxoOutput {
     tree: u32,
     position: u64,
-    token_hash: String,
+    token: String,
     value: String,
+}
+
+#[derive(Debug, Serialize)]
+struct TokenTotal {
+    token: String,
+    total: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -249,10 +333,7 @@ struct ListUtxosOutput {
     cache_key: String,
     utxo_count: usize,
     utxos: Vec<UtxoOutput>,
-}
-
-fn u256_hex(value: U256) -> String {
-    format!("0x{}", hex::encode(value.to_be_bytes::<32>()))
+    totals: Vec<TokenTotal>,
 }
 
 #[derive(Debug, Serialize)]
@@ -262,23 +343,131 @@ struct UnshieldOutput {
 }
 
 #[derive(Debug, Serialize)]
+struct UnshieldSendOutput {
+    tx_hash: String,
+    status: bool,
+    block_number: u64,
+    gas_used: u64,
+}
+
+#[derive(Debug, Serialize)]
 struct TxOutput {
     to: Address,
     data: String,
+    /// ETH value to send with the transaction (in wei, decimal string).
+    /// Only present for transactions that transfer native ETH (e.g. WETH deposit).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct ShieldOutput {
+    /// Present only when --wrap is used: calls WETH.deposit() with ETH value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wrap: Option<TxOutput>,
     approve: TxOutput,
     shield: TxOutput,
 }
 
-async fn run_shield(opts: ShieldOptions) -> Result<()> {
+#[derive(Debug, Serialize)]
+struct TxReceiptOutput {
+    tx_hash: String,
+    status: bool,
+    block_number: u64,
+    gas_used: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ShieldSendOutput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wrap: Option<TxReceiptOutput>,
+    approve: TxReceiptOutput,
+    shield: TxReceiptOutput,
+}
+
+/// WETH `deposit()` function selector — no arguments, ETH value is the deposit
+/// amount.
+const WETH_DEPOSIT_SELECTOR: [u8; 4] = [0xd0, 0xe3, 0x0d, 0xb0];
+
+/// Sign, send, and wait for a transaction receipt. Returns a structured receipt
+/// summary or an error.
+async fn sign_send_wait(
+    provider: &(impl Provider + Clone),
+    wallet: &EthereumWallet,
+    tx_req: TransactionRequest,
+    label: &str,
+) -> Result<TxReceiptOutput> {
+    let gas = provider
+        .estimate_gas(tx_req.clone())
+        .await
+        .wrap_err_with(|| format!("{label}: estimate gas"))?
+        + 100_000;
+    let tx_req = tx_req.with_gas_limit(gas);
+
+    tracing::info!(
+        from = %tx_req.from.unwrap_or_default(),
+        to = ?tx_req.to,
+        gas,
+        label,
+        "signing and sending",
+    );
+
+    let signed_tx = tx_req
+        .build(wallet)
+        .await
+        .wrap_err_with(|| format!("{label}: sign"))?
+        .encoded_2718();
+
+    let tx_hash = provider
+        .send_raw_transaction(&signed_tx)
+        .await
+        .wrap_err_with(|| format!("{label}: send"))?
+        .tx_hash()
+        .to_owned();
+
+    tracing::info!(%tx_hash, label, "sent, waiting for confirmation…");
+
+    let receipt = loop {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        if let Some(r) = provider
+            .get_transaction_receipt(tx_hash)
+            .await
+            .wrap_err_with(|| format!("{label}: fetch receipt"))?
+        {
+            break r;
+        }
+    };
+
+    let status = receipt.status();
+    let block_number = receipt.block_number.unwrap_or(0);
+    let gas_used = receipt.gas_used;
+
+    if status {
+        tracing::info!(%tx_hash, block_number, gas_used, label, "confirmed");
+    } else {
+        tracing::warn!(%tx_hash, block_number, gas_used, label, "reverted");
+    }
+
+    Ok(TxReceiptOutput {
+        tx_hash: format!("0x{}", hex::encode(tx_hash)),
+        status,
+        block_number,
+        gas_used,
+    })
+}
+
+async fn run_shield(
+    opts: ShieldOptions,
+    rpc_url_override: Option<Url>,
+    http: &HttpContext,
+) -> Result<()> {
     let amount = U256::from_str_radix(&opts.amount, 10)
         .map_err(|e| eyre!("invalid amount '{}': {e}", opts.amount))?;
 
     let chain_defaults = ChainConfigDefaults::for_chain(opts.chain_id)
         .ok_or_else(|| eyre!("unsupported chain id {}", opts.chain_id))?;
+
+    let rpc_url = rpc_url_override.unwrap_or_else(|| chain_defaults.rpc_url.clone());
 
     // Parse recipient 0zk address
     let railgun_addr = RailgunAddress::from(opts.recipient.as_str());
@@ -312,21 +501,123 @@ async fn run_shield(opts: ShieldOptions) -> Result<()> {
     )
     .wrap_err("build shield calldata")?;
 
-    let output = ShieldOutput {
-        approve: TxOutput {
-            to: opts.token,
-            data: format!("0x{}", hex::encode(&approve_data)),
-        },
-        shield: TxOutput {
-            to: chain_defaults.contract,
-            data: format!("0x{}", hex::encode(&shield_data)),
-        },
-    };
+    // ── Send mode ────────────────────────────────────────────────────────
+    if opts.send {
+        let signer = PrivateKeySigner::from(
+            SigningKey::from_bytes((&pk_bytes).into()).wrap_err("invalid signing key")?,
+        );
+        let from_address = signer.address();
 
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&output).wrap_err("serialize output")?
-    );
+        let provider = ProviderBuilder::new()
+            .connect_reqwest(http.client.clone(), rpc_url)
+            .erased();
+
+        // Fetch base gas price once (+5% buffer, matches codebase convention)
+        let gas_price = provider.get_gas_price().await.wrap_err("fetch gas price")? * 105 / 100;
+        let mut nonce = provider
+            .get_transaction_count(from_address)
+            .await
+            .wrap_err("fetch nonce")?;
+
+        let wallet = EthereumWallet::from(signer);
+
+        // 1. (optional) Wrap ETH → WETH
+        let wrap_receipt = if opts.wrap {
+            let tx_req = TransactionRequest::default()
+                .with_chain_id(opts.chain_id)
+                .with_from(from_address)
+                .with_to(opts.token)
+                .with_input(WETH_DEPOSIT_SELECTOR.to_vec())
+                .with_value(amount)
+                .with_gas_price(gas_price)
+                .with_nonce(nonce);
+
+            let receipt = sign_send_wait(&provider, &wallet, tx_req, "wrap").await?;
+            if !receipt.status {
+                return Err(eyre!("wrap transaction reverted ({})", receipt.tx_hash));
+            }
+            nonce += 1;
+            Some(receipt)
+        } else {
+            None
+        };
+
+        // 2. Approve WETH/token for Railgun contract
+        let approve_tx = TransactionRequest::default()
+            .with_chain_id(opts.chain_id)
+            .with_from(from_address)
+            .with_to(opts.token)
+            .with_input(approve_data)
+            .with_gas_price(gas_price)
+            .with_nonce(nonce);
+
+        let approve_receipt = sign_send_wait(&provider, &wallet, approve_tx, "approve").await?;
+        if !approve_receipt.status {
+            return Err(eyre!(
+                "approve transaction reverted ({})",
+                approve_receipt.tx_hash
+            ));
+        }
+        nonce += 1;
+
+        // 3. Shield
+        let shield_tx = TransactionRequest::default()
+            .with_chain_id(opts.chain_id)
+            .with_from(from_address)
+            .with_to(chain_defaults.contract)
+            .with_input(shield_data)
+            .with_gas_price(gas_price)
+            .with_nonce(nonce);
+
+        let shield_receipt = sign_send_wait(&provider, &wallet, shield_tx, "shield").await?;
+        if !shield_receipt.status {
+            return Err(eyre!(
+                "shield transaction reverted ({})",
+                shield_receipt.tx_hash
+            ));
+        }
+
+        let output = ShieldSendOutput {
+            wrap: wrap_receipt,
+            approve: approve_receipt,
+            shield: shield_receipt,
+        };
+
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&output).wrap_err("serialize output")?
+        );
+    } else {
+        // ── Calldata-only mode ───────────────────────────────────────────
+        let wrap_output = if opts.wrap {
+            Some(TxOutput {
+                to: opts.token,
+                data: format!("0x{}", hex::encode(WETH_DEPOSIT_SELECTOR)),
+                value: Some(amount.to_string()),
+            })
+        } else {
+            None
+        };
+
+        let output = ShieldOutput {
+            wrap: wrap_output,
+            approve: TxOutput {
+                to: opts.token,
+                data: format!("0x{}", hex::encode(&approve_data)),
+                value: None,
+            },
+            shield: TxOutput {
+                to: chain_defaults.contract,
+                data: format!("0x{}", hex::encode(&shield_data)),
+                value: None,
+            },
+        };
+
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&output).wrap_err("serialize output")?
+        );
+    }
 
     Ok(())
 }
@@ -334,6 +625,7 @@ async fn run_shield(opts: ShieldOptions) -> Result<()> {
 async fn run_submit_shield_poi(
     opts: SubmitShieldPoiOptions,
     rpc_url_override: Option<Url>,
+    http: &HttpContext,
 ) -> Result<()> {
     let chain_defaults = ChainConfigDefaults::for_chain(opts.chain_id)
         .ok_or_else(|| eyre!("unsupported chain id {}", opts.chain_id))?;
@@ -360,8 +652,10 @@ async fn run_submit_shield_poi(
         .map_err(|_| eyre!("tx hash must be 32 bytes"))?;
     let tx_hash = FixedBytes::from(tx_hash_bytes);
 
-    // Fetch transaction receipt
-    let provider = ProviderBuilder::new().connect_http(rpc_url).erased();
+    // Fetch transaction receipt using the (possibly proxied) HTTP client
+    let provider = ProviderBuilder::new()
+        .connect_reqwest(http.client.clone(), rpc_url)
+        .erased();
     let receipt = provider
         .get_transaction_receipt(tx_hash)
         .await
@@ -385,7 +679,7 @@ async fn run_submit_shield_poi(
     }
 
     // Submit each commitment to POI aggregator
-    let poi_client = PoiRpcClient::new(poi_rpc_url);
+    let poi_client = PoiRpcClient::with_http_client(poi_rpc_url, http.client.clone());
 
     for event in &shield_events {
         for (i, preimage) in event.commitments.iter().enumerate() {
@@ -417,7 +711,11 @@ async fn run_submit_shield_poi(
     Ok(())
 }
 
-async fn run_unshield(opts: UnshieldOptions, rpc_url_override: Option<Url>) -> Result<()> {
+async fn run_unshield(
+    opts: UnshieldOptions,
+    rpc_url_override: Option<Url>,
+    http: &HttpContext,
+) -> Result<()> {
     let amount = U256::from_str_radix(&opts.amount, 10)
         .map_err(|e| eyre!("invalid amount '{}': {e}", opts.amount))?;
 
@@ -433,7 +731,11 @@ async fn run_unshield(opts: UnshieldOptions, rpc_url_override: Option<Url>) -> R
     );
     let sync_manager = Arc::new(SyncManager::new(db.clone()));
 
-    let query_rpc_pool = Arc::new(QueryRpcPool::new(vec![rpc_url], DEFAULT_QUERY_RPC_COOLDOWN));
+    let query_rpc_pool = Arc::new(QueryRpcPool::with_http_client(
+        vec![rpc_url.clone()],
+        DEFAULT_QUERY_RPC_COOLDOWN,
+        http.client.clone(),
+    ));
 
     let chain_key = ChainKey {
         chain_id: chain_defaults.chain_id,
@@ -454,6 +756,7 @@ async fn run_unshield(opts: UnshieldOptions, rpc_url_override: Option<Url>) -> R
         quick_sync_endpoint: chain_defaults.quick_sync_endpoint.clone(),
         anchor_interval: chain_defaults.anchor_interval,
         anchor_retention: chain_defaults.anchor_retention,
+        http_client: Some(http.client.clone()),
     };
     sync_manager
         .add_chain(chain_cfg)
@@ -483,7 +786,11 @@ async fn run_unshield(opts: UnshieldOptions, rpc_url_override: Option<Url>) -> R
         .wrap_err("register wallet sync worker")?;
     handle.wait_until_ready().await;
 
-    let prover = ProverService::new_with_db(ArtifactSource::default(), db);
+    let artifact_source = match http.proxy_url.as_ref() {
+        Some(url) => ArtifactSource::default().with_proxy(url.clone()),
+        None => ArtifactSource::default(),
+    };
+    let prover = ProverService::new_with_db(artifact_source, db);
 
     let chain_handle = sync_manager
         .chain_handle(&chain_key)
@@ -521,15 +828,116 @@ async fn run_unshield(opts: UnshieldOptions, rpc_url_override: Option<Url>) -> R
         .await
         .wrap_err("build unshield plan")?;
 
-    let output = UnshieldOutput {
-        to: plan.call.to,
-        data: format!("0x{}", hex::encode(&plan.call.data)),
-    };
+    // If a private key was provided, sign and send the transaction on-chain.
+    // Otherwise, just print the calldata for external submission.
+    if let Some(ref pk_hex) = opts.private_key {
+        let pk_hex = pk_hex.strip_prefix("0x").unwrap_or(pk_hex);
+        let pk_bytes: [u8; 32] = hex::decode(pk_hex)
+            .wrap_err("invalid private key hex")?
+            .try_into()
+            .map_err(|_| eyre!("private key must be 32 bytes"))?;
+        let signer = PrivateKeySigner::from(
+            SigningKey::from_bytes((&pk_bytes).into()).wrap_err("invalid signing key")?,
+        );
+        let from_address = signer.address();
 
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&output).wrap_err("serialize output")?
-    );
+        let provider = ProviderBuilder::new()
+            .connect_reqwest(http.client.clone(), rpc_url)
+            .erased();
+
+        // Gas price: current price + 5% buffer (matches codebase convention)
+        let gas_price = provider.get_gas_price().await.wrap_err("fetch gas price")? * 105 / 100;
+
+        let nonce = provider
+            .get_transaction_count(from_address)
+            .await
+            .wrap_err("fetch nonce")?;
+
+        let tx_req = TransactionRequest::default()
+            .with_chain_id(opts.chain_id)
+            .with_from(from_address)
+            .with_to(plan.call.to)
+            .with_input(plan.call.data.clone())
+            .with_gas_price(gas_price)
+            .with_nonce(nonce);
+
+        let gas = provider
+            .estimate_gas(tx_req.clone())
+            .await
+            .wrap_err("estimate gas")?
+            + 100_000;
+        let tx_req = tx_req.with_gas_limit(gas);
+
+        let cost = U256::from(gas) * U256::from(gas_price);
+        tracing::info!(
+            from = %from_address,
+            to = %plan.call.to,
+            gas,
+            gas_price,
+            cost = %cost,
+            nonce,
+            "signing and sending unshield transaction",
+        );
+
+        let signed_tx = tx_req
+            .build(&EthereumWallet::from(signer))
+            .await
+            .wrap_err("sign transaction")?
+            .encoded_2718();
+
+        let tx_hash = provider
+            .send_raw_transaction(&signed_tx)
+            .await
+            .wrap_err("send raw transaction")?
+            .tx_hash()
+            .to_owned();
+
+        tracing::info!(%tx_hash, "transaction sent, waiting for confirmation…");
+
+        // Poll for receipt
+        let receipt = loop {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            if let Some(receipt) = provider
+                .get_transaction_receipt(tx_hash)
+                .await
+                .wrap_err("fetch transaction receipt")?
+            {
+                break receipt;
+            }
+        };
+
+        let status = receipt.status();
+        let block_number = receipt.block_number.unwrap_or(0);
+        let gas_used = receipt.gas_used;
+
+        if status {
+            tracing::info!(%tx_hash, block_number, gas_used, "transaction confirmed");
+        } else {
+            tracing::warn!(%tx_hash, block_number, gas_used, "transaction reverted");
+        }
+
+        let output = UnshieldSendOutput {
+            tx_hash: format!("0x{}", hex::encode(tx_hash)),
+            status,
+            block_number,
+            gas_used,
+        };
+
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&output).wrap_err("serialize output")?
+        );
+    } else {
+        let output = UnshieldOutput {
+            to: plan.call.to,
+            data: format!("0x{}", hex::encode(&plan.call.data)),
+        };
+
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&output).wrap_err("serialize output")?
+        );
+    }
 
     Ok(())
 }
