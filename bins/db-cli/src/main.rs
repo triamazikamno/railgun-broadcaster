@@ -1,5 +1,8 @@
 use eyre::{Result, WrapErr, bail, eyre};
-use local_db::{BlobMeta, MerkleForestMeta, Meta, WalletMeta, ZkeyMeta};
+use local_db::{
+    BlobMeta, MerkleForestMeta, Meta, PendingFeeNoteAssuranceRecord,
+    TerminalFeeNoteAssuranceRecord, WalletMeta, ZkeyMeta,
+};
 use redb::{Builder, ReadOnlyDatabase, ReadableDatabase, TableDefinition};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -13,6 +16,10 @@ const MERKLE_FOREST_INDEX_TABLE: TableDefinition<&str, &[u8]> =
 const ZKEY_INDEX_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("zkey_index");
 const WALLET_UNSPENT_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("wallet_unspent");
 const WALLET_META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("wallet_meta");
+const PENDING_FEE_NOTE_ASSURANCE_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("fee_note_assurance_pending");
+const TERMINAL_FEE_NOTE_ASSURANCE_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("fee_note_assurance_terminal");
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "db-cli")]
@@ -41,6 +48,8 @@ enum TableKind {
     ZkeyIndex,
     WalletUnspent,
     WalletMeta,
+    PendingFeeNoteAssurance,
+    TerminalFeeNoteAssurance,
 }
 
 impl TableKind {
@@ -52,6 +61,8 @@ impl TableKind {
             "zkey_index" => Some(Self::ZkeyIndex),
             "wallet_unspent" => Some(Self::WalletUnspent),
             "wallet_meta" => Some(Self::WalletMeta),
+            "fee_note_assurance_pending" => Some(Self::PendingFeeNoteAssurance),
+            "fee_note_assurance_terminal" => Some(Self::TerminalFeeNoteAssurance),
             _ => None,
         }
     }
@@ -64,6 +75,8 @@ impl TableKind {
             Self::ZkeyIndex => "zkey_index",
             Self::WalletUnspent => "wallet_unspent",
             Self::WalletMeta => "wallet_meta",
+            Self::PendingFeeNoteAssurance => "fee_note_assurance_pending",
+            Self::TerminalFeeNoteAssurance => "fee_note_assurance_terminal",
         }
     }
 }
@@ -148,6 +161,8 @@ fn main() -> Result<()> {
         TableKind::ZkeyIndex => txn.open_table(ZKEY_INDEX_TABLE)?,
         TableKind::WalletUnspent => txn.open_table(WALLET_UNSPENT_TABLE)?,
         TableKind::WalletMeta => txn.open_table(WALLET_META_TABLE)?,
+        TableKind::PendingFeeNoteAssurance => txn.open_table(PENDING_FEE_NOTE_ASSURANCE_TABLE)?,
+        TableKind::TerminalFeeNoteAssurance => txn.open_table(TERMINAL_FEE_NOTE_ASSURANCE_TABLE)?,
     };
 
     if let Some(key) = opt.key.as_deref() {
@@ -201,6 +216,8 @@ fn list_tables() {
         TableKind::ZkeyIndex,
         TableKind::WalletUnspent,
         TableKind::WalletMeta,
+        TableKind::PendingFeeNoteAssurance,
+        TableKind::TerminalFeeNoteAssurance,
     ] {
         println!("{}", table.name());
     }
@@ -221,6 +238,12 @@ fn print_value(table: TableKind, key: &str, value: &[u8], raw: bool) -> Result<(
         TableKind::MerkleForestIndex => print_decoded::<MerkleForestMeta>(key, value),
         TableKind::ZkeyIndex => print_decoded::<ZkeyMeta>(key, value),
         TableKind::WalletMeta => print_decoded::<WalletMeta>(key, value),
+        TableKind::PendingFeeNoteAssurance => {
+            print_decoded::<PendingFeeNoteAssuranceRecord>(key, value)
+        }
+        TableKind::TerminalFeeNoteAssurance => {
+            print_decoded::<TerminalFeeNoteAssuranceRecord>(key, value)
+        }
         TableKind::WalletUnspent => print_wallet_unspent(key, value),
     }
 }

@@ -143,6 +143,7 @@ async fn main() -> Result<()> {
         info!(chain_id, "starting broadcaster service");
         let service = BroadcasterService::new(
             chain_cfg,
+            db.clone(),
             waku_client.clone(),
             poi_verifier.clone(),
             cfg.required_poi_list.clone(),
@@ -162,6 +163,7 @@ async fn main() -> Result<()> {
         info!(address=%service.addr(), chain_id, "spawning workers");
         service.spawn_fees_publisher();
         service.spawn_tx_submitter();
+        service.spawn_fee_note_assurance_worker();
         services.push(service);
     }
 

@@ -1,6 +1,6 @@
 use curve25519_dalek::edwards::CompressedEdwardsY;
 use curve25519_dalek::scalar::Scalar;
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -26,12 +26,18 @@ pub fn shared_symmetric_key(
     Ok(out)
 }
 
+pub(crate) fn ed25519_private_scalar_bytes(seed32: &[u8; 32]) -> [u8; 32] {
+    let hash = Sha512::digest(seed32);
+    clamp25519(hash[..32].try_into().expect("sha512 output is 512 bits"))
+}
+
 fn ed25519_private_scalar(seed32: &[u8; 32]) -> Scalar {
-    let hash = sha2::Sha512::digest(seed32);
-    let mut head = [0u8; 32];
-    head.copy_from_slice(&hash[..32]);
-    head[0] &= 248;
-    head[31] &= 127;
-    head[31] |= 64;
-    Scalar::from_bytes_mod_order(head)
+    Scalar::from_bytes_mod_order(ed25519_private_scalar_bytes(seed32))
+}
+
+const fn clamp25519(mut bytes: [u8; 32]) -> [u8; 32] {
+    bytes[0] &= 0b1111_1000;
+    bytes[31] &= 0b0111_1111;
+    bytes[31] |= 0b0100_0000;
+    bytes
 }

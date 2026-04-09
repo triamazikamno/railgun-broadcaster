@@ -1,4 +1,5 @@
 mod auto_refill;
+mod fee_note_assurance;
 mod utxo_consolidation;
 
 use alloy::eips::Encodable2718;
@@ -15,18 +16,20 @@ use broadcaster_core::crypto::railgun::{
 };
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use broadcaster_core::transact::{
-    DecryptedTransact, ParsedTransactCalldata, TransactError, parse_transact_calldata,
-    try_decrypt_transact_request,
+    DecryptedTransact, ParsedTransactCalldata, TransactError, attach_fee_note_assurance_context,
+    parse_transact_calldata, try_decrypt_transact_request,
 };
 use broadcaster_core::transact_response::{
     build_transact_response_error, build_transact_response_txhash,
 };
 use config::{Chain, Key};
 use fees::{FeesError, Manager as FeesManager};
+use local_db::{DbStore, PendingFeeNoteAssuranceRecord};
 use poi::poi::Poi;
 use rand::seq::IndexedRandom;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -35,6 +38,7 @@ use tx_submit::{Queue, TxBroadcaster};
 use waku_relay::client::{Client, PUBSUB_PATH};
 
 use crate::auto_refill::{AutoRefillConfig, AutoRefillService};
+use crate::fee_note_assurance::{FeeNoteAssuranceRecordOutcome, process_fee_note_assurance_record};
 use crate::utxo_consolidation::{UtxoConsolidationConfig, UtxoConsolidationService};
 use poi::error::PoiError;
 use railgun_wallet::wallet_cache::wallet_cache_key;
@@ -73,6 +77,8 @@ pub enum HandleTransactError {
 
 #[derive(Debug, Error)]
 pub enum BroadcasterServiceError {
+    #[error("local db failed: {0}")]
+    Db(#[from] local_db::DbError),
     #[error("derive railgun address failed: {0}")]
     DeriveAddress(#[from] RailgunError),
     #[error("sync manager failed: {0}")]
@@ -147,7 +153,12 @@ type ResponseReceiver = kanal::AsyncReceiver<(DecryptedTransact, ParsedTransactC
 
 pub struct BroadcasterService {
     chain_id: ChainId,
+    db: Arc<DbStore>,
+    pending_fee_note_assurance_fallback:
+        Arc<Mutex<HashMap<FixedBytes<32>, PendingFeeNoteAssuranceRecord>>>,
+    logged_fee_note_assurance_submissions: Arc<Mutex<HashSet<FixedBytes<32>>>>,
     key: [u8; 32],
+    master_public_key: U256,
     addr: RailgunAddress,
     tx: ResponseSender,
     rx: ResponseReceiver,
@@ -160,6 +171,9 @@ pub struct BroadcasterService {
     poi: Option<Arc<Poi>>,
     required_poi_list: Vec<FixedBytes<32>>,
     query_rpc_pool: Arc<QueryRpcPool>,
+    railgun_contract: Option<Address>,
+    finality_depth: Option<u64>,
+    receipt_poll_interval: Duration,
     relay_adapt_contract: Address,
     relay_adapt_7702_contract: Option<Address>,
     identifier: Option<String>,
@@ -167,9 +181,18 @@ pub struct BroadcasterService {
     fees_ttl: Duration,
 }
 
+const fn fee_note_assurance_required(
+    poi_enabled: bool,
+    required_poi_list: &[FixedBytes<32>],
+    has_pending_jobs: bool,
+) -> bool {
+    poi_enabled && (!required_poi_list.is_empty() || has_pending_jobs)
+}
+
 impl BroadcasterService {
     pub async fn new(
         chain_cfg: Chain,
+        db: Arc<DbStore>,
         client: Arc<Client>,
         poi: Option<Arc<Poi>>,
         required_poi_list: Vec<FixedBytes<32>>,
@@ -178,8 +201,27 @@ impl BroadcasterService {
         query_rpc_cooldown: Duration,
     ) -> Result<Self, BroadcasterServiceError> {
         let (tx, rx) = kanal::bounded_async::<(DecryptedTransact, ParsedTransactCalldata)>(20);
+        let pending_fee_note_assurance_fallback = Arc::new(Mutex::new(HashMap::new()));
+        let logged_fee_note_assurance_submissions = Arc::new(Mutex::new(HashSet::new()));
         let count_transact_requests = Arc::new(AtomicU32::new(0));
         let count_txs_landed = Arc::new(AtomicU32::new(0));
+        let defaults = ChainConfigDefaults::for_chain(chain_cfg.chain_id);
+        let resolved_railgun_contract = chain_cfg
+            .sync
+            .as_ref()
+            .and_then(|sync| sync.railgun_contract)
+            .or_else(|| defaults.as_ref().map(|config| config.contract));
+        let resolved_finality_depth = chain_cfg
+            .sync
+            .as_ref()
+            .and_then(|sync| sync.finality_depth)
+            .or_else(|| defaults.as_ref().map(|config| config.finality_depth));
+        #[allow(clippy::redundant_closure_for_method_calls)]
+        let receipt_poll_interval = chain_cfg
+            .sync
+            .as_ref()
+            .and_then(|sync| sync.poll_interval)
+            .map_or(Duration::from_secs(15), |value| value.into_inner());
         let derived_wallets = if let Key::Mnemonic(mnemonic) = &chain_cfg.key
             && mnemonic.num_derived_evm_wallets > 0
         {
@@ -187,6 +229,20 @@ impl BroadcasterService {
         } else {
             vec![]
         };
+        let has_pending_fee_note_assurance = if poi.is_some() {
+            !db.list_pending_fee_note_assurance(chain_cfg.chain_id)?
+                .is_empty()
+        } else {
+            false
+        };
+        if fee_note_assurance_required(
+            poi.is_some(),
+            &required_poi_list,
+            has_pending_fee_note_assurance,
+        ) {
+            resolved_railgun_contract.ok_or(BroadcasterServiceError::RailgunContractMissing)?;
+            resolved_finality_depth.ok_or(BroadcasterServiceError::FinalityDepthMissing)?;
+        }
         let evm_wallets = chain_cfg
             .evm_wallets
             .iter()
@@ -220,14 +276,18 @@ impl BroadcasterService {
             chain_cfg.wrapped_native_token,
         ));
 
-        let (key, addr) = match &chain_cfg.key {
+        let (key, master_public_key, addr) = match &chain_cfg.key {
             Key::ViewingPrivkey(key) => {
                 let viewing_key: ShareableViewingKey = key.clone().into();
-                let key = viewing_key
-                    .decode_viewing_private_key()
+                let viewing_key_data = viewing_key
+                    .decode_viewing_key_data()
                     .map_err(|_| BroadcasterServiceError::InvalidViewingPrivkey)?;
-                let addr = viewing_key.derive_address(None)?;
-                (key, addr)
+                let addr = viewing_key_data.derive_address(None)?;
+                (
+                    viewing_key_data.viewing_private_key,
+                    viewing_key_data.master_public_key,
+                    addr,
+                )
             }
             Key::Mnemonic(mnemonic) => {
                 let config::MnemonicSettings {
@@ -240,20 +300,12 @@ impl BroadcasterService {
                 let chain_id = chain_cfg.chain_id;
                 let wallet = WalletKeys::from_mnemonic(seed_phrase, 0)?;
                 let key = wallet.viewing.viewing_private_key;
+                let master_public_key = wallet.viewing.master_public_key;
                 let addr = wallet.viewing.derive_address(None)?;
-                let defaults = ChainConfigDefaults::for_chain(chain_id);
-                let railgun_contract = chain_cfg
-                    .sync
-                    .as_ref()
-                    .and_then(|sync| sync.railgun_contract)
-                    .or_else(|| defaults.as_ref().map(|config| config.contract))
+                let railgun_contract = resolved_railgun_contract
                     .ok_or(BroadcasterServiceError::RailgunContractMissing)?;
-                let finality_depth = chain_cfg
-                    .sync
-                    .as_ref()
-                    .and_then(|sync| sync.finality_depth)
-                    .or_else(|| defaults.as_ref().map(|config| config.finality_depth))
-                    .ok_or(BroadcasterServiceError::FinalityDepthMissing)?;
+                let finality_depth =
+                    resolved_finality_depth.ok_or(BroadcasterServiceError::FinalityDepthMissing)?;
                 let anchor_interval = chain_cfg
                     .sync
                     .as_ref()
@@ -307,12 +359,6 @@ impl BroadcasterService {
                                 .and_then(|config| config.quick_sync_endpoint.clone())
                         })
                 };
-                #[allow(clippy::redundant_closure_for_method_calls)]
-                let poll_interval = chain_cfg
-                    .sync
-                    .as_ref()
-                    .and_then(|sync| sync.poll_interval)
-                    .map_or(Duration::from_secs(15), |value| value.into_inner());
                 let block_range = chain_cfg
                     .sync
                     .as_ref()
@@ -331,7 +377,7 @@ impl BroadcasterService {
                     v2_start_block,
                     legacy_shield_block,
                     block_range,
-                    poll_interval,
+                    poll_interval: receipt_poll_interval,
                     finality_depth,
                     quick_sync_endpoint,
                     anchor_interval,
@@ -424,13 +470,17 @@ impl BroadcasterService {
                         .instrument(info_span!("utxo_consolidation")),
                     );
                 }
-                (key, addr)
+                (key, master_public_key, addr)
             }
         };
 
         Ok(Self {
             chain_id: chain_cfg.chain_id,
+            db,
+            pending_fee_note_assurance_fallback,
+            logged_fee_note_assurance_submissions,
             key,
+            master_public_key,
             addr,
             tx,
             rx,
@@ -443,6 +493,9 @@ impl BroadcasterService {
             poi,
             required_poi_list,
             query_rpc_pool,
+            railgun_contract: resolved_railgun_contract,
+            finality_depth: resolved_finality_depth,
+            receipt_poll_interval,
             relay_adapt_contract: chain_cfg.relay_adapt_contract,
             relay_adapt_7702_contract: chain_cfg.relay_adapt_7702_contract,
             identifier: chain_cfg.identifier,
@@ -579,13 +632,30 @@ impl BroadcasterService {
         let req = try_decrypt_transact_request(&self.key, pubkey, encrypted_data)?
             .ok_or(HandleTransactError::NotForUs)?;
 
-        let parsed_transact = parse_transact_calldata(req.params.data.as_ref(), &self.key)
-            .map_err(HandleTransactError::Parse)?;
+        let mut parsed_transact = parse_transact_calldata(
+            req.params.data.as_ref(),
+            &self.key,
+            self.master_public_key,
+            req.params.txid_version.as_deref(),
+        )
+        .map_err(HandleTransactError::Parse)?;
 
-        info!(data=?parsed_transact, "parsed");
+        info!(
+            fee_token = ?parsed_transact.fee_token,
+            fee_amount = ?parsed_transact.fee_amount,
+            railgun_txid = ?parsed_transact.railgun_txid,
+            utxo_tree_in = parsed_transact.utxo_tree_in,
+            "parsed transact calldata"
+        );
 
         if let Some(poi) = self.poi.as_ref() {
             poi.validate_all(&parsed_transact, &req.params).await?;
+            attach_fee_note_assurance_context(
+                &mut parsed_transact,
+                &req.params,
+                &self.required_poi_list,
+            )
+            .map_err(HandleTransactError::Parse)?;
         }
 
         self.tx.send((req, parsed_transact)).await?;
@@ -594,6 +664,8 @@ impl BroadcasterService {
 
     pub fn spawn_tx_submitter(&self) {
         let rx = self.rx.clone();
+        let db = self.db.clone();
+        let pending_fee_note_assurance_fallback = self.pending_fee_note_assurance_fallback.clone();
         let query_rpc_pool = self.query_rpc_pool.clone();
         let count_transact_requests = self.count_transact_requests.clone();
         let count_txs_landed = self.count_txs_landed.clone();
@@ -724,6 +796,25 @@ impl BroadcasterService {
                         {
                             info!(?tx_hash, shared_key=%hex::encode(decrypted_payload.shared_key), "submitted tx");
                             count_txs_landed.fetch_add(1, Ordering::Relaxed);
+                            if let Some(context) = calldata.fee_note_assurance.as_ref() {
+                                let record = PendingFeeNoteAssuranceRecord {
+                                    chain_id,
+                                    public_tx_hash: tx_hash,
+                                    context: context.clone(),
+                                };
+                                if let Err(error) = db.put_pending_fee_note_assurance(&record) {
+                                    error!(
+                                        ?error,
+                                        chain_id,
+                                        tx_hash = %tx_hash,
+                                        "persist fee-note assurance record failed"
+                                    );
+                                    queue_fee_note_assurance_fallback(
+                                        pending_fee_note_assurance_fallback.as_ref(),
+                                        record,
+                                    );
+                                }
+                            }
                             if let Ok(transact_response) = build_transact_response_txhash(
                                 None,
                                 &decrypted_payload.shared_key,
@@ -748,6 +839,75 @@ impl BroadcasterService {
             .instrument(info_span!("tx", chain_id))
         );
     }
+
+    pub fn spawn_fee_note_assurance_worker(&self) {
+        let Some(poi) = self.poi.clone() else {
+            return;
+        };
+        let Some(railgun_contract) = self.railgun_contract else {
+            return;
+        };
+        let Some(finality_depth) = self.finality_depth else {
+            return;
+        };
+
+        let db = self.db.clone();
+        let pending_fee_note_assurance_fallback = self.pending_fee_note_assurance_fallback.clone();
+        let logged_fee_note_assurance_submissions =
+            self.logged_fee_note_assurance_submissions.clone();
+        let query_rpc_pool = self.query_rpc_pool.clone();
+        let chain_id = self.chain_id;
+        let poll_interval = self.receipt_poll_interval;
+
+        tokio::spawn(
+            async move {
+                let mut interval = tokio::time::interval(poll_interval);
+                loop {
+                    interval.tick().await;
+                    try_persist_fee_note_assurance_fallback(
+                        db.as_ref(),
+                        pending_fee_note_assurance_fallback.as_ref(),
+                        chain_id,
+                    );
+
+                    let db_records = match db.list_pending_fee_note_assurance(chain_id) {
+                        Ok(records) => records,
+                        Err(error) => {
+                            error!(?error, chain_id, "list fee-note assurance records failed");
+                            continue;
+                        }
+                    };
+                    let records = collect_pending_fee_note_assurance_records(
+                        db_records,
+                        snapshot_fee_note_assurance_fallback(
+                            pending_fee_note_assurance_fallback.as_ref(),
+                        ),
+                    );
+
+                    for (record, was_fallback_only) in records {
+                        let outcome = process_fee_note_assurance_record(
+                            db.as_ref(),
+                            query_rpc_pool.as_ref(),
+                            poi.as_ref(),
+                            logged_fee_note_assurance_submissions.as_ref(),
+                            railgun_contract,
+                            finality_depth,
+                            record.clone(),
+                        )
+                        .await;
+                        if should_remove_fee_note_assurance_fallback(outcome, was_fallback_only) {
+                            remove_fee_note_assurance_fallback(
+                                pending_fee_note_assurance_fallback.as_ref(),
+                                &record.public_tx_hash,
+                            );
+                        }
+                    }
+                }
+            }
+            .instrument(info_span!("fee_note_assurance", chain_id)),
+        );
+    }
+
     pub async fn handle_trusted_signer_fees(
         &self,
         railgun_address: String,
@@ -756,6 +916,225 @@ impl BroadcasterService {
         self.fees_manager
             .handle_trusted_signer_fees(railgun_address, fees)
             .await;
+    }
+}
+
+fn queue_fee_note_assurance_fallback(
+    fallback: &Mutex<HashMap<FixedBytes<32>, PendingFeeNoteAssuranceRecord>>,
+    record: PendingFeeNoteAssuranceRecord,
+) {
+    let mut fallback = fallback
+        .lock()
+        .expect("fee-note assurance fallback poisoned");
+    fallback.insert(record.public_tx_hash, record);
+}
+
+fn snapshot_fee_note_assurance_fallback(
+    fallback: &Mutex<HashMap<FixedBytes<32>, PendingFeeNoteAssuranceRecord>>,
+) -> Vec<PendingFeeNoteAssuranceRecord> {
+    let fallback = fallback
+        .lock()
+        .expect("fee-note assurance fallback poisoned");
+    fallback.values().cloned().collect()
+}
+
+fn remove_fee_note_assurance_fallback(
+    fallback: &Mutex<HashMap<FixedBytes<32>, PendingFeeNoteAssuranceRecord>>,
+    public_tx_hash: &FixedBytes<32>,
+) {
+    let mut fallback = fallback
+        .lock()
+        .expect("fee-note assurance fallback poisoned");
+    fallback.remove(public_tx_hash);
+}
+
+fn try_persist_fee_note_assurance_fallback(
+    db: &DbStore,
+    fallback: &Mutex<HashMap<FixedBytes<32>, PendingFeeNoteAssuranceRecord>>,
+    chain_id: u64,
+) {
+    for record in snapshot_fee_note_assurance_fallback(fallback) {
+        match db.put_pending_fee_note_assurance(&record) {
+            Ok(()) => {
+                info!(
+                    chain_id,
+                    tx_hash = %record.public_tx_hash,
+                    "persisted fallback fee-note assurance record"
+                );
+                remove_fee_note_assurance_fallback(fallback, &record.public_tx_hash);
+            }
+            Err(error) => {
+                warn!(
+                    ?error,
+                    chain_id,
+                    tx_hash = %record.public_tx_hash,
+                    "persist fallback fee-note assurance record failed"
+                );
+            }
+        }
+    }
+}
+
+fn collect_pending_fee_note_assurance_records(
+    db_records: Vec<PendingFeeNoteAssuranceRecord>,
+    fallback_records: Vec<PendingFeeNoteAssuranceRecord>,
+) -> Vec<(PendingFeeNoteAssuranceRecord, bool)> {
+    let mut records = HashMap::with_capacity(db_records.len() + fallback_records.len());
+    for record in fallback_records {
+        records.insert(record.public_tx_hash, (record, true));
+    }
+    for record in db_records {
+        records.insert(record.public_tx_hash, (record, false));
+    }
+    records.into_values().collect()
+}
+
+const fn should_remove_fee_note_assurance_fallback(
+    record_outcome: FeeNoteAssuranceRecordOutcome,
+    was_fallback_only: bool,
+) -> bool {
+    was_fallback_only
+        && matches!(
+            record_outcome,
+            FeeNoteAssuranceRecordOutcome::Completed | FeeNoteAssuranceRecordOutcome::Terminal
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        collect_pending_fee_note_assurance_records, fee_note_assurance_required,
+        queue_fee_note_assurance_fallback, remove_fee_note_assurance_fallback,
+        should_remove_fee_note_assurance_fallback, snapshot_fee_note_assurance_fallback,
+    };
+    use crate::fee_note_assurance::FeeNoteAssuranceRecordOutcome;
+    use alloy::primitives::{FixedBytes, U256};
+    use broadcaster_core::transact::FeeNoteAssuranceContext;
+    use local_db::PendingFeeNoteAssuranceRecord;
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::Mutex;
+
+    #[test]
+    fn fee_note_assurance_is_not_required_without_poi() {
+        assert!(!fee_note_assurance_required(
+            false,
+            &[FixedBytes::from([0x11; 32])],
+            true,
+        ));
+    }
+
+    #[test]
+    fn fee_note_assurance_is_not_required_without_lists_or_pending_jobs() {
+        assert!(!fee_note_assurance_required(true, &[], false));
+    }
+
+    #[test]
+    fn fee_note_assurance_is_required_with_required_lists() {
+        assert!(fee_note_assurance_required(
+            true,
+            &[FixedBytes::from([0x11; 32])],
+            false,
+        ));
+    }
+
+    #[test]
+    fn fee_note_assurance_is_required_with_pending_jobs() {
+        assert!(fee_note_assurance_required(true, &[], true));
+    }
+
+    fn sample_record(chain_id: u64, tx_hash: [u8; 32]) -> PendingFeeNoteAssuranceRecord {
+        PendingFeeNoteAssuranceRecord {
+            chain_id,
+            public_tx_hash: FixedBytes::from(tx_hash),
+            context: FeeNoteAssuranceContext {
+                chain_type: 0,
+                txid_version: "V2_PoseidonMerkle".to_string(),
+                railgun_txid: U256::from(5_u8),
+                utxo_tree_in: 9,
+                fee_commitment: FixedBytes::from([1u8; 32]),
+                fee_note_npk: FixedBytes::from([2u8; 32]),
+                pre_transaction_pois_per_txid_leaf_per_list: BTreeMap::new(),
+                required_poi_list_keys: vec![FixedBytes::from([4u8; 32])],
+            },
+        }
+    }
+
+    #[test]
+    fn fallback_queue_roundtrips_records() {
+        let fallback = Mutex::new(HashMap::new());
+        let record = sample_record(1, [0x11; 32]);
+
+        queue_fee_note_assurance_fallback(&fallback, record.clone());
+
+        let snapshot = snapshot_fee_note_assurance_fallback(&fallback);
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].public_tx_hash, record.public_tx_hash);
+        assert_eq!(
+            snapshot[0].context.railgun_txid,
+            record.context.railgun_txid
+        );
+
+        remove_fee_note_assurance_fallback(&fallback, &record.public_tx_hash);
+        assert!(snapshot_fee_note_assurance_fallback(&fallback).is_empty());
+    }
+
+    #[test]
+    fn collect_pending_fee_note_assurance_records_prefers_db_record() {
+        let fallback_record = sample_record(1, [0x22; 32]);
+        let mut db_record = fallback_record.clone();
+        db_record.context.railgun_txid = U256::from(9_u8);
+
+        let records = collect_pending_fee_note_assurance_records(
+            vec![db_record.clone()],
+            vec![fallback_record, sample_record(1, [0x33; 32])],
+        );
+        let by_hash = records
+            .into_iter()
+            .map(|(record, was_fallback_only)| (record.public_tx_hash, (record, was_fallback_only)))
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(by_hash.len(), 2);
+        assert_eq!(
+            by_hash[&FixedBytes::from([0x22; 32])]
+                .0
+                .context
+                .railgun_txid,
+            db_record.context.railgun_txid
+        );
+        assert!(!by_hash[&FixedBytes::from([0x22; 32])].1);
+        assert!(by_hash[&FixedBytes::from([0x33; 32])].1);
+    }
+
+    #[test]
+    fn completed_fallback_record_is_removed() {
+        assert!(should_remove_fee_note_assurance_fallback(
+            FeeNoteAssuranceRecordOutcome::Completed,
+            true,
+        ));
+    }
+
+    #[test]
+    fn terminal_fallback_record_is_removed() {
+        assert!(should_remove_fee_note_assurance_fallback(
+            FeeNoteAssuranceRecordOutcome::Terminal,
+            true,
+        ));
+    }
+
+    #[test]
+    fn pending_fallback_record_is_kept() {
+        assert!(!should_remove_fee_note_assurance_fallback(
+            FeeNoteAssuranceRecordOutcome::Pending,
+            true,
+        ));
+    }
+
+    #[test]
+    fn db_backed_record_is_never_removed_from_fallback() {
+        assert!(!should_remove_fee_note_assurance_fallback(
+            FeeNoteAssuranceRecordOutcome::Completed,
+            false,
+        ));
     }
 }
 

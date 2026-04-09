@@ -1694,10 +1694,12 @@ name = "broadcaster-service"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "alloy-rpc-types-eth",
  "broadcaster-core",
  "config",
  "fees",
  "kanal",
+ "local-db",
  "poi",
  "railgun-wallet",
  "rand 0.9.2",
@@ -4759,6 +4761,8 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 name = "local-db"
 version = "0.1.0"
 dependencies = [
+ "alloy",
+ "broadcaster-core",
  "redb",
  "rmp-serde",
  "serde",
@@ -5627,7 +5631,9 @@ dependencies = [
  "hex",
  "reqwest 0.12.28",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
