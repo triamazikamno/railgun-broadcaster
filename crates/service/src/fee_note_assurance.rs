@@ -7,9 +7,13 @@ use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use local_db::{DbStore, FeeNoteAssuranceTerminalOutcome, PendingFeeNoteAssuranceRecord};
 use poi::poi::{Poi, PoiStatus};
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
+
+const FEE_NOTE_ASSURANCE_SUBMIT_BACKOFF: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DerivedFeeOutputPosition {
@@ -43,6 +47,7 @@ pub(crate) async fn process_fee_note_assurance_record(
     query_rpc_pool: &QueryRpcPool,
     poi: &Poi,
     logged_submissions: &Mutex<HashSet<FixedBytes<32>>>,
+    submission_attempts: &Mutex<HashMap<FixedBytes<32>, Instant>>,
     railgun_contract: Address,
     finality_depth: u64,
     record: PendingFeeNoteAssuranceRecord,
@@ -164,6 +169,23 @@ pub(crate) async fn process_fee_note_assurance_record(
                 return FeeNoteAssuranceRecordOutcome::Completed;
             }
 
+            let now = Instant::now();
+            if let Some(next_submit_in) = next_fee_note_submit_in(
+                submission_attempts,
+                record.public_tx_hash,
+                now,
+                FEE_NOTE_ASSURANCE_SUBMIT_BACKOFF,
+            ) {
+                debug!(
+                    chain_id = record.chain_id,
+                    tx_hash = %record.public_tx_hash,
+                    fee_blinded_commitment = %fee_blinded_commitment,
+                    next_submit_in_secs = next_submit_in.as_secs(),
+                    "fee-note assurance pending; submit backoff active"
+                );
+                return FeeNoteAssuranceRecordOutcome::Pending;
+            }
+
             if let Err(error) = poi
                 .submit_fee_note_single_commitment(
                     record.context.chain_type,
@@ -184,6 +206,8 @@ pub(crate) async fn process_fee_note_assurance_record(
                 );
                 return FeeNoteAssuranceRecordOutcome::Pending;
             }
+
+            mark_fee_note_submission_attempt(submission_attempts, record.public_tx_hash, now);
 
             if mark_fee_note_submission_logged(logged_submissions, record.public_tx_hash) {
                 info!(
@@ -259,6 +283,31 @@ fn mark_fee_note_submission_logged(
         .lock()
         .expect("fee-note assurance submission log set poisoned");
     logged_submissions.insert(public_tx_hash)
+}
+
+fn next_fee_note_submit_in(
+    submission_attempts: &Mutex<HashMap<FixedBytes<32>, Instant>>,
+    public_tx_hash: FixedBytes<32>,
+    now: Instant,
+    backoff: Duration,
+) -> Option<Duration> {
+    let submission_attempts = submission_attempts
+        .lock()
+        .expect("fee-note assurance submission attempt map poisoned");
+    submission_attempts
+        .get(&public_tx_hash)
+        .and_then(|last_attempt| backoff.checked_sub(now.duration_since(*last_attempt)))
+}
+
+fn mark_fee_note_submission_attempt(
+    submission_attempts: &Mutex<HashMap<FixedBytes<32>, Instant>>,
+    public_tx_hash: FixedBytes<32>,
+    now: Instant,
+) {
+    let mut submission_attempts = submission_attempts
+        .lock()
+        .expect("fee-note assurance submission attempt map poisoned");
+    submission_attempts.insert(public_tx_hash, now);
 }
 
 pub(crate) fn evaluate_receipt(
@@ -338,7 +387,8 @@ fn derive_fee_output_position_from_logs(
 mod tests {
     use super::{
         ReceiptEvaluation, ReceiptObservation, derive_fee_note_blinded_commitment,
-        evaluate_receipt, mark_fee_note_submission_logged, required_list_statuses_valid,
+        evaluate_receipt, mark_fee_note_submission_attempt, mark_fee_note_submission_logged,
+        required_list_statuses_valid,
     };
     use alloy::hex;
     use alloy::primitives::{Address, Bytes, FixedBytes, Log as PrimitiveLog, U256};
@@ -347,9 +397,10 @@ mod tests {
     use broadcaster_core::contracts::railgun::{CommitmentCiphertext, Transact};
     use local_db::FeeNoteAssuranceTerminalOutcome;
     use poi::poi::PoiStatus;
-    use std::collections::BTreeMap;
     use std::collections::HashSet;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::Mutex;
+    use std::time::{Duration, Instant};
 
     fn railgun_contract() -> Address {
         Address::from([0x55; 20])
@@ -361,6 +412,15 @@ mod tests {
             .try_into()
             .expect("32-byte hex value");
         FixedBytes::from(bytes)
+    }
+
+    fn should_submit_fee_note_assurance(
+        submission_attempts: &Mutex<HashMap<FixedBytes<32>, Instant>>,
+        public_tx_hash: FixedBytes<32>,
+        now: Instant,
+        backoff: Duration,
+    ) -> bool {
+        super::next_fee_note_submit_in(submission_attempts, public_tx_hash, now, backoff).is_none()
     }
 
     fn transact_log(fee_commitment: FixedBytes<32>, start_position: u64) -> Log {
@@ -519,6 +579,48 @@ mod tests {
         assert!(!mark_fee_note_submission_logged(
             &logged_submissions,
             tx_hash
+        ));
+    }
+
+    #[test]
+    fn submission_backoff_allows_first_submit() {
+        let submission_attempts = Mutex::new(HashMap::new());
+
+        assert!(should_submit_fee_note_assurance(
+            &submission_attempts,
+            FixedBytes::from([0x11; 32]),
+            Instant::now(),
+            Duration::from_secs(900),
+        ));
+    }
+
+    #[test]
+    fn submission_backoff_blocks_immediate_retry() {
+        let submission_attempts = Mutex::new(HashMap::new());
+        let tx_hash = FixedBytes::from([0x11; 32]);
+        let now = Instant::now();
+        mark_fee_note_submission_attempt(&submission_attempts, tx_hash, now);
+
+        assert!(!should_submit_fee_note_assurance(
+            &submission_attempts,
+            tx_hash,
+            now + Duration::from_secs(60),
+            Duration::from_secs(900),
+        ));
+    }
+
+    #[test]
+    fn submission_backoff_allows_retry_after_elapsed_time() {
+        let submission_attempts = Mutex::new(HashMap::new());
+        let tx_hash = FixedBytes::from([0x11; 32]);
+        let now = Instant::now();
+        mark_fee_note_submission_attempt(&submission_attempts, tx_hash, now);
+
+        assert!(should_submit_fee_note_assurance(
+            &submission_attempts,
+            tx_hash,
+            now + Duration::from_secs(901),
+            Duration::from_secs(900),
         ));
     }
 }
