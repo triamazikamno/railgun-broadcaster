@@ -31,7 +31,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::{Instrument, debug, error, info, info_span, warn};
 use tx_submit::{Queue, TxBroadcaster};
@@ -157,6 +157,7 @@ pub struct BroadcasterService {
     pending_fee_note_assurance_fallback:
         Arc<Mutex<HashMap<FixedBytes<32>, PendingFeeNoteAssuranceRecord>>>,
     logged_fee_note_assurance_submissions: Arc<Mutex<HashSet<FixedBytes<32>>>>,
+    fee_note_assurance_submission_attempts: Arc<Mutex<HashMap<FixedBytes<32>, Instant>>>,
     key: [u8; 32],
     master_public_key: U256,
     addr: RailgunAddress,
@@ -203,6 +204,7 @@ impl BroadcasterService {
         let (tx, rx) = kanal::bounded_async::<(DecryptedTransact, ParsedTransactCalldata)>(20);
         let pending_fee_note_assurance_fallback = Arc::new(Mutex::new(HashMap::new()));
         let logged_fee_note_assurance_submissions = Arc::new(Mutex::new(HashSet::new()));
+        let fee_note_assurance_submission_attempts = Arc::new(Mutex::new(HashMap::new()));
         let count_transact_requests = Arc::new(AtomicU32::new(0));
         let count_txs_landed = Arc::new(AtomicU32::new(0));
         let defaults = ChainConfigDefaults::for_chain(chain_cfg.chain_id);
@@ -480,6 +482,7 @@ impl BroadcasterService {
             db,
             pending_fee_note_assurance_fallback,
             logged_fee_note_assurance_submissions,
+            fee_note_assurance_submission_attempts,
             key,
             master_public_key,
             addr,
@@ -856,6 +859,8 @@ impl BroadcasterService {
         let pending_fee_note_assurance_fallback = self.pending_fee_note_assurance_fallback.clone();
         let logged_fee_note_assurance_submissions =
             self.logged_fee_note_assurance_submissions.clone();
+        let fee_note_assurance_submission_attempts =
+            self.fee_note_assurance_submission_attempts.clone();
         let query_rpc_pool = self.query_rpc_pool.clone();
         let chain_id = self.chain_id;
         let poll_interval = self.receipt_poll_interval;
@@ -891,6 +896,7 @@ impl BroadcasterService {
                             query_rpc_pool.as_ref(),
                             poi.as_ref(),
                             logged_fee_note_assurance_submissions.as_ref(),
+                            fee_note_assurance_submission_attempts.as_ref(),
                             railgun_contract,
                             finality_depth,
                             record.clone(),
