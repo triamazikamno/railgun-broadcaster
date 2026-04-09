@@ -10,6 +10,8 @@ thiserror = { workspace = true }
 hex = { version = "0.4" }
 reqwest = { workspace = true, features = ["json"] }
 serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
 broadcaster-core = { path = "../core" }
 
 [lints]

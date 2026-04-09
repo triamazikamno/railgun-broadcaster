@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 alloy = { workspace = true }
+alloy-rpc-types-eth = { workspace = true }
 kanal = { version = "0.1", features = ["async"] }
 rand = { workspace = true }
 serde = { workspace = true }
@@ -22,6 +23,7 @@ poi = { path = "../poi" }
 tx-submit = { path = "../tx-submit" }
 waku-relay = { path = "../waku-relay" }
 sync-service = { path = "../sync-service" }
+local-db = { path = "../local-db" }
 
 [lints]
 workspace = true

@@ -190,7 +190,10 @@ impl Manager {
             let Some(trusted_fee) = trusted_fees.get(address) else {
                 continue;
             };
-            let (max_fee, min_fee) = (trusted_fee * uint!(129_U256) / uint!(100_U256), trusted_fee * uint!(91_U256) / uint!(100_U256));
+            let (max_fee, min_fee) = (
+                trusted_fee * uint!(129_U256) / uint!(100_U256),
+                trusted_fee * uint!(91_U256) / uint!(100_U256),
+            );
             if !max_fee.is_zero() && *fee > max_fee {
                 *fee = max_fee;
             }
@@ -265,7 +268,11 @@ impl Manager {
         }
         Ok(())
     }
-    pub async fn handle_trusted_signer_fees(&self, railgun_address: String, fees: HashMap<Address, U256>) {
+    pub async fn handle_trusted_signer_fees(
+        &self,
+        railgun_address: String,
+        fees: HashMap<Address, U256>,
+    ) {
         self.trusted_fees.lock().await.insert(railgun_address, fees);
     }
     async fn get_avg_trusted_signer_fees(&self) -> HashMap<Address, U256> {
@@ -277,7 +284,10 @@ impl Manager {
                 *count.entry(*address).or_insert(0) += 1;
             }
         }
-        total_fees.iter().map(|(address, total)| (*address, total / U256::from(count[address]))).collect()
+        total_fees
+            .iter()
+            .map(|(address, total)| (*address, total / U256::from(count[address])))
+            .collect()
     }
     pub async fn convert_to_eth(&self, calldata: &ParsedTransactCalldata) -> U256 {
         tracing::info!(token=?calldata.fee_token, amount=%calldata.fee_amount, "converting value to gas token");
