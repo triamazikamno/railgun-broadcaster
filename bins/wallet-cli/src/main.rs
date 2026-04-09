@@ -6,13 +6,11 @@ use std::{cmp::Ordering, path::PathBuf};
 use alloy::eips::Encodable2718;
 use alloy::hex;
 use alloy::network::{EthereumWallet, TransactionBuilder as _};
-use alloy::primitives::{Address, FixedBytes, U256};
+use alloy::primitives::{Address, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::k256::ecdsa::SigningKey;
 use alloy::signers::local::PrivateKeySigner;
-use alloy::sol_types::SolEvent;
-use broadcaster_core::contracts::railgun::Shield;
 use broadcaster_core::contracts::shield::{
     build_approve_calldata, build_shield_calldata, derive_shield_private_key,
 };
@@ -20,7 +18,6 @@ use broadcaster_core::crypto::railgun::{Address as RailgunAddress, AddressData};
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use eyre::{Result, WrapErr, eyre};
 use local_db::{DbConfig, DbStore};
-use poi::poi::PoiRpcClient;
 use railgun_wallet::artifacts::ArtifactSource;
 use railgun_wallet::tx::{UnshieldMode, UnshieldRequest};
 use railgun_wallet::wallet_cache::wallet_cache_key;
@@ -38,8 +35,6 @@ const DEFAULT_DB_PATH: &str = "db";
 const DEFAULT_QUERY_RPC_COOLDOWN: Duration = Duration::from_secs(5);
 const DEFAULT_BLOCK_RANGE: u64 = 500;
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(15);
-const DEFAULT_POI_RPC: &str = "https://ppoi.fdi.network";
-const DEFAULT_POI_LIST: &str = "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88";
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "wallet-cli")]
@@ -59,7 +54,6 @@ enum Command {
     ListUtxos(ListUtxosOptions),
     Unshield(UnshieldOptions),
     Shield(ShieldOptions),
-    SubmitShieldPoi(SubmitShieldPoiOptions),
 }
 
 #[derive(Debug, StructOpt)]
@@ -122,21 +116,6 @@ struct ShieldOptions {
     send: bool,
 }
 
-#[derive(Debug, StructOpt)]
-struct SubmitShieldPoiOptions {
-    #[structopt(long)]
-    chain_id: u64,
-    /// Confirmed shield transaction hash
-    #[structopt(long)]
-    tx_hash: String,
-    /// POI aggregator RPC endpoint
-    #[structopt(long)]
-    poi_rpc: Option<String>,
-    /// Required POI list keys (repeatable)
-    #[structopt(long)]
-    poi_list: Vec<String>,
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let options = Options::from_args();
@@ -160,9 +139,6 @@ async fn main() -> Result<()> {
         Command::ListUtxos(opts) => run_list_utxos(opts, rpc_url_override, &http_client).await,
         Command::Unshield(opts) => run_unshield(opts, rpc_url_override, &http_client).await,
         Command::Shield(opts) => run_shield(opts, rpc_url_override, &http_client).await,
-        Command::SubmitShieldPoi(opts) => {
-            run_submit_shield_poi(opts, rpc_url_override, &http_client).await
-        }
     }
 }
 
@@ -619,95 +595,6 @@ async fn run_shield(
         );
     }
 
-    Ok(())
-}
-
-async fn run_submit_shield_poi(
-    opts: SubmitShieldPoiOptions,
-    rpc_url_override: Option<Url>,
-    http: &HttpContext,
-) -> Result<()> {
-    let chain_defaults = ChainConfigDefaults::for_chain(opts.chain_id)
-        .ok_or_else(|| eyre!("unsupported chain id {}", opts.chain_id))?;
-    let rpc_url = rpc_url_override.unwrap_or_else(|| chain_defaults.rpc_url.clone());
-
-    let poi_rpc_url: Url = opts
-        .poi_rpc
-        .as_deref()
-        .unwrap_or(DEFAULT_POI_RPC)
-        .parse()
-        .wrap_err("invalid POI RPC URL")?;
-
-    let poi_list_keys: Vec<String> = if opts.poi_list.is_empty() {
-        vec![DEFAULT_POI_LIST.to_string()]
-    } else {
-        opts.poi_list
-    };
-
-    // Parse tx hash
-    let tx_hash_hex = opts.tx_hash.strip_prefix("0x").unwrap_or(&opts.tx_hash);
-    let tx_hash_bytes: [u8; 32] = hex::decode(tx_hash_hex)
-        .wrap_err("invalid tx hash hex")?
-        .try_into()
-        .map_err(|_| eyre!("tx hash must be 32 bytes"))?;
-    let tx_hash = FixedBytes::from(tx_hash_bytes);
-
-    // Fetch transaction receipt using the (possibly proxied) HTTP client
-    let provider = ProviderBuilder::new()
-        .connect_reqwest(http.client.clone(), rpc_url)
-        .erased();
-    let receipt = provider
-        .get_transaction_receipt(tx_hash)
-        .await
-        .wrap_err("fetch transaction receipt")?
-        .ok_or_else(|| eyre!("transaction {} not found", opts.tx_hash))?;
-
-    // Parse Shield events from receipt logs
-    let shield_events: Vec<Shield> = receipt
-        .inner
-        .logs()
-        .iter()
-        .filter_map(|log| Shield::decode_log(log.as_ref()).ok())
-        .map(|decoded| decoded.data)
-        .collect();
-
-    if shield_events.is_empty() {
-        return Err(eyre!(
-            "no Shield events found in transaction {}",
-            opts.tx_hash
-        ));
-    }
-
-    // Submit each commitment to POI aggregator
-    let poi_client = PoiRpcClient::with_http_client(poi_rpc_url, http.client.clone());
-
-    for event in &shield_events {
-        for (i, preimage) in event.commitments.iter().enumerate() {
-            let commitment_hash = preimage.hash();
-            let commitment_hash_hex =
-                format!("0x{}", hex::encode(commitment_hash.to_be_bytes::<32>()));
-            let npk_hex = format!("0x{}", hex::encode(preimage.npk));
-
-            tracing::info!(
-                commitment = %commitment_hash_hex,
-                "submitting shield commitment to POI aggregator"
-            );
-
-            poi_client
-                .submit_single_commitment_proof(
-                    opts.chain_id,
-                    &commitment_hash_hex,
-                    &npk_hex,
-                    &format!("0x{}", hex::encode(tx_hash)),
-                    i,
-                    &poi_list_keys,
-                )
-                .await
-                .wrap_err("submit shield POI")?;
-        }
-    }
-
-    tracing::info!("shield POI submission complete");
     Ok(())
 }
 
