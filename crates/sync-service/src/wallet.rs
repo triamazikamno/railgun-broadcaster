@@ -47,14 +47,25 @@ async fn apply_wallet_logs(
     let mut locked = unspents.write().await;
     if !nullifiers.is_empty() {
         let nullifier_set: HashSet<_> = nullifiers.into_iter().collect();
-        locked
-            .retain(|utxo| !nullifier_set.contains(&utxo.nullifier(cfg.scan_keys.nullifying_key)));
-        utxos.retain(|utxo| !nullifier_set.contains(&utxo.nullifier(cfg.scan_keys.nullifying_key)));
+        locked.retain(|utxo| {
+            !utxo_spent_by_nullifier(utxo, cfg.scan_keys.nullifying_key, &nullifier_set)
+        });
+        utxos.retain(|utxo| {
+            !utxo_spent_by_nullifier(utxo, cfg.scan_keys.nullifying_key, &nullifier_set)
+        });
     }
     locked.append(&mut utxos);
     dedupe_utxos(&mut locked);
 
     Ok(batch.to_block)
+}
+
+fn utxo_spent_by_nullifier(
+    utxo: &Utxo,
+    nullifying_key: alloy::primitives::U256,
+    nullifier_set: &HashSet<(u32, alloy::primitives::U256)>,
+) -> bool {
+    nullifier_set.contains(&(utxo.tree, utxo.nullifier(nullifying_key)))
 }
 
 impl WalletHandle {
@@ -211,4 +222,46 @@ pub(crate) fn spawn_wallet_worker(
 fn dedupe_utxos(utxos: &mut Vec<Utxo>) {
     let mut seen = HashSet::new();
     utxos.retain(|utxo| seen.insert((utxo.tree, utxo.position)));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::utxo_spent_by_nullifier;
+    use alloy::primitives::U256;
+    use broadcaster_core::notes::Note;
+    use railgun_wallet::Utxo;
+    use std::collections::HashSet;
+
+    #[test]
+    fn spent_nullifiers_are_scoped_by_tree() {
+        let nullifying_key = U256::from(42_u8);
+        let utxo_tree_one = Utxo {
+            note: Note {
+                token_hash: U256::from(1_u8),
+                value: U256::from(10_u8),
+                random: [0u8; 16],
+                npk: U256::from(2_u8),
+            },
+            tree: 1,
+            position: 7,
+        };
+        let utxo_tree_two = Utxo {
+            note: utxo_tree_one.note.clone(),
+            tree: 2,
+            position: 7,
+        };
+        let shared_nullifier = utxo_tree_one.nullifier(nullifying_key);
+        let nullifier_set = HashSet::from([(2, shared_nullifier)]);
+
+        assert!(!utxo_spent_by_nullifier(
+            &utxo_tree_one,
+            nullifying_key,
+            &nullifier_set,
+        ));
+        assert!(utxo_spent_by_nullifier(
+            &utxo_tree_two,
+            nullifying_key,
+            &nullifier_set,
+        ));
+    }
 }

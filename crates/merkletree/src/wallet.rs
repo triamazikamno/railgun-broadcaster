@@ -30,7 +30,7 @@ pub type WalletScanKeys = ViewingKeyData;
 #[derive(Debug)]
 pub struct WalletLogDelta {
     pub utxos: Vec<Utxo>,
-    pub nullifiers: Vec<U256>,
+    pub nullifiers: Vec<(u32, U256)>,
 }
 
 pub fn parse_wallet_delta_from_logs(
@@ -109,13 +109,15 @@ pub fn parse_wallet_delta_from_logs(
             }
         } else if topic0 == Nullifiers::SIGNATURE_HASH {
             let event = Nullifiers::decode_log(&raw_log.inner)?.data;
+            let tree_number: u32 = event.treeNumber.to();
             for nullifier in event.nullifier {
-                nullifiers.insert(nullifier);
+                nullifiers.insert((tree_number, nullifier));
             }
         } else if topic0 == Nullified::SIGNATURE_HASH {
             let event = Nullified::decode_log(&raw_log.inner)?.data;
+            let tree_number: u32 = event.treeNumber.into();
             for nullifier in event.nullifier {
-                nullifiers.insert(U256::from_be_bytes(nullifier.0));
+                nullifiers.insert((tree_number, U256::from_be_bytes(nullifier.0)));
             }
         }
     }

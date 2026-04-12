@@ -556,7 +556,7 @@ impl BroadcasterService {
                         if count_transact_requests < 10
                             || count_transact_requests == count_txs_landed
                         {
-                            1.0
+                            0.99
                         } else {
                             let ratio =
                                 f64::from(count_txs_landed) / f64::from(count_transact_requests);
