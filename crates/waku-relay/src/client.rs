@@ -92,7 +92,7 @@ impl Client {
             }
             {
                 let mut fleet_rx = rx;
-                let (sink_tx, sink_rx) = mpsc::channel(64);
+                let (sink_tx, sink_rx) = mpsc::channel(1024);
                 rx = sink_rx;
                 let mut cache = LruCache::new(CACHE_SIZE);
 
