@@ -36,6 +36,22 @@ pub struct PeerStats {
     pub peer_exchange_capable: usize,
 }
 
+/// A read-only snapshot of a single peer's state suitable for UI rendering.
+///
+/// Intentionally flat and additive; do not expose mutation or coordinator control
+/// surfaces through this type.
+#[derive(Debug, Clone)]
+pub struct PeerSnapshot {
+    pub peer_id: PeerId,
+    pub addrs: Vec<Multiaddr>,
+    pub connected: bool,
+    pub dialing: bool,
+    pub supports_lightpush_v3: bool,
+    pub supports_peer_exchange: bool,
+    pub supports_filter: bool,
+    pub dial_failures: u32,
+}
+
 #[derive(Debug)]
 pub struct LightPushResult {
     pub peer_id: PeerId,
@@ -102,6 +118,24 @@ impl PeerBook {
     #[must_use]
     pub fn num_connections(&self) -> usize {
         self.connected.len() + self.dialing.len()
+    }
+
+    /// Build a read-only snapshot of every known peer's state.
+    #[must_use]
+    pub fn peer_snapshots(&self) -> Vec<PeerSnapshot> {
+        self.peers
+            .iter()
+            .map(|(peer_id, state)| PeerSnapshot {
+                peer_id: *peer_id,
+                addrs: state.addrs.clone(),
+                connected: self.connected.contains(peer_id),
+                dialing: self.dialing.contains(peer_id),
+                supports_lightpush_v3: state.supports_lightpush_v3,
+                supports_peer_exchange: state.supports_peer_exchange,
+                supports_filter: state.supports_filter,
+                dial_failures: state.dial_failures,
+            })
+            .collect()
     }
 }
 
@@ -1168,6 +1202,12 @@ impl WakuNode {
     #[must_use]
     pub fn connected_peers(&self) -> Vec<PeerId> {
         self.inner.peer_book.read().connected_peers()
+    }
+
+    /// Read-only peer snapshot for viewer-style consumers.
+    #[must_use]
+    pub fn peer_snapshots(&self) -> Vec<PeerSnapshot> {
+        self.inner.peer_book.read().peer_snapshots()
     }
 
     /// Dial known peers until the configured connection cap is reached.

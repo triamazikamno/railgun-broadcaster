@@ -9,5 +9,5 @@ pub mod transport;
 pub mod types;
 
 pub use config::WakuConfig;
-pub use coordinator::{LightPushResult, PeerBook, PeerStats, SubId, WakuNode};
+pub use coordinator::{LightPushResult, PeerBook, PeerSnapshot, PeerStats, SubId, WakuNode};
 pub use error::WakuError;

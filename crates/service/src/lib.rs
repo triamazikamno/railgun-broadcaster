@@ -761,6 +761,7 @@ impl BroadcasterService {
 
                         info!(
                             gas,
+                            %gas_price,
                             cost = pretty_number(&cost, 18),
                             refund = pretty_number(&refund, 18),
                             "estimated gas"

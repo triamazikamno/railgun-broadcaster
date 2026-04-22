@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use waku::discovery::DiscoveredPeer;
 use waku::proto::{HashKey, WakuMessage};
 use waku::types::{parse_multiaddr, parse_peer_id};
-use waku::{WakuConfig, WakuNode};
+use waku::{PeerSnapshot, PeerStats, WakuConfig, WakuNode};
 
 pub const PUBSUB_PATH: &str = "/waku/2/rs/5/1";
 const CACHE_SIZE: NonZeroUsize = match NonZeroUsize::new(500) {
@@ -66,6 +66,18 @@ impl Client {
             nwaku_url: cfg.nwaku_url.clone(),
             waku_fleet: waku,
         })
+    }
+
+    /// Current aggregate peer statistics from the underlying Waku node.
+    #[must_use]
+    pub fn peer_stats(&self) -> PeerStats {
+        self.waku_fleet.get_stats()
+    }
+
+    /// Read-only per-peer snapshot rows from the underlying Waku node.
+    #[must_use]
+    pub fn peer_snapshots(&self) -> Vec<PeerSnapshot> {
+        self.waku_fleet.peer_snapshots()
     }
 
     pub async fn subscribe(

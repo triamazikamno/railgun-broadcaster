@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "bins/broadcaster",
+    "bins/broadcaster-viewer",
     "bins/db-cli",
     "bins/wallet-cli",
     "crates/config",
@@ -129,3 +130,9 @@ struct_field_names = "allow"
 implicit_hasher = "allow"
 needless_lifetimes = "allow"
 fn_params_excessive_bools = "allow"
+
+[profile.profiling]
+inherits = "release"
+debug = true
+panic = "abort"
+strip = "none"

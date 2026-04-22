@@ -97,7 +97,7 @@ async fn fetch_poi_vkey_json(
         return Err(SnarkProofError::InvalidVariant { variant });
     }
 
-    let url = format!("{IPFS_GATEWAY}/ipfs/{IPFS_HASH_ARTIFACTS_POI}/{variant}/vkey.json",);
+    let url = format!("{IPFS_GATEWAY}/ipfs/{IPFS_HASH_ARTIFACTS_POI}/{variant}/vkey.json");
 
     let response = reqwest::get(&url).await?;
     let body = response.bytes().await?;
