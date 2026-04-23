@@ -4,10 +4,6 @@ use std::time::Duration;
 use structopt::StructOpt;
 
 pub(crate) const DEFAULT_CHAINS: &[u64] = &[1, 56, 137, 42161];
-pub(crate) const DEFAULT_CLUSTER_ID: u32 = 5;
-pub(crate) const DEFAULT_DOH_ENDPOINT: &str = "https://cloudflare-dns.com/dns-query";
-pub(crate) const DEFAULT_MAX_PEERS: usize = 10;
-pub(crate) const DEFAULT_PEER_CONNECTION_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Debug, Clone, StructOpt)]
 #[structopt(

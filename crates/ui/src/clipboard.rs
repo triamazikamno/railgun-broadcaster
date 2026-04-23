@@ -11,7 +11,7 @@ const COPIED_MESSAGE: &str = "Copied to clipboard!";
 /// Write `text` to the system clipboard and push a brief success toast to
 /// the window's `NotificationList`. Intended to be called from `on_click`
 /// closures on stateful elements.
-pub(crate) fn copy_with_toast(text: impl Into<String>, window: &mut Window, cx: &mut App) {
+pub fn copy_with_toast(text: impl Into<String>, window: &mut Window, cx: &mut App) {
     cx.write_to_clipboard(ClipboardItem::new_string(text.into()));
     window.push_notification(Notification::success(COPIED_MESSAGE), cx);
 }

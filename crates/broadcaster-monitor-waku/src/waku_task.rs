@@ -7,19 +7,30 @@ use waku::PeerSnapshot;
 use waku::proto::WakuMessage;
 use waku_relay::client::{Client, PUBSUB_PATH};
 
-use crate::cli::{
-    DEFAULT_CLUSTER_ID, DEFAULT_DOH_ENDPOINT, DEFAULT_MAX_PEERS,
-    DEFAULT_PEER_CONNECTION_TIMEOUT_SECS, Options,
-};
-use crate::state::{EventTx, FeeRow, LogEntry, PeerRow, PeerSummary, Shared, ViewerEvent};
+use broadcaster_monitor::{EventTx, FeeRow, MonitorEvent, PeerRow, PeerSummary, Shared};
+
+pub const DEFAULT_CLUSTER_ID: u32 = 5;
+pub const DEFAULT_DOH_ENDPOINT: &str = "https://cloudflare-dns.com/dns-query";
+pub const DEFAULT_MAX_PEERS: usize = 10;
+pub const DEFAULT_PEER_CONNECTION_TIMEOUT_SECS: u64 = 10;
+
+#[derive(Debug, Clone, Default)]
+pub struct WakuViewerConfig {
+    pub chain_ids: Vec<u64>,
+    pub cluster_id: Option<u32>,
+    pub doh_endpoint: Option<String>,
+    pub max_peers: Option<usize>,
+    pub peer_connection_timeout: Option<Duration>,
+    pub nwaku_url: Option<String>,
+}
 
 /// Interval for refreshing peer snapshots from the Waku node.
 const PEER_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Build a `config::Waku` from parsed CLI options. The viewer intentionally
-/// does not load a broadcaster config file; every Waku input is CLI-driven
-/// and falls back to the design-document defaults when the flag is omitted.
-pub(crate) fn waku_config_from_cli(opts: &Options) -> config::Waku {
+/// Build a `config::Waku` from explicit monitor settings. The standalone
+/// viewer fills these from CLI flags; wallet apps can pass their own values.
+#[must_use]
+pub fn waku_config(opts: &WakuViewerConfig) -> config::Waku {
     let doh = opts
         .doh_endpoint
         .clone()
@@ -39,21 +50,21 @@ pub(crate) fn waku_config_from_cli(opts: &Options) -> config::Waku {
     }
 }
 
-/// Construct and start the viewer's Waku client from CLI inputs.
-pub(crate) fn build_waku_client(opts: &Options) -> Result<Arc<Client>> {
-    let cfg = waku_config_from_cli(opts);
+/// Construct and start a Waku client from monitor settings.
+pub fn build_waku_client(opts: &WakuViewerConfig) -> Result<Arc<Client>> {
+    let cfg = waku_config(opts);
     let client = Client::new(&cfg).wrap_err("construct waku relay client")?;
     Ok(Arc::new(client))
 }
 
 /// Spawn the viewer's background Waku + fees workers on the current runtime.
-pub(crate) async fn spawn_workers(
-    opts: Options,
+pub async fn spawn_workers(
+    opts: WakuViewerConfig,
     waku: Arc<Client>,
     shared: Shared,
     events: EventTx,
 ) -> Result<()> {
-    let chain_ids = opts.effective_chain_ids();
+    let chain_ids = opts.chain_ids;
     let content_topics: Vec<String> = chain_ids
         .iter()
         .map(|chain_id| format!("/railgun/v2/0-{chain_id}-fees/json"))
@@ -105,7 +116,7 @@ async fn run_fees_loop(mut msg_rx: mpsc::Receiver<WakuMessage>, shared: Shared, 
 
 /// Decode one fees `WakuMessage` payload and emit one row per token fee.
 /// Returns the number of rows produced (for testability).
-pub(crate) fn handle_fees_message(
+pub fn handle_fees_message(
     chain_id: u64,
     payload: &[u8],
     shared: &Shared,
@@ -148,7 +159,7 @@ pub(crate) fn handle_fees_message(
             reliability: body.reliability,
         };
         shared.write().upsert_fee(row.clone());
-        let _ = events.try_send(ViewerEvent::FeeRow(row));
+        let _ = events.try_send(MonitorEvent::FeeRow(row));
         produced += 1;
     }
     produced
@@ -156,7 +167,8 @@ pub(crate) fn handle_fees_message(
 
 /// Extract the chain id from a `/railgun/v2/0-{chain_id}-fees/json` topic.
 /// Returns `None` for non-fees topics.
-pub(crate) fn extract_fees_chain_id(topic: &str) -> Option<u64> {
+#[must_use]
+pub fn extract_fees_chain_id(topic: &str) -> Option<u64> {
     let rest = topic.strip_prefix("/railgun/v2/0-")?;
     let chain = rest.strip_suffix("-fees/json")?;
     chain.parse::<u64>().ok()
@@ -178,11 +190,12 @@ async fn run_peer_poll_loop(waku: Arc<Client>, shared: Shared, events: EventTx) 
         let rows: Vec<PeerRow> = snapshots.iter().map(peer_row_from_snapshot).collect();
 
         shared.write().set_peers(summary.clone(), rows.clone());
-        let _ = events.try_send(ViewerEvent::Peers { summary, rows });
+        let _ = events.try_send(MonitorEvent::Peers { summary, rows });
     }
 }
 
-pub(crate) fn peer_row_from_snapshot(snapshot: &PeerSnapshot) -> PeerRow {
+#[must_use]
+pub fn peer_row_from_snapshot(snapshot: &PeerSnapshot) -> PeerRow {
     PeerRow {
         peer_id: Arc::from(snapshot.peer_id.to_string().as_str()),
         addrs: snapshot
@@ -199,15 +212,10 @@ pub(crate) fn peer_row_from_snapshot(snapshot: &PeerSnapshot) -> PeerRow {
     }
 }
 
-// Silence `LogEntry` dead-code until the UI consumes it.
-#[allow(dead_code)]
-fn _log_entry_use(_: LogEntry) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{event_channel, shared};
-    use structopt::StructOpt;
+    use broadcaster_monitor::{event_channel, shared};
 
     #[test]
     fn extract_fees_chain_id_matches_valid_topic() {
@@ -251,8 +259,8 @@ mod tests {
 
     #[test]
     fn waku_config_defaults_apply_when_flags_are_absent() {
-        let opts = Options::from_iter_safe(["broadcaster-viewer"]).unwrap();
-        let cfg = waku_config_from_cli(&opts);
+        let opts = WakuViewerConfig::default();
+        let cfg = waku_config(&opts);
         assert_eq!(cfg.cluster_id, Some(DEFAULT_CLUSTER_ID));
         assert_eq!(cfg.max_peers, Some(DEFAULT_MAX_PEERS));
         assert_eq!(cfg.doh_endpoint.as_deref(), Some(DEFAULT_DOH_ENDPOINT));
@@ -267,21 +275,15 @@ mod tests {
 
     #[test]
     fn waku_config_overrides_apply_when_flags_present() {
-        let opts = Options::from_iter_safe([
-            "broadcaster-viewer",
-            "--cluster-id",
-            "7",
-            "--max-peers",
-            "42",
-            "--doh-endpoint",
-            "https://example.invalid/dns-query",
-            "--peer-connection-timeout",
-            "3s",
-            "--nwaku-url",
-            "http://127.0.0.1:8645",
-        ])
-        .unwrap();
-        let cfg = waku_config_from_cli(&opts);
+        let opts = WakuViewerConfig {
+            chain_ids: Vec::new(),
+            cluster_id: Some(7),
+            max_peers: Some(42),
+            doh_endpoint: Some("https://example.invalid/dns-query".to_string()),
+            peer_connection_timeout: Some(Duration::from_secs(3)),
+            nwaku_url: Some("http://127.0.0.1:8645".to_string()),
+        };
+        let cfg = waku_config(&opts);
         assert_eq!(cfg.cluster_id, Some(7));
         assert_eq!(cfg.max_peers, Some(42));
         assert_eq!(
@@ -298,7 +300,7 @@ mod tests {
 
     #[test]
     fn handle_fees_message_rejects_invalid_json_without_producing_rows() {
-        let shared = shared(16);
+        let shared = shared();
         let (tx, _rx) = event_channel(16);
         let produced = handle_fees_message(1, b"not-json", &shared, &tx);
         assert_eq!(produced, 0);

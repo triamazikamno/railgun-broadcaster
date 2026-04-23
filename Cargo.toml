@@ -8,6 +8,11 @@ members = [
     "crates/core",
     "crates/fees",
     "crates/local-db",
+    "crates/ui",
+    "crates/railgun-ui",
+    "crates/broadcaster-monitor",
+    "crates/broadcaster-monitor-waku",
+    "crates/broadcaster-monitor-gpui",
     "crates/railgun-wallet",
     "crates/merkletree",
     "crates/poi",
@@ -29,6 +34,8 @@ alloy-provider = "1"
 alloy-rpc-types-eth = "1"
 alloy-transport = "1"
 eyre = "0.6"
+gpui = "=0.2.2"
+gpui-component = "=0.5.1"
 rand = "0.9"
 reqwest = { version = "0.12", features = ["socks"] }
 ruint = { version = "1.17", features = ["num-bigint"] }

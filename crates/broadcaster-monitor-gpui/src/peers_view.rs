@@ -11,9 +11,9 @@ use gpui_component::{
     table::{Column, Table, TableDelegate, TableState},
 };
 
-use crate::state::{PeerRow, PeerSummary};
-use crate::ui::clipboard::copy_with_toast;
-use crate::ui::table_columns::ColumnWidthSync;
+use broadcaster_monitor::{PeerRow, PeerSummary};
+use ui::clipboard::copy_with_toast;
+use ui::table::ColumnWidthSync;
 
 /// `TableDelegate` backing the peers pane. The peer summary (connected /
 /// known / dialing counts + capability tallies) is rendered outside the
@@ -269,7 +269,7 @@ fn short(input: &str, chunk_size: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::PeerRow;
+    use broadcaster_monitor::PeerRow;
 
     fn addrs(values: &[&str]) -> Vec<Arc<str>> {
         values.iter().map(|value| Arc::from(*value)).collect()

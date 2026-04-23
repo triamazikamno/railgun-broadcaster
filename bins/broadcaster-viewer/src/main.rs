@@ -1,19 +1,18 @@
 mod cli;
-mod log_sink;
 mod pprof_server;
-mod state;
-mod ui;
-mod waku_task;
 
+use broadcaster_monitor::{DEFAULT_EVENT_CAPACITY, event_channel, shared};
+use broadcaster_monitor_waku::{
+    DEFAULT_CLUSTER_ID, WakuViewerConfig, build_waku_client, spawn_workers,
+};
 use eyre::{Result, WrapErr};
 use gpui::{App, Application};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
+use ui::logs::{DEFAULT_LOG_CAPACITY, LogStore, UiLogLayer};
 
 use crate::cli::Options;
-use crate::log_sink::ViewerLogLayer;
-use crate::state::{DEFAULT_LOG_CAPACITY, event_channel, shared};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, gpui::Action)]
 #[action(no_json)]
@@ -29,14 +28,25 @@ fn main() -> Result<()> {
         .build()
         .wrap_err("build tokio runtime")?;
 
-    let shared = shared(DEFAULT_LOG_CAPACITY);
-    let (event_tx, event_rx) = event_channel(1024);
+    let monitor = shared();
+    let logs = LogStore::new(DEFAULT_LOG_CAPACITY);
+    let (event_tx, event_rx) = event_channel(DEFAULT_EVENT_CAPACITY);
 
-    install_tracing(&opts, &shared)?;
+    install_tracing(&opts, logs)?;
+
+    let chain_ids = opts.effective_chain_ids();
+    let waku_config = WakuViewerConfig {
+        chain_ids: chain_ids.clone(),
+        cluster_id: opts.cluster_id,
+        doh_endpoint: opts.doh_endpoint.clone(),
+        max_peers: opts.max_peers,
+        peer_connection_timeout: opts.peer_connection_timeout,
+        nwaku_url: opts.nwaku_url.clone(),
+    };
 
     tracing::info!(
-        chains = ?opts.effective_chain_ids(),
-        cluster_id = opts.cluster_id.unwrap_or(cli::DEFAULT_CLUSTER_ID),
+        chains = ?chain_ids,
+        cluster_id = waku_config.cluster_id.unwrap_or(DEFAULT_CLUSTER_ID),
         nwaku_url = opts.nwaku_url.as_deref().unwrap_or(""),
         "starting broadcaster-viewer"
     );
@@ -49,7 +59,7 @@ fn main() -> Result<()> {
 
     // Optional diagnostic pprof HTTP server. Off by default; only spawned
     // when `--pprof-listen <addr>` is passed on the command line.
-    if let Some(addr) = opts.pprof_listen.clone() {
+    if let Some(addr) = opts.pprof_listen {
         runtime.spawn(async move {
             if let Err(error) = pprof_server::start(&addr).await {
                 tracing::error!(%error, addr = %addr, "pprof server failed");
@@ -59,13 +69,10 @@ fn main() -> Result<()> {
 
     // Build the Waku client from CLI inputs (no broadcaster config file is
     // loaded) and spawn the background subscription workers.
-    let waku = waku_task::build_waku_client(&opts)?;
-    let worker_shared = shared.clone();
-    // Capture before moving `opts` into the worker task — the UI also needs
-    // the chain list to populate the fees-table chain filter.
-    let chain_ids = opts.effective_chain_ids();
+    let waku = build_waku_client(&waku_config)?;
+    let worker_monitor = monitor.clone();
     runtime.spawn(async move {
-        if let Err(error) = waku_task::spawn_workers(opts, waku, worker_shared, event_tx).await {
+        if let Err(error) = spawn_workers(waku_config, waku, worker_monitor, event_tx).await {
             tracing::error!(%error, "viewer background workers failed to start");
         }
     });
@@ -78,7 +85,7 @@ fn main() -> Result<()> {
         // global.
         gpui_component::init(app);
         install_quit_behavior(app);
-        ui::open_main_window(app, shared.clone(), event_rx, chain_ids);
+        broadcaster_monitor_gpui::open_monitor_window(app, monitor.clone(), event_rx, chain_ids);
 
         #[cfg(target_os = "macos")]
         app.activate(true);
@@ -89,7 +96,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn install_tracing(opts: &Options, shared: &state::Shared) -> Result<()> {
+fn install_tracing(opts: &Options, logs: LogStore) -> Result<()> {
     let filter_directive = opts.effective_debug_level();
     let env_filter = EnvFilter::try_new(&filter_directive)
         .wrap_err_with(|| format!("parse tracing filter `{filter_directive}`"))?;
@@ -99,7 +106,7 @@ fn install_tracing(opts: &Options, shared: &state::Shared) -> Result<()> {
         .with_level(true)
         .with_writer(std::io::stderr);
 
-    let viewer_layer = ViewerLogLayer::new(shared.clone());
+    let viewer_layer = UiLogLayer::new(logs);
 
     tracing_subscriber::registry()
         .with(env_filter)

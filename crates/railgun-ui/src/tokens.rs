@@ -7,16 +7,13 @@
 //! different config we fall through to the raw-address / raw-integer
 //! display, which is the signal to extend this list.
 
-use std::path::PathBuf;
-use std::sync::LazyLock;
-
 use alloy::primitives::{Address, address};
 use ruint::aliases::U256;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) struct TokenInfo {
-    pub(crate) symbol: &'static str,
-    pub(crate) decimals: u8,
+pub struct TokenInfo {
+    pub symbol: &'static str,
+    pub decimals: u8,
 }
 
 #[rustfmt::skip]
@@ -64,7 +61,8 @@ const TOKENS: &[(u64, Address, &str, u8)] = &[
     (42161, address!("0x4D15a3A2286D883AF0AA1B3f21367843FAc63E07"), "TUSD", 18),
 ];
 
-pub(crate) fn lookup_token(chain_id: u64, addr: &Address) -> Option<TokenInfo> {
+#[must_use]
+pub fn lookup_token(chain_id: u64, addr: &Address) -> Option<TokenInfo> {
     TOKENS
         .iter()
         .find(|(c, a, _, _)| *c == chain_id && a == addr)
@@ -139,48 +137,18 @@ fn format_token_amount_with_precision(amount: U256, decimals: u8, precision: u8)
 /// Format a raw integer amount as a decimal string scaled by `decimals`,
 /// using coarse precision for large values and finer precision for small
 /// values so fee cells stay readable.
-pub(crate) fn format_token_amount(amount: U256, decimals: u8) -> String {
+#[must_use]
+pub fn format_token_amount(amount: U256, decimals: u8) -> String {
     format_token_amount_with_precision(amount, decimals, display_precision(amount, decimals))
 }
 
 /// Shorten an address for the fallback display on unknown tokens.
 /// Produces `"0xc02a…6cc2"` — 4 hex chars on each side, enough to
 /// distinguish tokens without burning a full 42-char column.
-pub(crate) fn short_address(addr: &Address) -> String {
+#[must_use]
+pub fn short_address(addr: &Address) -> String {
     let hex = format!("{addr:#x}");
     format!("{}…{}", &hex[..6], &hex[38..])
-}
-
-static CHAIN_ICON_DIR: LazyLock<PathBuf> =
-    LazyLock::new(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/chains"));
-
-const fn chain_icon_file(chain_id: u64) -> Option<&'static str> {
-    match chain_id {
-        1 => Some("ethereum.svg"),
-        56 => Some("bsc.svg"),
-        137 => Some("polygon.svg"),
-        42161 => Some("arbitrum.svg"),
-        _ => None,
-    }
-}
-
-/// Human-readable name for a chain id. Returns `None` for any chain outside
-/// the default broadcaster set so callers can decide whether to fall back to
-/// the numeric id.
-#[must_use]
-pub(crate) const fn chain_name(chain_id: u64) -> Option<&'static str> {
-    match chain_id {
-        1 => Some("Ethereum"),
-        56 => Some("BSC"),
-        137 => Some("Polygon"),
-        42161 => Some("Arbitrum"),
-        _ => None,
-    }
-}
-
-#[must_use]
-pub(crate) fn chain_icon_path(chain_id: u64) -> Option<PathBuf> {
-    chain_icon_file(chain_id).map(|file| CHAIN_ICON_DIR.join(file))
 }
 
 #[cfg(test)]
@@ -288,6 +256,8 @@ mod tests {
 
     #[test]
     fn chain_name_covers_default_set_and_misses_others() {
+        use crate::chains::chain_name;
+
         assert_eq!(chain_name(1), Some("Ethereum"));
         assert_eq!(chain_name(56), Some("BSC"));
         assert_eq!(chain_name(137), Some("Polygon"));
@@ -298,6 +268,8 @@ mod tests {
 
     #[test]
     fn chain_icon_path_covers_default_set_and_misses_others() {
+        use crate::chains::chain_icon_path;
+
         assert!(
             chain_icon_path(1).is_some_and(|path| path.ends_with("assets/chains/ethereum.svg"))
         );

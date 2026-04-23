@@ -15,11 +15,9 @@ use gpui_component::{
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use crate::state::FeeRow;
-use crate::ui::clipboard::copy_with_toast;
-use crate::ui::tokens::{
-    chain_icon_path, chain_name, format_token_amount, lookup_token, short_address,
-};
+use broadcaster_monitor::FeeRow;
+use railgun_ui::{chain_icon_path, chain_name, format_token_amount, lookup_token, short_address};
+use ui::clipboard::copy_with_toast;
 
 /// A single-select filter: either "All" (no filter) or a specific value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

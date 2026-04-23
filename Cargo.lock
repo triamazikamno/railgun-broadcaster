@@ -2248,6 +2248,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "broadcaster-monitor"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "parking_lot",
+ "ruint",
+ "tokio",
+]
+
+[[package]]
+name = "broadcaster-monitor-gpui"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "broadcaster-monitor",
+ "gpui",
+ "gpui-component",
+ "humantime",
+ "railgun-ui",
+ "ruint",
+ "tokio",
+ "tracing",
+ "ui",
+]
+
+[[package]]
+name = "broadcaster-monitor-waku"
+version = "0.1.0"
+dependencies = [
+ "broadcaster-monitor",
+ "config",
+ "eyre",
+ "fees",
+ "humantime-serde",
+ "libp2p",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "waku",
+ "waku-relay",
+]
+
+[[package]]
 name = "broadcaster-service"
 version = "0.1.0"
 dependencies = [
@@ -2275,28 +2318,22 @@ dependencies = [
 name = "broadcaster-viewer"
 version = "0.1.0"
 dependencies = [
- "alloy",
  "axum 0.8.9",
- "config",
+ "broadcaster-monitor",
+ "broadcaster-monitor-gpui",
+ "broadcaster-monitor-waku",
  "eyre",
- "fees",
  "gpui",
  "gpui-component",
  "humantime",
- "humantime-serde",
- "libp2p",
- "parking_lot",
  "pprof",
- "ruint",
  "serde",
- "serde_json",
  "serde_urlencoded",
  "structopt",
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.22",
- "waku",
- "waku-relay",
+ "ui",
 ]
 
 [[package]]
@@ -9086,6 +9123,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "railgun-ui"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "ruint",
+]
+
+[[package]]
 name = "railgun-wallet"
 version = "0.1.0"
 dependencies = [
@@ -12033,6 +12078,17 @@ dependencies = [
  "memoffset",
  "tempfile",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "ui"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "gpui-component",
+ "parking_lot",
+ "tracing",
+ "tracing-subscriber 0.3.22",
 ]
 
 [[package]]
