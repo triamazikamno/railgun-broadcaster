@@ -1,13 +1,14 @@
 use alloy::primitives::Address;
 use gpui::{
-    App, Context, Entity, InteractiveElement, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, px, rgb,
+    App, Context, Entity, InteractiveElement, IntoElement, ParentElement, Pixels, SharedString,
+    StatefulInteractiveElement, Styled, Window, div, img, px, rgb,
 };
 use gpui_component::{
     Sizable, Size,
     button::{Button, ButtonVariants},
     input::{Input, InputState},
     popover::Popover,
+    scroll::ScrollableElement,
     table::{Column, ColumnSort, TableDelegate, TableState},
     v_flex,
 };
@@ -16,7 +17,9 @@ use std::time::{Duration, SystemTime};
 
 use crate::state::FeeRow;
 use crate::ui::clipboard::copy_with_toast;
-use crate::ui::tokens::{chain_name, format_token_amount, lookup_token, short_address};
+use crate::ui::tokens::{
+    chain_icon_path, chain_name, format_token_amount, lookup_token, short_address,
+};
 
 /// A single-select filter: either "All" (no filter) or a specific value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,9 +56,7 @@ impl FeesDelegate {
             all_rows: Arc::from(Vec::<FeeRow>::new()),
             rows: Arc::from(Vec::<FeeRow>::new()),
             columns: [
-                Column::new("chain", "chain")
-                    .width(px(100.0))
-                    .movable(false),
+                Column::new("chain", "chain").width(px(60.0)).movable(false),
                 Column::new("broadcaster", "broadcaster")
                     .width(px(240.0))
                     .movable(false),
@@ -66,7 +67,7 @@ impl FeesDelegate {
                 // `render_th` — not `.sortable()`. The built-in sort icon
                 // hitbox was too small (a ~14px square on the right edge);
                 // our replacement makes the entire header area clickable.
-                Column::new("fee", "fee").width(px(150.0)).movable(false),
+                Column::new("fee", "fee").width(px(100.0)).movable(false),
                 Column::new("sig", "sig").width(px(40.0)).movable(false),
                 Column::new("reliability", "rel")
                     .width(px(50.0))
@@ -238,6 +239,34 @@ fn token_menu_label(chain_id: u64, addr: &Address, show_chain: bool) -> String {
     }
 }
 
+fn icon_label_row(chain_id: u64, label: SharedString, icon_size: Pixels) -> impl IntoElement {
+    let mut row = div().flex().items_center().gap_1();
+    if let Some(path) = chain_icon_path(chain_id) {
+        row = row.child(img(path).size(icon_size).flex_none());
+    }
+    row.child(label)
+}
+
+fn trigger_content(
+    chain_id: Option<u64>,
+    label: SharedString,
+    icon_size: Pixels,
+) -> impl IntoElement {
+    let mut row = div().w_full().flex().items_center().gap_1().text_left();
+    if let Some(chain_id) = chain_id {
+        row = row.child(icon_label_row(chain_id, label, icon_size));
+    } else {
+        row = row.child(label);
+    }
+    row
+}
+
+const FILTER_POPOVER_MAX_HEIGHT: Pixels = px(850.0);
+
+fn filter_popover_max_height(window: &Window) -> Pixels {
+    (window.viewport_size().height * 0.7).min(FILTER_POPOVER_MAX_HEIGHT)
+}
+
 impl TableDelegate for FeesDelegate {
     fn columns_count(&self, _: &App) -> usize {
         self.columns.len()
@@ -285,10 +314,20 @@ impl TableDelegate for FeesDelegate {
     ) -> impl IntoElement {
         let row = &self.rows[row_ix];
         match col_ix {
-            0 => div()
-                .text_color(rgb(0xcba6f7))
-                .child(SharedString::from(row.chain_id.to_string()))
-                .into_any_element(),
+            0 => {
+                if matches!(self.chain_filter, FeesFilter::All) {
+                    div()
+                        .text_color(rgb(0xcba6f7))
+                        .child(icon_label_row(
+                            row.chain_id,
+                            SharedString::from(""),
+                            px(16.0),
+                        ))
+                        .into_any_element()
+                } else {
+                    div().into_any_element()
+                }
+            }
             1 => {
                 // 0zk addresses are ASCII base32; byte-slice on the last 4 is safe.
                 let addr = row.railgun_address.as_ref();
@@ -401,9 +440,9 @@ fn render_chain_header(
     current: FeesFilter<u64>,
     table: Entity<TableState<FeesDelegate>>,
 ) -> impl IntoElement {
-    let trigger_label = match current {
-        FeesFilter::All => SharedString::from("All ▼"),
-        FeesFilter::One(id) => SharedString::from(format!("{} ▼", chain_label(id))),
+    let (trigger_chain, trigger_label) = match current {
+        FeesFilter::All => (None, SharedString::from("All ▼")),
+        FeesFilter::One(id) => (Some(id), SharedString::from(" ▼")),
     };
     let ids: Vec<u64> = chain_ids.to_vec();
 
@@ -412,22 +451,28 @@ fn render_chain_header(
             Button::new("fees-chain-filter-trigger")
                 .ghost()
                 .xsmall()
-                .label(trigger_label),
+                .justify_start()
+                .child(trigger_content(trigger_chain, trigger_label, px(16.0))),
         )
-        .content(move |_state, _window, cx| {
+        .content(move |_state, window, cx| {
             let table = table.clone();
             let ids = ids.clone();
             let popover = cx.entity();
+            let max_height = filter_popover_max_height(window);
             v_flex()
                 .gap_1()
-                .min_w(px(140.0))
+                .min_w(px(160.0))
+                .max_h(max_height)
+                .overflow_y_scrollbar()
                 .child({
                     let table = table.clone();
                     let popover = popover.clone();
                     Button::new("fees-chain-filter-all")
                         .ghost()
                         .xsmall()
-                        .label("All")
+                        .w_full()
+                        .justify_start()
+                        .child(trigger_content(None, SharedString::from("All"), px(16.0)))
                         .on_click(move |_event, window, cx| {
                             table.update(cx, |state, cx| {
                                 state.delegate_mut().set_chain_filter(FeesFilter::All);
@@ -442,7 +487,13 @@ fn render_chain_header(
                     Button::new(SharedString::from(format!("fees-chain-filter-{id}")))
                         .ghost()
                         .xsmall()
-                        .label(SharedString::from(chain_label(id)))
+                        .w_full()
+                        .justify_start()
+                        .child(trigger_content(
+                            Some(id),
+                            SharedString::from(chain_label(id)),
+                            px(16.0),
+                        ))
                         .on_click(move |_event, window, cx| {
                             table.update(cx, |state, cx| {
                                 state.delegate_mut().set_chain_filter(FeesFilter::One(id));
@@ -465,12 +516,15 @@ fn render_token_header(
     // `BSC: USDC`). The trigger label uses the same rule so a pinned
     // cross-chain token is self-describing.
     let show_chain = matches!(chain, FeesFilter::All);
-    let trigger_label = match current {
-        FeesFilter::All => SharedString::from("token: All"),
-        FeesFilter::One((chain_id, addr)) => SharedString::from(format!(
-            "token: {}",
-            token_menu_label(chain_id, &addr, show_chain)
-        )),
+    let (trigger_chain, trigger_label) = match current {
+        FeesFilter::All => (None, SharedString::from("token: All")),
+        FeesFilter::One((chain_id, addr)) => (
+            show_chain.then_some(chain_id),
+            SharedString::from(format!(
+                "token: {}",
+                token_menu_label(chain_id, &addr, show_chain)
+            )),
+        ),
     };
 
     Popover::new("fees-token-filter")
@@ -478,22 +532,28 @@ fn render_token_header(
             Button::new("fees-token-filter-trigger")
                 .ghost()
                 .xsmall()
-                .label(trigger_label),
+                .justify_start()
+                .child(trigger_content(trigger_chain, trigger_label, px(16.0))),
         )
-        .content(move |_state, _window, cx| {
+        .content(move |_state, window, cx| {
             let table = table.clone();
             let options = options.clone();
             let popover = cx.entity();
+            let max_height = filter_popover_max_height(window);
             v_flex()
                 .gap_1()
-                .min_w(px(140.0))
+                .min_w(px(200.0))
+                .max_h(max_height)
+                .overflow_y_scrollbar()
                 .child({
                     let table = table.clone();
                     let popover = popover.clone();
                     Button::new("fees-token-filter-all")
                         .ghost()
                         .xsmall()
-                        .label("All")
+                        .w_full()
+                        .justify_start()
+                        .child(trigger_content(None, SharedString::from("All"), px(16.0)))
                         .on_click(move |_event, window, cx| {
                             table.update(cx, |state, cx| {
                                 state.delegate_mut().set_token_filter(FeesFilter::All);
@@ -509,9 +569,13 @@ fn render_token_header(
                     Button::new(SharedString::from(id))
                         .ghost()
                         .xsmall()
-                        .label(SharedString::from(token_menu_label(
-                            chain_id, &addr, show_chain,
-                        )))
+                        .w_full()
+                        .justify_start()
+                        .child(trigger_content(
+                            show_chain.then_some(chain_id),
+                            SharedString::from(token_menu_label(chain_id, &addr, false)),
+                            px(16.0),
+                        ))
                         .on_click(move |_event, window, cx| {
                             table.update(cx, |state, cx| {
                                 state

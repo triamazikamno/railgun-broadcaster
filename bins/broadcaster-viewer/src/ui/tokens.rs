@@ -7,6 +7,9 @@
 //! different config we fall through to the raw-address / raw-integer
 //! display, which is the signal to extend this list.
 
+use std::path::PathBuf;
+use std::sync::LazyLock;
+
 use alloy::primitives::{Address, address};
 use ruint::aliases::U256;
 
@@ -71,15 +74,15 @@ pub(crate) fn lookup_token(chain_id: u64, addr: &Address) -> Option<TokenInfo> {
         })
 }
 
-/// Format a raw integer amount as a decimal string scaled by `decimals`,
-/// trimming trailing zeros in the fractional part. No truncation — a 1
-/// wei fee with 18 decimals renders as `"0.000000000000000001"`, so
-/// operators can always spot dust without being misled by rounding.
-pub(crate) fn format_token_amount(amount: U256, decimals: u8) -> String {
+fn pow10(exp: u8) -> U256 {
+    U256::from(10u8).pow(U256::from(exp))
+}
+
+fn format_scaled_amount(amount: U256, decimals: u8) -> String {
     if decimals == 0 {
         return amount.to_string();
     }
-    let divisor = U256::from(10u8).pow(U256::from(decimals));
+    let divisor = pow10(decimals);
     let whole = amount / divisor;
     let frac = amount % divisor;
     let frac_str = frac.to_string();
@@ -92,12 +95,73 @@ pub(crate) fn format_token_amount(amount: U256, decimals: u8) -> String {
     }
 }
 
+fn display_precision(amount: U256, decimals: u8) -> u8 {
+    if decimals == 0 {
+        return 0;
+    }
+
+    let scale = pow10(decimals);
+    let precision = if amount >= scale * U256::from(100u8) {
+        0
+    } else if amount >= scale {
+        2
+    } else {
+        let tenth = pow10(decimals - 1);
+        if amount >= U256::from(5u8) * tenth {
+            4
+        } else if amount >= tenth {
+            5
+        } else {
+            6
+        }
+    };
+
+    precision.min(decimals)
+}
+
+fn format_token_amount_with_precision(amount: U256, decimals: u8, precision: u8) -> String {
+    debug_assert!(precision <= decimals);
+
+    if precision == decimals {
+        return format_scaled_amount(amount, decimals);
+    }
+
+    let rounding_divisor = pow10(decimals - precision);
+    let mut rounded = amount / rounding_divisor;
+    let remainder = amount % rounding_divisor;
+    if remainder >= rounding_divisor / U256::from(2u8) {
+        rounded += U256::from(1u8);
+    }
+
+    format_scaled_amount(rounded, precision)
+}
+
+/// Format a raw integer amount as a decimal string scaled by `decimals`,
+/// using coarse precision for large values and finer precision for small
+/// values so fee cells stay readable.
+pub(crate) fn format_token_amount(amount: U256, decimals: u8) -> String {
+    format_token_amount_with_precision(amount, decimals, display_precision(amount, decimals))
+}
+
 /// Shorten an address for the fallback display on unknown tokens.
 /// Produces `"0xc02a…6cc2"` — 4 hex chars on each side, enough to
 /// distinguish tokens without burning a full 42-char column.
 pub(crate) fn short_address(addr: &Address) -> String {
     let hex = format!("{addr:#x}");
     format!("{}…{}", &hex[..6], &hex[38..])
+}
+
+static CHAIN_ICON_DIR: LazyLock<PathBuf> =
+    LazyLock::new(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/chains"));
+
+const fn chain_icon_file(chain_id: u64) -> Option<&'static str> {
+    match chain_id {
+        1 => Some("ethereum.svg"),
+        56 => Some("bsc.svg"),
+        137 => Some("polygon.svg"),
+        42161 => Some("arbitrum.svg"),
+        _ => None,
+    }
 }
 
 /// Human-readable name for a chain id. Returns `None` for any chain outside
@@ -114,6 +178,11 @@ pub(crate) const fn chain_name(chain_id: u64) -> Option<&'static str> {
     }
 }
 
+#[must_use]
+pub(crate) fn chain_icon_path(chain_id: u64) -> Option<PathBuf> {
+    chain_icon_file(chain_id).map(|file| CHAIN_ICON_DIR.join(file))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,29 +193,56 @@ mod tests {
     }
 
     #[test]
-    fn format_whole_number_trims_fraction() {
-        // 1_000_000 with 6 decimals == 1.0 → "1"
-        assert_eq!(format_token_amount(U256::from(1_000_000u64), 6), "1");
+    fn format_inclusive_thresholds_pick_expected_precision() {
+        assert_eq!(display_precision(U256::from(100_000_000u64), 6), 0);
+        assert_eq!(display_precision(U256::from(1_000_000u64), 6), 2);
+        assert_eq!(display_precision(U256::from(500_000u64), 6), 4);
+        assert_eq!(display_precision(U256::from(100_000u64), 6), 5);
+        assert_eq!(display_precision(U256::from(99_999u64), 6), 6);
+        assert_eq!(display_precision(U256::from(99_999_999u64), 6), 2);
     }
 
     #[test]
-    fn format_fractional_trims_trailing_zeros() {
-        // 1_500_000 with 6 decimals == 1.5 → "1.5" (not "1.500000")
+    fn format_trims_trailing_zeros_after_rounding() {
+        assert_eq!(format_token_amount(U256::from(1_000_000u64), 6), "1");
         assert_eq!(format_token_amount(U256::from(1_500_000u64), 6), "1.5");
     }
 
     #[test]
-    fn format_zero_whole_pads_leading_fraction_zeros() {
-        // 12_345 with 6 decimals == 0.012345
+    fn format_rounds_large_values_to_whole_numbers() {
+        assert_eq!(
+            format_token_amount(U256::from(19_232_527_572_893u64), 9),
+            "19233"
+        );
+    }
+
+    #[test]
+    fn format_uses_two_decimals_between_one_and_hundred() {
+        assert_eq!(format_token_amount(U256::from(12_345_600u64), 6), "12.35");
+    }
+
+    #[test]
+    fn format_uses_four_decimals_between_half_and_one() {
+        assert_eq!(format_token_amount(U256::from(543_250u64), 6), "0.5433");
+    }
+
+    #[test]
+    fn format_uses_five_decimals_between_tenth_and_half() {
+        assert_eq!(
+            format_token_amount(U256::from(123_456_789u64), 9),
+            "0.12346"
+        );
+    }
+
+    #[test]
+    fn format_uses_six_decimals_below_tenth() {
         assert_eq!(format_token_amount(U256::from(12_345u64), 6), "0.012345");
     }
 
     #[test]
-    fn format_single_wei_at_18_decimals() {
-        assert_eq!(
-            format_token_amount(U256::from(1u64), 18),
-            "0.000000000000000001"
-        );
+    fn precision_caps_to_available_token_decimals() {
+        assert_eq!(display_precision(U256::from(54u64), 2), 2);
+        assert_eq!(format_token_amount(U256::from(54u64), 2), "0.54");
     }
 
     #[test]
@@ -198,5 +294,20 @@ mod tests {
         assert_eq!(chain_name(42161), Some("Arbitrum"));
         assert_eq!(chain_name(10), None);
         assert_eq!(chain_name(0), None);
+    }
+
+    #[test]
+    fn chain_icon_path_covers_default_set_and_misses_others() {
+        assert!(
+            chain_icon_path(1).is_some_and(|path| path.ends_with("assets/chains/ethereum.svg"))
+        );
+        assert!(chain_icon_path(56).is_some_and(|path| path.ends_with("assets/chains/bsc.svg")));
+        assert!(
+            chain_icon_path(137).is_some_and(|path| path.ends_with("assets/chains/polygon.svg"))
+        );
+        assert!(
+            chain_icon_path(42161).is_some_and(|path| path.ends_with("assets/chains/arbitrum.svg"))
+        );
+        assert_eq!(chain_icon_path(10), None);
     }
 }

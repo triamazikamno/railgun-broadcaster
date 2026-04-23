@@ -1,0 +1,47 @@
+[package]
+name = "broadcaster-viewer"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "broadcaster-viewer"
+path = "src/main.rs"
+
+[dependencies]
+# Pinned GUI stack (pre-1.0; keep exact pins and narrow API use).
+gpui = "=0.2.2"
+gpui-component = "=0.5.1"
+
+# Async runtime / CLI / diagnostics.
+eyre = { workspace = true }
+humantime = "2"
+humantime-serde = "1"
+parking_lot = "0.12"
+structopt = "0.3"
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net"] }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "parking_lot"] }
+
+# Diagnostic profiling endpoint (ported from liquidator-rust/utils/src/pprof.rs).
+axum = "0.8"
+pprof = { version = "0.15", default-features = false, features = ["flamegraph", "prost-codec", "frame-pointer"] }
+serde = { workspace = true }
+serde_urlencoded = "0.7"
+
+# Serialisation / domain types.
+alloy = { workspace = true }
+ruint = { workspace = true }
+serde_json = { workspace = true }
+
+# Local crates.
+config = { path = "../../crates/config" }
+fees = { path = "../../crates/fees" }
+waku = { path = "../../crates/waku" }
+waku-relay = { path = "../../crates/waku-relay" }
+
+[dev-dependencies]
+libp2p = { version = "0.56" }
+
+[lints]
+workspace = true
