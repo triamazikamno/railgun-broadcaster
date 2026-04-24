@@ -9,6 +9,7 @@ members = [
     "crates/fees",
     "crates/local-db",
     "crates/ui",
+    "crates/wallet-ops",
     "crates/railgun-ui",
     "crates/broadcaster-monitor",
     "crates/broadcaster-monitor-waku",

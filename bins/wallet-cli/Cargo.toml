@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-alloy = { workspace = true, features = ["provider-http", "rpc-types", "network", "signers"] }
+alloy = { workspace = true }
 eyre = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
@@ -16,9 +16,4 @@ tracing = { workspace = true }
 tracing-appender = { version = "0.2" }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "parking_lot"] }
 
-broadcaster-core = { path = "../../crates/core" }
-local-db = { path = "../../crates/local-db" }
-merkletree = { path = "../../crates/merkletree" }
-poi = { path = "../../crates/poi" }
-railgun-wallet = { path = "../../crates/railgun-wallet" }
-sync-service = { path = "../../crates/sync-service" }
+wallet-ops = { path = "../../crates/wallet-ops" }

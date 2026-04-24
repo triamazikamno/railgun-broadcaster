@@ -12628,21 +12628,33 @@ name = "wallet-cli"
 version = "0.1.0"
 dependencies = [
  "alloy",
- "broadcaster-core",
  "eyre",
- "local-db",
- "merkletree",
- "poi",
- "railgun-wallet",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "structopt",
- "sync-service",
  "tokio",
  "tracing",
  "tracing-appender",
  "tracing-subscriber 0.3.22",
+ "wallet-ops",
+]
+
+[[package]]
+name = "wallet-ops"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "broadcaster-core",
+ "eyre",
+ "local-db",
+ "railgun-wallet",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sync-service",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
