@@ -1,0 +1,22 @@
+[package]
+name = "broadcaster-monitor-gpui"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+alloy = { workspace = true }
+broadcaster-monitor = { path = "../broadcaster-monitor" }
+gpui = { workspace = true }
+gpui-component = { workspace = true }
+humantime = "2"
+railgun-ui = { path = "../railgun-ui" }
+tokio = { workspace = true, features = ["sync", "time", "macros"] }
+tracing = { workspace = true }
+ui = { path = "../ui" }
+
+[dev-dependencies]
+ruint = { workspace = true }
+
+[lints]
+workspace = true

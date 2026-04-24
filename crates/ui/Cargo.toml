@@ -1,0 +1,15 @@
+[package]
+name = "ui"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+gpui = { workspace = true }
+gpui-component = { workspace = true }
+parking_lot = "0.12"
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["parking_lot"] }
+
+[lints]
+workspace = true

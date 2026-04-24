@@ -32,7 +32,7 @@ fn main() -> Result<()> {
     let logs = LogStore::new(DEFAULT_LOG_CAPACITY);
     let (event_tx, event_rx) = event_channel(DEFAULT_EVENT_CAPACITY);
 
-    install_tracing(&opts, logs)?;
+    install_tracing(&opts, logs.clone())?;
 
     let chain_ids = opts.effective_chain_ids();
     let waku_config = WakuViewerConfig {
@@ -85,7 +85,13 @@ fn main() -> Result<()> {
         // global.
         gpui_component::init(app);
         install_quit_behavior(app);
-        broadcaster_monitor_gpui::open_monitor_window(app, monitor.clone(), event_rx, chain_ids);
+        broadcaster_monitor_gpui::open_monitor_window(
+            app,
+            monitor.clone(),
+            event_rx,
+            chain_ids,
+            logs,
+        );
 
         #[cfg(target_os = "macos")]
         app.activate(true);

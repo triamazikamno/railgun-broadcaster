@@ -2,12 +2,13 @@ use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    App, Context, IntoElement, ParentElement, Pixels, SharedString, Styled, Window, div, px, rgb,
+    App, AppContext, Context, Entity, IntoElement, ParentElement, Pixels, Render, SharedString,
+    Styled, Window, canvas, div, px, rgb,
 };
-use gpui_component::table::{Column, TableDelegate, TableState};
+use gpui_component::table::{Column, Table, TableDelegate, TableEvent, TableState};
 use parking_lot::RwLock;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
@@ -18,6 +19,8 @@ use crate::table::ColumnWidthSync;
 
 /// Maximum number of retained log lines kept in the bounded in-memory ring.
 pub const DEFAULT_LOG_CAPACITY: usize = 2_000;
+
+const LOG_PANE_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Single retained log line from the app's in-memory tracing layer.
 #[derive(Debug, Clone)]
@@ -269,6 +272,20 @@ impl TableDelegate for LogsDelegate {
                 .child(SharedString::from(entry.message.as_ref().to_owned())),
         }
     }
+
+    fn render_empty(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<'_, TableState<Self>>,
+    ) -> impl IntoElement {
+        div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_color(rgb(0x6c7086))
+            .child("No log entries yet")
+    }
 }
 
 fn format_time(unix_ms: u64) -> String {
@@ -278,6 +295,111 @@ fn format_time(unix_ms: u64) -> String {
     let mm = (secs / 60) % 60;
     let ss = secs % 60;
     format!("{hh:02}:{mm:02}:{ss:02}.{ms:03}")
+}
+
+/// Reusable app-wide logs pane. Hosts a table and mirrors [`LogStore`] changes
+/// into the delegate without tying logs to any specific feature pane.
+pub struct LogsPane {
+    logs: LogStore,
+    table: Entity<TableState<LogsDelegate>>,
+    last_width: Option<Pixels>,
+}
+
+impl LogsPane {
+    pub fn new(logs: LogStore, window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
+        let table = cx.new(|cx| {
+            let mut delegate = LogsDelegate::new();
+            delegate.set_rows(logs.logs());
+            TableState::new(delegate, window, cx)
+        });
+
+        cx.subscribe(&table, |_this, state, event: &TableEvent, cx| {
+            if let TableEvent::ColumnWidthsChanged(widths) = event {
+                state.update(cx, |s, _| {
+                    s.delegate_mut().apply_column_widths(widths);
+                });
+            }
+        })
+        .detach();
+
+        let refresh_logs = logs.clone();
+        cx.spawn(async move |this, cx| {
+            let mut last_rev = refresh_logs.rev();
+            loop {
+                cx.background_executor()
+                    .timer(LOG_PANE_REFRESH_INTERVAL)
+                    .await;
+                let current_rev = refresh_logs.rev();
+                if current_rev == last_rev {
+                    continue;
+                }
+                last_rev = current_rev;
+                let rows = refresh_logs.logs();
+
+                if this
+                    .update(cx, |pane, cx| {
+                        pane.table.update(cx, |state, cx| {
+                            state.delegate_mut().set_rows(rows);
+                            cx.notify();
+                        });
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        Self {
+            logs,
+            table,
+            last_width: None,
+        }
+    }
+
+    fn sync_table_width(&mut self, width: Pixels, cx: &mut Context<'_, Self>) {
+        if self.last_width == Some(width) {
+            return;
+        }
+
+        self.last_width = Some(width);
+        self.table.update(cx, |state, cx| {
+            state.delegate_mut().set_message_width(width - px(410.0));
+            state.refresh(cx);
+        });
+    }
+
+    #[must_use]
+    pub fn retained_count(&self) -> usize {
+        self.logs.logs().len()
+    }
+}
+
+impl Render for LogsPane {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        let entity = cx.entity();
+
+        div()
+            .relative()
+            .size_full()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .child(Table::new(&self.table))
+            .child(
+                canvas(
+                    move |bounds, _, cx| {
+                        entity.update(cx, |this, cx| {
+                            this.sync_table_width(bounds.size.width, cx);
+                        });
+                    },
+                    |_, (), _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+    }
 }
 
 #[cfg(test)]

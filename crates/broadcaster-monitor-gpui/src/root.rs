@@ -3,15 +3,20 @@ use std::time::Duration;
 
 use broadcaster_monitor::{EventRx, Shared};
 use gpui::{
-    App, AppContext, Bounds, Context, Entity, IntoElement, ParentElement, Pixels, Point, Render,
-    SharedString, Styled, Window, WindowBounds, WindowOptions, div, px, rgb, size,
+    App, AppContext, Bounds, Context, Entity, InteractiveElement, IntoElement, ParentElement,
+    Pixels, Point, Render, SharedString, StatefulInteractiveElement, Styled, Window, WindowBounds,
+    WindowOptions, canvas, div, img, prelude::FluentBuilder as _, px, rgb, size,
 };
 use gpui_component::{
     Root,
     input::{InputEvent, InputState},
-    resizable::{ResizableState, h_resizable, resizable_panel},
+    resizable::{ResizableState, h_resizable, resizable_panel, v_resizable},
     table::{Table, TableDelegate, TableEvent, TableState},
+    tooltip::Tooltip,
 };
+use ui::icons;
+use ui::logs::{LogStore, LogsPane};
+use ui::style::{APP_FONT_FAMILY, APP_TEXT_COLOR, APP_TEXT_SIZE};
 use ui::table::ColumnWidthSync;
 
 use crate::fees_view::FeesDelegate;
@@ -23,7 +28,18 @@ const UI_REFRESH_THROTTLE: Duration = Duration::from_millis(100);
 /// Periodic wakeup that updates relative timestamp cells at a bounded rate.
 const UI_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
-pub fn open_monitor_window(app: &mut App, shared: Shared, event_rx: EventRx, chain_ids: Vec<u64>) {
+const ACTIVITY_RAIL_WIDTH: Pixels = px(48.0);
+const LOGS_DRAWER_HEIGHT: Pixels = px(260.0);
+const LOGS_DRAWER_MIN_HEIGHT: Pixels = px(160.0);
+const LOGS_DRAWER_MAX_HEIGHT: Pixels = px(600.0);
+
+pub fn open_monitor_window(
+    app: &mut App,
+    shared: Shared,
+    event_rx: EventRx,
+    chain_ids: Vec<u64>,
+    logs: LogStore,
+) {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds {
             origin: Point::default(),
@@ -40,7 +56,8 @@ pub fn open_monitor_window(app: &mut App, shared: Shared, event_rx: EventRx, cha
     if let Err(error) = app.open_window(options, |window, cx| {
         let pane =
             cx.new(|cx| BroadcasterMonitorPane::new(shared, event_rx, chain_ids, window, cx));
-        let root = cx.new(|cx| StandaloneMonitorRoot::new(pane, cx));
+        let logs = cx.new(|cx| LogsPane::new(logs, window, cx));
+        let root = cx.new(|cx| StandaloneMonitorRoot::new(pane, logs, cx));
         cx.new(|cx| Root::new(root, window, cx))
     }) {
         tracing::error!(%error, "failed to open broadcaster monitor window");
@@ -49,20 +66,183 @@ pub fn open_monitor_window(app: &mut App, shared: Shared, event_rx: EventRx, cha
 
 struct StandaloneMonitorRoot {
     pane: Entity<BroadcasterMonitorPane>,
+    logs: Entity<LogsPane>,
+    logs_open: bool,
+    drawer_split: Entity<ResizableState>,
 }
 
 impl StandaloneMonitorRoot {
-    const fn new(pane: Entity<BroadcasterMonitorPane>, _cx: &mut Context<'_, Self>) -> Self {
-        Self { pane }
+    fn new(
+        pane: Entity<BroadcasterMonitorPane>,
+        logs: Entity<LogsPane>,
+        cx: &mut Context<'_, Self>,
+    ) -> Self {
+        Self {
+            pane,
+            logs,
+            logs_open: false,
+            drawer_split: cx.new(|_| ResizableState::default()),
+        }
+    }
+
+    fn render_activity_rail(
+        &self,
+        root: Entity<Self>,
+        _window: &mut Window,
+        _cx: &mut Context<'_, Self>,
+    ) -> impl IntoElement {
+        let logs_open = self.logs_open;
+        let tooltip = if logs_open { "Hide log" } else { "Show log" };
+        div()
+            .w(ACTIVITY_RAIL_WIDTH)
+            .h_full()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .items_center()
+            .bg(rgb(0x181825))
+            .border_r_1()
+            .border_color(rgb(0x313244))
+            .child(div().flex_1())
+            .child(
+                div()
+                    .id("activity-logs")
+                    .mb(px(10.0))
+                    .size(px(36.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(logs_open, |this| this.bg(rgb(0x3b82f6)))
+                    .when(!logs_open, |this| {
+                        this.bg(rgb(0x181825)).hover(|this| this.bg(rgb(0x313244)))
+                    })
+                    .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
+                    .on_click(move |_event, _window, cx| {
+                        root.update(cx, |root, cx| {
+                            root.logs_open = !root.logs_open;
+                            cx.notify();
+                        });
+                    })
+                    .child(img(icons::logs_icon_path()).size(px(18.0)).flex_none()),
+            )
+    }
+
+    fn render_logs_drawer(&self, root: Entity<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .flex()
+            .flex_col()
+            .bg(rgb(0x1e1e2e))
+            .border_t_1()
+            .border_color(rgb(0x313244))
+            .child(
+                div()
+                    .h(px(34.0))
+                    .flex()
+                    .items_center()
+                    .px(px(12.0))
+                    .bg(rgb(0x181825))
+                    .border_b_1()
+                    .border_color(rgb(0x313244))
+                    .child(img(icons::logs_icon_path()).size(px(16.0)).flex_none())
+                    .child(
+                        div()
+                            .ml(px(8.0))
+                            .text_color(rgb(0xcdd6f4))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child("Logs"),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("close-logs-drawer")
+                            .size(px(24.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_color(rgb(0xa6adc8))
+                            .hover(|this| this.bg(rgb(0x313244)).text_color(rgb(0xcdd6f4)))
+                            .on_click(move |_event, _window, cx| {
+                                root.update(cx, |root, cx| {
+                                    root.logs_open = false;
+                                    cx.notify();
+                                });
+                            })
+                            .child(img(icons::close_icon_path()).size(px(14.0)).flex_none()),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .min_h(px(0.0))
+                    .child(self.logs.clone()),
+            )
+    }
+
+    fn render_workspace(&self, root: Entity<Self>) -> impl IntoElement {
+        if self.logs_open {
+            div().size_full().min_w(px(0.0)).min_h(px(0.0)).child(
+                v_resizable("standalone-monitor-logs-drawer")
+                    .with_state(&self.drawer_split)
+                    .child(
+                        resizable_panel().child(
+                            div()
+                                .size_full()
+                                .min_w(px(0.0))
+                                .min_h(px(0.0))
+                                .child(self.pane.clone()),
+                        ),
+                    )
+                    .child(
+                        resizable_panel()
+                            .size(LOGS_DRAWER_HEIGHT)
+                            .size_range(LOGS_DRAWER_MIN_HEIGHT..LOGS_DRAWER_MAX_HEIGHT)
+                            .child(
+                                div()
+                                    .size_full()
+                                    .min_w(px(0.0))
+                                    .min_h(px(0.0))
+                                    .child(self.render_logs_drawer(root)),
+                            ),
+                    ),
+            )
+        } else {
+            div()
+                .size_full()
+                .min_w(px(0.0))
+                .min_h(px(0.0))
+                .child(self.pane.clone())
+        }
     }
 }
 
 impl Render for StandaloneMonitorRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        let root = cx.entity();
         div()
             .relative()
             .size_full()
-            .child(self.pane.clone())
+            .flex()
+            .bg(rgb(0x1e1e2e))
+            .text_color(rgb(APP_TEXT_COLOR))
+            .font_family(APP_FONT_FAMILY)
+            .text_size(APP_TEXT_SIZE)
+            .child(self.render_activity_rail(root.clone(), window, cx))
+            .child(
+                div()
+                    .flex_1()
+                    .h_full()
+                    .min_w(px(0.0))
+                    .min_h(px(0.0))
+                    .child(self.render_workspace(root)),
+            )
             .children(Root::render_notification_layer(window, cx))
     }
 }
@@ -72,8 +252,8 @@ pub struct BroadcasterMonitorPane {
     top_split: Entity<ResizableState>,
     fees_table: Entity<TableState<FeesDelegate>>,
     peers_table: Entity<TableState<PeersDelegate>>,
-    /// Last viewport width seen in `render`; used to avoid refreshing the table on every paint.
-    last_viewport_width: Option<Pixels>,
+    /// Last pane width measured in layout; used to avoid refreshing the table on every paint.
+    last_pane_width: Option<Pixels>,
 }
 
 impl BroadcasterMonitorPane {
@@ -168,7 +348,7 @@ impl BroadcasterMonitorPane {
             top_split,
             fees_table,
             peers_table,
-            last_viewport_width: None,
+            last_pane_width: None,
         }
     }
 
@@ -220,21 +400,16 @@ impl BroadcasterMonitorPane {
 }
 
 impl Render for BroadcasterMonitorPane {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        let viewport_width = window.viewport_size().width;
-        if self.last_viewport_width != Some(viewport_width) {
-            self.last_viewport_width = Some(viewport_width);
-            self.sync_peers_addr_width(Some(viewport_width), cx);
-        }
-
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        let entity = cx.entity();
         let peer_summary = self.shared.read().peer_summary();
 
         div()
+            .relative()
             .size_full()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
             .bg(rgb(0x1e1e2e))
-            .text_color(rgb(0xcdd6f4))
-            .font_family("Menlo")
-            .text_size(px(12.0))
             .child(
                 h_resizable("broadcaster-monitor-top")
                     .with_state(&self.top_split)
@@ -247,6 +422,22 @@ impl Render for BroadcasterMonitorPane {
                         resizable_panel()
                             .child(peers_view::render_pane(&peer_summary, &self.peers_table)),
                     ),
+            )
+            .child(
+                canvas(
+                    move |bounds, _, cx| {
+                        entity.update(cx, |this, cx| {
+                            let pane_width = bounds.size.width;
+                            if this.last_pane_width != Some(pane_width) {
+                                this.last_pane_width = Some(pane_width);
+                                this.sync_peers_addr_width(Some(pane_width), cx);
+                            }
+                        });
+                    },
+                    |_, (), _, _| {},
+                )
+                .absolute()
+                .size_full(),
             )
     }
 }
