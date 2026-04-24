@@ -648,7 +648,7 @@ fn select_utxos(
         .filter(|utxo| utxo.note.token_hash == token_hash)
         .cloned()
         .collect();
-    candidates.sort_by(|a, b| b.note.value.cmp(&a.note.value));
+    candidates.sort_by_key(|b| std::cmp::Reverse(b.note.value));
 
     let mut best: Option<(Vec<Utxo>, U256)> = None;
     for tree in candidates

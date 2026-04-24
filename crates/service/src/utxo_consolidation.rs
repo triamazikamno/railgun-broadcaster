@@ -187,7 +187,7 @@ impl UtxoConsolidationService {
                 continue;
             }
 
-            candidates.sort_by(|a, b| a.note.value.cmp(&b.note.value));
+            candidates.sort_by_key(|a| a.note.value);
             if candidates.len() > max_inputs {
                 candidates.truncate(max_inputs);
             }
