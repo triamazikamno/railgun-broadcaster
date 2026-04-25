@@ -14,7 +14,7 @@ const BLOB_INDEX_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("blo
 const MERKLE_FOREST_INDEX_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("merkle_forest_index");
 const ZKEY_INDEX_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("zkey_index");
-const WALLET_UNSPENT_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("wallet_unspent");
+const WALLET_UTXO_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("wallet_utxo");
 const WALLET_META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("wallet_meta");
 const PENDING_FEE_NOTE_ASSURANCE_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("fee_note_assurance_pending");
@@ -46,7 +46,7 @@ enum TableKind {
     BlobIndex,
     MerkleForestIndex,
     ZkeyIndex,
-    WalletUnspent,
+    WalletUtxo,
     WalletMeta,
     PendingFeeNoteAssurance,
     TerminalFeeNoteAssurance,
@@ -59,7 +59,7 @@ impl TableKind {
             "blob_index" => Some(Self::BlobIndex),
             "merkle_forest_index" => Some(Self::MerkleForestIndex),
             "zkey_index" => Some(Self::ZkeyIndex),
-            "wallet_unspent" => Some(Self::WalletUnspent),
+            "wallet_utxo" => Some(Self::WalletUtxo),
             "wallet_meta" => Some(Self::WalletMeta),
             "fee_note_assurance_pending" => Some(Self::PendingFeeNoteAssurance),
             "fee_note_assurance_terminal" => Some(Self::TerminalFeeNoteAssurance),
@@ -73,7 +73,7 @@ impl TableKind {
             Self::BlobIndex => "blob_index",
             Self::MerkleForestIndex => "merkle_forest_index",
             Self::ZkeyIndex => "zkey_index",
-            Self::WalletUnspent => "wallet_unspent",
+            Self::WalletUtxo => "wallet_utxo",
             Self::WalletMeta => "wallet_meta",
             Self::PendingFeeNoteAssurance => "fee_note_assurance_pending",
             Self::TerminalFeeNoteAssurance => "fee_note_assurance_terminal",
@@ -94,7 +94,7 @@ struct RawEntry {
 }
 
 #[derive(Serialize)]
-struct WalletUnspentValue {
+struct WalletUtxoValue {
     wallet_id: String,
     utxo_id: String,
     payload_hex: String,
@@ -159,7 +159,7 @@ fn main() -> Result<()> {
         TableKind::BlobIndex => txn.open_table(BLOB_INDEX_TABLE)?,
         TableKind::MerkleForestIndex => txn.open_table(MERKLE_FOREST_INDEX_TABLE)?,
         TableKind::ZkeyIndex => txn.open_table(ZKEY_INDEX_TABLE)?,
-        TableKind::WalletUnspent => txn.open_table(WALLET_UNSPENT_TABLE)?,
+        TableKind::WalletUtxo => txn.open_table(WALLET_UTXO_TABLE)?,
         TableKind::WalletMeta => txn.open_table(WALLET_META_TABLE)?,
         TableKind::PendingFeeNoteAssurance => txn.open_table(PENDING_FEE_NOTE_ASSURANCE_TABLE)?,
         TableKind::TerminalFeeNoteAssurance => txn.open_table(TERMINAL_FEE_NOTE_ASSURANCE_TABLE)?,
@@ -214,7 +214,7 @@ fn list_tables() {
         TableKind::BlobIndex,
         TableKind::MerkleForestIndex,
         TableKind::ZkeyIndex,
-        TableKind::WalletUnspent,
+        TableKind::WalletUtxo,
         TableKind::WalletMeta,
         TableKind::PendingFeeNoteAssurance,
         TableKind::TerminalFeeNoteAssurance,
@@ -244,7 +244,7 @@ fn print_value(table: TableKind, key: &str, value: &[u8], raw: bool) -> Result<(
         TableKind::TerminalFeeNoteAssurance => {
             print_decoded::<TerminalFeeNoteAssuranceRecord>(key, value)
         }
-        TableKind::WalletUnspent => print_wallet_unspent(key, value),
+        TableKind::WalletUtxo => print_wallet_utxo(key, value),
     }
 }
 
@@ -260,11 +260,11 @@ where
     print_json(&entry)
 }
 
-fn print_wallet_unspent(key: &str, value: &[u8]) -> Result<()> {
+fn print_wallet_utxo(key: &str, value: &[u8]) -> Result<()> {
     let (wallet_id, utxo_id) = split_wallet_key(key);
     let entry = Entry {
         key: key.to_string(),
-        value: WalletUnspentValue {
+        value: WalletUtxoValue {
             wallet_id,
             utxo_id,
             payload_hex: format!("0x{}", hex::encode(value)),

@@ -145,7 +145,15 @@ impl AutoRefillService {
                 }
             }
 
-            let utxos = self.wallet_handle.unspents.read().await.clone();
+            let utxos = self
+                .wallet_handle
+                .utxos
+                .read()
+                .await
+                .iter()
+                .filter(|entry| !entry.is_spent())
+                .map(|entry| entry.utxo.clone())
+                .collect::<Vec<_>>();
             if utxos.is_empty() {
                 warn!(wallet = %wallet_address, "no unspent utxos available for auto-refill");
                 continue;

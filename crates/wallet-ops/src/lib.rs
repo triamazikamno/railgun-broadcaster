@@ -21,7 +21,7 @@ use local_db::{DbConfig, DbStore};
 use railgun_wallet::artifacts::ArtifactSource;
 use railgun_wallet::tx::{UnshieldMode, UnshieldRequest as RailgunUnshieldRequest};
 use railgun_wallet::wallet_cache::wallet_cache_key;
-use railgun_wallet::{ProverService, TransactionBuilder, Utxo, WalletKeys};
+use railgun_wallet::{ProverService, TransactionBuilder, Utxo, UtxoSource, WalletKeys, WalletUtxo};
 use reqwest::Url;
 use serde::Serialize;
 use sync_service::{
@@ -119,6 +119,11 @@ pub struct UtxoOutput {
     pub position: u64,
     pub token: String,
     pub value: String,
+    pub source_tx_hash: String,
+    pub source_block_number: u64,
+    pub is_spent: bool,
+    pub spent_tx_hash: Option<String>,
+    pub spent_block_number: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -132,6 +137,8 @@ pub struct ListUtxosOutput {
     pub chain_id: u64,
     pub cache_key: String,
     pub utxo_count: usize,
+    pub unspent_count: usize,
+    pub spent_count: usize,
     pub utxos: Vec<UtxoOutput>,
     pub totals: Vec<TokenTotal>,
 }
@@ -423,7 +430,15 @@ pub async fn unshield(
     let mut forest = chain_handle.forest.read().await.clone();
     forest.compute_roots();
 
-    let utxos = synced.handle.unspents.read().await.clone();
+    let utxos = synced
+        .handle
+        .utxos
+        .read()
+        .await
+        .iter()
+        .filter(|entry| !entry.is_spent())
+        .map(|entry| entry.utxo.clone())
+        .collect::<Vec<_>>();
     let tx_builder = TransactionBuilder {
         chain_type: 0,
         chain_id: request.chain_id,
@@ -493,24 +508,34 @@ pub async fn unshield(
 }
 
 #[must_use]
-pub fn utxo_outputs_from_utxos(mut utxos: Vec<Utxo>) -> (Vec<UtxoOutput>, Vec<TokenTotal>) {
-    utxos.sort_by(|a, b| match a.tree.cmp(&b.tree) {
-        std::cmp::Ordering::Equal => a.position.cmp(&b.position),
+pub fn utxo_outputs_from_utxos(mut utxos: Vec<WalletUtxo>) -> (Vec<UtxoOutput>, Vec<TokenTotal>) {
+    utxos.sort_by(|a, b| match a.utxo.tree.cmp(&b.utxo.tree) {
+        std::cmp::Ordering::Equal => a.utxo.position.cmp(&b.utxo.position),
         other => other,
     });
 
     let mut totals_map: BTreeMap<Address, U256> = BTreeMap::new();
     let utxo_outputs = utxos
         .into_iter()
-        .map(|utxo| {
+        .map(|wallet_utxo| {
+            let utxo = wallet_utxo.utxo;
             let token_addr = token_address_from_utxo(&utxo);
-            *totals_map.entry(token_addr).or_default() += utxo.note.value;
+            if wallet_utxo.spent.is_none() {
+                *totals_map.entry(token_addr).or_default() += utxo.note.value;
+            }
+            let source = &utxo.source;
+            let spent = wallet_utxo.spent.as_ref();
 
             UtxoOutput {
                 tree: utxo.tree,
                 position: utxo.position,
                 token: token_addr.to_checksum(None),
                 value: utxo.note.value.to_string(),
+                source_tx_hash: source_tx_hash(source),
+                source_block_number: source.block_number,
+                is_spent: wallet_utxo.spent.is_some(),
+                spent_tx_hash: spent.map(source_tx_hash),
+                spent_block_number: spent.map(|source| source.block_number),
             }
         })
         .collect();
@@ -527,16 +552,24 @@ pub fn utxo_outputs_from_utxos(mut utxos: Vec<Utxo>) -> (Vec<UtxoOutput>, Vec<To
 }
 
 async fn snapshot_from_handle(chain_id: u64, handle: &WalletHandle) -> ListUtxosOutput {
-    let utxos = handle.unspents.read().await.clone();
+    let utxos = handle.utxos.read().await.clone();
     let (utxo_outputs, totals) = utxo_outputs_from_utxos(utxos);
+    let unspent_count = utxo_outputs.iter().filter(|utxo| !utxo.is_spent).count();
+    let spent_count = utxo_outputs.len().saturating_sub(unspent_count);
 
     ListUtxosOutput {
         chain_id,
         cache_key: handle.cache_key.clone(),
         utxo_count: utxo_outputs.len(),
+        unspent_count,
+        spent_count,
         utxos: utxo_outputs,
         totals,
     }
+}
+
+fn source_tx_hash(source: &UtxoSource) -> String {
+    format!("0x{}", hex::encode(source.tx_hash))
 }
 
 fn token_address_from_utxo(utxo: &Utxo) -> Address {
@@ -740,9 +773,9 @@ async fn sign_send_wait(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, U256};
+    use alloy::primitives::{Address, FixedBytes, U256};
     use broadcaster_core::notes::Note;
-    use railgun_wallet::Utxo;
+    use railgun_wallet::{Utxo, UtxoSource, WalletUtxo};
     use serde_json::json;
 
     use super::{ListUtxosOutput, TokenTotal, UtxoOutput, utxo_outputs_from_utxos};
@@ -751,12 +784,26 @@ mod tests {
         Address::from_slice(&[byte; 20])
     }
 
-    fn utxo(token: Address, value: u64, tree: u32, position: u64) -> Utxo {
-        Utxo {
+    fn source(byte: u8) -> UtxoSource {
+        UtxoSource {
+            tx_hash: FixedBytes::from([byte; 32]),
+            block_number: u64::from(byte),
+        }
+    }
+
+    fn utxo(token: Address, value: u64, tree: u32, position: u64) -> WalletUtxo {
+        WalletUtxo::new(Utxo {
             note: Note::new_unshield(Address::ZERO, token, U256::from(value)),
             tree,
             position,
-        }
+            source: source(position as u8 + 1),
+        })
+    }
+
+    fn spent_utxo(token: Address, value: u64, tree: u32, position: u64) -> WalletUtxo {
+        let mut wallet_utxo = utxo(token, value, tree, position);
+        wallet_utxo.spent = Some(source(9));
+        wallet_utxo
     }
 
     #[test]
@@ -783,6 +830,7 @@ mod tests {
             utxo(token_b, 7, 0, 0),
             utxo(token_a, 3, 0, 1),
             utxo(token_a, 4, 0, 2),
+            spent_utxo(token_a, 100, 0, 3),
         ]);
 
         assert_eq!(
@@ -806,11 +854,22 @@ mod tests {
             chain_id: 1,
             cache_key: "cache".to_string(),
             utxo_count: 1,
+            unspent_count: 0,
+            spent_count: 1,
             utxos: vec![UtxoOutput {
                 tree: 2,
                 position: 3,
                 token: "0x0000000000000000000000000000000000000001".to_string(),
                 value: "4".to_string(),
+                source_tx_hash:
+                    "0x1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+                source_block_number: 11,
+                is_spent: true,
+                spent_tx_hash: Some(
+                    "0x2222222222222222222222222222222222222222222222222222222222222222"
+                        .to_string(),
+                ),
+                spent_block_number: Some(21),
             }],
             totals: vec![TokenTotal {
                 token: "0x0000000000000000000000000000000000000001".to_string(),
@@ -824,11 +883,18 @@ mod tests {
                 "chain_id": 1,
                 "cache_key": "cache",
                 "utxo_count": 1,
+                "unspent_count": 0,
+                "spent_count": 1,
                 "utxos": [{
                     "tree": 2,
                     "position": 3,
                     "token": "0x0000000000000000000000000000000000000001",
                     "value": "4",
+                    "source_tx_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                    "source_block_number": 11,
+                    "is_spent": true,
+                    "spent_tx_hash": "0x2222222222222222222222222222222222222222222222222222222222222222",
+                    "spent_block_number": 21,
                 }],
                 "totals": [{
                     "token": "0x0000000000000000000000000000000000000001",

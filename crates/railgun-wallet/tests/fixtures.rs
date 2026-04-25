@@ -149,6 +149,10 @@ fn build_valid_unshield_plan() -> UnshieldPlan {
                 note: note.clone(),
                 tree: 0,
                 position: 0,
+                source: railgun_wallet::UtxoSource {
+                    tx_hash: FixedBytes::from([1u8; 32]),
+                    block_number: 1,
+                },
             };
             let mut forest = MerkleForest::new();
             forest

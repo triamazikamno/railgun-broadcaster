@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tokio::sync::{RwLock, broadcast, mpsc, watch};
@@ -7,22 +7,22 @@ use tracing::{Instrument, debug, info, warn};
 
 use local_db::DbStore;
 use merkletree::wallet::{WalletLogDelta, WalletScanError, parse_wallet_delta_from_logs};
-use railgun_wallet::Utxo;
 use railgun_wallet::wallet_cache::WalletCacheDbExt;
+use railgun_wallet::{Utxo, UtxoSource, WalletUtxo};
 
 use crate::types::{BackfillEvent, SharedLogBatch, WalletConfig};
 
 #[derive(Debug, Clone)]
 pub struct WalletHandle {
     pub cache_key: String,
-    pub unspents: Arc<RwLock<Vec<Utxo>>>,
+    pub utxos: Arc<RwLock<Vec<WalletUtxo>>>,
     pub ready_rx: watch::Receiver<bool>,
     pub rev_rx: watch::Receiver<u64>,
 }
 
 async fn apply_wallet_logs(
     cfg: &WalletConfig,
-    unspents: &Arc<RwLock<Vec<Utxo>>>,
+    wallet_utxos: &Arc<RwLock<Vec<WalletUtxo>>>,
     batch: &SharedLogBatch,
     last_scanned: u64,
 ) -> Result<u64, WalletScanError> {
@@ -34,7 +34,7 @@ async fn apply_wallet_logs(
         .collect();
 
     let WalletLogDelta {
-        mut utxos,
+        utxos: new_utxos,
         nullifiers,
     } = if filtered_logs.is_empty() {
         WalletLogDelta {
@@ -45,28 +45,39 @@ async fn apply_wallet_logs(
         parse_wallet_delta_from_logs(&filtered_logs, &cfg.scan_keys)?
     };
 
-    let mut locked = unspents.write().await;
-    if !nullifiers.is_empty() {
-        let nullifier_set: HashSet<_> = nullifiers.into_iter().collect();
-        locked.retain(|utxo| {
-            !utxo_spent_by_nullifier(utxo, cfg.scan_keys.nullifying_key, &nullifier_set)
-        });
-        utxos.retain(|utxo| {
-            !utxo_spent_by_nullifier(utxo, cfg.scan_keys.nullifying_key, &nullifier_set)
-        });
+    let mut locked = wallet_utxos.write().await;
+    let nullifier_sources: HashMap<_, _> = nullifiers
+        .into_iter()
+        .map(|spent| ((spent.tree, spent.nullifier), spent.source))
+        .collect();
+    if !nullifier_sources.is_empty() {
+        for wallet_utxo in locked.iter_mut().filter(|entry| !entry.is_spent()) {
+            if let Some(source) = spent_source_for_utxo(
+                &wallet_utxo.utxo,
+                cfg.scan_keys.nullifying_key,
+                &nullifier_sources,
+            ) {
+                wallet_utxo.spent = Some(source);
+            }
+        }
     }
-    locked.append(&mut utxos);
-    dedupe_utxos(&mut locked);
+    locked.extend(new_utxos.into_iter().map(|utxo| {
+        let spent = spent_source_for_utxo(&utxo, cfg.scan_keys.nullifying_key, &nullifier_sources);
+        WalletUtxo { utxo, spent }
+    }));
+    dedupe_wallet_utxos(&mut locked);
 
     Ok(batch.to_block)
 }
 
-fn utxo_spent_by_nullifier(
+fn spent_source_for_utxo(
     utxo: &Utxo,
     nullifying_key: alloy::primitives::U256,
-    nullifier_set: &HashSet<(u32, alloy::primitives::U256)>,
-) -> bool {
-    nullifier_set.contains(&(utxo.tree, utxo.nullifier(nullifying_key)))
+    nullifier_sources: &HashMap<(u32, alloy::primitives::U256), UtxoSource>,
+) -> Option<UtxoSource> {
+    nullifier_sources
+        .get(&(utxo.tree, utxo.nullifier(nullifying_key)))
+        .cloned()
 }
 
 impl WalletHandle {
@@ -93,12 +104,12 @@ pub(crate) fn spawn_wallet_worker(
     mut backfill_rx: mpsc::Receiver<BackfillEvent>,
     cancel: CancellationToken,
 ) -> WalletHandle {
-    let unspents = Arc::new(RwLock::new(Vec::new()));
+    let utxos = Arc::new(RwLock::new(Vec::new()));
     let (ready_tx, ready_rx) = watch::channel(false);
     let (rev_tx, rev_rx) = watch::channel(0_u64);
     let handle = WalletHandle {
         cache_key: cfg.cache_key.clone(),
-        unspents: unspents.clone(),
+        utxos: utxos.clone(),
         ready_rx,
         rev_rx,
     };
@@ -109,9 +120,9 @@ pub(crate) fn spawn_wallet_worker(
         let start_block = cfg.start_block.unwrap_or(0);
         let mut last_scanned = start_block.saturating_sub(1);
 
-        match db.load_unspent_utxos(&cfg.cache_key) {
+        match db.load_wallet_utxos(&cfg.cache_key) {
             Ok(cached) => {
-                let mut locked = unspents.write().await;
+                let mut locked = utxos.write().await;
                 *locked = cached;
                 notify_wallet_rev(&rev_tx, &mut rev, &cfg.cache_key);
             }
@@ -138,12 +149,12 @@ pub(crate) fn spawn_wallet_worker(
                             if batch.to_block <= last_scanned {
                                 continue;
                             }
-                            match apply_wallet_logs(&cfg, &unspents, &batch, last_scanned).await {
+                            match apply_wallet_logs(&cfg, &utxos, &batch, last_scanned).await {
                                 Ok(updated_last_scanned) => {
                                     last_scanned = updated_last_scanned;
-                                    if let Err(err) = db.store_unspent_utxos(
+                                    if let Err(err) = db.store_wallet_utxos(
                                         &cfg.cache_key,
-                                        &unspents.read().await,
+                                        &utxos.read().await,
                                         Some(last_scanned),
                                         batch.to_block_hash,
                                     ) {
@@ -159,9 +170,9 @@ pub(crate) fn spawn_wallet_worker(
                         BackfillEvent::Done { last_block } => {
                             if last_scanned < last_block {
                                 last_scanned = last_block;
-                                if let Err(err) = db.store_unspent_utxos(
+                                if let Err(err) = db.store_wallet_utxos(
                                     &cfg.cache_key,
-                                    &unspents.read().await,
+                                    &utxos.read().await,
                                     Some(last_scanned),
                                     None,
                                 ) {
@@ -175,10 +186,10 @@ pub(crate) fn spawn_wallet_worker(
                             debug!(cache_key = %cfg.cache_key, "wallet backfill complete");
                         }
                         BackfillEvent::Reset { from_block } => {
-                            let mut locked = unspents.write().await;
+                            let mut locked = utxos.write().await;
                             locked.clear();
                             last_scanned = from_block.saturating_sub(1);
-                            if let Err(err) = db.store_unspent_utxos(
+                            if let Err(err) = db.store_wallet_utxos(
                                 &cfg.cache_key,
                                 &locked,
                                 Some(last_scanned),
@@ -203,12 +214,12 @@ pub(crate) fn spawn_wallet_worker(
                             {
                                 continue;
                             }
-                            match apply_wallet_logs(&cfg, &unspents, &batch, last_scanned).await {
+                            match apply_wallet_logs(&cfg, &utxos, &batch, last_scanned).await {
                                 Ok(updated_last_scanned) => {
                                     last_scanned = updated_last_scanned;
-                                    if let Err(err) = db.store_unspent_utxos(
+                                    if let Err(err) = db.store_wallet_utxos(
                                         &cfg.cache_key,
-                                        &unspents.read().await,
+                                        &utxos.read().await,
                                         Some(last_scanned),
                                         batch.to_block_hash,
                                     ) {
@@ -234,19 +245,26 @@ pub(crate) fn spawn_wallet_worker(
     handle
 }
 
-fn dedupe_utxos(utxos: &mut Vec<Utxo>) {
+fn dedupe_wallet_utxos(utxos: &mut Vec<WalletUtxo>) {
     let mut seen = HashSet::new();
-    utxos.retain(|utxo| seen.insert((utxo.tree, utxo.position)));
+    utxos.retain(|wallet_utxo| seen.insert((wallet_utxo.utxo.tree, wallet_utxo.utxo.position)));
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{notify_wallet_rev, utxo_spent_by_nullifier};
-    use alloy::primitives::U256;
+    use super::{notify_wallet_rev, spent_source_for_utxo};
+    use alloy::primitives::{FixedBytes, U256};
     use broadcaster_core::notes::Note;
-    use railgun_wallet::Utxo;
-    use std::collections::HashSet;
+    use railgun_wallet::{Utxo, UtxoSource};
+    use std::collections::HashMap;
     use tokio::sync::watch;
+
+    fn source(byte: u8) -> UtxoSource {
+        UtxoSource {
+            tx_hash: FixedBytes::from([byte; 32]),
+            block_number: u64::from(byte),
+        }
+    }
 
     #[test]
     fn notify_wallet_rev_increments_revision() {
@@ -272,24 +290,25 @@ mod tests {
             },
             tree: 1,
             position: 7,
+            source: source(1),
         };
         let utxo_tree_two = Utxo {
             note: utxo_tree_one.note.clone(),
             tree: 2,
             position: 7,
+            source: source(2),
         };
         let shared_nullifier = utxo_tree_one.nullifier(nullifying_key);
-        let nullifier_set = HashSet::from([(2, shared_nullifier)]);
+        let spent_source = source(9);
+        let nullifier_sources = HashMap::from([((2, shared_nullifier), spent_source.clone())]);
 
-        assert!(!utxo_spent_by_nullifier(
-            &utxo_tree_one,
-            nullifying_key,
-            &nullifier_set,
-        ));
-        assert!(utxo_spent_by_nullifier(
-            &utxo_tree_two,
-            nullifying_key,
-            &nullifier_set,
-        ));
+        assert_eq!(
+            spent_source_for_utxo(&utxo_tree_one, nullifying_key, &nullifier_sources,),
+            None,
+        );
+        assert_eq!(
+            spent_source_for_utxo(&utxo_tree_two, nullifying_key, &nullifier_sources),
+            Some(spent_source),
+        );
     }
 }

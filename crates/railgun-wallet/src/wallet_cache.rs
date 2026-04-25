@@ -1,9 +1,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::Address as ContractAddress;
-use alloy::primitives::U256;
+use alloy::primitives::{FixedBytes, U256};
 use broadcaster_core::notes::Note;
-use broadcaster_core::utxo::Utxo;
+use broadcaster_core::utxo::{Utxo, UtxoSource, WalletUtxo};
 use local_db::{DbError, DbStore, WalletMeta};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -29,14 +29,41 @@ struct CachedNote {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct CachedUtxo {
+struct CachedUtxoSource {
+    tx_hash: [u8; 32],
+    block_number: u64,
+}
+
+impl From<&UtxoSource> for CachedUtxoSource {
+    fn from(source: &UtxoSource) -> Self {
+        Self {
+            tx_hash: source.tx_hash.0,
+            block_number: source.block_number,
+        }
+    }
+}
+
+impl CachedUtxoSource {
+    fn into_source(self) -> UtxoSource {
+        UtxoSource {
+            tx_hash: FixedBytes::from(self.tx_hash),
+            block_number: self.block_number,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedWalletUtxo {
     note: CachedNote,
     tree: u32,
     position: u64,
+    source: CachedUtxoSource,
+    spent: Option<CachedUtxoSource>,
 }
 
-impl From<&Utxo> for CachedUtxo {
-    fn from(utxo: &Utxo) -> Self {
+impl From<&WalletUtxo> for CachedWalletUtxo {
+    fn from(wallet_utxo: &WalletUtxo) -> Self {
+        let utxo = &wallet_utxo.utxo;
         Self {
             note: CachedNote {
                 token_hash: utxo.note.token_hash,
@@ -46,13 +73,15 @@ impl From<&Utxo> for CachedUtxo {
             },
             tree: utxo.tree,
             position: utxo.position,
+            source: CachedUtxoSource::from(&utxo.source),
+            spent: wallet_utxo.spent.as_ref().map(CachedUtxoSource::from),
         }
     }
 }
 
-impl CachedUtxo {
-    fn into_utxo(self) -> Utxo {
-        Utxo {
+impl CachedWalletUtxo {
+    fn into_wallet_utxo(self) -> WalletUtxo {
+        let utxo = Utxo {
             note: Note {
                 token_hash: self.note.token_hash,
                 value: self.note.value,
@@ -61,6 +90,11 @@ impl CachedUtxo {
             },
             tree: self.tree,
             position: self.position,
+            source: self.source.into_source(),
+        };
+        WalletUtxo {
+            utxo,
+            spent: self.spent.map(CachedUtxoSource::into_source),
         }
     }
 
@@ -78,29 +112,29 @@ pub fn wallet_cache_key(
 }
 
 pub trait WalletCacheDbExt {
-    fn store_unspent_utxos(
+    fn store_wallet_utxos(
         &self,
         wallet_id: &str,
-        utxos: &[Utxo],
+        utxos: &[WalletUtxo],
         last_scanned_block: Option<u64>,
         last_scanned_block_hash: Option<[u8; 32]>,
     ) -> Result<(), WalletCacheError>;
 
-    fn load_unspent_utxos(&self, wallet_id: &str) -> Result<Vec<Utxo>, WalletCacheError>;
+    fn load_wallet_utxos(&self, wallet_id: &str) -> Result<Vec<WalletUtxo>, WalletCacheError>;
 }
 
 impl WalletCacheDbExt for DbStore {
-    fn store_unspent_utxos(
+    fn store_wallet_utxos(
         &self,
         wallet_id: &str,
-        utxos: &[Utxo],
+        utxos: &[WalletUtxo],
         last_scanned_block: Option<u64>,
         last_scanned_block_hash: Option<[u8; 32]>,
     ) -> Result<(), WalletCacheError> {
         let utxo_entries: Vec<(String, Vec<u8>)> = utxos
             .iter()
             .map(|utxo| {
-                let cached = CachedUtxo::from(utxo);
+                let cached = CachedWalletUtxo::from(utxo);
                 let payload = rmp_serde::to_vec_named(&cached)?;
                 Ok((cached.utxo_id(), payload))
             })
@@ -116,16 +150,16 @@ impl WalletCacheDbExt for DbStore {
             })
             .transpose()?;
 
-        self.batch_store_wallet(wallet_id, &utxo_entries, meta.as_ref())?;
+        self.batch_store_wallet_utxos(wallet_id, &utxo_entries, meta.as_ref())?;
         Ok(())
     }
 
-    fn load_unspent_utxos(&self, wallet_id: &str) -> Result<Vec<Utxo>, WalletCacheError> {
-        let entries = self.list_wallet_unspent(wallet_id)?;
+    fn load_wallet_utxos(&self, wallet_id: &str) -> Result<Vec<WalletUtxo>, WalletCacheError> {
+        let entries = self.list_wallet_utxos(wallet_id)?;
         let mut out = Vec::with_capacity(entries.len());
         for entry in entries {
-            let cached: CachedUtxo = rmp_serde::from_slice(&entry.payload)?;
-            out.push(cached.into_utxo());
+            let cached: CachedWalletUtxo = rmp_serde::from_slice(&entry.payload)?;
+            out.push(cached.into_wallet_utxo());
         }
         Ok(out)
     }

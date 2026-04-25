@@ -7,7 +7,7 @@ pub mod wallet_cache;
 mod zkey_cache;
 
 pub use broadcaster_core::crypto::railgun::{AddressData, ViewingKeyData};
-pub use broadcaster_core::utxo::Utxo;
+pub use broadcaster_core::utxo::{Utxo, UtxoSource, WalletUtxo};
 pub use keys::WalletKeys;
 pub use keys::public_spending_key;
 pub use notes::{Note, NoteCiphertext};

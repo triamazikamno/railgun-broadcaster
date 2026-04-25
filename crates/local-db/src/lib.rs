@@ -14,7 +14,7 @@ const BLOB_INDEX_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("blo
 const MERKLE_FOREST_INDEX_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("merkle_forest_index");
 const ZKEY_INDEX_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("zkey_index");
-const WALLET_UNSPENT_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("wallet_unspent");
+const WALLET_UTXO_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("wallet_utxo");
 const WALLET_META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("wallet_meta");
 const PENDING_FEE_NOTE_ASSURANCE_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("fee_note_assurance_pending");
@@ -25,7 +25,7 @@ const META_KEY: &str = "meta";
 const RAILGUN_DIR: &str = "railgun";
 const BLOBS_DIR: &str = "blobs";
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Clone)]
 pub struct DbConfig {
@@ -111,7 +111,7 @@ pub struct ZkeyMeta {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WalletUnspent {
+pub struct WalletUtxoRecord {
     pub utxo_id: String,
     pub payload: Vec<u8>,
 }
@@ -321,39 +321,39 @@ impl DbStore {
         Ok(())
     }
 
-    pub fn put_wallet_unspent(
+    pub fn put_wallet_utxo(
         &self,
         wallet_id: &str,
         utxo_id: &str,
         payload: &[u8],
     ) -> Result<(), DbError> {
-        let key = wallet_unspent_key(wallet_id, utxo_id);
+        let key = wallet_utxo_key(wallet_id, utxo_id);
         let txn = self.db.begin_write()?;
         {
-            let mut table = txn.open_table(WALLET_UNSPENT_TABLE)?;
+            let mut table = txn.open_table(WALLET_UTXO_TABLE)?;
             table.insert(key.as_str(), payload)?;
         }
         txn.commit()?;
         Ok(())
     }
 
-    pub fn delete_wallet_unspent(&self, wallet_id: &str, utxo_id: &str) -> Result<(), DbError> {
-        let key = wallet_unspent_key(wallet_id, utxo_id);
+    pub fn delete_wallet_utxo(&self, wallet_id: &str, utxo_id: &str) -> Result<(), DbError> {
+        let key = wallet_utxo_key(wallet_id, utxo_id);
         let txn = self.db.begin_write()?;
         {
-            let mut table = txn.open_table(WALLET_UNSPENT_TABLE)?;
+            let mut table = txn.open_table(WALLET_UTXO_TABLE)?;
             table.remove(key.as_str())?;
         }
         txn.commit()?;
         Ok(())
     }
 
-    pub fn clear_wallet_unspent(&self, wallet_id: &str) -> Result<(), DbError> {
-        let prefix = wallet_unspent_prefix(wallet_id);
+    pub fn clear_wallet_utxos(&self, wallet_id: &str) -> Result<(), DbError> {
+        let prefix = wallet_utxo_prefix(wallet_id);
         let range_end = format!("{prefix}~");
         let txn = self.db.begin_write()?;
         {
-            let mut table = txn.open_table(WALLET_UNSPENT_TABLE)?;
+            let mut table = txn.open_table(WALLET_UTXO_TABLE)?;
             let keys: Vec<String> = table
                 .range(prefix.as_str()..range_end.as_str())?
                 .map(|entry| entry.map(|(key, _)| key.value().to_string()))
@@ -369,31 +369,28 @@ impl DbStore {
     /// Atomically replace all UTXO entries for a wallet and update its
     /// metadata in a single transaction. This prevents partial state if the
     /// process is interrupted mid-write.
-    pub fn batch_store_wallet(
+    pub fn batch_store_wallet_utxos(
         &self,
         wallet_id: &str,
         utxos: &[(String, Vec<u8>)],
         meta: Option<&WalletMeta>,
     ) -> Result<(), DbError> {
-        let prefix = wallet_unspent_prefix(wallet_id);
+        let prefix = wallet_utxo_prefix(wallet_id);
         let range_end = format!("{prefix}~");
         let txn = self.db.begin_write()?;
         {
-            // Clear existing UTXOs
-            let mut unspent_table = txn.open_table(WALLET_UNSPENT_TABLE)?;
-            let keys: Vec<String> = unspent_table
+            let mut utxo_table = txn.open_table(WALLET_UTXO_TABLE)?;
+            let keys: Vec<String> = utxo_table
                 .range(prefix.as_str()..range_end.as_str())?
                 .map(|entry| entry.map(|(key, _)| key.value().to_string()))
                 .collect::<Result<_, _>>()?;
             for key in keys {
-                unspent_table.remove(key.as_str())?;
+                utxo_table.remove(key.as_str())?;
             }
-            // Write new UTXOs
             for (utxo_id, payload) in utxos {
-                let key = wallet_unspent_key(wallet_id, utxo_id);
-                unspent_table.insert(key.as_str(), payload.as_slice())?;
+                let key = wallet_utxo_key(wallet_id, utxo_id);
+                utxo_table.insert(key.as_str(), payload.as_slice())?;
             }
-            // Write metadata in the same transaction
             if let Some(meta) = meta {
                 let data = encode(meta)?;
                 let mut meta_table = txn.open_table(WALLET_META_TABLE)?;
@@ -404,17 +401,17 @@ impl DbStore {
         Ok(())
     }
 
-    pub fn list_wallet_unspent(&self, wallet_id: &str) -> Result<Vec<WalletUnspent>, DbError> {
-        let prefix = wallet_unspent_prefix(wallet_id);
+    pub fn list_wallet_utxos(&self, wallet_id: &str) -> Result<Vec<WalletUtxoRecord>, DbError> {
+        let prefix = wallet_utxo_prefix(wallet_id);
         let range_end = format!("{prefix}~");
         let txn = self.db.begin_read()?;
-        let table = txn.open_table(WALLET_UNSPENT_TABLE)?;
+        let table = txn.open_table(WALLET_UTXO_TABLE)?;
         let mut out = Vec::new();
         for entry in table.range(prefix.as_str()..range_end.as_str())? {
             let (key, value) = entry?;
             let key = key.value();
             let utxo_id = key.strip_prefix(&prefix).unwrap_or(key).to_string();
-            out.push(WalletUnspent {
+            out.push(WalletUtxoRecord {
                 utxo_id,
                 payload: value.value().to_vec(),
             });
@@ -563,7 +560,7 @@ impl DbStore {
         txn.open_table(BLOB_INDEX_TABLE)?;
         txn.open_table(MERKLE_FOREST_INDEX_TABLE)?;
         txn.open_table(ZKEY_INDEX_TABLE)?;
-        txn.open_table(WALLET_UNSPENT_TABLE)?;
+        txn.open_table(WALLET_UTXO_TABLE)?;
         txn.open_table(WALLET_META_TABLE)?;
         txn.open_table(PENDING_FEE_NOTE_ASSURANCE_TABLE)?;
         txn.open_table(TERMINAL_FEE_NOTE_ASSURANCE_TABLE)?;
@@ -592,15 +589,8 @@ impl DbStore {
     }
 
     fn run_migrations(&self, from: u32, to: u32) -> Result<(), DbError> {
-        let mut version = from;
-        while version < to {
-            match version {
-                0..=2 => {}
-                _ => {
-                    return Err(DbError::UnsupportedSchemaVersion { version });
-                }
-            }
-            version += 1;
+        if from < to {
+            return Err(DbError::UnsupportedSchemaVersion { version: from });
         }
         Ok(())
     }
@@ -670,11 +660,11 @@ fn merkle_forest_key(chain_id: u64, contract: &str) -> String {
     format!("{chain_id}|{contract}")
 }
 
-fn wallet_unspent_key(wallet_id: &str, utxo_id: &str) -> String {
+fn wallet_utxo_key(wallet_id: &str, utxo_id: &str) -> String {
     format!("{wallet_id}|{utxo_id}")
 }
 
-fn wallet_unspent_prefix(wallet_id: &str) -> String {
+fn wallet_utxo_prefix(wallet_id: &str) -> String {
     format!("{wallet_id}|")
 }
 
@@ -857,10 +847,9 @@ mod tests {
     }
 
     #[test]
-    fn reopen_schema_1_db_keeps_existing_records() {
+    fn reopen_older_schema_db_backs_up_and_recreates() {
         let root_dir = temp_db_root();
         let wallet_id = "wallet-1";
-        let original_created_at = 123;
 
         {
             let store = DbStore::open(DbConfig {
@@ -879,11 +868,11 @@ mod tests {
 
             store
                 .write_meta(&Meta {
-                    schema_version: 1,
+                    schema_version: 3,
                     app_version: "0.0.0".to_string(),
-                    created_at: original_created_at,
+                    created_at: 123,
                 })
-                .expect("write schema-1 meta");
+                .expect("write schema-3 meta");
         }
 
         let reopened = DbStore::open(DbConfig {
@@ -891,20 +880,27 @@ mod tests {
         })
         .expect("reopen db");
 
-        let wallet_meta = reopened
-            .get_wallet_meta(wallet_id)
-            .expect("load wallet meta")
-            .expect("wallet meta present");
-        assert_eq!(wallet_meta.last_scanned_block, 42);
-        assert_eq!(wallet_meta.updated_at, 99);
-        assert_eq!(wallet_meta.last_scanned_block_hash, Some([7u8; 32]));
+        assert!(
+            reopened
+                .get_wallet_meta(wallet_id)
+                .expect("load wallet meta")
+                .is_none()
+        );
 
         let meta = reopened
             .read_meta()
             .expect("read meta")
             .expect("meta present");
         assert_eq!(meta.schema_version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(meta.created_at, original_created_at);
+        assert!(
+            fs::read_dir(root_dir.join("railgun"))
+                .expect("read railgun dir")
+                .any(|entry| entry
+                    .expect("read dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("db.redb.bak."))
+        );
 
         drop(reopened);
         fs::remove_dir_all(root_dir).expect("remove temp db dir");

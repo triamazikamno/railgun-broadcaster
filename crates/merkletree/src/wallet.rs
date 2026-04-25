@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use alloy::primitives::U256;
 use alloy::sol_types::{Error as SolError, SolEvent};
@@ -8,7 +8,7 @@ use thiserror::Error;
 use broadcaster_core::crypto::railgun::ViewingKeyData;
 use broadcaster_core::crypto::shared_key::shared_symmetric_key;
 use broadcaster_core::notes::{Note, decrypt_shield_random};
-use broadcaster_core::utxo::Utxo;
+use broadcaster_core::utxo::{Utxo, UtxoSource};
 
 use crate::errors::SyncError;
 use crate::slow::types::{
@@ -23,6 +23,8 @@ pub enum WalletScanError {
     Decode(#[from] SolError),
     #[error("apply commitment updates: {0}")]
     Update(#[from] SyncError),
+    #[error("log missing required metadata: {0}")]
+    MissingLogMetadata(&'static str),
 }
 
 pub type WalletScanKeys = ViewingKeyData;
@@ -30,7 +32,14 @@ pub type WalletScanKeys = ViewingKeyData;
 #[derive(Debug)]
 pub struct WalletLogDelta {
     pub utxos: Vec<Utxo>,
-    pub nullifiers: Vec<(u32, U256)>,
+    pub nullifiers: Vec<SpentNullifier>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SpentNullifier {
+    pub tree: u32,
+    pub nullifier: U256,
+    pub source: UtxoSource,
 }
 
 pub fn parse_wallet_delta_from_logs(
@@ -38,7 +47,7 @@ pub fn parse_wallet_delta_from_logs(
     keys: &WalletScanKeys,
 ) -> Result<WalletLogDelta, WalletScanError> {
     let mut utxos = Vec::new();
-    let mut nullifiers = HashSet::new();
+    let mut nullifiers = HashMap::new();
 
     for raw_log in logs {
         let topic0 = raw_log.inner.topics().first().copied().unwrap_or_default();
@@ -72,10 +81,12 @@ pub fn parse_wallet_delta_from_logs(
                         .get(index)
                         .map(|h| U256::from_be_bytes(h.0));
                     if expected.is_some_and(|hash| hash == commitment) {
+                        let source = source_from_log(raw_log)?;
                         utxos.push(Utxo {
                             note,
                             tree: tree_number,
                             position: tree_position,
+                            source,
                         });
                     }
                 }
@@ -100,31 +111,57 @@ pub fn parse_wallet_delta_from_logs(
                         continue;
                     };
                     let note = preimage.note_with_random(random);
+                    let source = source_from_log(raw_log)?;
                     utxos.push(Utxo {
                         note,
                         tree: tree_number,
                         position: tree_position,
+                        source,
                     });
                 }
             }
         } else if topic0 == Nullifiers::SIGNATURE_HASH {
             let event = Nullifiers::decode_log(&raw_log.inner)?.data;
             let tree_number: u32 = event.treeNumber.to();
+            let source = source_from_log(raw_log)?;
             for nullifier in event.nullifier {
-                nullifiers.insert((tree_number, nullifier));
+                nullifiers
+                    .entry((tree_number, nullifier))
+                    .or_insert_with(|| source.clone());
             }
         } else if topic0 == Nullified::SIGNATURE_HASH {
             let event = Nullified::decode_log(&raw_log.inner)?.data;
             let tree_number: u32 = event.treeNumber.into();
+            let source = source_from_log(raw_log)?;
             for nullifier in event.nullifier {
-                nullifiers.insert((tree_number, U256::from_be_bytes(nullifier.0)));
+                nullifiers
+                    .entry((tree_number, U256::from_be_bytes(nullifier.0)))
+                    .or_insert_with(|| source.clone());
             }
         }
     }
 
     Ok(WalletLogDelta {
         utxos,
-        nullifiers: nullifiers.into_iter().collect(),
+        nullifiers: nullifiers
+            .into_iter()
+            .map(|((tree, nullifier), source)| SpentNullifier {
+                tree,
+                nullifier,
+                source,
+            })
+            .collect(),
+    })
+}
+
+fn source_from_log(log: &Log) -> Result<UtxoSource, WalletScanError> {
+    Ok(UtxoSource {
+        tx_hash: log
+            .transaction_hash
+            .ok_or(WalletScanError::MissingLogMetadata("transaction_hash"))?,
+        block_number: log
+            .block_number
+            .ok_or(WalletScanError::MissingLogMetadata("block_number"))?,
     })
 }
 

@@ -446,10 +446,18 @@ impl WalletRoot {
         let summary = match self.chain_states.get(&self.selected_chain) {
             Some(ChainUtxoState::Ready { snapshot, .. }) => {
                 let totals = totals_label(self.selected_chain, &snapshot.totals);
-                if totals.is_empty() {
-                    format!("{} UTXOs", snapshot.utxo_count)
+                let counts = if snapshot.spent_count == 0 {
+                    format!("{} unspent UTXOs", snapshot.unspent_count)
                 } else {
-                    format!("{} UTXOs · Totals: {totals}", snapshot.utxo_count)
+                    format!(
+                        "{} unspent · {} spent",
+                        snapshot.unspent_count, snapshot.spent_count
+                    )
+                };
+                if totals.is_empty() {
+                    counts
+                } else {
+                    format!("{counts} · Totals: {totals}")
                 }
             }
             Some(ChainUtxoState::Loading) => "Synchronizing wallet events...".to_string(),
@@ -527,8 +535,8 @@ impl WalletRoot {
         match self.chain_states.get(&self.selected_chain) {
             Some(ChainUtxoState::Loading) => centered_message("Synchronizing wallet events..."),
             Some(ChainUtxoState::Error(error)) => error_message(error.as_ref()),
-            Some(ChainUtxoState::Ready { snapshot, .. }) if snapshot.utxos.is_empty() => {
-                centered_message("No UTXOs found")
+            Some(ChainUtxoState::Ready { snapshot, .. }) if snapshot.unspent_count == 0 => {
+                centered_message("No unspent UTXOs found")
             }
             Some(ChainUtxoState::Ready { .. }) => div()
                 .size_full()
@@ -628,12 +636,13 @@ struct UtxoDisplayRow {
     position: u64,
     token: String,
     amount: String,
+    source_tx_hash: String,
     token_address: String,
 }
 
 struct UtxoDelegate {
     rows: Arc<[UtxoDisplayRow]>,
-    columns: [Column; 6],
+    columns: [Column; 7],
 }
 
 impl UtxoDelegate {
@@ -653,6 +662,9 @@ impl UtxoDelegate {
                     .movable(false),
                 Column::new("amount", "amount")
                     .width(px(160.0))
+                    .movable(false),
+                Column::new("source_tx", "source tx")
+                    .width(px(170.0))
                     .movable(false),
                 Column::new("token_address", "token address")
                     .width(px(420.0))
@@ -705,6 +717,18 @@ impl TableDelegate for UtxoDelegate {
                 .text_color(rgb(0xf9e2af))
                 .child(SharedString::from(row.amount.clone()))
                 .into_any_element(),
+            5 => {
+                let tx_hash = row.source_tx_hash.clone();
+                div()
+                    .id(SharedString::from(format!("wallet-source-tx-{row_ix}")))
+                    .cursor_pointer()
+                    .text_color(rgb(0x94e2d5))
+                    .child(SharedString::from(short_hash(&tx_hash)))
+                    .on_click(move |_event, window, cx| {
+                        copy_with_toast(tx_hash.clone(), window, cx);
+                    })
+                    .into_any_element()
+            }
             _ => {
                 let address = row.token_address.clone();
                 div()
@@ -780,6 +804,7 @@ fn display_rows_from_output(output: &ListUtxosOutput) -> Vec<UtxoDisplayRow> {
     output
         .utxos
         .iter()
+        .filter(|row| !row.is_spent)
         .map(|row| display_row_from_utxo(output.chain_id, row))
         .collect()
 }
@@ -792,6 +817,7 @@ fn display_row_from_utxo(chain_id: u64, row: &UtxoOutput) -> UtxoDisplayRow {
             position: row.position,
             token: row.token.clone(),
             amount: row.value.clone(),
+            source_tx_hash: row.source_tx_hash.clone(),
             token_address: row.token.clone(),
         };
     };
@@ -812,8 +838,16 @@ fn display_row_from_utxo(chain_id: u64, row: &UtxoOutput) -> UtxoDisplayRow {
         position: row.position,
         token,
         amount,
+        source_tx_hash: row.source_tx_hash.clone(),
         token_address: address.to_checksum(None),
     }
+}
+
+fn short_hash(hash: &str) -> String {
+    if hash.len() <= 14 {
+        return hash.to_string();
+    }
+    format!("{}...{}", &hash[..8], &hash[hash.len() - 6..])
 }
 
 fn parse_address(raw: &str) -> Option<Address> {
@@ -826,18 +860,36 @@ mod tests {
 
     use super::{display_rows_from_output, format_total};
 
+    fn utxo_output(token: &str, value: &str, is_spent: bool) -> UtxoOutput {
+        UtxoOutput {
+            tree: 0,
+            position: 7,
+            token: token.to_string(),
+            value: value.to_string(),
+            source_tx_hash: "0x1111111111111111111111111111111111111111111111111111111111111111"
+                .to_string(),
+            source_block_number: 11,
+            is_spent,
+            spent_tx_hash: is_spent.then(|| {
+                "0x2222222222222222222222222222222222222222222222222222222222222222".to_string()
+            }),
+            spent_block_number: is_spent.then_some(21),
+        }
+    }
+
     #[test]
     fn display_rows_use_known_token_metadata() {
         let output = ListUtxosOutput {
             chain_id: 1,
             cache_key: "cache".to_string(),
             utxo_count: 1,
-            utxos: vec![UtxoOutput {
-                tree: 0,
-                position: 7,
-                token: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string(),
-                value: "1234567".to_string(),
-            }],
+            unspent_count: 1,
+            spent_count: 0,
+            utxos: vec![utxo_output(
+                "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+                "1234567",
+                false,
+            )],
             totals: Vec::new(),
         };
 
@@ -852,12 +904,13 @@ mod tests {
             chain_id: 1,
             cache_key: "cache".to_string(),
             utxo_count: 1,
-            utxos: vec![UtxoOutput {
-                tree: 1,
-                position: 2,
-                token: "0x1111111111111111111111111111111111111111".to_string(),
-                value: "42".to_string(),
-            }],
+            unspent_count: 1,
+            spent_count: 0,
+            utxos: vec![utxo_output(
+                "0x1111111111111111111111111111111111111111",
+                "42",
+                false,
+            )],
             totals: Vec::new(),
         };
 
@@ -877,5 +930,25 @@ mod tests {
         };
 
         assert_eq!(format_total(1, &total), "USDC 1.23");
+    }
+
+    #[test]
+    fn display_rows_hide_spent_utxos() {
+        let output = ListUtxosOutput {
+            chain_id: 1,
+            cache_key: "cache".to_string(),
+            utxo_count: 2,
+            unspent_count: 1,
+            spent_count: 1,
+            utxos: vec![
+                utxo_output("0x1111111111111111111111111111111111111111", "42", true),
+                utxo_output("0x2222222222222222222222222222222222222222", "7", false),
+            ],
+            totals: Vec::new(),
+        };
+
+        let rows = display_rows_from_output(&output);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].amount, "7");
     }
 }
