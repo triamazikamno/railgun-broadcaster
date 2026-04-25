@@ -45,13 +45,43 @@ async fn apply_wallet_logs(
         parse_wallet_delta_from_logs(&filtered_logs, &cfg.scan_keys)?
     };
 
+    apply_wallet_delta(
+        cfg,
+        wallet_utxos,
+        WalletLogDelta {
+            utxos: new_utxos,
+            nullifiers,
+        },
+    )
+    .await;
+
+    Ok(batch.to_block)
+}
+
+pub(crate) async fn apply_wallet_delta(
+    cfg: &WalletConfig,
+    wallet_utxos: &Arc<RwLock<Vec<WalletUtxo>>>,
+    delta: WalletLogDelta,
+) {
     let mut locked = wallet_utxos.write().await;
+    apply_wallet_delta_to_vec(cfg, &mut locked, delta);
+}
+
+pub(crate) fn apply_wallet_delta_to_vec(
+    cfg: &WalletConfig,
+    wallet_utxos: &mut Vec<WalletUtxo>,
+    delta: WalletLogDelta,
+) {
+    let WalletLogDelta {
+        utxos: new_utxos,
+        nullifiers,
+    } = delta;
     let nullifier_sources: HashMap<_, _> = nullifiers
         .into_iter()
         .map(|spent| ((spent.tree, spent.nullifier), spent.source))
         .collect();
     if !nullifier_sources.is_empty() {
-        for wallet_utxo in locked.iter_mut().filter(|entry| !entry.is_spent()) {
+        for wallet_utxo in wallet_utxos.iter_mut().filter(|entry| !entry.is_spent()) {
             if let Some(source) = spent_source_for_utxo(
                 &wallet_utxo.utxo,
                 cfg.scan_keys.nullifying_key,
@@ -61,13 +91,11 @@ async fn apply_wallet_logs(
             }
         }
     }
-    locked.extend(new_utxos.into_iter().map(|utxo| {
+    wallet_utxos.extend(new_utxos.into_iter().map(|utxo| {
         let spent = spent_source_for_utxo(&utxo, cfg.scan_keys.nullifying_key, &nullifier_sources);
         WalletUtxo { utxo, spent }
     }));
-    dedupe_wallet_utxos(&mut locked);
-
-    Ok(batch.to_block)
+    dedupe_wallet_utxos(wallet_utxos);
 }
 
 fn spent_source_for_utxo(
@@ -252,10 +280,13 @@ fn dedupe_wallet_utxos(utxos: &mut Vec<WalletUtxo>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{notify_wallet_rev, spent_source_for_utxo};
-    use alloy::primitives::{FixedBytes, U256};
+    use super::{apply_wallet_delta_to_vec, notify_wallet_rev, spent_source_for_utxo};
+    use crate::types::{ChainKey, WalletConfig};
+    use alloy::primitives::{Address, FixedBytes, U256};
+    use broadcaster_core::crypto::railgun::ViewingKeyData;
     use broadcaster_core::notes::Note;
-    use railgun_wallet::{Utxo, UtxoSource};
+    use merkletree::wallet::{SpentNullifier, WalletLogDelta};
+    use railgun_wallet::{Utxo, UtxoSource, WalletUtxo};
     use std::collections::HashMap;
     use tokio::sync::watch;
 
@@ -263,6 +294,24 @@ mod tests {
         UtxoSource {
             tx_hash: FixedBytes::from([byte; 32]),
             block_number: u64::from(byte),
+        }
+    }
+
+    fn wallet_config(nullifying_key: U256) -> WalletConfig {
+        WalletConfig {
+            chain: ChainKey {
+                chain_id: 1,
+                contract: Address::ZERO,
+            },
+            cache_key: "test".to_string(),
+            start_block: Some(0),
+            scan_keys: ViewingKeyData {
+                viewing_private_key: [0u8; 32],
+                viewing_public_key: [0u8; 32],
+                nullifying_key,
+                master_public_key: U256::ZERO,
+            },
+            progress_tx: None,
         }
     }
 
@@ -310,5 +359,68 @@ mod tests {
             spent_source_for_utxo(&utxo_tree_two, nullifying_key, &nullifier_sources),
             Some(spent_source),
         );
+    }
+
+    #[test]
+    fn indexed_delta_marks_matching_utxo_spent() {
+        let nullifying_key = U256::from(42_u8);
+        let cfg = wallet_config(nullifying_key);
+        let utxo = Utxo {
+            note: Note {
+                token_hash: U256::from(1_u8),
+                value: U256::from(10_u8),
+                random: [0u8; 16],
+                npk: U256::from(2_u8),
+            },
+            tree: 2,
+            position: 7,
+            source: source(1),
+        };
+        let spent_source = source(9);
+        let nullifier = utxo.nullifier(nullifying_key);
+        let mut wallet_utxos = vec![WalletUtxo::new(utxo)];
+        let delta = WalletLogDelta {
+            utxos: Vec::new(),
+            nullifiers: vec![SpentNullifier {
+                tree: 2,
+                nullifier,
+                source: spent_source.clone(),
+            }],
+        };
+
+        apply_wallet_delta_to_vec(&cfg, &mut wallet_utxos, delta);
+
+        assert_eq!(wallet_utxos[0].spent, Some(spent_source));
+    }
+
+    #[test]
+    fn indexed_delta_preserves_unmatched_utxo() {
+        let nullifying_key = U256::from(42_u8);
+        let cfg = wallet_config(nullifying_key);
+        let utxo = Utxo {
+            note: Note {
+                token_hash: U256::from(1_u8),
+                value: U256::from(10_u8),
+                random: [0u8; 16],
+                npk: U256::from(2_u8),
+            },
+            tree: 2,
+            position: 7,
+            source: source(1),
+        };
+        let nullifier = utxo.nullifier(nullifying_key);
+        let mut wallet_utxos = vec![WalletUtxo::new(utxo)];
+        let delta = WalletLogDelta {
+            utxos: Vec::new(),
+            nullifiers: vec![SpentNullifier {
+                tree: 3,
+                nullifier,
+                source: source(9),
+            }],
+        };
+
+        apply_wallet_delta_to_vec(&cfg, &mut wallet_utxos, delta);
+
+        assert!(wallet_utxos[0].spent.is_none());
     }
 }

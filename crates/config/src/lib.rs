@@ -133,6 +133,7 @@ pub struct SyncChainConfig {
     pub anchor_retention: Option<usize>,
     pub poll_interval: Option<humantime_serde::Serde<Duration>>,
     pub block_range: Option<u64>,
+    pub indexed_wallet_block_range: Option<u64>,
 }
 
 #[derive(Deserialize, Clone)]

@@ -26,6 +26,19 @@ pub fn shared_symmetric_key(
     Ok(out)
 }
 
+pub fn shared_symmetric_key_legacy(
+    viewing_private_key: &[u8; 32],
+    blinded_public_key: &[u8; 32],
+) -> Result<[u8; 32], SharedKeyError> {
+    let comp = CompressedEdwardsY(*blinded_public_key);
+    let point = comp
+        .decompress()
+        .ok_or(SharedKeyError::InvalidEd25519Pubkey)?;
+
+    let scalar = ed25519_private_scalar(viewing_private_key);
+    Ok((point * scalar).compress().to_bytes())
+}
+
 pub(crate) fn ed25519_private_scalar_bytes(seed32: &[u8; 32]) -> [u8; 32] {
     let hash = Sha512::digest(seed32);
     clamp25519(hash[..32].try_into().expect("sha512 output is 512 bits"))

@@ -1,7 +1,8 @@
 use crate::types::{
-    BackfillEvent, BackfillRequest, ChainConfig, LogBatch, SharedLogBatch, WalletConfig,
+    BackfillEvent, BackfillRequest, ChainConfig, LogBatch, SharedLogBatch, SyncProgressSender,
+    SyncProgressStage, SyncProgressUpdate, WalletConfig,
 };
-use crate::wallet::{WalletHandle, spawn_wallet_worker};
+use crate::wallet::{WalletHandle, apply_wallet_delta_to_vec, spawn_wallet_worker};
 use alloy::eips::BlockNumberOrTag;
 use alloy::primitives::Address;
 use alloy::sol_types::SolEvent;
@@ -12,16 +13,27 @@ use async_trait::async_trait;
 use broadcaster_core::provider::build_provider;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use local_db::DbStore;
+use merkletree::errors::SyncError;
 use merkletree::persist::{
     PersistError, SNAPSHOT_VERSION, load_forest_snapshot, write_forest_snapshot,
 };
-use merkletree::quick::{DEFAULT_PAGE_SIZE, QuickSyncConfig, run_quick_sync};
+use merkletree::quick::{
+    DEFAULT_PAGE_SIZE, IndexedLegacyEncryptedCommitment, IndexedLegacyGeneratedCommitment,
+    IndexedNullifier, IndexedShieldCommitment, IndexedTransactCommitment, QuickSyncClient,
+    QuickSyncConfig, run_quick_sync_into_with_progress,
+};
 use merkletree::slow::types::{
     CommitmentBatch, GeneratedCommitmentBatch, Nullified, Nullifiers, Shield, ShieldLegacyPreMar23,
     Transact,
 };
 use merkletree::tree::MerkleForest;
-use merkletree::wallet::{WalletScanError, apply_commitment_updates_from_logs};
+use merkletree::wallet::{
+    IndexedLegacyEncryptedCommitmentInput, IndexedLegacyGeneratedCommitmentInput,
+    IndexedNullifierInput, IndexedShieldCommitmentInput, IndexedTransactCommitmentInput,
+    WalletScanError, apply_commitment_updates_from_logs, parse_indexed_wallet_delta,
+};
+use railgun_wallet::UtxoSource;
+use railgun_wallet::wallet_cache::WalletCacheDbExt;
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -31,6 +43,29 @@ use std::time::Duration;
 use tokio::sync::{RwLock, broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info, warn};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexedWalletPageKind {
+    Legacy,
+    Modern,
+}
+
+impl IndexedWalletPageKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Modern => "modern",
+        }
+    }
+}
+
+fn send_sync_progress(progress_tx: Option<&SyncProgressSender>, update: SyncProgressUpdate) {
+    if let Some(progress_tx) = progress_tx
+        && let Err(err) = progress_tx.send(Some(update))
+    {
+        debug!(?err, "failed to send sync progress update");
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ChainError {
@@ -116,16 +151,27 @@ impl ChainService {
             None => None,
         };
 
-        let (forest, last_processed, snapshot_path, last_anchor) =
-            db.load_or_initialize_forest(&chain).await?;
+        let rpcs = chain.rpcs.clone();
+        let rpc = rpcs
+            .random_provider()
+            .ok_or_else(|| ChainError::NoHealthyRpc)?;
+        let (initial_head, initial_safe_head) = fetch_initial_head(&chain, &rpc.provider).await;
 
-        let (head_tx, _head_rx) = watch::channel(0);
-        let (safe_head_tx, safe_head_rx) = watch::channel(0);
+        let (forest, last_processed, snapshot_path, last_anchor) = db
+            .load_or_initialize_forest(
+                &chain,
+                initial_safe_head,
+                Some(&rpc.provider),
+                archive_provider.as_ref(),
+            )
+            .await?;
+
+        let (head_tx, _head_rx) = watch::channel(initial_head);
+        let (safe_head_tx, safe_head_rx) = watch::channel(initial_safe_head);
         let (forest_last_tx, forest_last_rx) = watch::channel(last_processed);
         let (live_log_tx, _live_log_rx) = broadcast::channel(64);
         let (backfill_tx, backfill_rx) = mpsc::channel(128);
         let cancel = CancellationToken::new();
-        let rpcs = chain.rpcs.clone();
         let service = Arc::new(Self {
             chain,
             db,
@@ -139,34 +185,6 @@ impl ChainService {
             cancel: cancel.clone(),
             anchor_last: AtomicU64::new(last_anchor),
         });
-        let rpc = rpcs
-            .random_provider()
-            .ok_or_else(|| ChainError::NoHealthyRpc)?;
-        for attempt in 0..3u32 {
-            match rpc.provider.get_block_number().await {
-                Ok(head) => {
-                    let safe_head = head
-                        .saturating_sub(service.chain.finality_depth)
-                        .max(service.chain.deployment_block);
-                    if let Err(err) = service.head_tx.send(head) {
-                        debug!(?err, head, "failed to send head update");
-                    }
-                    if let Err(err) = service.safe_head_tx.send(safe_head) {
-                        debug!(?err, safe_head, "failed to send safe head update");
-                    }
-                    break;
-                }
-                Err(err) => {
-                    warn!(
-                        ?err,
-                        attempt, "failed to fetch initial block number, retrying..."
-                    );
-                    if attempt < 2 {
-                        tokio::time::sleep(Duration::from_millis(500 * 2u64.pow(attempt))).await;
-                    }
-                }
-            }
-        }
 
         spawn_head_poller(service.clone(), rpcs.clone());
         spawn_live_log_loop(
@@ -254,6 +272,16 @@ impl ChainService {
         let start_block = cfg.start_block.unwrap_or(self.chain.deployment_block);
         cfg.start_block = Some(start_block);
 
+        let mut last_scanned = start_block.saturating_sub(1);
+        if let Ok(Some(meta)) = self.db.get_wallet_meta(&cfg.cache_key) {
+            last_scanned = meta.last_scanned_block;
+        }
+
+        let safe_head = *self.safe_head_tx.borrow();
+        last_scanned = self
+            .indexed_wallet_catch_up(&cfg, start_block, last_scanned, safe_head)
+            .await;
+
         let cancel = self.cancel.child_token();
         let live_rx = self.live_log_tx.subscribe();
         let (backfill_sender, backfill_rx) = mpsc::channel(128);
@@ -264,13 +292,7 @@ impl ChainService {
             backfill_rx,
             cancel.clone(),
         );
-        let mut last_scanned = start_block.saturating_sub(1);
-        if let Ok(Some(meta)) = self.db.get_wallet_meta(&cfg.cache_key) {
-            last_scanned = meta.last_scanned_block;
-        }
-
-        let safe_head = *self.safe_head_tx.borrow();
-        let from_block = last_scanned.saturating_add(1).max(start_block);
+        let from_block = wallet_backfill_from_block(last_scanned, start_block);
 
         // When safe_head has not been set yet (still 0) we cannot tell
         // whether the wallet is caught up, so we always enqueue a backfill
@@ -339,6 +361,467 @@ impl ChainService {
     pub fn shutdown(&self) {
         self.cancel.cancel();
     }
+
+    async fn indexed_wallet_catch_up(
+        &self,
+        cfg: &WalletConfig,
+        start_block: u64,
+        last_scanned: u64,
+        safe_head: u64,
+    ) -> u64 {
+        if safe_head == 0 {
+            debug!(cache_key = %cfg.cache_key, "safe head unavailable; skipping indexed wallet catch-up");
+            return last_scanned;
+        }
+        let Some(endpoint) = self.chain.quick_sync_endpoint.clone() else {
+            debug!(cache_key = %cfg.cache_key, "no indexed endpoint configured; using RPC wallet backfill");
+            return last_scanned;
+        };
+        let client = match self.chain.http_client.clone() {
+            Some(http_client) => QuickSyncClient::with_http_client(endpoint, http_client),
+            None => QuickSyncClient::new(endpoint),
+        };
+        let probe = match client.probe_indexed_wallet_support().await {
+            Ok(probe) => probe,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    cache_key = %cfg.cache_key,
+                    "indexed wallet probe failed; using RPC backfill"
+                );
+                return last_scanned;
+            }
+        };
+        let target = probe.height.min(safe_head);
+        let mut from_block = last_scanned.saturating_add(1).max(start_block);
+        let progress_start = from_block;
+        let progress_tx = cfg
+            .progress_tx
+            .clone()
+            .or_else(|| self.chain.progress_tx.clone());
+        info!(
+            cache_key = %cfg.cache_key,
+            indexed_height = probe.height,
+            safe_head,
+            from_block,
+            target,
+            indexed_block_range = self.chain.indexed_wallet_block_range,
+            "indexed wallet catch-up target"
+        );
+        if from_block > target {
+            return last_scanned;
+        }
+        send_sync_progress(
+            progress_tx.as_ref(),
+            SyncProgressUpdate::new(
+                SyncProgressStage::IndexingUtxos,
+                progress_start,
+                progress_start,
+                target,
+            ),
+        );
+
+        let mut wallet_utxos = match self.db.load_wallet_utxos(&cfg.cache_key) {
+            Ok(wallet_utxos) => wallet_utxos,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    cache_key = %cfg.cache_key,
+                    "failed to load wallet cache for indexed catch-up; using RPC backfill"
+                );
+                return last_scanned;
+            }
+        };
+        let mut checkpoint = last_scanned;
+        while from_block <= target {
+            let page_kind = indexed_wallet_page_kind(from_block, self.chain.v2_start_block);
+            let to_block = indexed_wallet_to_block(
+                from_block,
+                target,
+                self.chain.v2_start_block,
+                self.chain.indexed_wallet_block_range,
+            );
+            let page =
+                match fetch_indexed_wallet_page(&client, page_kind, from_block, to_block).await {
+                    Ok(page) => page,
+                    Err(err) => {
+                        warn!(
+                            ?err,
+                            cache_key = %cfg.cache_key,
+                            fallback_from = checkpoint,
+                            "indexed wallet catch-up page failed; using RPC backfill"
+                        );
+                        return checkpoint;
+                    }
+                };
+            let delta = parse_indexed_wallet_delta(
+                &page.transact_commitments,
+                &page.shield_commitments,
+                &page.legacy_encrypted_commitments,
+                &page.legacy_generated_commitments,
+                &page.nullifiers,
+                &cfg.scan_keys,
+            );
+            apply_wallet_delta_to_vec(cfg, &mut wallet_utxos, delta);
+            if let Err(err) = self.db.store_wallet_utxos(
+                &cfg.cache_key,
+                &wallet_utxos,
+                Some(page.checkpoint_block),
+                None,
+            ) {
+                warn!(
+                    ?err,
+                    cache_key = %cfg.cache_key,
+                    fallback_from = checkpoint,
+                    "failed to persist indexed wallet checkpoint; using RPC backfill"
+                );
+                return checkpoint;
+            }
+            checkpoint = page.checkpoint_block;
+            info!(
+                cache_key = %cfg.cache_key,
+                page_kind = page_kind.as_str(),
+                from_block,
+                to_block,
+                checkpoint,
+                transact_rows = page.transact_rows,
+                shield_rows = page.shield_rows,
+                legacy_encrypted_rows = page.legacy_encrypted_rows,
+                legacy_generated_rows = page.legacy_generated_rows,
+                nullifier_rows = page.nullifier_rows,
+                "indexed wallet catch-up page complete"
+            );
+            from_block = checkpoint.saturating_add(1);
+            send_sync_progress(
+                progress_tx.as_ref(),
+                SyncProgressUpdate::new(
+                    SyncProgressStage::IndexingUtxos,
+                    progress_start,
+                    checkpoint,
+                    target,
+                ),
+            );
+        }
+        send_sync_progress(
+            progress_tx.as_ref(),
+            SyncProgressUpdate::new(
+                SyncProgressStage::IndexingUtxos,
+                progress_start,
+                target,
+                target,
+            ),
+        );
+        checkpoint
+    }
+}
+
+async fn fetch_initial_head(chain: &ChainConfig, provider: &DynProvider) -> (u64, u64) {
+    for attempt in 0..3u32 {
+        match provider.get_block_number().await {
+            Ok(head) => {
+                let safe_head = head
+                    .saturating_sub(chain.finality_depth)
+                    .max(chain.deployment_block);
+                return (head, safe_head);
+            }
+            Err(err) => {
+                warn!(
+                    ?err,
+                    attempt, "failed to fetch initial block number, retrying..."
+                );
+                if attempt < 2 {
+                    tokio::time::sleep(Duration::from_millis(500 * 2u64.pow(attempt))).await;
+                }
+            }
+        }
+    }
+    (0, 0)
+}
+
+struct IndexedWalletPage {
+    transact_commitments: Vec<IndexedTransactCommitmentInput>,
+    shield_commitments: Vec<IndexedShieldCommitmentInput>,
+    legacy_encrypted_commitments: Vec<IndexedLegacyEncryptedCommitmentInput>,
+    legacy_generated_commitments: Vec<IndexedLegacyGeneratedCommitmentInput>,
+    nullifiers: Vec<IndexedNullifierInput>,
+    checkpoint_block: u64,
+    transact_rows: usize,
+    shield_rows: usize,
+    legacy_encrypted_rows: usize,
+    legacy_generated_rows: usize,
+    nullifier_rows: usize,
+}
+
+async fn fetch_indexed_wallet_page(
+    client: &QuickSyncClient,
+    page_kind: IndexedWalletPageKind,
+    from_block: u64,
+    to_block: u64,
+) -> Result<IndexedWalletPage, SyncError> {
+    match page_kind {
+        IndexedWalletPageKind::Legacy => {
+            fetch_indexed_legacy_wallet_page(client, from_block, to_block).await
+        }
+        IndexedWalletPageKind::Modern => {
+            fetch_indexed_modern_wallet_page(client, from_block, to_block).await
+        }
+    }
+}
+
+async fn fetch_indexed_modern_wallet_page(
+    client: &QuickSyncClient,
+    from_block: u64,
+    to_block: u64,
+) -> Result<IndexedWalletPage, SyncError> {
+    let page = client
+        .fetch_indexed_wallet_page(from_block, to_block, DEFAULT_PAGE_SIZE)
+        .await?;
+    let transact = page.transact_commitments;
+    let shields = page.shield_commitments;
+    let nullifiers = page.nullifiers;
+    let page_size = DEFAULT_PAGE_SIZE.get();
+    let transact_checkpoint = complete_stream_checkpoint(
+        transact.len(),
+        page_size,
+        to_block,
+        transact.iter().map(|item| item.block_number.to()),
+    );
+    let shield_checkpoint = complete_stream_checkpoint(
+        shields.len(),
+        page_size,
+        to_block,
+        shields.iter().map(|item| item.block_number.to()),
+    );
+    let nullifier_checkpoint = complete_stream_checkpoint(
+        nullifiers.len(),
+        page_size,
+        to_block,
+        nullifiers.iter().map(|item| item.block_number.to()),
+    );
+    let checkpoint_block = transact_checkpoint
+        .min(shield_checkpoint)
+        .min(nullifier_checkpoint);
+    if checkpoint_block < from_block {
+        return Err(SyncError::UnexpectedFormat(format!(
+            "indexed wallet page is incomplete at block {from_block}; reduce page range or increase page size"
+        )));
+    }
+
+    let transact_rows = transact.len();
+    let shield_rows = shields.len();
+    let nullifier_rows = nullifiers.len();
+    let transact_commitments = transact
+        .into_iter()
+        .filter(|item| item.block_number.to::<u64>() <= checkpoint_block)
+        .map(indexed_transact_input)
+        .collect();
+    let shield_commitments = shields
+        .into_iter()
+        .filter(|item| item.block_number.to::<u64>() <= checkpoint_block)
+        .map(indexed_shield_input)
+        .collect();
+    let nullifiers = nullifiers
+        .into_iter()
+        .filter(|item| item.block_number.to::<u64>() <= checkpoint_block)
+        .map(indexed_nullifier_input)
+        .collect();
+
+    Ok(IndexedWalletPage {
+        transact_commitments,
+        shield_commitments,
+        legacy_encrypted_commitments: Vec::new(),
+        legacy_generated_commitments: Vec::new(),
+        nullifiers,
+        checkpoint_block,
+        transact_rows,
+        shield_rows,
+        legacy_encrypted_rows: 0,
+        legacy_generated_rows: 0,
+        nullifier_rows,
+    })
+}
+
+async fn fetch_indexed_legacy_wallet_page(
+    client: &QuickSyncClient,
+    from_block: u64,
+    to_block: u64,
+) -> Result<IndexedWalletPage, SyncError> {
+    let page = client
+        .fetch_indexed_legacy_wallet_page(from_block, to_block, DEFAULT_PAGE_SIZE)
+        .await?;
+    let legacy_encrypted = page.legacy_encrypted_commitments;
+    let legacy_generated = page.legacy_generated_commitments;
+    let nullifiers = page.nullifiers;
+    let page_size = DEFAULT_PAGE_SIZE.get();
+    let encrypted_checkpoint = complete_stream_checkpoint(
+        legacy_encrypted.len(),
+        page_size,
+        to_block,
+        legacy_encrypted.iter().map(|item| item.block_number.to()),
+    );
+    let generated_checkpoint = complete_stream_checkpoint(
+        legacy_generated.len(),
+        page_size,
+        to_block,
+        legacy_generated.iter().map(|item| item.block_number.to()),
+    );
+    let nullifier_checkpoint = complete_stream_checkpoint(
+        nullifiers.len(),
+        page_size,
+        to_block,
+        nullifiers.iter().map(|item| item.block_number.to()),
+    );
+    let checkpoint_block = encrypted_checkpoint
+        .min(generated_checkpoint)
+        .min(nullifier_checkpoint);
+    if checkpoint_block < from_block {
+        return Err(SyncError::UnexpectedFormat(format!(
+            "indexed legacy wallet page is incomplete at block {from_block}; reduce page range or increase page size"
+        )));
+    }
+
+    let legacy_encrypted_rows = legacy_encrypted.len();
+    let legacy_generated_rows = legacy_generated.len();
+    let nullifier_rows = nullifiers.len();
+    let legacy_encrypted_commitments = legacy_encrypted
+        .into_iter()
+        .filter(|item| item.block_number.to::<u64>() <= checkpoint_block)
+        .map(indexed_legacy_encrypted_input)
+        .collect();
+    let legacy_generated_commitments = legacy_generated
+        .into_iter()
+        .filter(|item| item.block_number.to::<u64>() <= checkpoint_block)
+        .map(indexed_legacy_generated_input)
+        .collect();
+    let nullifiers = nullifiers
+        .into_iter()
+        .filter(|item| item.block_number.to::<u64>() <= checkpoint_block)
+        .map(indexed_nullifier_input)
+        .collect();
+
+    Ok(IndexedWalletPage {
+        transact_commitments: Vec::new(),
+        shield_commitments: Vec::new(),
+        legacy_encrypted_commitments,
+        legacy_generated_commitments,
+        nullifiers,
+        checkpoint_block,
+        transact_rows: 0,
+        shield_rows: 0,
+        legacy_encrypted_rows,
+        legacy_generated_rows,
+        nullifier_rows,
+    })
+}
+
+fn complete_stream_checkpoint<I>(
+    row_count: usize,
+    page_size: usize,
+    target_block: u64,
+    block_numbers: I,
+) -> u64
+where
+    I: Iterator<Item = u64>,
+{
+    if row_count < page_size {
+        return target_block;
+    }
+    block_numbers
+        .max()
+        .unwrap_or(target_block)
+        .saturating_sub(1)
+}
+
+fn indexed_source(tx_hash: alloy::primitives::FixedBytes<32>, block_number: u64) -> UtxoSource {
+    UtxoSource {
+        tx_hash,
+        block_number,
+    }
+}
+
+fn indexed_transact_input(item: IndexedTransactCommitment) -> IndexedTransactCommitmentInput {
+    IndexedTransactCommitmentInput {
+        tree_number: item.tree_number.to(),
+        tree_position: item.tree_position.to(),
+        hash: item.hash,
+        ciphertext: item.ciphertext.ciphertext,
+        blinded_sender_viewing_key: item.ciphertext.blinded_sender_viewing_key,
+        memo: item.ciphertext.memo,
+        source: indexed_source(item.transaction_hash, item.block_number.to()),
+    }
+}
+
+fn indexed_shield_input(item: IndexedShieldCommitment) -> IndexedShieldCommitmentInput {
+    IndexedShieldCommitmentInput {
+        tree_number: item.tree_number.to(),
+        tree_position: item.tree_position.to(),
+        preimage: item.preimage(),
+        shield_ciphertext: item.shield_ciphertext(),
+        source: indexed_source(item.transaction_hash, item.block_number.to()),
+    }
+}
+
+fn indexed_nullifier_input(item: IndexedNullifier) -> IndexedNullifierInput {
+    IndexedNullifierInput {
+        tree_number: item.tree_number.to(),
+        nullifier: item.nullifier,
+        source: indexed_source(item.transaction_hash, item.block_number.to()),
+    }
+}
+
+fn indexed_legacy_encrypted_input(
+    item: IndexedLegacyEncryptedCommitment,
+) -> IndexedLegacyEncryptedCommitmentInput {
+    IndexedLegacyEncryptedCommitmentInput {
+        tree_number: item.tree_number.to(),
+        tree_position: item.tree_position.to(),
+        hash: item.hash,
+        ciphertext: item.ciphertext.ciphertext,
+        ephemeral_keys: item.ciphertext.ephemeral_keys,
+        memo: item.ciphertext.memo,
+        source: indexed_source(item.transaction_hash, item.block_number.to()),
+    }
+}
+
+fn indexed_legacy_generated_input(
+    item: IndexedLegacyGeneratedCommitment,
+) -> IndexedLegacyGeneratedCommitmentInput {
+    IndexedLegacyGeneratedCommitmentInput {
+        tree_number: item.tree_number.to(),
+        tree_position: item.tree_position.to(),
+        preimage: item.preimage.into(),
+        encrypted_random: item.encrypted_random,
+        source: indexed_source(item.transaction_hash, item.block_number.to()),
+    }
+}
+
+fn indexed_wallet_page_kind(from_block: u64, v2_start_block: u64) -> IndexedWalletPageKind {
+    if v2_start_block > 0 && from_block < v2_start_block {
+        IndexedWalletPageKind::Legacy
+    } else {
+        IndexedWalletPageKind::Modern
+    }
+}
+
+fn indexed_wallet_to_block(
+    from_block: u64,
+    target: u64,
+    v2_start_block: u64,
+    indexed_wallet_block_range: u64,
+) -> u64 {
+    let range_end = min(
+        from_block.saturating_add(indexed_wallet_block_range.saturating_sub(1)),
+        target,
+    );
+    if v2_start_block > 0 && from_block < v2_start_block {
+        range_end.min(v2_start_block.saturating_sub(1))
+    } else {
+        range_end
+    }
+}
+
+fn wallet_backfill_from_block(last_scanned: u64, start_block: u64) -> u64 {
+    last_scanned.saturating_add(1).max(start_block)
 }
 
 #[async_trait]
@@ -346,6 +829,9 @@ pub trait MerkleForestDbExt {
     async fn load_or_initialize_forest(
         &self,
         chain: &ChainConfig,
+        safe_head: u64,
+        provider: Option<&DynProvider>,
+        archive_provider: Option<&DynProvider>,
     ) -> Result<(Arc<RwLock<MerkleForest>>, u64, PathBuf, u64), ChainError>;
     fn anchor_dir(&self) -> PathBuf;
     fn find_latest_anchor(&self, chain: &ChainConfig)
@@ -357,6 +843,9 @@ impl MerkleForestDbExt for DbStore {
     async fn load_or_initialize_forest(
         &self,
         chain: &ChainConfig,
+        safe_head: u64,
+        provider: Option<&DynProvider>,
+        archive_provider: Option<&DynProvider>,
     ) -> Result<(Arc<RwLock<MerkleForest>>, u64, PathBuf, u64), ChainError> {
         let mut forest = MerkleForest::new();
         let mut last_processed = chain.deployment_block.saturating_sub(1);
@@ -383,28 +872,6 @@ impl MerkleForestDbExt for DbStore {
             }
         }
 
-        if last_processed < chain.deployment_block
-            && let Some(endpoint) = chain.quick_sync_endpoint.clone()
-        {
-            let config = QuickSyncConfig {
-                endpoint,
-                start_block: chain.deployment_block,
-                end_block: None,
-                page_size: DEFAULT_PAGE_SIZE,
-                http_client: chain.http_client.clone(),
-            };
-            match run_quick_sync(config).await {
-                Ok(result) => {
-                    forest = result.forest;
-                    last_processed = result.progress.latest_commitment_block;
-                    forest.compute_roots();
-                }
-                Err(err) => {
-                    warn!(?err, "quick sync failed");
-                }
-            }
-        }
-
         if let Ok(Some((anchor_path, anchor_block))) = self.find_latest_anchor(chain) {
             last_anchor = anchor_block;
             if last_processed < anchor_block {
@@ -418,6 +885,135 @@ impl MerkleForestDbExt for DbStore {
                     Err(err) => {
                         warn!(?err, path = %anchor_path.display(), "failed to load anchor snapshot");
                     }
+                }
+            }
+        }
+
+        if let Some(endpoint) = chain.quick_sync_endpoint.clone() {
+            let client = match chain.http_client.clone() {
+                Some(http_client) => {
+                    QuickSyncClient::with_http_client(endpoint.clone(), http_client)
+                }
+                None => QuickSyncClient::new(endpoint.clone()),
+            };
+            match client.fetch_squid_height().await {
+                Ok(indexed_height) => {
+                    let target = indexed_height.min(safe_head);
+                    info!(
+                        chain_id = chain.chain_id,
+                        indexed_height,
+                        safe_head,
+                        current_block = last_processed,
+                        target,
+                        "indexed forest catch-up target"
+                    );
+                    if target > last_processed {
+                        let start_block =
+                            last_processed.saturating_add(1).max(chain.deployment_block);
+                        if start_block <= target {
+                            let mut candidate = forest.clone();
+                            let config = QuickSyncConfig {
+                                endpoint,
+                                start_block,
+                                end_block: Some(target),
+                                page_size: DEFAULT_PAGE_SIZE,
+                                http_client: chain.http_client.clone(),
+                            };
+                            let progress_tx = chain.progress_tx.clone();
+                            send_sync_progress(
+                                progress_tx.as_ref(),
+                                SyncProgressUpdate::new(
+                                    SyncProgressStage::SynchronizingCommitments,
+                                    start_block,
+                                    start_block,
+                                    target,
+                                ),
+                            );
+                            match run_quick_sync_into_with_progress(
+                                &mut candidate,
+                                config,
+                                |progress| {
+                                    send_sync_progress(
+                                        progress_tx.as_ref(),
+                                        SyncProgressUpdate::new(
+                                            SyncProgressStage::SynchronizingCommitments,
+                                            progress.start_block,
+                                            progress.latest_block,
+                                            target,
+                                        ),
+                                    );
+                                },
+                            )
+                            .await
+                            {
+                                Ok(progress) => {
+                                    let block_hash = match provider {
+                                        Some(provider) => chain
+                                            .fetch_block_hash(provider, archive_provider, target)
+                                            .await
+                                            .unwrap_or_else(|err| {
+                                                warn!(
+                                                    ?err,
+                                                    target,
+                                                    "failed to fetch indexed forest target block hash"
+                                                );
+                                                None
+                                            }),
+                                        None => None,
+                                    };
+                                    match persist_indexed_forest_snapshot(
+                                        self,
+                                        chain,
+                                        &snapshot_path,
+                                        target,
+                                        block_hash,
+                                        &candidate,
+                                    ) {
+                                        Ok(()) => {
+                                            forest = candidate;
+                                            last_processed = target;
+                                            send_sync_progress(
+                                                progress_tx.as_ref(),
+                                                SyncProgressUpdate::new(
+                                                    SyncProgressStage::SynchronizingCommitments,
+                                                    start_block,
+                                                    target,
+                                                    target,
+                                                ),
+                                            );
+                                            info!(
+                                                chain_id = chain.chain_id,
+                                                from_block = start_block,
+                                                target,
+                                                commitments = progress.commitments,
+                                                "indexed forest catch-up complete"
+                                            );
+                                        }
+                                        Err(err) => {
+                                            warn!(
+                                                ?err,
+                                                fallback_from = last_processed,
+                                                "indexed forest catch-up persistence failed; falling back to RPC"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    warn!(
+                                        ?err,
+                                        fallback_from = last_processed,
+                                        "indexed forest catch-up failed; falling back to RPC"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        "indexed forest status query failed; falling back to RPC"
+                    );
                 }
             }
         }
@@ -459,6 +1055,32 @@ impl MerkleForestDbExt for DbStore {
         }
         Ok(latest)
     }
+}
+
+fn persist_indexed_forest_snapshot(
+    db: &DbStore,
+    chain: &ChainConfig,
+    snapshot_path: &Path,
+    last_block: u64,
+    block_hash: Option<[u8; 32]>,
+    forest: &MerkleForest,
+) -> Result<(), ChainError> {
+    write_forest_snapshot(
+        snapshot_path,
+        chain.chain_id,
+        chain.contract,
+        last_block,
+        forest,
+    )?;
+    db.update_merkle_forest_meta(
+        chain.chain_id,
+        &chain.contract.to_string(),
+        snapshot_path,
+        last_block,
+        SNAPSHOT_VERSION,
+        block_hash.unwrap_or([0u8; 32]),
+    )?;
+    Ok(())
 }
 
 fn spawn_head_poller(service: Arc<ChainService>, rpcs: Arc<QueryRpcPool>) {
@@ -1195,4 +1817,67 @@ fn parse_anchor_block(chain_id: u64, contract: Address, name: &str) -> Option<u6
     let start = prefix.len();
     let end = name.len().saturating_sub(suffix.len());
     name.get(start..end)?.parse::<u64>().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        IndexedWalletPageKind, complete_stream_checkpoint, indexed_wallet_page_kind,
+        indexed_wallet_to_block, wallet_backfill_from_block,
+    };
+
+    #[test]
+    fn complete_stream_checkpoint_uses_target_for_non_full_pages() {
+        let checkpoint = complete_stream_checkpoint(2, 10, 100, [20_u64, 40].into_iter());
+
+        assert_eq!(checkpoint, 100);
+    }
+
+    #[test]
+    fn complete_stream_checkpoint_stops_before_partial_final_block() {
+        let checkpoint = complete_stream_checkpoint(3, 3, 100, [20_u64, 25, 25].into_iter());
+
+        assert_eq!(checkpoint, 24);
+    }
+
+    #[test]
+    fn wallet_backfill_starts_after_indexed_checkpoint() {
+        assert_eq!(wallet_backfill_from_block(99, 10), 100);
+        assert_eq!(wallet_backfill_from_block(0, 10), 10);
+    }
+
+    #[test]
+    fn indexed_wallet_page_kind_is_legacy_only_before_v2_start() {
+        assert_eq!(
+            indexed_wallet_page_kind(99, 100),
+            IndexedWalletPageKind::Legacy
+        );
+        assert_eq!(
+            indexed_wallet_page_kind(100, 100),
+            IndexedWalletPageKind::Modern
+        );
+        assert_eq!(
+            indexed_wallet_page_kind(99, 0),
+            IndexedWalletPageKind::Modern
+        );
+    }
+
+    #[test]
+    fn indexed_wallet_to_block_splits_at_v2_start() {
+        assert_eq!(indexed_wallet_to_block(50, 200_000, 100, 300_000), 99);
+        assert_eq!(indexed_wallet_to_block(100, 200_000, 100, 300_000), 200_000);
+        assert_eq!(indexed_wallet_to_block(50, 60, 100, 300_000), 60);
+    }
+
+    #[test]
+    fn indexed_wallet_to_block_uses_configured_range() {
+        assert_eq!(
+            indexed_wallet_to_block(100, 10_000_000, 0, 1_000_000),
+            1_000_099
+        );
+        assert_eq!(
+            indexed_wallet_to_block(100, 10_000_000, 0, 5_000_000),
+            5_000_099
+        );
+    }
 }

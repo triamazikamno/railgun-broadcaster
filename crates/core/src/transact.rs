@@ -75,7 +75,7 @@ pub struct BroadcasterRawParamsTransact {
     #[serde(rename = "chainID")]
     pub chain_id: u64,
 
-    pub min_gas_price: U256,
+    pub min_gas_price: Option<U256>,
 
     #[serde(rename = "feesID")]
     pub fees_id: Option<String>,
@@ -531,7 +531,7 @@ mod tests {
         let params = BroadcasterRawParamsTransact {
             chain_type: 0,
             chain_id: 1,
-            min_gas_price: U256::ZERO,
+            min_gas_price: None,
             fees_id: None,
             to: Address::ZERO,
             data: transactCall {

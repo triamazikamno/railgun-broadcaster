@@ -5,8 +5,70 @@ use alloy::primitives::{Address, address};
 use alloy_rpc_types_eth::Log;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use merkletree::wallet::WalletScanKeys;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use url::Url;
+
+pub const DEFAULT_INDEXED_WALLET_BLOCK_RANGE: u64 = 100_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncProgressStage {
+    SynchronizingCommitments,
+    IndexingUtxos,
+}
+
+impl SyncProgressStage {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::SynchronizingCommitments => "Synchronizing commitments",
+            Self::IndexingUtxos => "Indexing UTXOs",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncProgressUpdate {
+    pub stage: SyncProgressStage,
+    pub start_block: u64,
+    pub current_block: u64,
+    pub target_block: u64,
+}
+
+impl SyncProgressUpdate {
+    #[must_use]
+    pub const fn new(
+        stage: SyncProgressStage,
+        start_block: u64,
+        current_block: u64,
+        target_block: u64,
+    ) -> Self {
+        Self {
+            stage,
+            start_block,
+            current_block,
+            target_block,
+        }
+    }
+
+    #[must_use]
+    pub const fn percent(self) -> u8 {
+        if self.target_block <= self.start_block {
+            return 100;
+        }
+        let current_block = if self.current_block < self.start_block {
+            self.start_block
+        } else if self.current_block > self.target_block {
+            self.target_block
+        } else {
+            self.current_block
+        };
+        let completed = current_block - self.start_block;
+        let total = self.target_block - self.start_block;
+        ((completed.saturating_mul(100)) / total) as u8
+    }
+}
+
+pub type SyncProgressSender = watch::Sender<Option<SyncProgressUpdate>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChainKey {
@@ -25,6 +87,7 @@ pub struct ChainConfig {
     pub v2_start_block: u64,
     pub legacy_shield_block: u64,
     pub block_range: u64,
+    pub indexed_wallet_block_range: u64,
     pub poll_interval: Duration,
     pub finality_depth: u64,
     pub quick_sync_endpoint: Option<Url>,
@@ -33,6 +96,7 @@ pub struct ChainConfig {
     /// Optional pre-configured HTTP client (e.g. with proxy support) for
     /// quick-sync and other internal HTTP requests.
     pub http_client: Option<reqwest::Client>,
+    pub progress_tx: Option<SyncProgressSender>,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +107,7 @@ pub struct ChainConfigDefaults {
     pub relay_adapt_7702_contract: Address,
     pub rpc_url: Url,
     pub quick_sync_endpoint: Option<Url>,
+    pub indexed_wallet_block_range: u64,
     pub deployment_block: u64,
     pub v2_start_block: u64,
     pub legacy_shield_block: u64,
@@ -66,6 +131,7 @@ impl ChainConfigDefaults {
                     Url::parse("https://rail-squid.squids.live/squid-railgun-ethereum-v2/graphql")
                         .expect("valid ethereum quick sync endpoint"),
                 ),
+                indexed_wallet_block_range: 300_000,
                 deployment_block: 14_737_691,
                 v2_start_block: 16_076_750,
                 legacy_shield_block: 16_790_263,
@@ -84,6 +150,7 @@ impl ChainConfigDefaults {
                     Url::parse("https://rail-squid.squids.live/squid-railgun-bsc-v2/graphql")
                         .expect("valid bsc quick sync endpoint"),
                 ),
+                indexed_wallet_block_range: 1_000_000,
                 deployment_block: 17_633_701,
                 v2_start_block: 23_478_204,
                 legacy_shield_block: 26_313_947,
@@ -103,6 +170,7 @@ impl ChainConfigDefaults {
                     Url::parse("https://rail-squid.squids.live/squid-railgun-polygon-v2/graphql")
                         .expect("valid polygon quick sync endpoint"),
                 ),
+                indexed_wallet_block_range: 1_000_000,
                 deployment_block: 28_083_766,
                 v2_start_block: 36_219_104,
                 legacy_shield_block: 40_143_539,
@@ -116,12 +184,13 @@ impl ChainConfigDefaults {
                 contract: address!("0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"),
                 relay_adapt_contract: address!("0xB4F2d77bD12c6b548Ae398244d7FAD4ABCE4D89b"),
                 relay_adapt_7702_contract: address!("0x6fa84bc1587cc90978dc9535d4d38dc74fa4b522"),
-                rpc_url: Url::parse("https://rpc.ankr.com/arbitrum")
+                rpc_url: Url::parse("https://arbitrum-one-public.nodies.app")
                     .expect("valid arbitrum rpc url"),
                 quick_sync_endpoint: Some(
                     Url::parse("https://rail-squid.squids.live/squid-railgun-arbitrum-v2/graphql")
                         .expect("valid arbitrum quick sync endpoint"),
                 ),
+                indexed_wallet_block_range: 5_000_000,
                 deployment_block: 56_109_834,
                 v2_start_block: 0,
                 legacy_shield_block: 68_196_853,
@@ -141,6 +210,57 @@ pub struct WalletConfig {
     pub cache_key: String,
     pub start_block: Option<u64>,
     pub scan_keys: WalletScanKeys,
+    pub progress_tx: Option<SyncProgressSender>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ChainConfigDefaults, SyncProgressStage, SyncProgressUpdate};
+
+    #[test]
+    fn default_indexed_wallet_ranges_are_chain_specific() {
+        assert_eq!(
+            ChainConfigDefaults::for_chain(1)
+                .unwrap()
+                .indexed_wallet_block_range,
+            300_000
+        );
+        assert_eq!(
+            ChainConfigDefaults::for_chain(56)
+                .unwrap()
+                .indexed_wallet_block_range,
+            1_000_000
+        );
+        assert_eq!(
+            ChainConfigDefaults::for_chain(137)
+                .unwrap()
+                .indexed_wallet_block_range,
+            1_000_000
+        );
+        assert_eq!(
+            ChainConfigDefaults::for_chain(42161)
+                .unwrap()
+                .indexed_wallet_block_range,
+            5_000_000
+        );
+    }
+
+    #[test]
+    fn sync_progress_percent_uses_block_distance() {
+        let progress =
+            SyncProgressUpdate::new(SyncProgressStage::SynchronizingCommitments, 100, 150, 300);
+
+        assert_eq!(progress.percent(), 25);
+    }
+
+    #[test]
+    fn sync_progress_percent_is_clamped() {
+        let early = SyncProgressUpdate::new(SyncProgressStage::IndexingUtxos, 100, 99, 300);
+        let late = SyncProgressUpdate::new(SyncProgressStage::IndexingUtxos, 100, 400, 300);
+
+        assert_eq!(early.percent(), 0);
+        assert_eq!(late.percent(), 100);
+    }
 }
 
 #[derive(Debug, Clone)]

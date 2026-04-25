@@ -128,3 +128,19 @@ pub fn decrypt_shield_random(
     random.copy_from_slice(&pt[..16]);
     Ok(random)
 }
+
+pub fn decrypt_legacy_random(
+    iv_tag: FixedBytes<32>,
+    data: FixedBytes<16>,
+    viewing_private_key: &[u8; 32],
+) -> Result<[u8; 16], NoteError> {
+    let (iv, tag) = split_iv_tag(iv_tag.0);
+    let mut pt = data.0.to_vec();
+    decrypt_in_place_16b_iv(viewing_private_key, &iv, &tag, &mut pt)?;
+    if pt.len() < 16 {
+        return Err(NoteError::CiphertextTooShort);
+    }
+    let mut random = [0u8; 16];
+    random.copy_from_slice(&pt[..16]);
+    Ok(random)
+}

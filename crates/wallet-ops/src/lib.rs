@@ -25,8 +25,10 @@ use railgun_wallet::{ProverService, TransactionBuilder, Utxo, UtxoSource, Wallet
 use reqwest::Url;
 use serde::Serialize;
 use sync_service::{
-    ChainConfig, ChainConfigDefaults, ChainKey, SyncManager, WalletConfig, WalletHandle,
+    ChainConfig, ChainConfigDefaults, ChainKey, SyncManager, SyncProgressSender, WalletConfig,
+    WalletHandle,
 };
+pub use sync_service::{SyncProgressStage, SyncProgressUpdate};
 use tokio::sync::watch;
 
 const DEFAULT_QUERY_RPC_COOLDOWN: Duration = Duration::from_secs(5);
@@ -78,6 +80,14 @@ pub struct WalletSessionRequest {
     pub chain_id: u64,
     pub db_path: PathBuf,
     pub init_block_number: Option<u64>,
+    pub progress_tx: Option<SyncProgressSender>,
+}
+
+pub struct WalletChainSessionRequest {
+    pub mnemonic: String,
+    pub chain_id: u64,
+    pub init_block_number: Option<u64>,
+    pub progress_tx: Option<SyncProgressSender>,
 }
 
 impl From<ListUtxosRequest> for WalletSessionRequest {
@@ -87,6 +97,18 @@ impl From<ListUtxosRequest> for WalletSessionRequest {
             chain_id: value.chain_id,
             db_path: value.db_path,
             init_block_number: value.init_block_number,
+            progress_tx: None,
+        }
+    }
+}
+
+impl From<WalletSessionRequest> for WalletChainSessionRequest {
+    fn from(value: WalletSessionRequest) -> Self {
+        Self {
+            mnemonic: value.mnemonic,
+            chain_id: value.chain_id,
+            init_block_number: value.init_block_number,
+            progress_tx: value.progress_tx,
         }
     }
 }
@@ -215,6 +237,43 @@ pub struct WalletSession {
     _handle: WalletHandle,
 }
 
+pub struct WalletSessionStore {
+    db: Arc<DbStore>,
+    sync_manager: Arc<SyncManager>,
+}
+
+impl WalletSessionStore {
+    pub fn open(db_path: PathBuf) -> Result<Self> {
+        let db = Arc::new(DbStore::open(DbConfig { root_dir: db_path }).wrap_err("open local db")?);
+        let sync_manager = Arc::new(SyncManager::new(Arc::clone(&db)));
+
+        Ok(Self { db, sync_manager })
+    }
+
+    pub async fn start_wallet_session(
+        &self,
+        request: WalletChainSessionRequest,
+        rpc_url_override: Option<Url>,
+        http: &HttpContext,
+    ) -> Result<WalletSession> {
+        let chain_id = request.chain_id;
+        let synced = setup_synced_wallet_with_store(
+            &request.mnemonic,
+            chain_id,
+            request.init_block_number,
+            rpc_url_override,
+            http,
+            UnsupportedChainMessage::WalletCliV1,
+            request.progress_tx.clone(),
+            Arc::clone(&self.db),
+            Arc::clone(&self.sync_manager),
+        )
+        .await?;
+
+        wallet_session_from_synced(chain_id, synced).await
+    }
+}
+
 pub async fn list_utxos(
     request: ListUtxosRequest,
     rpc_url_override: Option<Url>,
@@ -229,18 +288,16 @@ pub async fn start_wallet_session(
     rpc_url_override: Option<Url>,
     http: &HttpContext,
 ) -> Result<WalletSession> {
-    let chain_id = request.chain_id;
-    let synced = setup_synced_wallet(
-        &request.mnemonic,
-        chain_id,
-        request.db_path,
-        request.init_block_number,
-        rpc_url_override,
-        http,
-        UnsupportedChainMessage::WalletCliV1,
-    )
-    .await?;
+    let db_path = request.db_path.clone();
+    let request = WalletChainSessionRequest::from(request);
+    let store = WalletSessionStore::open(db_path)?;
 
+    store
+        .start_wallet_session(request, rpc_url_override, http)
+        .await
+}
+
+async fn wallet_session_from_synced(chain_id: u64, synced: SyncedWallet) -> Result<WalletSession> {
     let initial_snapshot = Arc::new(snapshot_from_handle(chain_id, &synced.handle).await);
     let (snapshots_tx, snapshots_rx) = watch::channel(initial_snapshot);
     let handle = synced.handle.clone();
@@ -596,16 +653,41 @@ async fn setup_synced_wallet(
     http: &HttpContext,
     unsupported_chain_message: UnsupportedChainMessage,
 ) -> Result<SyncedWallet> {
+    let store = WalletSessionStore::open(db_path)?;
+
+    setup_synced_wallet_with_store(
+        mnemonic,
+        chain_id,
+        init_block_number,
+        rpc_url_override,
+        http,
+        unsupported_chain_message,
+        None,
+        store.db,
+        store.sync_manager,
+    )
+    .await
+}
+
+async fn setup_synced_wallet_with_store(
+    mnemonic: &str,
+    chain_id: u64,
+    init_block_number: Option<u64>,
+    rpc_url_override: Option<Url>,
+    http: &HttpContext,
+    unsupported_chain_message: UnsupportedChainMessage,
+    progress_tx: Option<SyncProgressSender>,
+    db: Arc<DbStore>,
+    sync_manager: Arc<SyncManager>,
+) -> Result<SyncedWallet> {
     let chain_defaults = chain_defaults_for_chain(chain_id, unsupported_chain_message)?;
     let rpc_url = rpc_url_override.unwrap_or_else(|| chain_defaults.rpc_url.clone());
-    let db = Arc::new(DbStore::open(DbConfig { root_dir: db_path }).wrap_err("open local db")?);
-    let sync_manager = Arc::new(SyncManager::new(Arc::clone(&db)));
     let chain_key = ChainKey {
         chain_id: chain_defaults.chain_id,
         contract: chain_defaults.contract,
     };
 
-    let chain_cfg = chain_config(&chain_defaults, rpc_url.clone(), http);
+    let chain_cfg = chain_config(&chain_defaults, rpc_url.clone(), http, progress_tx.clone());
     sync_manager
         .add_chain(chain_cfg)
         .await
@@ -623,6 +705,7 @@ async fn setup_synced_wallet(
         cache_key,
         start_block: Some(start_block),
         scan_keys,
+        progress_tx,
     };
 
     let mut handle = sync_manager
@@ -660,7 +743,12 @@ fn chain_defaults_for_chain(
     })
 }
 
-fn chain_config(defaults: &ChainConfigDefaults, rpc_url: Url, http: &HttpContext) -> ChainConfig {
+fn chain_config(
+    defaults: &ChainConfigDefaults,
+    rpc_url: Url,
+    http: &HttpContext,
+    progress_tx: Option<SyncProgressSender>,
+) -> ChainConfig {
     let query_rpc_pool = Arc::new(QueryRpcPool::with_http_client(
         vec![rpc_url],
         DEFAULT_QUERY_RPC_COOLDOWN,
@@ -677,12 +765,14 @@ fn chain_config(defaults: &ChainConfigDefaults, rpc_url: Url, http: &HttpContext
         v2_start_block: defaults.v2_start_block,
         legacy_shield_block: defaults.legacy_shield_block,
         block_range: DEFAULT_BLOCK_RANGE,
+        indexed_wallet_block_range: defaults.indexed_wallet_block_range,
         poll_interval: DEFAULT_POLL_INTERVAL,
         finality_depth: defaults.finality_depth,
         quick_sync_endpoint: defaults.quick_sync_endpoint.clone(),
         anchor_interval: defaults.anchor_interval,
         anchor_retention: defaults.anchor_retention,
         http_client: Some(http.client.clone()),
+        progress_tx,
     }
 }
 

@@ -19,7 +19,7 @@ use ui::logs::{DEFAULT_LOG_CAPACITY, LogStore, UiLogLayer};
 use wallet_ops::build_http_client;
 
 use crate::cli::Options;
-use crate::root::{WalletAppOptions, open_wallet_window};
+use crate::root::{WalletAppOptions, install_utxo_navigation_bindings, open_wallet_window};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, gpui::Action)]
 #[action(no_json)]
@@ -72,6 +72,7 @@ fn main() -> Result<()> {
     application.run(move |app: &mut App| {
         gpui_component::init(app);
         install_quit_behavior(app);
+        install_utxo_navigation_bindings(app);
         open_wallet_window(
             app,
             wallet_options.clone(),

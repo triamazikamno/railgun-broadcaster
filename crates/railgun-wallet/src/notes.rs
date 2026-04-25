@@ -3,7 +3,9 @@ use alloy::primitives::{Bytes, FixedBytes, U256};
 use broadcaster_core::contracts::railgun::CommitmentCiphertext;
 use broadcaster_core::crypto::aes_gcm::{AesGcmError, encrypt_in_place_16b_iv};
 use broadcaster_core::crypto::shared_key::shared_symmetric_key;
-pub use broadcaster_core::notes::{Note, NoteError, decrypt_shield_random, note_public_key};
+pub use broadcaster_core::notes::{
+    Note, NoteError, decrypt_legacy_random, decrypt_shield_random, note_public_key,
+};
 
 use crate::keys::note_blinding_keys;
 use broadcaster_core::crypto::railgun::AddressData;

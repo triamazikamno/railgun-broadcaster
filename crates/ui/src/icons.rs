@@ -17,6 +17,14 @@ pub fn close_icon_path() -> PathBuf {
 }
 
 #[must_use]
+pub fn search_icon_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("icons")
+        .join("search.svg")
+}
+
+#[must_use]
 pub fn wallet_icon_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("assets")

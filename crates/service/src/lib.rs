@@ -45,7 +45,10 @@ use railgun_wallet::wallet_cache::wallet_cache_key;
 use railgun_wallet::{ProverService, WalletKeys};
 use serde::{Deserialize, Serialize};
 use sync_service::manager::SyncManagerError;
-use sync_service::{ChainConfig, ChainConfigDefaults, ChainKey, SyncManager, WalletConfig};
+use sync_service::{
+    ChainConfig, ChainConfigDefaults, ChainKey, DEFAULT_INDEXED_WALLET_BLOCK_RANGE, SyncManager,
+    WalletConfig,
+};
 use waku_relay::msg::ContentTopic;
 
 sol! {
@@ -366,6 +369,16 @@ impl BroadcasterService {
                     .as_ref()
                     .and_then(|sync| sync.block_range)
                     .unwrap_or(500);
+                let indexed_wallet_block_range = chain_cfg
+                    .sync
+                    .as_ref()
+                    .and_then(|sync| sync.indexed_wallet_block_range)
+                    .or_else(|| {
+                        defaults
+                            .as_ref()
+                            .map(|config| config.indexed_wallet_block_range)
+                    })
+                    .unwrap_or(DEFAULT_INDEXED_WALLET_BLOCK_RANGE);
                 let chain_config = ChainConfig {
                     chain_id,
                     contract: railgun_contract,
@@ -379,12 +392,14 @@ impl BroadcasterService {
                     v2_start_block,
                     legacy_shield_block,
                     block_range,
+                    indexed_wallet_block_range,
                     poll_interval: receipt_poll_interval,
                     finality_depth,
                     quick_sync_endpoint,
                     anchor_interval,
                     anchor_retention,
                     http_client: None,
+                    progress_tx: None,
                 };
                 let chain_service = sync_manager.add_chain(chain_config).await?;
                 let chain_key = ChainKey {
@@ -399,6 +414,7 @@ impl BroadcasterService {
                     cache_key: cache_key.clone(),
                     start_block: Some(*init_block_number),
                     scan_keys,
+                    progress_tx: None,
                 };
                 let handle = sync_manager.add_wallet(wallet_cfg).await?;
                 if let Some(auto_refill) = auto_refill.clone() {
@@ -715,7 +731,7 @@ impl BroadcasterService {
                     };
                     let rpc = provider_handle.provider.clone();
 
-                    let min_gas_price = decrypted_payload.params.min_gas_price.to();
+                    let min_gas_price = decrypted_payload.params.min_gas_price.unwrap_or_default().to();
                     let gas_price = match rpc.get_gas_price().await {
                         Ok(gas_price) => gas_price.max(min_gas_price) * 101 / 100,
                         Err(error) => {

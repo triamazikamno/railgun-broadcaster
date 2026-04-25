@@ -1,27 +1,41 @@
 use std::collections::VecDeque;
 use std::fmt::Write as _;
-use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    App, AppContext, Context, Entity, IntoElement, ParentElement, Pixels, Render, ScrollStrategy,
-    SharedString, Styled, Window, canvas, div, px, rgb,
+    AppContext, Context, DragMoveEvent, InteractiveElement, IntoElement, ListAlignment, ListOffset,
+    ListState, MouseButton, MouseDownEvent, ParentElement, Pixels, Render, Rgba, SharedString,
+    StatefulInteractiveElement, Styled, Window, canvas, div, list, px, rgb,
 };
-use gpui_component::table::{Column, Table, TableDelegate, TableEvent, TableState};
+use gpui_component::scroll::Scrollbar;
 use parking_lot::RwLock;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::layer::{Context as LayerContext, Layer};
 use tracing_subscriber::registry::LookupSpan;
 
-use crate::table::ColumnWidthSync;
-
 /// Maximum number of retained log lines kept in the bounded in-memory ring.
 pub const DEFAULT_LOG_CAPACITY: usize = 100;
 
 const LOG_PANE_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+const LOG_HEADER_HEIGHT: Pixels = px(32.0);
+const LOG_ROW_MIN_HEIGHT: Pixels = px(32.0);
+const LOG_CELL_PADDING_X: Pixels = px(8.0);
+const LOG_CELL_PADDING_Y: Pixels = px(5.0);
+const LOG_SCROLLBAR_WIDTH: Pixels = px(16.0);
+const LOG_RESIZE_HANDLE_WIDTH: Pixels = px(10.0);
+const LOG_LIST_OVERDRAW: Pixels = px(480.0);
+
+const DEFAULT_TIME_WIDTH: Pixels = px(90.0);
+const DEFAULT_LEVEL_WIDTH: Pixels = px(60.0);
+const DEFAULT_TARGET_WIDTH: Pixels = px(200.0);
+
+const MIN_TIME_WIDTH: Pixels = px(72.0);
+const MIN_LEVEL_WIDTH: Pixels = px(48.0);
+const MIN_TARGET_WIDTH: Pixels = px(80.0);
+const MIN_MESSAGE_WIDTH: Pixels = px(140.0);
 
 /// Single retained log line from the app's in-memory tracing layer.
 #[derive(Debug, Clone)]
@@ -179,118 +193,82 @@ pub fn now_unix_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
-/// `TableDelegate` backing a generic app log pane.
-pub struct LogsDelegate {
-    rows: Arc<[LogEntry]>,
-    columns: [Column; 4],
+#[derive(Debug, Clone, Copy)]
+struct LogColumnWidths {
+    time: Pixels,
+    level: Pixels,
+    target: Pixels,
 }
 
-impl LogsDelegate {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            rows: Arc::from(Vec::<LogEntry>::new()),
-            columns: [
-                Column::new("time", "time").width(px(90.0)).movable(false),
-                Column::new("level", "level").width(px(60.0)).movable(false),
-                Column::new("target", "target")
-                    .width(px(200.0))
-                    .movable(false),
-                Column::new("message", "message")
-                    .width(px(900.0))
-                    .movable(false),
-            ],
-        }
-    }
-
-    pub fn set_rows(&mut self, rows: Vec<LogEntry>) {
-        self.rows = Arc::from(rows);
-    }
-
-    #[must_use]
-    pub fn row_count(&self) -> usize {
-        self.rows.len()
-    }
-
-    pub fn set_message_width(&mut self, width: Pixels) {
-        const MIN_MESSAGE_WIDTH: Pixels = px(120.0);
-        self.columns[3].width = width.max(MIN_MESSAGE_WIDTH);
-    }
-
-    #[must_use]
-    pub const fn message_width(&self) -> Pixels {
-        self.columns[3].width
-    }
-}
-
-impl Default for LogsDelegate {
+impl Default for LogColumnWidths {
     fn default() -> Self {
-        Self::new()
+        Self {
+            time: DEFAULT_TIME_WIDTH,
+            level: DEFAULT_LEVEL_WIDTH,
+            target: DEFAULT_TARGET_WIDTH,
+        }
     }
 }
 
-impl ColumnWidthSync for LogsDelegate {
-    fn columns_mut(&mut self) -> &mut [Column] {
-        &mut self.columns
-    }
-}
-
-impl TableDelegate for LogsDelegate {
-    fn columns_count(&self, _: &App) -> usize {
-        self.columns.len()
+impl LogColumnWidths {
+    fn fixed_width(self) -> Pixels {
+        self.time + self.level + self.target
     }
 
-    fn rows_count(&self, _: &App) -> usize {
-        self.rows.len()
-    }
-
-    fn column(&self, col_ix: usize, _: &App) -> &Column {
-        &self.columns[col_ix]
-    }
-
-    fn render_td(
-        &mut self,
-        row_ix: usize,
-        col_ix: usize,
-        _window: &mut Window,
-        _cx: &mut Context<'_, TableState<Self>>,
-    ) -> impl IntoElement {
-        let entry = &self.rows[row_ix];
-        match col_ix {
-            0 => div()
-                .text_color(rgb(0x6c7086))
-                .child(SharedString::from(format_time(entry.unix_ms))),
-            1 => {
-                let (label, color) = match entry.level {
-                    Level::ERROR => ("ERR", rgb(0xf38ba8)),
-                    Level::WARN => ("WRN", rgb(0xf9e2af)),
-                    Level::INFO => ("INF", rgb(0xa6e3a1)),
-                    Level::DEBUG => ("DBG", rgb(0x89dceb)),
-                    Level::TRACE => ("TRC", rgb(0xa6adc8)),
-                };
-                div().text_color(color).child(SharedString::from(label))
-            }
-            2 => div()
-                .text_color(rgb(0xcba6f7))
-                .child(SharedString::from(entry.target.as_ref().to_owned())),
-            _ => div()
-                .text_color(rgb(0xcdd6f4))
-                .child(SharedString::from(entry.message.as_ref().to_owned())),
+    const fn width(self, column: LogResizeColumn) -> Pixels {
+        match column {
+            LogResizeColumn::Time => self.time,
+            LogResizeColumn::Level => self.level,
+            LogResizeColumn::Target => self.target,
         }
     }
 
-    fn render_empty(
-        &mut self,
-        _window: &mut Window,
-        _cx: &mut Context<'_, TableState<Self>>,
-    ) -> impl IntoElement {
-        div()
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .text_color(rgb(0x6c7086))
-            .child("No log entries yet")
+    const fn set_width(&mut self, column: LogResizeColumn, width: Pixels) {
+        match column {
+            LogResizeColumn::Time => self.time = width,
+            LogResizeColumn::Level => self.level = width,
+            LogResizeColumn::Target => self.target = width,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogResizeColumn {
+    Time,
+    Level,
+    Target,
+}
+
+impl LogResizeColumn {
+    const fn index(self) -> usize {
+        match self {
+            Self::Time => 0,
+            Self::Level => 1,
+            Self::Target => 2,
+        }
+    }
+
+    const fn min_width(self) -> Pixels {
+        match self {
+            Self::Time => MIN_TIME_WIDTH,
+            Self::Level => MIN_LEVEL_WIDTH,
+            Self::Target => MIN_TARGET_WIDTH,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LogResizeState {
+    column: LogResizeColumn,
+    start_x: Pixels,
+    start_width: Pixels,
+}
+
+struct LogResizeDrag;
+
+impl Render for LogResizeDrag {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<'_, Self>) -> impl IntoElement {
+        div().size(px(1.0))
     }
 }
 
@@ -303,39 +281,29 @@ fn format_time(unix_ms: u64) -> String {
     format!("{hh:02}:{mm:02}:{ss:02}.{ms:03}")
 }
 
-/// Reusable app-wide logs pane. Hosts a table and mirrors [`LogStore`] changes
-/// into the delegate without tying logs to any specific feature pane.
+/// Reusable app-wide logs pane. Hosts a variable-height list and mirrors
+/// [`LogStore`] changes without tying logs to any specific feature pane.
 pub struct LogsPane {
     logs: LogStore,
-    table: Entity<TableState<LogsDelegate>>,
+    rows: Arc<[LogEntry]>,
+    list_state: ListState,
+    column_widths: LogColumnWidths,
     last_width: Option<Pixels>,
     follow_tail: bool,
+    resizing: Option<LogResizeState>,
 }
 
 impl LogsPane {
-    pub fn new(logs: LogStore, window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
-        let table = cx.new(|cx| {
-            let mut delegate = LogsDelegate::new();
-            let rows = logs.logs();
-            let row_count = rows.len();
-            delegate.set_rows(rows);
-            let state = TableState::new(delegate, window, cx);
-            if row_count > 0 {
-                state
-                    .vertical_scroll_handle
-                    .scroll_to_item(row_count - 1, ScrollStrategy::Bottom);
-            }
-            state
+    pub fn new(logs: LogStore, _window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
+        let rows: Arc<[LogEntry]> = Arc::from(logs.logs());
+        let list_state = ListState::new(rows.len(), ListAlignment::Bottom, LOG_LIST_OVERDRAW);
+        let entity = cx.entity();
+        list_state.set_scroll_handler(move |event, _window, cx| {
+            entity.update(cx, |pane, cx| {
+                pane.follow_tail = should_follow_tail(event.is_scrolled);
+                cx.notify();
+            });
         });
-
-        cx.subscribe(&table, |_this, state, event: &TableEvent, cx| {
-            if let TableEvent::ColumnWidthsChanged(widths) = event {
-                state.update(cx, |s, _| {
-                    s.delegate_mut().apply_column_widths(widths);
-                });
-            }
-        })
-        .detach();
 
         let refresh_logs = logs.clone();
         cx.spawn(async move |this, cx| {
@@ -350,26 +318,10 @@ impl LogsPane {
                 }
                 last_rev = current_rev;
                 let rows = refresh_logs.logs();
-                let row_count = rows.len();
 
                 if this
                     .update(cx, |pane, cx| {
-                        let mut follow_tail = pane.follow_tail;
-                        pane.table.update(cx, |state, cx| {
-                            follow_tail = should_follow_tail(
-                                follow_tail,
-                                state.delegate().row_count(),
-                                state.visible_range().rows(),
-                            );
-                            state.delegate_mut().set_rows(rows);
-                            if follow_tail && row_count > 0 {
-                                state
-                                    .vertical_scroll_handle
-                                    .scroll_to_item(row_count - 1, ScrollStrategy::Bottom);
-                            }
-                            cx.notify();
-                        });
-                        pane.follow_tail = follow_tail;
+                        pane.set_rows(rows);
                         cx.notify();
                     })
                     .is_err()
@@ -382,22 +334,322 @@ impl LogsPane {
 
         Self {
             logs,
-            table,
+            rows,
+            list_state,
+            column_widths: LogColumnWidths::default(),
             last_width: None,
             follow_tail: true,
+            resizing: None,
         }
     }
 
-    fn sync_table_width(&mut self, width: Pixels, cx: &mut Context<'_, Self>) {
+    fn sync_pane_width(&mut self, width: Pixels, cx: &mut Context<'_, Self>) {
         if self.last_width == Some(width) {
             return;
         }
 
         self.last_width = Some(width);
-        self.table.update(cx, |state, cx| {
-            state.delegate_mut().set_message_width(width - px(410.0));
-            state.refresh(cx);
+        self.invalidate_row_measurements();
+        cx.notify();
+    }
+
+    fn set_rows(&mut self, rows: Vec<LogEntry>) {
+        let rows = Arc::<[LogEntry]>::from(rows);
+        self.sync_list_items(&rows);
+        self.rows = rows;
+    }
+
+    fn sync_list_items(&self, new_rows: &[LogEntry]) {
+        let old_count = self.rows.len();
+        let new_count = new_rows.len();
+
+        if old_count == 0 {
+            self.list_state.splice(0..0, new_count);
+            return;
+        }
+
+        if new_count == 0 {
+            self.replace_all_list_items(0);
+            return;
+        }
+
+        let Some(old_last_seq) = self.rows.last().map(|entry| entry.seq) else {
+            self.replace_all_list_items(new_count);
+            return;
+        };
+        let Some(new_first_seq) = new_rows.first().map(|entry| entry.seq) else {
+            self.replace_all_list_items(new_count);
+            return;
+        };
+
+        let dropped = self
+            .rows
+            .iter()
+            .take_while(|entry| entry.seq < new_first_seq)
+            .count();
+        let added = new_rows
+            .iter()
+            .filter(|entry| entry.seq > old_last_seq)
+            .count();
+        let old_overlap = old_count.saturating_sub(dropped);
+        let new_overlap = new_count.saturating_sub(added);
+        let overlap_matches = old_overlap == new_overlap
+            && self.rows[dropped..]
+                .iter()
+                .zip(new_rows[..new_overlap].iter())
+                .all(|(old, new)| old.seq == new.seq);
+
+        if !overlap_matches {
+            self.replace_all_list_items(new_count);
+            return;
+        }
+
+        if dropped > 0 {
+            self.list_state.splice(0..dropped, 0);
+        }
+
+        if added > 0 {
+            let append_at = old_count.saturating_sub(dropped);
+            self.list_state.splice(append_at..append_at, added);
+        }
+
+        if self.list_state.item_count() != new_count {
+            self.replace_all_list_items(new_count);
+        }
+    }
+
+    fn replace_all_list_items(&self, new_count: usize) {
+        let old_count = self.list_state.item_count();
+        let scroll_top = self.list_state.logical_scroll_top();
+        self.list_state.splice(0..old_count, new_count);
+        if !self.follow_tail {
+            self.list_state
+                .scroll_to(clamp_scroll_top(scroll_top, new_count));
+        }
+    }
+
+    fn invalidate_row_measurements(&self) {
+        let count = self.rows.len();
+        if count == 0 {
+            return;
+        }
+
+        let scroll_top = self.list_state.logical_scroll_top();
+        self.list_state.splice(0..count, count);
+        if !self.follow_tail {
+            self.list_state
+                .scroll_to(clamp_scroll_top(scroll_top, count));
+        }
+    }
+
+    const fn begin_resize(&mut self, column: LogResizeColumn, start_x: Pixels) {
+        self.resizing = Some(LogResizeState {
+            column,
+            start_x,
+            start_width: self.column_widths.width(column),
         });
+    }
+
+    fn update_resize(&mut self, pointer_x: Pixels) {
+        let Some(resizing) = self.resizing else {
+            return;
+        };
+
+        let width = resizing.start_width + pointer_x - resizing.start_x;
+        let width = self.clamp_column_width(resizing.column, width);
+        if self.column_widths.width(resizing.column) == width {
+            return;
+        }
+
+        self.column_widths.set_width(resizing.column, width);
+        self.invalidate_row_measurements();
+    }
+
+    const fn end_resize(&mut self) {
+        self.resizing = None;
+    }
+
+    fn clamp_column_width(&self, column: LogResizeColumn, width: Pixels) -> Pixels {
+        let min = column.min_width();
+        let pane_width = self.last_width.unwrap_or(px(1_280.0)) - LOG_SCROLLBAR_WIDTH;
+        let other_fixed = self.column_widths.fixed_width() - self.column_widths.width(column);
+        let max = (pane_width - other_fixed - MIN_MESSAGE_WIDTH).max(min);
+        width.max(min).min(max)
+    }
+
+    fn render_header(&self, cx: &Context<'_, Self>) -> impl IntoElement {
+        div()
+            .h(LOG_HEADER_HEIGHT)
+            .w_full()
+            .pr(LOG_SCROLLBAR_WIDTH)
+            .flex()
+            .items_start()
+            .overflow_hidden()
+            .bg(rgb(0x181825))
+            .border_b_1()
+            .border_color(rgb(0x313244))
+            .child(self.render_header_cell(
+                "time",
+                self.column_widths.time,
+                Some(LogResizeColumn::Time),
+                cx,
+            ))
+            .child(self.render_header_cell(
+                "level",
+                self.column_widths.level,
+                Some(LogResizeColumn::Level),
+                cx,
+            ))
+            .child(self.render_header_cell(
+                "target",
+                self.column_widths.target,
+                Some(LogResizeColumn::Target),
+                cx,
+            ))
+            .child(Self::render_message_header_cell("message"))
+    }
+
+    fn render_header_cell(
+        &self,
+        label: &'static str,
+        width: Pixels,
+        resize_column: Option<LogResizeColumn>,
+        cx: &Context<'_, Self>,
+    ) -> impl IntoElement {
+        let mut cell = div()
+            .relative()
+            .h_full()
+            .w(width)
+            .flex_none()
+            .flex()
+            .items_center()
+            .px(LOG_CELL_PADDING_X)
+            .text_color(rgb(0xa6adc8))
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .child(SharedString::from(label));
+
+        if let Some(column) = resize_column {
+            let active = self.resizing.is_some_and(|state| state.column == column);
+            cell = cell.child(Self::render_resize_handle(column, active, cx));
+        }
+
+        cell
+    }
+
+    fn render_message_header_cell(label: &'static str) -> impl IntoElement {
+        div()
+            .relative()
+            .h_full()
+            .flex_1()
+            .min_w(px(0.0))
+            .flex()
+            .items_center()
+            .px(LOG_CELL_PADDING_X)
+            .text_color(rgb(0xa6adc8))
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .child(SharedString::from(label))
+    }
+
+    fn render_resize_handle(
+        column: LogResizeColumn,
+        active: bool,
+        cx: &Context<'_, Self>,
+    ) -> impl IntoElement {
+        let divider_color = if active { rgb(0x89b4fa) } else { rgb(0x313244) };
+
+        div()
+            .id(("log-column-resize", column.index()))
+            .absolute()
+            .top_0()
+            .right_0()
+            .h_full()
+            .w(LOG_RESIZE_HANDLE_WIDTH)
+            .cursor_col_resize()
+            .occlude()
+            .hover(|this| this.bg(rgb(0x242437)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                    this.begin_resize(column, event.position.x);
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, cx| {
+                    this.end_resize();
+                    cx.notify();
+                }),
+            )
+            .on_drag(column, |_column, _position, _window, cx| {
+                cx.stop_propagation();
+                cx.new(|_| LogResizeDrag)
+            })
+            .on_drag_move(cx.listener(
+                move |this, event: &DragMoveEvent<LogResizeColumn>, _window, cx| {
+                    let column = *event.drag(cx);
+                    if this.resizing.is_none_or(|state| state.column != column) {
+                        this.begin_resize(column, event.event.position.x);
+                    }
+                    this.update_resize(event.event.position.x);
+                    cx.stop_propagation();
+                    cx.notify();
+                },
+            ))
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .right_0()
+                    .w(px(1.0))
+                    .bg(divider_color),
+            )
+    }
+
+    fn render_body(&self) -> impl IntoElement {
+        let rows = self.rows.clone();
+        let row_count = rows.len();
+        let widths = self.column_widths;
+        let content = if row_count == 0 {
+            render_empty_logs().into_any_element()
+        } else {
+            list(self.list_state.clone(), move |ix, _window, _cx| {
+                rows.get(ix).map_or_else(
+                    || div().into_any_element(),
+                    |entry| render_log_row(entry, widths, ix),
+                )
+            })
+            .size_full()
+            .into_any_element()
+        };
+
+        let mut body = div()
+            .relative()
+            .flex_1()
+            .min_h(px(0.0))
+            .pr(LOG_SCROLLBAR_WIDTH)
+            .overflow_hidden()
+            .child(content);
+
+        if row_count > 0 {
+            body = body.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .bottom_0()
+                    .w(LOG_SCROLLBAR_WIDTH)
+                    .child(Scrollbar::vertical(&self.list_state)),
+            );
+        }
+
+        body
     }
 
     #[must_use]
@@ -406,20 +658,96 @@ impl LogsPane {
     }
 }
 
-fn should_follow_tail(
-    current_follow_tail: bool,
-    old_row_count: usize,
-    visible_rows: &Range<usize>,
-) -> bool {
-    if old_row_count == 0 {
-        return true;
+fn clamp_scroll_top(scroll_top: ListOffset, count: usize) -> ListOffset {
+    let item_ix = scroll_top.item_ix.min(count);
+    ListOffset {
+        item_ix,
+        offset_in_item: if item_ix == count {
+            px(0.0)
+        } else {
+            scroll_top.offset_in_item
+        },
     }
+}
 
-    if visible_rows.is_empty() {
-        return current_follow_tail;
+const fn should_follow_tail(is_scrolled: bool) -> bool {
+    !is_scrolled
+}
+
+fn render_log_row(entry: &LogEntry, widths: LogColumnWidths, row_ix: usize) -> gpui::AnyElement {
+    let (level_label, level_color) = level_style(entry.level);
+    let bg = if row_ix.is_multiple_of(2) {
+        rgb(0x1e1e2e)
+    } else {
+        rgb(0x202033)
+    };
+
+    div()
+        .w_full()
+        .min_h(LOG_ROW_MIN_HEIGHT)
+        .flex()
+        .items_start()
+        .bg(bg)
+        .border_b_1()
+        .border_color(rgb(0x25253a))
+        .child(render_nowrap_log_cell(
+            SharedString::from(format_time(entry.unix_ms)),
+            widths.time,
+            rgb(0x6c7086),
+        ))
+        .child(render_nowrap_log_cell(
+            SharedString::from(level_label),
+            widths.level,
+            level_color,
+        ))
+        .child(render_nowrap_log_cell(
+            SharedString::from(entry.target.as_ref().to_owned()),
+            widths.target,
+            rgb(0xcba6f7),
+        ))
+        .child(
+            div()
+                .flex_1()
+                .min_w(MIN_MESSAGE_WIDTH)
+                .px(LOG_CELL_PADDING_X)
+                .py(LOG_CELL_PADDING_Y)
+                .text_color(rgb(0xcdd6f4))
+                .whitespace_normal()
+                .child(SharedString::from(entry.message.as_ref().to_owned())),
+        )
+        .into_any_element()
+}
+
+fn render_nowrap_log_cell(text: SharedString, width: Pixels, color: Rgba) -> impl IntoElement {
+    div()
+        .w(width)
+        .flex_none()
+        .px(LOG_CELL_PADDING_X)
+        .py(LOG_CELL_PADDING_Y)
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_color(color)
+        .child(text)
+}
+
+fn render_empty_logs() -> impl IntoElement {
+    div()
+        .size_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_color(rgb(0x6c7086))
+        .child("No log entries yet")
+}
+
+fn level_style(level: Level) -> (&'static str, Rgba) {
+    match level {
+        Level::ERROR => ("ERR", rgb(0xf38ba8)),
+        Level::WARN => ("WRN", rgb(0xf9e2af)),
+        Level::INFO => ("INF", rgb(0xa6e3a1)),
+        Level::DEBUG => ("DBG", rgb(0x89dceb)),
+        Level::TRACE => ("TRC", rgb(0xa6adc8)),
     }
-
-    visible_rows.end >= old_row_count
 }
 
 impl Render for LogsPane {
@@ -431,12 +759,17 @@ impl Render for LogsPane {
             .size_full()
             .min_w(px(0.0))
             .min_h(px(0.0))
-            .child(Table::new(&self.table))
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .bg(rgb(0x1e1e2e))
+            .child(self.render_header(cx))
+            .child(self.render_body())
             .child(
                 canvas(
                     move |bounds, _, cx| {
                         entity.update(cx, |this, cx| {
-                            this.sync_table_width(bounds.size.width, cx);
+                            this.sync_pane_width(bounds.size.width, cx);
                         });
                     },
                     |_, (), _, _| {},
@@ -475,28 +808,12 @@ mod tests {
 
     #[test]
     fn follow_tail_stays_enabled_at_bottom() {
-        assert!(should_follow_tail(true, 100, &(90..100)));
+        assert!(should_follow_tail(false));
     }
 
     #[test]
     fn follow_tail_pauses_when_scrolled_up() {
-        assert!(!should_follow_tail(true, 100, &(20..60)));
-    }
-
-    #[test]
-    fn follow_tail_resumes_when_scrolled_back_to_bottom() {
-        assert!(should_follow_tail(false, 100, &(80..100)));
-    }
-
-    #[test]
-    fn follow_tail_preserves_state_without_visible_range() {
-        assert!(should_follow_tail(true, 100, &(0..0)));
-        assert!(!should_follow_tail(false, 100, &(0..0)));
-    }
-
-    #[test]
-    fn follow_tail_starts_enabled_for_empty_table() {
-        assert!(should_follow_tail(false, 0, &(0..0)));
+        assert!(!should_follow_tail(true));
     }
 
     #[test]
