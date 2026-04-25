@@ -71,6 +71,7 @@ fn main() -> Result<()> {
     let application = Application::new();
     application.run(move |app: &mut App| {
         gpui_component::init(app);
+        gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, app);
         install_quit_behavior(app);
         install_utxo_navigation_bindings(app);
         open_wallet_window(
