@@ -1,38 +1,30 @@
 [package]
-name = "broadcaster-viewer"
+name = "wallet"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "broadcaster-viewer"
+name = "wallet"
 path = "src/main.rs"
 
 [dependencies]
-# Pinned GUI stack (pre-1.0; keep exact pins and narrow API use).
+alloy = { workspace = true }
+eyre = { workspace = true }
 gpui = { workspace = true }
 gpui-component = { workspace = true }
-
-# Async runtime / CLI / diagnostics.
-eyre = { workspace = true }
-humantime = "2"
+reqwest = { workspace = true }
 structopt = "0.3"
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "parking_lot"] }
 
-# Diagnostic profiling endpoint (ported from liquidator-rust/utils/src/pprof.rs).
-axum = "0.8"
-pprof = { version = "0.15", default-features = false, features = ["flamegraph", "prost-codec", "frame-pointer"] }
-serde = { workspace = true }
-serde_urlencoded = "0.7"
-
-# Local crates.
 broadcaster-monitor = { path = "../../crates/broadcaster-monitor" }
 broadcaster-monitor-gpui = { path = "../../crates/broadcaster-monitor-gpui" }
 broadcaster-monitor-waku = { path = "../../crates/broadcaster-monitor-waku" }
 railgun-ui = { path = "../../crates/railgun-ui" }
 ui = { path = "../../crates/ui" }
+wallet-ops = { path = "../../crates/wallet-ops" }
 
 [lints]
 workspace = true

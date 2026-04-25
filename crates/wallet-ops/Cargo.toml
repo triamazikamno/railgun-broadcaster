@@ -9,7 +9,7 @@ alloy = { workspace = true, features = ["provider-http", "rpc-types", "network",
 eyre = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tracing = { workspace = true }
 
 broadcaster-core = { path = "../core" }

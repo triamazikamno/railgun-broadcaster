@@ -17,6 +17,7 @@ pub struct WalletHandle {
     pub cache_key: String,
     pub unspents: Arc<RwLock<Vec<Utxo>>>,
     pub ready_rx: watch::Receiver<bool>,
+    pub rev_rx: watch::Receiver<u64>,
 }
 
 async fn apply_wallet_logs(
@@ -78,6 +79,13 @@ impl WalletHandle {
     }
 }
 
+fn notify_wallet_rev(rev_tx: &watch::Sender<u64>, rev: &mut u64, cache_key: &str) {
+    *rev = rev.wrapping_add(1);
+    if let Err(err) = rev_tx.send(*rev) {
+        debug!(?err, cache_key, "failed to send wallet revision");
+    }
+}
+
 pub(crate) fn spawn_wallet_worker(
     db: Arc<DbStore>,
     cfg: WalletConfig,
@@ -87,14 +95,17 @@ pub(crate) fn spawn_wallet_worker(
 ) -> WalletHandle {
     let unspents = Arc::new(RwLock::new(Vec::new()));
     let (ready_tx, ready_rx) = watch::channel(false);
+    let (rev_tx, rev_rx) = watch::channel(0_u64);
     let handle = WalletHandle {
         cache_key: cfg.cache_key.clone(),
         unspents: unspents.clone(),
         ready_rx,
+        rev_rx,
     };
 
     let chain_id = cfg.chain.chain_id;
     tokio::spawn(async move {
+        let mut rev = 0_u64;
         let start_block = cfg.start_block.unwrap_or(0);
         let mut last_scanned = start_block.saturating_sub(1);
 
@@ -102,6 +113,7 @@ pub(crate) fn spawn_wallet_worker(
             Ok(cached) => {
                 let mut locked = unspents.write().await;
                 *locked = cached;
+                notify_wallet_rev(&rev_tx, &mut rev, &cfg.cache_key);
             }
             Err(err) => {
                 warn!(?err, cache_key = %cfg.cache_key, "failed to load wallet cache");
@@ -137,6 +149,7 @@ pub(crate) fn spawn_wallet_worker(
                                     ) {
                                         warn!(?err, cache_key = %cfg.cache_key, "failed to persist wallet cache");
                                     }
+                                    notify_wallet_rev(&rev_tx, &mut rev, &cfg.cache_key);
                                 }
                                 Err(err) => {
                                     warn!(?err, cache_key = %cfg.cache_key, "failed to apply backfill logs");
@@ -173,6 +186,7 @@ pub(crate) fn spawn_wallet_worker(
                             ) {
                                 warn!(?err, cache_key = %cfg.cache_key, "failed to reset wallet cache");
                             }
+                            notify_wallet_rev(&rev_tx, &mut rev, &cfg.cache_key);
                             backfill_complete_block = None;
                             if let Err(err) = ready_tx.send(false) {
                                 debug!(?err, cache_key = %cfg.cache_key, "failed to send ready state");
@@ -200,6 +214,7 @@ pub(crate) fn spawn_wallet_worker(
                                     ) {
                                         warn!(?err, cache_key = %cfg.cache_key, "failed to persist wallet cache");
                                     }
+                                    notify_wallet_rev(&rev_tx, &mut rev, &cfg.cache_key);
                                 }
                                 Err(err) => {
                                     warn!(?err, cache_key = %cfg.cache_key, "failed to apply live logs");
@@ -226,11 +241,24 @@ fn dedupe_utxos(utxos: &mut Vec<Utxo>) {
 
 #[cfg(test)]
 mod tests {
-    use super::utxo_spent_by_nullifier;
+    use super::{notify_wallet_rev, utxo_spent_by_nullifier};
     use alloy::primitives::U256;
     use broadcaster_core::notes::Note;
     use railgun_wallet::Utxo;
     use std::collections::HashSet;
+    use tokio::sync::watch;
+
+    #[test]
+    fn notify_wallet_rev_increments_revision() {
+        let (tx, rx) = watch::channel(0_u64);
+        let mut rev = 0_u64;
+
+        notify_wallet_rev(&tx, &mut rev, "cache-key");
+        assert_eq!(*rx.borrow(), 1);
+
+        notify_wallet_rev(&tx, &mut rev, "cache-key");
+        assert_eq!(*rx.borrow(), 2);
+    }
 
     #[test]
     fn spent_nullifiers_are_scoped_by_tree() {

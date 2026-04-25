@@ -92,7 +92,7 @@ impl StandaloneMonitorRoot {
         _cx: &mut Context<'_, Self>,
     ) -> impl IntoElement {
         let logs_open = self.logs_open;
-        let tooltip = if logs_open { "Hide log" } else { "Show log" };
+        let tooltip = if logs_open { "Hide logs" } else { "Show logs" };
         div()
             .w(ACTIVITY_RAIL_WIDTH)
             .h_full()
@@ -413,11 +413,7 @@ impl Render for BroadcasterMonitorPane {
             .child(
                 h_resizable("broadcaster-monitor-top")
                     .with_state(&self.top_split)
-                    .child(
-                        resizable_panel()
-                            .size(px(640.0))
-                            .child(Table::new(&self.fees_table)),
-                    )
+                    .child(resizable_panel().child(Table::new(&self.fees_table)))
                     .child(
                         resizable_panel()
                             .child(peers_view::render_pane(&peer_summary, &self.peers_table)),

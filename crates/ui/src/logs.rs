@@ -1,12 +1,13 @@
 use std::collections::VecDeque;
 use std::fmt::Write as _;
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    App, AppContext, Context, Entity, IntoElement, ParentElement, Pixels, Render, SharedString,
-    Styled, Window, canvas, div, px, rgb,
+    App, AppContext, Context, Entity, IntoElement, ParentElement, Pixels, Render, ScrollStrategy,
+    SharedString, Styled, Window, canvas, div, px, rgb,
 };
 use gpui_component::table::{Column, Table, TableDelegate, TableEvent, TableState};
 use parking_lot::RwLock;
@@ -18,7 +19,7 @@ use tracing_subscriber::registry::LookupSpan;
 use crate::table::ColumnWidthSync;
 
 /// Maximum number of retained log lines kept in the bounded in-memory ring.
-pub const DEFAULT_LOG_CAPACITY: usize = 2_000;
+pub const DEFAULT_LOG_CAPACITY: usize = 100;
 
 const LOG_PANE_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -206,6 +207,11 @@ impl LogsDelegate {
         self.rows = Arc::from(rows);
     }
 
+    #[must_use]
+    pub fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
     pub fn set_message_width(&mut self, width: Pixels) {
         const MIN_MESSAGE_WIDTH: Pixels = px(120.0);
         self.columns[3].width = width.max(MIN_MESSAGE_WIDTH);
@@ -303,14 +309,23 @@ pub struct LogsPane {
     logs: LogStore,
     table: Entity<TableState<LogsDelegate>>,
     last_width: Option<Pixels>,
+    follow_tail: bool,
 }
 
 impl LogsPane {
     pub fn new(logs: LogStore, window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
         let table = cx.new(|cx| {
             let mut delegate = LogsDelegate::new();
-            delegate.set_rows(logs.logs());
-            TableState::new(delegate, window, cx)
+            let rows = logs.logs();
+            let row_count = rows.len();
+            delegate.set_rows(rows);
+            let state = TableState::new(delegate, window, cx);
+            if row_count > 0 {
+                state
+                    .vertical_scroll_handle
+                    .scroll_to_item(row_count - 1, ScrollStrategy::Bottom);
+            }
+            state
         });
 
         cx.subscribe(&table, |_this, state, event: &TableEvent, cx| {
@@ -335,13 +350,26 @@ impl LogsPane {
                 }
                 last_rev = current_rev;
                 let rows = refresh_logs.logs();
+                let row_count = rows.len();
 
                 if this
                     .update(cx, |pane, cx| {
+                        let mut follow_tail = pane.follow_tail;
                         pane.table.update(cx, |state, cx| {
+                            follow_tail = should_follow_tail(
+                                follow_tail,
+                                state.delegate().row_count(),
+                                state.visible_range().rows(),
+                            );
                             state.delegate_mut().set_rows(rows);
+                            if follow_tail && row_count > 0 {
+                                state
+                                    .vertical_scroll_handle
+                                    .scroll_to_item(row_count - 1, ScrollStrategy::Bottom);
+                            }
                             cx.notify();
                         });
+                        pane.follow_tail = follow_tail;
                         cx.notify();
                     })
                     .is_err()
@@ -356,6 +384,7 @@ impl LogsPane {
             logs,
             table,
             last_width: None,
+            follow_tail: true,
         }
     }
 
@@ -375,6 +404,22 @@ impl LogsPane {
     pub fn retained_count(&self) -> usize {
         self.logs.logs().len()
     }
+}
+
+fn should_follow_tail(
+    current_follow_tail: bool,
+    old_row_count: usize,
+    visible_rows: &Range<usize>,
+) -> bool {
+    if old_row_count == 0 {
+        return true;
+    }
+
+    if visible_rows.is_empty() {
+        return current_follow_tail;
+    }
+
+    visible_rows.end >= old_row_count
 }
 
 impl Render for LogsPane {
@@ -409,6 +454,11 @@ mod tests {
     use tracing_subscriber::layer::SubscriberExt;
 
     #[test]
+    fn default_log_capacity_is_100() {
+        assert_eq!(DEFAULT_LOG_CAPACITY, 100);
+    }
+
+    #[test]
     fn bounded_retention_drops_oldest() {
         let logs = LogStore::new(4);
         let layer = UiLogLayer::new(logs.clone());
@@ -421,6 +471,32 @@ mod tests {
         let entries = logs.logs();
         assert_eq!(entries.len(), 4, "only the newest 4 entries should remain");
         assert!(entries.last().unwrap().message.contains("log-line"));
+    }
+
+    #[test]
+    fn follow_tail_stays_enabled_at_bottom() {
+        assert!(should_follow_tail(true, 100, &(90..100)));
+    }
+
+    #[test]
+    fn follow_tail_pauses_when_scrolled_up() {
+        assert!(!should_follow_tail(true, 100, &(20..60)));
+    }
+
+    #[test]
+    fn follow_tail_resumes_when_scrolled_back_to_bottom() {
+        assert!(should_follow_tail(false, 100, &(80..100)));
+    }
+
+    #[test]
+    fn follow_tail_preserves_state_without_visible_range() {
+        assert!(should_follow_tail(true, 100, &(0..0)));
+        assert!(!should_follow_tail(false, 100, &(0..0)));
+    }
+
+    #[test]
+    fn follow_tail_starts_enabled_for_empty_table() {
+        assert!(should_follow_tail(false, 0, &(0..0)));
     }
 
     #[test]

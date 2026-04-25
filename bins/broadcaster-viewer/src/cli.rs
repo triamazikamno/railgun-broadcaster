@@ -1,9 +1,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use railgun_ui::DEFAULT_CHAINS;
 use structopt::StructOpt;
-
-pub(crate) const DEFAULT_CHAINS: &[u64] = &[1, 56, 137, 42161];
 
 #[derive(Debug, Clone, StructOpt)]
 #[structopt(

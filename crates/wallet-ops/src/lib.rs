@@ -27,6 +27,7 @@ use serde::Serialize;
 use sync_service::{
     ChainConfig, ChainConfigDefaults, ChainKey, SyncManager, WalletConfig, WalletHandle,
 };
+use tokio::sync::watch;
 
 const DEFAULT_QUERY_RPC_COOLDOWN: Duration = Duration::from_secs(5);
 const DEFAULT_BLOCK_RANGE: u64 = 500;
@@ -70,6 +71,24 @@ pub struct ListUtxosRequest {
     pub chain_id: u64,
     pub db_path: PathBuf,
     pub init_block_number: Option<u64>,
+}
+
+pub struct WalletSessionRequest {
+    pub mnemonic: String,
+    pub chain_id: u64,
+    pub db_path: PathBuf,
+    pub init_block_number: Option<u64>,
+}
+
+impl From<ListUtxosRequest> for WalletSessionRequest {
+    fn from(value: ListUtxosRequest) -> Self {
+        Self {
+            mnemonic: value.mnemonic,
+            chain_id: value.chain_id,
+            db_path: value.db_path,
+            init_block_number: value.init_block_number,
+        }
+    }
 }
 
 pub struct ShieldRequest {
@@ -178,14 +197,35 @@ pub enum UnshieldResult {
     Sent(UnshieldSendOutput),
 }
 
+pub struct WalletSession {
+    pub chain_id: u64,
+    pub cache_key: String,
+    pub ready_rx: watch::Receiver<bool>,
+    pub snapshots_rx: watch::Receiver<Arc<ListUtxosOutput>>,
+    _db: Arc<DbStore>,
+    _sync_manager: Arc<SyncManager>,
+    _chain_key: ChainKey,
+    _handle: WalletHandle,
+}
+
 pub async fn list_utxos(
     request: ListUtxosRequest,
     rpc_url_override: Option<Url>,
     http: &HttpContext,
 ) -> Result<ListUtxosOutput> {
+    let session = start_wallet_session(request.into(), rpc_url_override, http).await?;
+    Ok(session.snapshots_rx.borrow().as_ref().clone())
+}
+
+pub async fn start_wallet_session(
+    request: WalletSessionRequest,
+    rpc_url_override: Option<Url>,
+    http: &HttpContext,
+) -> Result<WalletSession> {
+    let chain_id = request.chain_id;
     let synced = setup_synced_wallet(
         &request.mnemonic,
-        request.chain_id,
+        chain_id,
         request.db_path,
         request.init_block_number,
         rpc_url_override,
@@ -194,15 +234,31 @@ pub async fn list_utxos(
     )
     .await?;
 
-    let utxos = synced.handle.unspents.read().await.clone();
-    let (utxo_outputs, totals) = utxo_outputs_from_utxos(utxos);
+    let initial_snapshot = Arc::new(snapshot_from_handle(chain_id, &synced.handle).await);
+    let (snapshots_tx, snapshots_rx) = watch::channel(initial_snapshot);
+    let handle = synced.handle.clone();
+    let mut rev_rx = handle.rev_rx.clone();
+    tokio::spawn(async move {
+        loop {
+            if rev_rx.changed().await.is_err() {
+                break;
+            }
+            let snapshot = Arc::new(snapshot_from_handle(chain_id, &handle).await);
+            if snapshots_tx.send(snapshot).is_err() {
+                break;
+            }
+        }
+    });
 
-    Ok(ListUtxosOutput {
-        chain_id: request.chain_id,
-        cache_key: synced.handle.cache_key,
-        utxo_count: utxo_outputs.len(),
-        utxos: utxo_outputs,
-        totals,
+    Ok(WalletSession {
+        chain_id,
+        cache_key: synced.handle.cache_key.clone(),
+        ready_rx: synced.handle.ready_rx.clone(),
+        snapshots_rx,
+        _db: synced.db,
+        _sync_manager: synced.sync_manager,
+        _chain_key: synced.chain_key,
+        _handle: synced.handle,
     })
 }
 
@@ -468,6 +524,19 @@ pub fn utxo_outputs_from_utxos(mut utxos: Vec<Utxo>) -> (Vec<UtxoOutput>, Vec<To
         .collect();
 
     (utxo_outputs, totals)
+}
+
+async fn snapshot_from_handle(chain_id: u64, handle: &WalletHandle) -> ListUtxosOutput {
+    let utxos = handle.unspents.read().await.clone();
+    let (utxo_outputs, totals) = utxo_outputs_from_utxos(utxos);
+
+    ListUtxosOutput {
+        chain_id,
+        cache_key: handle.cache_key.clone(),
+        utxo_count: utxo_outputs.len(),
+        utxos: utxo_outputs,
+        totals,
+    }
 }
 
 fn token_address_from_utxo(utxo: &Utxo) -> Address {

@@ -2327,6 +2327,7 @@ dependencies = [
  "gpui-component",
  "humantime",
  "pprof",
+ "railgun-ui",
  "serde",
  "serde_urlencoded",
  "structopt",
@@ -12621,6 +12622,27 @@ checksum = "29790946404f91d9c5d06f9874efddea1dc06c5efe94541a7d6863108e3a5e4b"
 dependencies = [
  "same-file",
  "winapi-util",
+]
+
+[[package]]
+name = "wallet"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "broadcaster-monitor",
+ "broadcaster-monitor-gpui",
+ "broadcaster-monitor-waku",
+ "eyre",
+ "gpui",
+ "gpui-component",
+ "railgun-ui",
+ "reqwest 0.12.28",
+ "structopt",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.22",
+ "ui",
+ "wallet-ops",
 ]
 
 [[package]]
