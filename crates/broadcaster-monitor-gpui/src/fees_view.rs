@@ -18,6 +18,7 @@ use std::time::{Duration, SystemTime};
 use broadcaster_monitor::FeeRow;
 use railgun_ui::{chain_icon_path, chain_name, format_token_amount, lookup_token, short_address};
 use ui::clipboard::copy_with_toast;
+use ui::theme;
 
 /// A single-select filter: either "All" (no filter) or a specific value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -315,7 +316,7 @@ impl TableDelegate for FeesDelegate {
             0 => {
                 if matches!(self.chain_filter, FeesFilter::All) {
                     div()
-                        .text_color(rgb(0xcba6f7))
+                        .text_color(rgb(theme::PURPLE))
                         .child(icon_label_row(
                             row.chain_id,
                             SharedString::from(""),
@@ -340,7 +341,7 @@ impl TableDelegate for FeesDelegate {
                         "broadcaster-addr-cell-{row_ix}"
                     )))
                     .cursor_pointer()
-                    .text_color(rgb(0xcdd6f4))
+                    .text_color(rgb(theme::TEXT))
                     .child(SharedString::from(label))
                     .on_click(move |_event, window, cx| {
                         copy_with_toast(addr.clone(), window, cx);
@@ -358,7 +359,7 @@ impl TableDelegate for FeesDelegate {
                 div()
                     .id(SharedString::from(format!("token-cell-{row_ix}")))
                     .cursor_pointer()
-                    .text_color(rgb(0xcdd6f4))
+                    .text_color(rgb(theme::TEXT))
                     .child(SharedString::from(label))
                     .on_click(move |_event, window, cx| {
                         copy_with_toast(addr_for_clipboard.clone(), window, cx);
@@ -371,15 +372,15 @@ impl TableDelegate for FeesDelegate {
                     |info| format_token_amount(row.fee, info.decimals),
                 );
                 div()
-                    .text_color(rgb(0xf9e2af))
+                    .text_color(rgb(theme::WARNING))
                     .child(SharedString::from(label))
                     .into_any_element()
             }
             4 => {
                 let (label, color) = if row.signature_valid {
-                    ("OK", rgb(0xa6e3a1))
+                    ("OK", rgb(theme::SUCCESS))
                 } else {
-                    ("BAD", rgb(0xf38ba8))
+                    ("BAD", rgb(theme::DANGER))
                 };
                 div()
                     .text_color(color)
@@ -388,9 +389,9 @@ impl TableDelegate for FeesDelegate {
             }
             5 => {
                 let color = if row.reliability >= 0.9 {
-                    rgb(0xa6e3a1)
+                    rgb(theme::SUCCESS)
                 } else {
-                    rgb(0xddbb44)
+                    rgb(theme::WARNING_STRONG)
                 };
                 div()
                     .text_color(color)
@@ -405,7 +406,7 @@ impl TableDelegate for FeesDelegate {
                         .as_secs(),
                 ));
                 div()
-                    .text_color(rgb(0xa6adc8))
+                    .text_color(rgb(theme::TEXT_MUTED))
                     .child(SharedString::from(format!("{age} ago")))
                     .into_any_element()
             }
@@ -414,7 +415,7 @@ impl TableDelegate for FeesDelegate {
                 if let Ok(d) = row.fee_expiration.duration_since(now) {
                     let expires = humantime::Duration::from(Duration::from_secs(d.as_secs()));
                     div()
-                        .text_color(rgb(0xa6adc8))
+                        .text_color(rgb(theme::TEXT_MUTED))
                         .child(SharedString::from(expires.to_string()))
                         .into_any_element()
                 } else {
@@ -424,7 +425,7 @@ impl TableDelegate for FeesDelegate {
                             .as_secs(),
                     ));
                     div()
-                        .text_color(rgb(0xf38ba8))
+                        .text_color(rgb(theme::DANGER))
                         .child(SharedString::from(format!("expired {age} ago")))
                         .into_any_element()
                 }

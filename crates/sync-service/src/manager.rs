@@ -53,6 +53,19 @@ impl SyncManager {
         }
     }
 
+    pub async fn shutdown(&self) {
+        let services = self
+            .chains
+            .write()
+            .await
+            .drain()
+            .map(|(_, service)| service)
+            .collect::<Vec<_>>();
+        for service in services {
+            service.shutdown();
+        }
+    }
+
     pub async fn add_wallet(&self, cfg: WalletConfig) -> Result<WalletHandle, SyncManagerError> {
         let chain = self
             .chains

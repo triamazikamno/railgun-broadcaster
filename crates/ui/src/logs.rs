@@ -16,6 +16,8 @@ use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::layer::{Context as LayerContext, Layer};
 use tracing_subscriber::registry::LookupSpan;
 
+use crate::theme;
+
 /// Maximum number of retained log lines kept in the bounded in-memory ring.
 pub const DEFAULT_LOG_CAPACITY: usize = 100;
 
@@ -485,9 +487,9 @@ impl LogsPane {
             .flex()
             .items_start()
             .overflow_hidden()
-            .bg(rgb(0x181825))
+            .bg(rgb(theme::SURFACE))
             .border_b_1()
-            .border_color(rgb(0x313244))
+            .border_color(rgb(theme::BORDER))
             .child(self.render_header_cell(
                 "time",
                 self.column_widths.time,
@@ -524,7 +526,7 @@ impl LogsPane {
             .flex()
             .items_center()
             .px(LOG_CELL_PADDING_X)
-            .text_color(rgb(0xa6adc8))
+            .text_color(rgb(theme::TEXT_MUTED))
             .font_weight(gpui::FontWeight::SEMIBOLD)
             .overflow_hidden()
             .whitespace_nowrap()
@@ -547,7 +549,7 @@ impl LogsPane {
             .flex()
             .items_center()
             .px(LOG_CELL_PADDING_X)
-            .text_color(rgb(0xa6adc8))
+            .text_color(rgb(theme::TEXT_MUTED))
             .font_weight(gpui::FontWeight::SEMIBOLD)
             .overflow_hidden()
             .whitespace_nowrap()
@@ -559,7 +561,11 @@ impl LogsPane {
         active: bool,
         cx: &Context<'_, Self>,
     ) -> impl IntoElement {
-        let divider_color = if active { rgb(0x89b4fa) } else { rgb(0x313244) };
+        let divider_color = if active {
+            rgb(theme::ACCENT_BLUE)
+        } else {
+            rgb(theme::BORDER)
+        };
 
         div()
             .id(("log-column-resize", column.index()))
@@ -570,7 +576,7 @@ impl LogsPane {
             .w(LOG_RESIZE_HANDLE_WIDTH)
             .cursor_col_resize()
             .occlude()
-            .hover(|this| this.bg(rgb(0x242437)))
+            .hover(|this| this.bg(rgb(theme::SURFACE_HOVER_SUBTLE)))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
@@ -677,9 +683,9 @@ const fn should_follow_tail(is_scrolled: bool) -> bool {
 fn render_log_row(entry: &LogEntry, widths: LogColumnWidths, row_ix: usize) -> gpui::AnyElement {
     let (level_label, level_color) = level_style(entry.level);
     let bg = if row_ix.is_multiple_of(2) {
-        rgb(0x1e1e2e)
+        rgb(theme::SURFACE_ELEVATED)
     } else {
-        rgb(0x202033)
+        rgb(theme::SURFACE_ELEVATED_ALT)
     };
 
     div()
@@ -689,11 +695,11 @@ fn render_log_row(entry: &LogEntry, widths: LogColumnWidths, row_ix: usize) -> g
         .items_start()
         .bg(bg)
         .border_b_1()
-        .border_color(rgb(0x25253a))
+        .border_color(rgb(theme::BORDER_SUBTLE))
         .child(render_nowrap_log_cell(
             SharedString::from(format_time(entry.unix_ms)),
             widths.time,
-            rgb(0x6c7086),
+            rgb(theme::TEXT_SUBTLE),
         ))
         .child(render_nowrap_log_cell(
             SharedString::from(level_label),
@@ -703,7 +709,7 @@ fn render_log_row(entry: &LogEntry, widths: LogColumnWidths, row_ix: usize) -> g
         .child(render_nowrap_log_cell(
             SharedString::from(entry.target.as_ref().to_owned()),
             widths.target,
-            rgb(0xcba6f7),
+            rgb(theme::PURPLE),
         ))
         .child(
             div()
@@ -711,7 +717,7 @@ fn render_log_row(entry: &LogEntry, widths: LogColumnWidths, row_ix: usize) -> g
                 .min_w(MIN_MESSAGE_WIDTH)
                 .px(LOG_CELL_PADDING_X)
                 .py(LOG_CELL_PADDING_Y)
-                .text_color(rgb(0xcdd6f4))
+                .text_color(rgb(theme::TEXT))
                 .whitespace_normal()
                 .child(SharedString::from(entry.message.as_ref().to_owned())),
         )
@@ -736,17 +742,17 @@ fn render_empty_logs() -> impl IntoElement {
         .flex()
         .items_center()
         .justify_center()
-        .text_color(rgb(0x6c7086))
+        .text_color(rgb(theme::TEXT_SUBTLE))
         .child("No log entries yet")
 }
 
 fn level_style(level: Level) -> (&'static str, Rgba) {
     match level {
-        Level::ERROR => ("ERR", rgb(0xf38ba8)),
-        Level::WARN => ("WRN", rgb(0xf9e2af)),
-        Level::INFO => ("INF", rgb(0xa6e3a1)),
-        Level::DEBUG => ("DBG", rgb(0x89dceb)),
-        Level::TRACE => ("TRC", rgb(0xa6adc8)),
+        Level::ERROR => ("ERR", rgb(theme::DANGER)),
+        Level::WARN => ("WRN", rgb(theme::WARNING)),
+        Level::INFO => ("INF", rgb(theme::SUCCESS)),
+        Level::DEBUG => ("DBG", rgb(theme::INFO)),
+        Level::TRACE => ("TRC", rgb(theme::TEXT_MUTED)),
     }
 }
 
@@ -762,7 +768,7 @@ impl Render for LogsPane {
             .overflow_hidden()
             .flex()
             .flex_col()
-            .bg(rgb(0x1e1e2e))
+            .bg(rgb(theme::SURFACE_ELEVATED))
             .child(self.render_header(cx))
             .child(self.render_body())
             .child(

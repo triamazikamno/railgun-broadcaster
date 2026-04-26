@@ -413,8 +413,11 @@ impl BroadcasterService {
                     chain: chain_key,
                     cache_key: cache_key.clone(),
                     start_block: Some(*init_block_number),
+                    sync_to_block: None,
                     scan_keys,
                     progress_tx: None,
+                    cache_store: None,
+                    use_indexed_wallet_catch_up: true,
                 };
                 let handle = sync_manager.add_wallet(wallet_cfg).await?;
                 if let Some(auto_refill) = auto_refill.clone() {

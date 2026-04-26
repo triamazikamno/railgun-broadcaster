@@ -30,6 +30,9 @@ use sync_service::{
 };
 pub use sync_service::{SyncProgressStage, SyncProgressUpdate};
 use tokio::sync::watch;
+use zeroize::Zeroize;
+
+pub mod vault;
 
 const DEFAULT_QUERY_RPC_COOLDOWN: Duration = Duration::from_secs(5);
 const DEFAULT_BLOCK_RANGE: u64 = 500;
@@ -73,6 +76,8 @@ pub struct ListUtxosRequest {
     pub chain_id: u64,
     pub db_path: PathBuf,
     pub init_block_number: Option<u64>,
+    pub sync_to_block: Option<u64>,
+    pub use_indexed_wallet_catch_up: bool,
 }
 
 pub struct WalletSessionRequest {
@@ -80,6 +85,8 @@ pub struct WalletSessionRequest {
     pub chain_id: u64,
     pub db_path: PathBuf,
     pub init_block_number: Option<u64>,
+    pub sync_to_block: Option<u64>,
+    pub use_indexed_wallet_catch_up: bool,
     pub progress_tx: Option<SyncProgressSender>,
 }
 
@@ -87,6 +94,18 @@ pub struct WalletChainSessionRequest {
     pub mnemonic: String,
     pub chain_id: u64,
     pub init_block_number: Option<u64>,
+    pub sync_to_block: Option<u64>,
+    pub use_indexed_wallet_catch_up: bool,
+    pub progress_tx: Option<SyncProgressSender>,
+}
+
+pub struct ViewWalletChainSessionRequest {
+    pub view_session: Arc<vault::DesktopViewSession>,
+    pub chain_id: u64,
+    pub init_block_number: Option<u64>,
+    pub sync_to_block: Option<u64>,
+    pub use_indexed_wallet_catch_up: bool,
+    pub rewind_wallet_cache: bool,
     pub progress_tx: Option<SyncProgressSender>,
 }
 
@@ -97,6 +116,8 @@ impl From<ListUtxosRequest> for WalletSessionRequest {
             chain_id: value.chain_id,
             db_path: value.db_path,
             init_block_number: value.init_block_number,
+            sync_to_block: value.sync_to_block,
+            use_indexed_wallet_catch_up: value.use_indexed_wallet_catch_up,
             progress_tx: None,
         }
     }
@@ -108,6 +129,8 @@ impl From<WalletSessionRequest> for WalletChainSessionRequest {
             mnemonic: value.mnemonic,
             chain_id: value.chain_id,
             init_block_number: value.init_block_number,
+            sync_to_block: value.sync_to_block,
+            use_indexed_wallet_catch_up: value.use_indexed_wallet_catch_up,
             progress_tx: value.progress_tx,
         }
     }
@@ -133,6 +156,56 @@ pub struct UnshieldRequest {
     pub init_block_number: Option<u64>,
     pub unwrap: bool,
     pub private_key: Option<String>,
+}
+
+pub trait EvmTransactionSigner {
+    fn address(&self) -> Address;
+
+    fn ethereum_wallet(&self) -> EthereumWallet;
+}
+
+pub trait EvmMessageSigner {
+    fn derive_shield_private_key(&self) -> Result<[u8; 32]>;
+}
+
+pub struct SoftwareEvmSigner {
+    private_key: [u8; 32],
+    signer: PrivateKeySigner,
+}
+
+impl SoftwareEvmSigner {
+    pub fn from_private_key_hex(private_key: &str) -> Result<Self> {
+        let private_key = parse_private_key(private_key)?;
+        let signer = PrivateKeySigner::from(
+            SigningKey::from_bytes((&private_key).into()).wrap_err("invalid signing key")?,
+        );
+        Ok(Self {
+            private_key,
+            signer,
+        })
+    }
+}
+
+impl EvmTransactionSigner for SoftwareEvmSigner {
+    fn address(&self) -> Address {
+        self.signer.address()
+    }
+
+    fn ethereum_wallet(&self) -> EthereumWallet {
+        EthereumWallet::from(self.signer.clone())
+    }
+}
+
+impl EvmMessageSigner for SoftwareEvmSigner {
+    fn derive_shield_private_key(&self) -> Result<[u8; 32]> {
+        derive_shield_private_key(&self.private_key).wrap_err("derive shield private key")
+    }
+}
+
+impl Drop for SoftwareEvmSigner {
+    fn drop(&mut self) {
+        self.private_key.zeroize();
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -232,9 +305,18 @@ pub struct WalletSession {
     pub ready_rx: watch::Receiver<bool>,
     pub snapshots_rx: watch::Receiver<Arc<ListUtxosOutput>>,
     _db: Arc<DbStore>,
-    _sync_manager: Arc<SyncManager>,
-    _chain_key: ChainKey,
+    sync_manager: Arc<SyncManager>,
+    chain_key: ChainKey,
     _handle: WalletHandle,
+}
+
+impl WalletSession {
+    pub async fn stop(&self) -> Result<()> {
+        self.sync_manager
+            .remove_wallet(&self.chain_key, &self.cache_key)
+            .await
+            .wrap_err("remove wallet sync worker")
+    }
 }
 
 pub struct WalletSessionStore {
@@ -245,9 +327,14 @@ pub struct WalletSessionStore {
 impl WalletSessionStore {
     pub fn open(db_path: PathBuf) -> Result<Self> {
         let db = Arc::new(DbStore::open(DbConfig { root_dir: db_path }).wrap_err("open local db")?);
+        Ok(Self::from_db(db))
+    }
+
+    #[must_use]
+    pub fn from_db(db: Arc<DbStore>) -> Self {
         let sync_manager = Arc::new(SyncManager::new(Arc::clone(&db)));
 
-        Ok(Self { db, sync_manager })
+        Self { db, sync_manager }
     }
 
     pub async fn start_wallet_session(
@@ -261,6 +348,8 @@ impl WalletSessionStore {
             &request.mnemonic,
             chain_id,
             request.init_block_number,
+            request.sync_to_block,
+            request.use_indexed_wallet_catch_up,
             rpc_url_override,
             http,
             UnsupportedChainMessage::WalletCliV1,
@@ -271,6 +360,36 @@ impl WalletSessionStore {
         .await?;
 
         wallet_session_from_synced(chain_id, synced).await
+    }
+
+    pub async fn start_view_wallet_session(
+        &self,
+        request: ViewWalletChainSessionRequest,
+        rpc_url_override: Option<Url>,
+        http: &HttpContext,
+    ) -> Result<WalletSession> {
+        let chain_id = request.chain_id;
+        let synced = setup_synced_view_wallet_with_store(
+            request.view_session,
+            chain_id,
+            request.init_block_number,
+            request.sync_to_block,
+            request.use_indexed_wallet_catch_up,
+            request.rewind_wallet_cache,
+            rpc_url_override,
+            http,
+            UnsupportedChainMessage::WalletCliV1,
+            request.progress_tx.clone(),
+            Arc::clone(&self.db),
+            Arc::clone(&self.sync_manager),
+        )
+        .await?;
+
+        wallet_session_from_view_synced(chain_id, synced).await
+    }
+
+    pub async fn shutdown(&self) {
+        self.sync_manager.shutdown().await;
     }
 }
 
@@ -298,16 +417,49 @@ pub async fn start_wallet_session(
 }
 
 async fn wallet_session_from_synced(chain_id: u64, synced: SyncedWallet) -> Result<WalletSession> {
-    let initial_snapshot = Arc::new(snapshot_from_handle(chain_id, &synced.handle).await);
+    wallet_session_from_parts(
+        chain_id,
+        synced.db,
+        synced.sync_manager,
+        synced.chain_key,
+        synced.handle,
+    )
+    .await
+}
+
+async fn wallet_session_from_view_synced(
+    chain_id: u64,
+    synced: SyncedViewWallet,
+) -> Result<WalletSession> {
+    wallet_session_from_parts(
+        chain_id,
+        synced.db,
+        synced.sync_manager,
+        synced.chain_key,
+        synced.handle,
+    )
+    .await
+}
+
+async fn wallet_session_from_parts(
+    chain_id: u64,
+    db: Arc<DbStore>,
+    sync_manager: Arc<SyncManager>,
+    chain_key: ChainKey,
+    handle: WalletHandle,
+) -> Result<WalletSession> {
+    let initial_snapshot = Arc::new(snapshot_from_handle(chain_id, &handle).await);
     let (snapshots_tx, snapshots_rx) = watch::channel(initial_snapshot);
-    let handle = synced.handle.clone();
+    let cache_key = handle.cache_key.clone();
+    let ready_rx = handle.ready_rx.clone();
+    let snapshot_handle = handle.clone();
     let mut rev_rx = handle.rev_rx.clone();
     tokio::spawn(async move {
         loop {
             if rev_rx.changed().await.is_err() {
                 break;
             }
-            let snapshot = Arc::new(snapshot_from_handle(chain_id, &handle).await);
+            let snapshot = Arc::new(snapshot_from_handle(chain_id, &snapshot_handle).await);
             if snapshots_tx.send(snapshot).is_err() {
                 break;
             }
@@ -316,13 +468,13 @@ async fn wallet_session_from_synced(chain_id: u64, synced: SyncedWallet) -> Resu
 
     Ok(WalletSession {
         chain_id,
-        cache_key: synced.handle.cache_key.clone(),
-        ready_rx: synced.handle.ready_rx.clone(),
+        cache_key,
+        ready_rx,
         snapshots_rx,
-        _db: synced.db,
-        _sync_manager: synced.sync_manager,
-        _chain_key: synced.chain_key,
-        _handle: synced.handle,
+        _db: db,
+        sync_manager,
+        chain_key,
+        _handle: handle,
     })
 }
 
@@ -342,9 +494,8 @@ pub async fn shield(
     let addr_data =
         AddressData::try_from(&railgun_addr).wrap_err("invalid recipient 0zk address")?;
 
-    let pk_bytes = parse_private_key(&request.private_key)?;
-    let shield_private_key =
-        derive_shield_private_key(&pk_bytes).wrap_err("derive shield private key")?;
+    let evm_signer = SoftwareEvmSigner::from_private_key_hex(&request.private_key)?;
+    let shield_private_key = evm_signer.derive_shield_private_key()?;
 
     let approve_data = build_approve_calldata(chain_defaults.contract, amount);
     let shield_data = build_shield_calldata(
@@ -382,10 +533,7 @@ pub async fn shield(
         }));
     }
 
-    let signer = PrivateKeySigner::from(
-        SigningKey::from_bytes((&pk_bytes).into()).wrap_err("invalid signing key")?,
-    );
-    let from_address = signer.address();
+    let from_address = evm_signer.address();
     let provider = ProviderBuilder::new()
         .connect_reqwest(http.client.clone(), rpc_url)
         .erased();
@@ -395,7 +543,7 @@ pub async fn shield(
         .get_transaction_count(from_address)
         .await
         .wrap_err("fetch nonce")?;
-    let wallet = EthereumWallet::from(signer);
+    let wallet = evm_signer.ethereum_wallet();
 
     let wrap_receipt = if request.wrap {
         let tx_req = TransactionRequest::default()
@@ -470,6 +618,8 @@ pub async fn unshield(
         request.chain_id,
         request.db_path,
         request.init_block_number,
+        None,
+        true,
         rpc_url_override,
         http,
         UnsupportedChainMessage::Generic,
@@ -530,11 +680,8 @@ pub async fn unshield(
         }));
     };
 
-    let pk_bytes = parse_private_key(private_key)?;
-    let signer = PrivateKeySigner::from(
-        SigningKey::from_bytes((&pk_bytes).into()).wrap_err("invalid signing key")?,
-    );
-    let from_address = signer.address();
+    let evm_signer = SoftwareEvmSigner::from_private_key_hex(private_key)?;
+    let from_address = evm_signer.address();
     let provider = ProviderBuilder::new()
         .connect_reqwest(http.client.clone(), synced.rpc_url)
         .erased();
@@ -553,8 +700,8 @@ pub async fn unshield(
         .with_gas_price(gas_price)
         .with_nonce(nonce);
 
-    let receipt =
-        sign_send_wait(&provider, &EthereumWallet::from(signer), tx_req, "unshield").await?;
+    let wallet = evm_signer.ethereum_wallet();
+    let receipt = sign_send_wait(&provider, &wallet, tx_req, "unshield").await?;
 
     Ok(UnshieldResult::Sent(UnshieldSendOutput {
         tx_hash: receipt.tx_hash,
@@ -644,11 +791,20 @@ struct SyncedWallet {
     handle: WalletHandle,
 }
 
+struct SyncedViewWallet {
+    db: Arc<DbStore>,
+    sync_manager: Arc<SyncManager>,
+    chain_key: ChainKey,
+    handle: WalletHandle,
+}
+
 async fn setup_synced_wallet(
     mnemonic: &str,
     chain_id: u64,
     db_path: PathBuf,
     init_block_number: Option<u64>,
+    sync_to_block: Option<u64>,
+    use_indexed_wallet_catch_up: bool,
     rpc_url_override: Option<Url>,
     http: &HttpContext,
     unsupported_chain_message: UnsupportedChainMessage,
@@ -659,6 +815,8 @@ async fn setup_synced_wallet(
         mnemonic,
         chain_id,
         init_block_number,
+        sync_to_block,
+        use_indexed_wallet_catch_up,
         rpc_url_override,
         http,
         unsupported_chain_message,
@@ -673,6 +831,8 @@ async fn setup_synced_wallet_with_store(
     mnemonic: &str,
     chain_id: u64,
     init_block_number: Option<u64>,
+    sync_to_block: Option<u64>,
+    use_indexed_wallet_catch_up: bool,
     rpc_url_override: Option<Url>,
     http: &HttpContext,
     unsupported_chain_message: UnsupportedChainMessage,
@@ -700,12 +860,22 @@ async fn setup_synced_wallet_with_store(
         .wrap_err("derive wallet id")?;
     let cache_key = wallet_cache_key(wallet_id.as_ref(), chain_id, chain_key.contract);
     let start_block = init_block_number.unwrap_or(chain_defaults.deployment_block);
+    tracing::info!(
+        chain_id,
+        start_block,
+        sync_to_block,
+        use_indexed_wallet_catch_up,
+        "starting mnemonic wallet sync"
+    );
     let wallet_cfg = WalletConfig {
         chain: chain_key,
         cache_key,
         start_block: Some(start_block),
+        sync_to_block,
         scan_keys,
         progress_tx,
+        cache_store: None,
+        use_indexed_wallet_catch_up,
     };
 
     let mut handle = sync_manager
@@ -721,6 +891,101 @@ async fn setup_synced_wallet_with_store(
         chain_defaults,
         rpc_url,
         wallet,
+        handle,
+    })
+}
+
+async fn setup_synced_view_wallet_with_store(
+    view_session: Arc<vault::DesktopViewSession>,
+    chain_id: u64,
+    init_block_number: Option<u64>,
+    sync_to_block: Option<u64>,
+    use_indexed_wallet_catch_up: bool,
+    rewind_wallet_cache: bool,
+    rpc_url_override: Option<Url>,
+    http: &HttpContext,
+    unsupported_chain_message: UnsupportedChainMessage,
+    progress_tx: Option<SyncProgressSender>,
+    db: Arc<DbStore>,
+    sync_manager: Arc<SyncManager>,
+) -> Result<SyncedViewWallet> {
+    let chain_defaults = chain_defaults_for_chain(chain_id, unsupported_chain_message)?;
+    let rpc_url = rpc_url_override.unwrap_or_else(|| chain_defaults.rpc_url.clone());
+    let chain_key = ChainKey {
+        chain_id: chain_defaults.chain_id,
+        contract: chain_defaults.contract,
+    };
+
+    let chain_cfg = chain_config(&chain_defaults, rpc_url, http, progress_tx.clone());
+    sync_manager
+        .add_chain(chain_cfg)
+        .await
+        .wrap_err("register chain sync service")?;
+
+    let start_block = init_block_number.unwrap_or(chain_defaults.deployment_block);
+    tracing::info!(
+        chain_id,
+        start_block,
+        sync_to_block,
+        use_indexed_wallet_catch_up,
+        "starting desktop view wallet sync"
+    );
+    let vault_store = vault::DesktopVaultStore::from_db(Arc::clone(&db));
+    let mut wallet_chain_metadata = vault_store
+        .wallet_chain_metadata_for_session(
+            view_session.as_ref(),
+            0,
+            chain_id,
+            &chain_key.contract.to_checksum(None),
+            start_block,
+        )
+        .wrap_err("load encrypted wallet chain metadata")?;
+    if rewind_wallet_cache {
+        vault_store
+            .rewind_wallet_chain_cache_with_session(
+                view_session.as_ref(),
+                &mut wallet_chain_metadata,
+                start_block,
+            )
+            .wrap_err("rewind encrypted wallet cache")?;
+        tracing::info!(
+            chain_id,
+            start_block,
+            wallet_chain_uuid = %wallet_chain_metadata.wallet_chain_uuid,
+            "rewound encrypted desktop wallet cache"
+        );
+    }
+    let cache_key = wallet_chain_metadata.wallet_chain_uuid.clone();
+    let cache_store = Arc::new(
+        vault::DesktopEncryptedWalletCacheStore::new(
+            Arc::clone(&db),
+            Arc::clone(&view_session),
+            wallet_chain_metadata,
+        )
+        .wrap_err("create encrypted wallet cache")?,
+    );
+    let scan_keys = view_session.scan_keys();
+    let wallet_cfg = WalletConfig {
+        chain: chain_key,
+        cache_key,
+        start_block: Some(start_block),
+        sync_to_block,
+        scan_keys,
+        progress_tx,
+        cache_store: Some(cache_store),
+        use_indexed_wallet_catch_up,
+    };
+
+    let mut handle = sync_manager
+        .add_wallet(wallet_cfg)
+        .await
+        .wrap_err("register wallet sync worker")?;
+    handle.wait_until_ready().await;
+
+    Ok(SyncedViewWallet {
+        db,
+        sync_manager,
+        chain_key,
         handle,
     })
 }
@@ -868,7 +1133,10 @@ mod tests {
     use railgun_wallet::{Utxo, UtxoSource, WalletUtxo};
     use serde_json::json;
 
-    use super::{ListUtxosOutput, TokenTotal, UtxoOutput, utxo_outputs_from_utxos};
+    use super::{
+        EvmMessageSigner, EvmTransactionSigner, ListUtxosOutput, SoftwareEvmSigner, TokenTotal,
+        UtxoOutput, utxo_outputs_from_utxos,
+    };
 
     fn address(byte: u8) -> Address {
         Address::from_slice(&[byte; 20])
@@ -992,5 +1260,27 @@ mod tests {
                 }],
             })
         );
+    }
+
+    #[test]
+    fn software_evm_signer_uses_separate_transaction_and_message_boundaries() {
+        fn exercise_boundaries(signer: &(impl EvmTransactionSigner + EvmMessageSigner)) {
+            let address = signer.address();
+            let shield_key = signer
+                .derive_shield_private_key()
+                .expect("derive shield key through EVM message boundary");
+            let _wallet = signer.ethereum_wallet();
+
+            assert_ne!(address, Address::ZERO);
+            assert_ne!(shield_key, [0u8; 32]);
+        }
+
+        let signer = SoftwareEvmSigner::from_private_key_hex(
+            "0x0101010101010101010101010101010101010101010101010101010101010101",
+        )
+        .expect("software EVM signer");
+
+        exercise_boundaries(&signer);
+        assert!(SoftwareEvmSigner::from_private_key_hex("0x1234").is_err());
     }
 }

@@ -20,6 +20,8 @@ const PENDING_FEE_NOTE_ASSURANCE_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("fee_note_assurance_pending");
 const TERMINAL_FEE_NOTE_ASSURANCE_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("fee_note_assurance_terminal");
+const DESKTOP_WALLET_VAULT_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("desktop_wallet_vault_v1");
 
 const META_KEY: &str = "meta";
 const RAILGUN_DIR: &str = "railgun";
@@ -143,6 +145,12 @@ pub struct TerminalFeeNoteAssuranceRecord {
     pub public_tx_hash: FixedBytes<32>,
     pub context: FeeNoteAssuranceContext,
     pub outcome: FeeNoteAssuranceTerminalOutcome,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DesktopWalletVaultRecord {
+    pub key: String,
+    pub payload: Vec<u8>,
 }
 
 impl DbStore {
@@ -554,6 +562,115 @@ impl DbStore {
         Ok(())
     }
 
+    pub fn get_desktop_wallet_vault_record(&self, key: &str) -> Result<Option<Vec<u8>>, DbError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(DESKTOP_WALLET_VAULT_TABLE)?;
+        match table.get(key)? {
+            Some(value) => Ok(Some(value.value().to_vec())),
+            None => Ok(None),
+        }
+    }
+
+    pub fn put_desktop_wallet_vault_record(
+        &self,
+        key: &str,
+        payload: &[u8],
+    ) -> Result<(), DbError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(DESKTOP_WALLET_VAULT_TABLE)?;
+            table.insert(key, payload)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn put_desktop_wallet_vault_record_if_absent(
+        &self,
+        key: &str,
+        payload: &[u8],
+    ) -> Result<bool, DbError> {
+        let txn = self.db.begin_write()?;
+        let inserted = {
+            let mut table = txn.open_table(DESKTOP_WALLET_VAULT_TABLE)?;
+            if table.get(key)?.is_some() {
+                false
+            } else {
+                table.insert(key, payload)?;
+                true
+            }
+        };
+        txn.commit()?;
+        Ok(inserted)
+    }
+
+    pub fn put_desktop_wallet_vault_records(
+        &self,
+        records: &[(String, Vec<u8>)],
+    ) -> Result<(), DbError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(DESKTOP_WALLET_VAULT_TABLE)?;
+            for (key, payload) in records {
+                table.insert(key.as_str(), payload.as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_desktop_wallet_vault_record(&self, key: &str) -> Result<(), DbError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(DESKTOP_WALLET_VAULT_TABLE)?;
+            table.remove(key)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn replace_desktop_wallet_vault_prefix_with_records(
+        &self,
+        prefix: &str,
+        records: &[(String, Vec<u8>)],
+    ) -> Result<(), DbError> {
+        let range_end = format!("{prefix}~");
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(DESKTOP_WALLET_VAULT_TABLE)?;
+            let keys: Vec<String> = table
+                .range(prefix..range_end.as_str())?
+                .map(|entry| entry.map(|(key, _)| key.value().to_string()))
+                .collect::<Result<_, _>>()?;
+            for key in keys {
+                table.remove(key.as_str())?;
+            }
+            for (key, payload) in records {
+                table.insert(key.as_str(), payload.as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn list_desktop_wallet_vault_records(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<DesktopWalletVaultRecord>, DbError> {
+        let range_end = format!("{prefix}~");
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(DESKTOP_WALLET_VAULT_TABLE)?;
+        let mut out = Vec::new();
+        for entry in table.range(prefix..range_end.as_str())? {
+            let (key, value) = entry?;
+            out.push(DesktopWalletVaultRecord {
+                key: key.value().to_string(),
+                payload: value.value().to_vec(),
+            });
+        }
+        Ok(out)
+    }
+
     fn initialize_schema(&self) -> Result<(), DbError> {
         let txn = self.db.begin_write()?;
         txn.open_table(META_TABLE)?;
@@ -564,6 +681,7 @@ impl DbStore {
         txn.open_table(WALLET_META_TABLE)?;
         txn.open_table(PENDING_FEE_NOTE_ASSURANCE_TABLE)?;
         txn.open_table(TERMINAL_FEE_NOTE_ASSURANCE_TABLE)?;
+        txn.open_table(DESKTOP_WALLET_VAULT_TABLE)?;
         txn.commit()?;
         Ok(())
     }
@@ -841,6 +959,122 @@ mod tests {
             .expect("list terminal assurance records");
         assert_eq!(terminal_records.len(), 1);
         assert_eq!(terminal_records[0].public_tx_hash, record.public_tx_hash);
+
+        drop(store);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn desktop_wallet_vault_records_are_isolated_by_prefix() {
+        let root_dir = temp_db_root();
+        let store = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db");
+
+        store
+            .put_desktop_wallet_vault_record("vault|meta", b"encrypted metadata")
+            .expect("store metadata");
+        store
+            .put_desktop_wallet_vault_record("wallet-cache|opaque-a|row-1", b"encrypted row 1")
+            .expect("store row 1");
+        store
+            .put_desktop_wallet_vault_record("wallet-cache|opaque-b|row-2", b"encrypted row 2")
+            .expect("store row 2");
+
+        let meta = store
+            .get_desktop_wallet_vault_record("vault|meta")
+            .expect("load metadata")
+            .expect("metadata present");
+        assert_eq!(meta, b"encrypted metadata");
+
+        assert!(
+            !store
+                .put_desktop_wallet_vault_record_if_absent("vault|meta", b"replacement")
+                .expect("skip existing metadata")
+        );
+        assert_eq!(
+            store
+                .get_desktop_wallet_vault_record("vault|meta")
+                .expect("load unchanged metadata")
+                .expect("metadata present"),
+            b"encrypted metadata"
+        );
+        assert!(
+            store
+                .put_desktop_wallet_vault_record_if_absent("vault|new", b"new metadata")
+                .expect("insert missing metadata")
+        );
+        assert_eq!(
+            store
+                .get_desktop_wallet_vault_record("vault|new")
+                .expect("load inserted metadata")
+                .expect("metadata present"),
+            b"new metadata"
+        );
+
+        let cache_a = store
+            .list_desktop_wallet_vault_records("wallet-cache|opaque-a|")
+            .expect("list cache records");
+        assert_eq!(cache_a.len(), 1);
+        assert_eq!(cache_a[0].key, "wallet-cache|opaque-a|row-1");
+        assert_eq!(cache_a[0].payload, b"encrypted row 1");
+
+        store
+            .put_desktop_wallet_vault_records(&[
+                (
+                    "wallet-cache|opaque-a|row-3".to_string(),
+                    b"encrypted row 3".to_vec(),
+                ),
+                (
+                    "wallet-chain-meta|opaque-a".to_string(),
+                    b"metadata".to_vec(),
+                ),
+            ])
+            .expect("batch put cache records");
+        let cache_a = store
+            .list_desktop_wallet_vault_records("wallet-cache|opaque-a|")
+            .expect("list updated cache records");
+        assert_eq!(cache_a.len(), 2);
+        assert!(
+            store
+                .get_desktop_wallet_vault_record("wallet-chain-meta|opaque-a")
+                .expect("load metadata")
+                .is_some()
+        );
+
+        store
+            .replace_desktop_wallet_vault_prefix_with_records(
+                "wallet-cache|opaque-a|",
+                &[(
+                    "wallet-chain-meta|opaque-a".to_string(),
+                    b"reset-meta".to_vec(),
+                )],
+            )
+            .expect("replace cache prefix");
+        assert!(
+            store
+                .list_desktop_wallet_vault_records("wallet-cache|opaque-a|")
+                .expect("list reset cache records")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .get_desktop_wallet_vault_record("wallet-chain-meta|opaque-a")
+                .expect("load reset metadata")
+                .expect("metadata present"),
+            b"reset-meta"
+        );
+
+        store
+            .delete_desktop_wallet_vault_record("wallet-cache|opaque-a|row-1")
+            .expect("delete cache record");
+        assert!(
+            store
+                .get_desktop_wallet_vault_record("wallet-cache|opaque-a|row-1")
+                .expect("load deleted cache record")
+                .is_none()
+        );
 
         drop(store);
         fs::remove_dir_all(root_dir).expect("remove temp db dir");

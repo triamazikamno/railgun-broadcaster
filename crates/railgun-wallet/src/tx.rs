@@ -11,7 +11,7 @@ use broadcaster_core::contracts::railgun::{
 use broadcaster_core::crypto::poseidon::poseidon;
 use merkletree::tree::{MerkleForest, MerkleProof};
 
-use crate::keys::{EddsaSignature, WalletKeys};
+use crate::keys::{RailgunSpendSigner, WalletKeys};
 use crate::notes::{Note, NoteCiphertext};
 use crate::prover::ProverService;
 use broadcaster_core::utxo::Utxo;
@@ -140,10 +140,9 @@ impl PublicInputs {
     }
 
     #[must_use]
-    pub fn signature(&self, wallet: &WalletKeys) -> [U256; 3] {
+    pub fn signature(&self, signer: &impl RailgunSpendSigner) -> [U256; 3] {
         let msg = poseidon(self.signature_message());
-        let signature = EddsaSignature::new(&wallet.spending_private_key, msg);
-        [signature.r8[0], signature.r8[1], signature.s]
+        signer.sign_spend_message(msg)
     }
 }
 
@@ -686,4 +685,50 @@ fn rand_array<const N: usize>() -> [u8; N] {
     let mut out = [0u8; N];
     rand::rng().fill_bytes(&mut out);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    struct MockSpendSigner {
+        signed_msg: Cell<Option<U256>>,
+    }
+
+    impl RailgunSpendSigner for MockSpendSigner {
+        fn spending_public_key(&self) -> [U256; 2] {
+            [U256::from(11_u8), U256::from(12_u8)]
+        }
+
+        fn sign_spend_message(&self, msg: U256) -> [U256; 3] {
+            self.signed_msg.set(Some(msg));
+            [U256::from(1_u8), U256::from(2_u8), U256::from(3_u8)]
+        }
+    }
+
+    #[test]
+    fn public_inputs_signature_uses_spend_signer_boundary() {
+        let public_inputs = PublicInputs {
+            merkle_root: U256::from(1_u8),
+            bound_params_hash: U256::from(2_u8),
+            nullifiers: vec![U256::from(3_u8)],
+            commitments_out: vec![U256::from(4_u8)],
+        };
+        let signer = MockSpendSigner {
+            signed_msg: Cell::new(None),
+        };
+
+        let signature = public_inputs.signature(&signer);
+
+        assert_eq!(
+            signature,
+            [U256::from(1_u8), U256::from(2_u8), U256::from(3_u8)]
+        );
+        assert_eq!(
+            signer.signed_msg.get(),
+            Some(poseidon(public_inputs.signature_message()))
+        );
+    }
 }

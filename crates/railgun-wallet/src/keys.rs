@@ -53,7 +53,7 @@ pub enum KeyError {
     InvalidEd25519Pubkey,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WalletKeys {
     pub spending_private_key: [u8; 32],
     pub spending_public_key: [U256; 2],
@@ -121,8 +121,19 @@ impl BabyJubPoint {
 impl WalletKeys {
     pub fn from_mnemonic(mnemonic: &str, index: u32) -> Result<Self, KeyError> {
         let seed = bip39_seed(mnemonic)?;
-        let spending_node = WalletNode::try_from_path(&seed, &spending_path(index))?;
-        let viewing_node = WalletNode::try_from_path(&seed, &viewing_path(index))?;
+        Self::from_seed(&seed, index)
+    }
+
+    pub fn from_bip39_entropy(entropy: &[u8], index: u32) -> Result<Self, KeyError> {
+        let mnemonic =
+            bip39::Mnemonic::from_entropy(entropy).map_err(|_| KeyError::InvalidMnemonic)?;
+        let seed = mnemonic.to_seed("");
+        Self::from_seed(&seed, index)
+    }
+
+    pub fn from_seed(seed: &[u8; 64], index: u32) -> Result<Self, KeyError> {
+        let spending_node = WalletNode::try_from_path(seed, &spending_path(index))?;
+        let viewing_node = WalletNode::try_from_path(seed, &viewing_path(index))?;
 
         let spending_private_key = spending_node.chain_key;
         let viewing_private_key = viewing_node.chain_key;
@@ -150,6 +161,16 @@ impl WalletKeys {
         )?;
         Ok(address.to_string())
     }
+}
+
+pub fn bip39_entropy_from_mnemonic(mnemonic: &str) -> Result<Vec<u8>, KeyError> {
+    let mnemonic = bip39::Mnemonic::parse(mnemonic).map_err(|_| KeyError::InvalidMnemonic)?;
+    Ok(mnemonic.to_entropy())
+}
+
+pub fn bip39_mnemonic_from_entropy(entropy: &[u8]) -> Result<String, KeyError> {
+    let mnemonic = bip39::Mnemonic::from_entropy(entropy).map_err(|_| KeyError::InvalidMnemonic)?;
+    Ok(mnemonic.to_string())
 }
 
 impl EddsaSignature {
@@ -186,6 +207,23 @@ impl EddsaSignature {
             r8: [prime_field_to_u256(r8.x), prime_field_to_u256(r8.y)],
             s: U256::from(s_value),
         }
+    }
+}
+
+pub trait RailgunSpendSigner {
+    fn spending_public_key(&self) -> [U256; 2];
+
+    fn sign_spend_message(&self, msg: U256) -> [U256; 3];
+}
+
+impl RailgunSpendSigner for WalletKeys {
+    fn spending_public_key(&self) -> [U256; 2] {
+        self.spending_public_key
+    }
+
+    fn sign_spend_message(&self, msg: U256) -> [U256; 3] {
+        let signature = EddsaSignature::new(&self.spending_private_key, msg);
+        [signature.r8[0], signature.r8[1], signature.s]
     }
 }
 
@@ -250,7 +288,7 @@ fn bip39_seed(mnemonic: &str) -> Result<[u8; 64], KeyError> {
     Ok(out)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct WalletNode {
     chain_key: [u8; 32],
     chain_code: [u8; 32],

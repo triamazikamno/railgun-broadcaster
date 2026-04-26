@@ -35,14 +35,20 @@ alloy = { version = "2", features = ["serde", "signer-mnemonic"] }
 alloy-provider = "2"
 alloy-rpc-types-eth = "2"
 alloy-transport = "2"
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
 eyre = "0.6"
+getrandom = "0.3"
 gpui = "=0.2.2"
 gpui-component = "=0.5.1"
+hkdf = "0.12"
+hmac = "0.12"
 rand = "0.10"
 reqwest = { version = "0.13", features = ["socks"] }
 ruint = { version = "1.17", features = ["num-bigint"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 thiserror = "2"
 tokio = "1"
 tracing = "0.1"
@@ -51,6 +57,7 @@ bytes = { version = "1.11" }
 byteorder = "1"
 rayon = { version = "1.11" }
 async-trait = "0.1"
+zeroize = { version = "1", features = ["derive"] }
 
 [patch.crates-io]
 wasmer-vm = { git = "https://github.com/triamazikamno/wasmer", rev = "d94b171d85bb5ff2aa7c4954a1921c9fb482be0c" }

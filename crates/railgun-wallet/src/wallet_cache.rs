@@ -18,6 +18,8 @@ pub enum WalletCacheError {
     Encode(#[from] rmp_serde::encode::Error),
     #[error("decode error: {0}")]
     Decode(#[from] rmp_serde::decode::Error),
+    #[error("encrypted wallet cache failed")]
+    Crypto,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +105,28 @@ impl CachedWalletUtxo {
     }
 }
 
+pub fn serialize_wallet_utxo(utxo: &WalletUtxo) -> Result<Vec<u8>, WalletCacheError> {
+    Ok(rmp_serde::to_vec_named(&CachedWalletUtxo::from(utxo))?)
+}
+
+pub fn deserialize_wallet_utxo(payload: &[u8]) -> Result<WalletUtxo, WalletCacheError> {
+    let cached: CachedWalletUtxo = rmp_serde::from_slice(payload)?;
+    Ok(cached.into_wallet_utxo())
+}
+
+#[must_use]
+pub fn wallet_utxo_stable_identity(utxo: &WalletUtxo) -> Vec<u8> {
+    let note = &utxo.utxo.note;
+    let source = &utxo.utxo.source;
+    let mut out = Vec::with_capacity(32 + 32 + 32 + 16 + 32);
+    out.extend_from_slice(source.tx_hash.as_slice());
+    out.extend_from_slice(&note.token_hash.to_be_bytes::<32>());
+    out.extend_from_slice(&note.value.to_be_bytes::<32>());
+    out.extend_from_slice(&note.random);
+    out.extend_from_slice(&note.npk.to_be_bytes::<32>());
+    out
+}
+
 pub fn wallet_cache_key(
     wallet_id: &str,
     chain_id: u64,
@@ -135,10 +159,10 @@ impl WalletCacheDbExt for DbStore {
             .iter()
             .map(|utxo| {
                 let cached = CachedWalletUtxo::from(utxo);
-                let payload = rmp_serde::to_vec_named(&cached)?;
+                let payload = serialize_wallet_utxo(utxo)?;
                 Ok((cached.utxo_id(), payload))
             })
-            .collect::<Result<_, rmp_serde::encode::Error>>()?;
+            .collect::<Result<_, WalletCacheError>>()?;
 
         let meta = last_scanned_block
             .map(|block| {
@@ -158,8 +182,7 @@ impl WalletCacheDbExt for DbStore {
         let entries = self.list_wallet_utxos(wallet_id)?;
         let mut out = Vec::with_capacity(entries.len());
         for entry in entries {
-            let cached: CachedWalletUtxo = rmp_serde::from_slice(&entry.payload)?;
-            out.push(cached.into_wallet_utxo());
+            out.push(deserialize_wallet_utxo(&entry.payload)?);
         }
         Ok(out)
     }

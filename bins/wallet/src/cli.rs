@@ -11,9 +11,6 @@ const DEFAULT_INITIAL_CHAIN_ID: u64 = 1;
 #[derive(Clone, StructOpt)]
 #[structopt(name = "wallet", about = "Railgun wallet desktop GUI.")]
 pub(crate) struct Options {
-    #[structopt(long)]
-    pub(crate) mnemonic: String,
-
     /// Initial selected wallet chain. All default chains remain available in the UI.
     #[structopt(long = "chain-id", default_value = "1")]
     pub(crate) chain_id: u64,
@@ -23,6 +20,18 @@ pub(crate) struct Options {
 
     #[structopt(long)]
     pub(crate) init_block_number: Option<u64>,
+
+    /// Debug: cap wallet UTXO sync for the initially selected chain at this block.
+    #[structopt(long)]
+    pub(crate) sync_to_block: Option<u64>,
+
+    /// Debug: skip indexed wallet UTXO catch-up for the initially selected chain.
+    #[structopt(long)]
+    pub(crate) disable_indexed_wallet_catch_up: bool,
+
+    /// Debug: rewind encrypted wallet cache cursor for the initially selected chain before syncing.
+    #[structopt(long)]
+    pub(crate) rewind_wallet_cache: bool,
 
     /// Override the default RPC URL for the initially selected chain.
     #[structopt(long)]

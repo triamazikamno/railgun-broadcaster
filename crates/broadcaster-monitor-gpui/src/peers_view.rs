@@ -14,6 +14,7 @@ use gpui_component::{
 use broadcaster_monitor::{PeerRow, PeerSummary};
 use ui::clipboard::copy_with_toast;
 use ui::table::ColumnWidthSync;
+use ui::theme;
 
 /// `TableDelegate` backing the peers pane. The peer summary (connected /
 /// known / dialing counts + capability tallies) is rendered outside the
@@ -97,7 +98,7 @@ impl TableDelegate for PeersDelegate {
                 let peer_id = row.peer_id.to_string();
                 div()
                     .id(SharedString::from(format!("peer-id-cell-{row_ix}")))
-                    .text_color(rgb(0xcba6f7))
+                    .text_color(rgb(theme::PURPLE))
                     .cursor_pointer()
                     .child(SharedString::from(short(row.peer_id.as_ref(), 4)))
                     .on_click(move |_event, window, cx| {
@@ -107,11 +108,11 @@ impl TableDelegate for PeersDelegate {
             }
             1 => {
                 let (label, color) = if row.connected {
-                    ("connected", rgb(0xa6e3a1))
+                    ("connected", rgb(theme::SUCCESS))
                 } else if row.dialing {
-                    ("dialing", rgb(0xf9e2af))
+                    ("dialing", rgb(theme::WARNING))
                 } else {
-                    ("known", rgb(0xa6adc8))
+                    ("known", rgb(theme::TEXT_MUTED))
                 };
                 div()
                     .text_color(color)
@@ -119,14 +120,14 @@ impl TableDelegate for PeersDelegate {
                     .into_any_element()
             }
             2 => div()
-                .text_color(rgb(0x89dceb))
+                .text_color(rgb(theme::INFO))
                 .child(SharedString::from(capabilities(row)))
                 .into_any_element(),
             3 => div()
                 .text_color(if row.dial_failures == 0 {
-                    rgb(0xa6adc8)
+                    rgb(theme::TEXT_MUTED)
                 } else {
-                    rgb(0xf38ba8)
+                    rgb(theme::DANGER)
                 })
                 .child(SharedString::from(row.dial_failures.to_string()))
                 .into_any_element(),
@@ -149,7 +150,7 @@ impl TableDelegate for PeersDelegate {
                                 div()
                                     .w_full()
                                     .text_left()
-                                    .text_color(rgb(0xa6adc8))
+                                    .text_color(rgb(theme::TEXT_MUTED))
                                     .child(addr),
                             ),
                     )
@@ -169,7 +170,7 @@ impl TableDelegate for PeersDelegate {
                                         )))
                                         .px_2()
                                         .py_1()
-                                        .text_color(rgb(0xa6adc8))
+                                        .text_color(rgb(theme::TEXT_MUTED))
                                         .cursor_pointer()
                                         .child(label.clone())
                                         .on_click(move |_event, window, cx| {
@@ -211,8 +212,8 @@ pub(crate) fn render_pane(
                 .flex_none()
                 .px_3()
                 .py_1()
-                .bg(rgb(0x313244))
-                .text_color(rgb(0xa6adc8))
+                .bg(rgb(theme::SURFACE_HOVER))
+                .text_color(rgb(theme::TEXT_MUTED))
                 .child(SharedString::from(subtitle)),
         )
         .child(div().flex_1().min_h_0().child(Table::new(state)))

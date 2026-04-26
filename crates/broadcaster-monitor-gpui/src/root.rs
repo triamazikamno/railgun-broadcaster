@@ -16,8 +16,8 @@ use gpui_component::{
 };
 use ui::icons;
 use ui::logs::{LogStore, LogsPane};
-use ui::style::{APP_FONT_FAMILY, APP_TEXT_COLOR, APP_TEXT_SIZE};
 use ui::table::ColumnWidthSync;
+use ui::theme::{self, APP_FONT_FAMILY, APP_TEXT_SIZE};
 
 use crate::fees_view::FeesDelegate;
 use crate::peers_view::{self, PeersDelegate};
@@ -100,9 +100,9 @@ impl StandaloneMonitorRoot {
             .flex()
             .flex_col()
             .items_center()
-            .bg(rgb(0x181825))
+            .bg(rgb(theme::SURFACE))
             .border_r_1()
-            .border_color(rgb(0x313244))
+            .border_color(rgb(theme::BORDER))
             .child(div().flex_1())
             .child(
                 div()
@@ -114,9 +114,10 @@ impl StandaloneMonitorRoot {
                     .justify_center()
                     .rounded_md()
                     .cursor_pointer()
-                    .when(logs_open, |this| this.bg(rgb(0x3b82f6)))
+                    .when(logs_open, |this| this.bg(rgb(theme::PRIMARY)))
                     .when(!logs_open, |this| {
-                        this.bg(rgb(0x181825)).hover(|this| this.bg(rgb(0x313244)))
+                        this.bg(rgb(theme::SURFACE))
+                            .hover(|this| this.bg(rgb(theme::SURFACE_HOVER)))
                     })
                     .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
                     .on_click(move |_event, _window, cx| {
@@ -136,23 +137,23 @@ impl StandaloneMonitorRoot {
             .min_h(px(0.0))
             .flex()
             .flex_col()
-            .bg(rgb(0x1e1e2e))
+            .bg(rgb(theme::SURFACE_ELEVATED))
             .border_t_1()
-            .border_color(rgb(0x313244))
+            .border_color(rgb(theme::BORDER))
             .child(
                 div()
                     .h(px(34.0))
                     .flex()
                     .items_center()
                     .px(px(12.0))
-                    .bg(rgb(0x181825))
+                    .bg(rgb(theme::SURFACE))
                     .border_b_1()
-                    .border_color(rgb(0x313244))
+                    .border_color(rgb(theme::BORDER))
                     .child(img(icons::logs_icon_path()).size(px(16.0)).flex_none())
                     .child(
                         div()
                             .ml(px(8.0))
-                            .text_color(rgb(0xcdd6f4))
+                            .text_color(rgb(theme::TEXT))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .child("Logs"),
                     )
@@ -166,8 +167,11 @@ impl StandaloneMonitorRoot {
                             .justify_center()
                             .rounded_sm()
                             .cursor_pointer()
-                            .text_color(rgb(0xa6adc8))
-                            .hover(|this| this.bg(rgb(0x313244)).text_color(rgb(0xcdd6f4)))
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .hover(|this| {
+                                this.bg(rgb(theme::SURFACE_HOVER))
+                                    .text_color(rgb(theme::TEXT))
+                            })
                             .on_click(move |_event, _window, cx| {
                                 root.update(cx, |root, cx| {
                                     root.logs_open = false;
@@ -230,8 +234,8 @@ impl Render for StandaloneMonitorRoot {
             .relative()
             .size_full()
             .flex()
-            .bg(rgb(0x1e1e2e))
-            .text_color(rgb(APP_TEXT_COLOR))
+            .bg(rgb(theme::SURFACE_ELEVATED))
+            .text_color(rgb(theme::TEXT))
             .font_family(APP_FONT_FAMILY)
             .text_size(APP_TEXT_SIZE)
             .child(self.render_activity_rail(root.clone(), window, cx))
@@ -409,7 +413,7 @@ impl Render for BroadcasterMonitorPane {
             .size_full()
             .min_w(px(0.0))
             .min_h(px(0.0))
-            .bg(rgb(0x1e1e2e))
+            .bg(rgb(theme::SURFACE_ELEVATED))
             .child(
                 h_resizable("broadcaster-monitor-top")
                     .with_state(&self.top_split)

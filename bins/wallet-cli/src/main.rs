@@ -153,6 +153,8 @@ impl From<ListUtxosOptions> for ListUtxosRequest {
             chain_id: value.chain_id,
             db_path: value.db_path,
             init_block_number: value.init_block_number,
+            sync_to_block: None,
+            use_indexed_wallet_catch_up: true,
         }
     }
 }

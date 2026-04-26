@@ -33,6 +33,22 @@ pub fn wallet_icon_path() -> PathBuf {
 }
 
 #[must_use]
+pub fn wrench_icon_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("icons")
+        .join("wrench.svg")
+}
+
+#[must_use]
+pub fn lock_icon_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("icons")
+        .join("lock.svg")
+}
+
+#[must_use]
 pub fn robot_icon_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("assets")

@@ -6,11 +6,21 @@ rust-version.workspace = true
 
 [dependencies]
 alloy = { workspace = true, features = ["provider-http", "rpc-types", "network", "signers"] }
+argon2 = { workspace = true }
+chacha20poly1305 = { workspace = true }
 eyre = { workspace = true }
+getrandom = { workspace = true }
+hkdf = { workspace = true }
+hmac = { workspace = true }
+libc = "0.2"
 reqwest = { workspace = true }
+rmp-serde = "1.3"
 serde = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tracing = { workspace = true }
+zeroize = { workspace = true }
 
 broadcaster-core = { path = "../core" }
 local-db = { path = "../local-db" }

@@ -829,6 +829,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "argon2"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c3610892ee6e0cbce8ae2700349fcf8f98adb0dbfbee85aec3c9179d29cc072"
+dependencies = [
+ "base64ct",
+ "blake2",
+ "cpufeatures 0.2.17",
+ "password-hash",
+]
+
+[[package]]
 name = "ark-bn254"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8326,6 +8338,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "password-hash"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "346f04948ba92c43e8469c1ee6736c7563d71012b17d40745260fe106aac2166"
+dependencies = [
+ "base64ct",
+ "rand_core 0.6.4",
+ "subtle",
+]
+
+[[package]]
 name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12749,6 +12772,7 @@ dependencies = [
  "tracing-subscriber 0.3.22",
  "ui",
  "wallet-ops",
+ "zeroize",
 ]
 
 [[package]]
@@ -12773,16 +12797,26 @@ name = "wallet-ops"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "argon2",
  "broadcaster-core",
+ "chacha20poly1305",
  "eyre",
+ "getrandom 0.3.4",
+ "hkdf",
+ "hmac",
+ "libc",
  "local-db",
  "railgun-wallet",
  "reqwest 0.13.1",
+ "rmp-serde",
  "serde",
  "serde_json",
+ "sha2",
  "sync-service",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

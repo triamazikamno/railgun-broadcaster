@@ -2,7 +2,9 @@ use crate::types::{
     BackfillEvent, BackfillRequest, ChainConfig, LogBatch, SharedLogBatch, SyncProgressSender,
     SyncProgressStage, SyncProgressUpdate, WalletConfig,
 };
-use crate::wallet::{WalletHandle, apply_wallet_delta_to_vec, spawn_wallet_worker};
+use crate::wallet::{
+    WalletHandle, apply_wallet_delta_to_vec, spawn_wallet_worker, wallet_cache_store,
+};
 use alloy::eips::BlockNumberOrTag;
 use alloy::primitives::Address;
 use alloy::sol_types::SolEvent;
@@ -33,7 +35,6 @@ use merkletree::wallet::{
     WalletScanError, apply_commitment_updates_from_logs, parse_indexed_wallet_delta,
 };
 use railgun_wallet::UtxoSource;
-use railgun_wallet::wallet_cache::WalletCacheDbExt;
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -117,6 +118,7 @@ struct WalletRegistration {
     cancel: CancellationToken,
     backfill_sender: mpsc::Sender<BackfillEvent>,
     start_block: u64,
+    sync_to_block: Option<u64>,
 }
 
 pub struct ChainService {
@@ -232,17 +234,19 @@ impl ChainService {
         cache_key: &str,
         from_block: Option<u64>,
     ) -> Result<(), ChainError> {
-        let (backfill_sender, start_block) = {
+        let (backfill_sender, start_block, sync_to_block) = {
             let wallets = self.wallets.read().await;
             let registration = wallets.get(cache_key).ok_or(ChainError::WalletNotFound)?;
             (
                 registration.backfill_sender.clone(),
                 registration.start_block,
+                registration.sync_to_block,
             )
         };
 
         let reset_from = from_block.unwrap_or(start_block);
         let safe_head = *self.safe_head_tx.borrow();
+        let sync_target = wallet_sync_target(safe_head, sync_to_block);
         backfill_sender
             .send(BackfillEvent::Reset {
                 from_block: reset_from,
@@ -253,7 +257,7 @@ impl ChainService {
             .send(BackfillRequest::Add {
                 cache_key: cache_key.to_string(),
                 from_block: reset_from,
-                to_block: safe_head,
+                to_block: sync_target,
                 sender: backfill_sender,
             })
             .await?;
@@ -273,14 +277,31 @@ impl ChainService {
         cfg.start_block = Some(start_block);
 
         let mut last_scanned = start_block.saturating_sub(1);
-        if let Ok(Some(meta)) = self.db.get_wallet_meta(&cfg.cache_key) {
+        let cache_store = wallet_cache_store(&self.db, &cfg);
+        if let Ok(Some(meta)) = cache_store.get_wallet_meta(&cfg.cache_key) {
             last_scanned = meta.last_scanned_block;
         }
 
         let safe_head = *self.safe_head_tx.borrow();
-        last_scanned = self
-            .indexed_wallet_catch_up(&cfg, start_block, last_scanned, safe_head)
-            .await;
+        let sync_target = wallet_sync_target(safe_head, cfg.sync_to_block);
+        info!(
+            cache_key = %cfg.cache_key,
+            chain_id = cfg.chain.chain_id,
+            start_block,
+            last_scanned,
+            safe_head,
+            sync_to_block = ?cfg.sync_to_block,
+            sync_target,
+            indexed_wallet_catch_up = cfg.use_indexed_wallet_catch_up,
+            "registering wallet sync"
+        );
+        if cfg.use_indexed_wallet_catch_up {
+            last_scanned = self
+                .indexed_wallet_catch_up(&cfg, start_block, last_scanned, sync_target)
+                .await;
+        } else {
+            debug!(cache_key = %cfg.cache_key, "indexed wallet catch-up disabled");
+        }
 
         let cancel = self.cancel.child_token();
         let live_rx = self.live_log_tx.subscribe();
@@ -299,7 +320,7 @@ impl ChainService {
         // request and let the backfill loop wait for safe_head to become
         // available.  This avoids prematurely marking the wallet as ready
         // with stale cached data.
-        let needs_backfill = safe_head == 0 || from_block <= safe_head;
+        let needs_backfill = sync_target == 0 || from_block <= sync_target;
 
         if needs_backfill {
             if self
@@ -307,7 +328,7 @@ impl ChainService {
                 .send(BackfillRequest::Add {
                     cache_key: cfg.cache_key.clone(),
                     from_block,
-                    to_block: safe_head,
+                    to_block: sync_target,
                     sender: backfill_sender.clone(),
                 })
                 .await
@@ -322,7 +343,7 @@ impl ChainService {
             }
         } else if let Err(err) = backfill_sender
             .send(BackfillEvent::Done {
-                last_block: safe_head,
+                last_block: sync_target,
             })
             .await
         {
@@ -336,6 +357,7 @@ impl ChainService {
                 cancel,
                 backfill_sender,
                 start_block,
+                sync_to_block: cfg.sync_to_block,
             },
         );
 
@@ -421,7 +443,8 @@ impl ChainService {
             ),
         );
 
-        let mut wallet_utxos = match self.db.load_wallet_utxos(&cfg.cache_key) {
+        let cache_store = wallet_cache_store(&self.db, cfg);
+        let mut wallet_utxos = match cache_store.load_wallet_utxos(&cfg.cache_key) {
             Ok(wallet_utxos) => wallet_utxos,
             Err(err) => {
                 warn!(
@@ -462,8 +485,10 @@ impl ChainService {
                 &page.nullifiers,
                 &cfg.scan_keys,
             );
-            apply_wallet_delta_to_vec(cfg, &mut wallet_utxos, delta);
-            if let Err(err) = self.db.store_wallet_utxos(
+            let _ = apply_wallet_delta_to_vec(cfg, &mut wallet_utxos, delta);
+            let indexed_spent = wallet_utxos.iter().filter(|utxo| utxo.is_spent()).count();
+            let indexed_unspent = wallet_utxos.len().saturating_sub(indexed_spent);
+            if let Err(err) = cache_store.store_wallet_utxos(
                 &cfg.cache_key,
                 &wallet_utxos,
                 Some(page.checkpoint_block),
@@ -489,6 +514,9 @@ impl ChainService {
                 legacy_encrypted_rows = page.legacy_encrypted_rows,
                 legacy_generated_rows = page.legacy_generated_rows,
                 nullifier_rows = page.nullifier_rows,
+                total = wallet_utxos.len(),
+                unspent = indexed_unspent,
+                spent = indexed_spent,
                 "indexed wallet catch-up page complete"
             );
             from_block = checkpoint.saturating_add(1);
@@ -824,6 +852,14 @@ fn wallet_backfill_from_block(last_scanned: u64, start_block: u64) -> u64 {
     last_scanned.saturating_add(1).max(start_block)
 }
 
+fn wallet_sync_target(safe_head: u64, sync_to_block: Option<u64>) -> u64 {
+    match sync_to_block {
+        Some(sync_to_block) if safe_head == 0 => sync_to_block,
+        Some(sync_to_block) => sync_to_block.min(safe_head),
+        None => safe_head,
+    }
+}
+
 #[async_trait]
 pub trait MerkleForestDbExt {
     async fn load_or_initialize_forest(
@@ -1104,8 +1140,8 @@ fn spawn_head_poller(service: Arc<ChainService>, rpcs: Arc<QueryRpcPool>) {
                         let safe_head = head
                             .saturating_sub(service.chain.finality_depth)
                             .max(service.chain.deployment_block);
-                        if let Err(err) = service.head_tx.send(head) {
-                            debug!(?err, head, "failed to send head update");
+                        if service.head_tx.receiver_count() > 0 {
+                            let _ = service.head_tx.send(head);
                         }
                         if let Err(err) = service.safe_head_tx.send(safe_head) {
                             debug!(?err, safe_head, "failed to send safe head update");
@@ -1209,8 +1245,12 @@ fn spawn_live_log_loop(
                         if let Err(err) = service.apply_forest_updates(&batch).await {
                             warn!(?err, "failed to apply forest updates");
                         } else {
-                            if let Err(err) = service.live_log_tx.send(batch) {
-                                debug!(?err, to_block, "failed to broadcast live log batch");
+                            let log_count = batch.logs.len();
+                            if service.live_log_tx.send(batch).is_err() {
+                                debug!(
+                                    from_block,
+                                    to_block, log_count, "failed to broadcast live log batch"
+                                );
                             }
                             if let Err(err) = service.forest_last_tx.send(to_block) {
                                 debug!(?err, to_block, "failed to send forest progress update");
@@ -1261,8 +1301,8 @@ fn spawn_backfill_loop(
                     _ = cancel.cancelled() => break,
                     Some(request) = backfill_rx.recv() => {
                         match request {
-                            BackfillRequest::Add { cache_key, from_block, to_block: _, sender } => {
-                                cursors.insert(cache_key, WalletBackfill { from_block, sender });
+                            BackfillRequest::Add { cache_key, from_block, to_block, sender } => {
+                                cursors.insert(cache_key, WalletBackfill { from_block, target_block: to_block, sender });
                             }
                             BackfillRequest::Reset { cache_key, from_block } => {
                                 if let Some(cursor) = cursors.get_mut(&cache_key) {
@@ -1283,12 +1323,42 @@ fn spawn_backfill_loop(
             }
 
             let safe_head = *safe_head_rx.borrow();
+            if safe_head > 0 {
+                for cursor in cursors.values_mut().filter(|cursor| cursor.target_block == 0) {
+                    cursor.target_block = safe_head;
+                }
+            }
+
+            let done_keys: Vec<_> = cursors
+                .iter()
+                .filter(|(_, cursor)| cursor.target_block > 0 && cursor.from_block > cursor.target_block)
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in done_keys {
+                if let Some(cursor) = cursors.remove(&key)
+                    && let Err(err) = cursor
+                        .sender
+                        .send(BackfillEvent::Done {
+                            last_block: cursor.target_block,
+                        })
+                        .await
+                {
+                    debug!(?err, cache_key = %key, "failed to send backfill done");
+                }
+            }
+
             let min_from = cursors.values().map(|cursor| cursor.from_block).min();
             info!(block=?min_from, "scanning wallet events");
             let Some(from_block) = min_from else {
                 continue;
             };
-            if from_block > safe_head {
+            let Some(target_block) = cursors
+                .values()
+                .filter(|cursor| cursor.from_block == from_block)
+                .map(|cursor| cursor.target_block)
+                .filter(|target_block| *target_block > 0)
+                .min()
+            else {
                 if safe_head == 0 {
                     // safe_head not yet available — the head poller hasn't
                     // successfully fetched a block number yet.  Wait for it
@@ -1299,32 +1369,14 @@ fn spawn_backfill_loop(
                         _ = safe_head_rx.changed() => { continue; }
                     }
                 }
-                // safe_head > 0 and all cursors are past it — genuinely caught up.
-                let done_keys: Vec<String> = cursors.keys().cloned().collect();
-                for key in done_keys {
-                    if let Some(cursor) = cursors.remove(&key)
-                        && let Err(err) = cursor
-                            .sender
-                            .send(BackfillEvent::Done {
-                                last_block: safe_head,
-                            })
-                            .await
-                    {
-                        debug!(
-                            ?err,
-                            cache_key = %key,
-                            "failed to send backfill done"
-                        );
-                    }
-                }
                 continue;
-            }
+            };
             let Some(rpc) = rpcs.random_provider() else {
                 warn!("no healthy rpc providers available");
                 tokio::time::sleep(service.chain.poll_interval).await;
                 continue;
             };
-            let to_block = min(from_block + service.chain.block_range - 1, safe_head);
+            let to_block = min(from_block + service.chain.block_range - 1, target_block);
             match service.chain.fetch_logs_for_range(
                 &rpc.provider,
                 archive_provider.as_ref(),
@@ -1368,11 +1420,11 @@ fn spawn_backfill_loop(
                                 );
                             }
                             cursor.from_block = to_block.saturating_add(1);
-                            if cursor.from_block > safe_head {
+                            if cursor.from_block > cursor.target_block {
                                 if let Err(err) = cursor
                                     .sender
                                     .send(BackfillEvent::Done {
-                                        last_block: safe_head,
+                                        last_block: cursor.target_block,
                                     })
                                     .await
                                 {
@@ -1402,6 +1454,7 @@ fn spawn_backfill_loop(
 
 struct WalletBackfill {
     from_block: u64,
+    target_block: u64,
     sender: mpsc::Sender<BackfillEvent>,
 }
 
@@ -1485,6 +1538,7 @@ impl ChainService {
     async fn reset_wallets(&self, safe_head: u64) {
         let wallets = self.wallets.read().await;
         for (cache_key, registration) in wallets.iter() {
+            let sync_target = wallet_sync_target(safe_head, registration.sync_to_block);
             if let Err(err) = registration
                 .backfill_sender
                 .send(BackfillEvent::Reset {
@@ -1503,7 +1557,7 @@ impl ChainService {
                 .send(BackfillRequest::Add {
                     cache_key: cache_key.clone(),
                     from_block: registration.start_block,
-                    to_block: safe_head,
+                    to_block: sync_target,
                     sender: registration.backfill_sender.clone(),
                 })
                 .await
@@ -1823,7 +1877,7 @@ fn parse_anchor_block(chain_id: u64, contract: Address, name: &str) -> Option<u6
 mod tests {
     use super::{
         IndexedWalletPageKind, complete_stream_checkpoint, indexed_wallet_page_kind,
-        indexed_wallet_to_block, wallet_backfill_from_block,
+        indexed_wallet_to_block, wallet_backfill_from_block, wallet_sync_target,
     };
 
     #[test]
@@ -1844,6 +1898,14 @@ mod tests {
     fn wallet_backfill_starts_after_indexed_checkpoint() {
         assert_eq!(wallet_backfill_from_block(99, 10), 100);
         assert_eq!(wallet_backfill_from_block(0, 10), 10);
+    }
+
+    #[test]
+    fn wallet_sync_target_caps_to_debug_block() {
+        assert_eq!(wallet_sync_target(1_000, None), 1_000);
+        assert_eq!(wallet_sync_target(1_000, Some(900)), 900);
+        assert_eq!(wallet_sync_target(1_000, Some(1_100)), 1_000);
+        assert_eq!(wallet_sync_target(0, Some(900)), 900);
     }
 
     #[test]

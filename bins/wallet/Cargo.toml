@@ -18,6 +18,7 @@ structopt = "0.3"
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "parking_lot"] }
+zeroize = { workspace = true }
 
 broadcaster-monitor = { path = "../../crates/broadcaster-monitor" }
 broadcaster-monitor-gpui = { path = "../../crates/broadcaster-monitor-gpui" }

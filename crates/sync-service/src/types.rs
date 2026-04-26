@@ -4,7 +4,10 @@ use std::time::Duration;
 use alloy::primitives::{Address, address};
 use alloy_rpc_types_eth::Log;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
+use local_db::{DbStore, WalletMeta};
 use merkletree::wallet::WalletScanKeys;
+use railgun_wallet::WalletUtxo;
+use railgun_wallet::wallet_cache::{WalletCacheDbExt, WalletCacheError};
 use tokio::sync::{mpsc, watch};
 use url::Url;
 
@@ -204,13 +207,103 @@ impl ChainConfigDefaults {
     }
 }
 
-#[derive(Debug, Clone)]
+pub trait WalletCacheStore: Send + Sync {
+    fn store_wallet_utxos(
+        &self,
+        wallet_id: &str,
+        utxos: &[WalletUtxo],
+        last_scanned_block: Option<u64>,
+        last_scanned_block_hash: Option<[u8; 32]>,
+    ) -> Result<(), WalletCacheError>;
+
+    fn load_wallet_utxos(&self, wallet_id: &str) -> Result<Vec<WalletUtxo>, WalletCacheError>;
+
+    fn get_wallet_meta(&self, wallet_id: &str) -> Result<Option<WalletMeta>, WalletCacheError>;
+
+    fn update_wallet_meta(
+        &self,
+        wallet_id: &str,
+        last_scanned_block: u64,
+        last_scanned_block_hash: Option<[u8; 32]>,
+    ) -> Result<(), WalletCacheError>;
+
+    fn reset_wallet_cache(
+        &self,
+        wallet_id: &str,
+        last_scanned_block: u64,
+    ) -> Result<(), WalletCacheError>;
+}
+
+impl WalletCacheStore for DbStore {
+    fn store_wallet_utxos(
+        &self,
+        wallet_id: &str,
+        utxos: &[WalletUtxo],
+        last_scanned_block: Option<u64>,
+        last_scanned_block_hash: Option<[u8; 32]>,
+    ) -> Result<(), WalletCacheError> {
+        WalletCacheDbExt::store_wallet_utxos(
+            self,
+            wallet_id,
+            utxos,
+            last_scanned_block,
+            last_scanned_block_hash,
+        )
+    }
+
+    fn load_wallet_utxos(&self, wallet_id: &str) -> Result<Vec<WalletUtxo>, WalletCacheError> {
+        WalletCacheDbExt::load_wallet_utxos(self, wallet_id)
+    }
+
+    fn get_wallet_meta(&self, wallet_id: &str) -> Result<Option<WalletMeta>, WalletCacheError> {
+        Ok(DbStore::get_wallet_meta(self, wallet_id)?)
+    }
+
+    fn update_wallet_meta(
+        &self,
+        wallet_id: &str,
+        last_scanned_block: u64,
+        last_scanned_block_hash: Option<[u8; 32]>,
+    ) -> Result<(), WalletCacheError> {
+        self.put_wallet_meta(
+            wallet_id,
+            &WalletMeta {
+                last_scanned_block,
+                updated_at: 0,
+                last_scanned_block_hash,
+            },
+        )?;
+        Ok(())
+    }
+
+    fn reset_wallet_cache(
+        &self,
+        wallet_id: &str,
+        last_scanned_block: u64,
+    ) -> Result<(), WalletCacheError> {
+        self.batch_store_wallet_utxos(
+            wallet_id,
+            &[],
+            Some(&WalletMeta {
+                last_scanned_block,
+                updated_at: 0,
+                last_scanned_block_hash: None,
+            }),
+        )?;
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
 pub struct WalletConfig {
     pub chain: ChainKey,
     pub cache_key: String,
     pub start_block: Option<u64>,
+    pub sync_to_block: Option<u64>,
     pub scan_keys: WalletScanKeys,
     pub progress_tx: Option<SyncProgressSender>,
+    pub cache_store: Option<Arc<dyn WalletCacheStore>>,
+    pub use_indexed_wallet_catch_up: bool,
 }
 
 #[cfg(test)]
