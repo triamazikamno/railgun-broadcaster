@@ -7,8 +7,14 @@
 //! different config we fall through to the raw-address / raw-integer
 //! display, which is the signal to extend this list.
 
+use std::path::PathBuf;
+use std::sync::LazyLock;
+
 use alloy::primitives::{Address, address};
 use ruint::aliases::U256;
+
+static TOKEN_ICON_DIR: LazyLock<PathBuf> =
+    LazyLock::new(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/tokens"));
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct TokenInfo {
@@ -78,6 +84,20 @@ pub fn lookup_token(chain_id: u64, addr: &Address) -> Option<TokenInfo> {
             symbol,
             decimals: *decimals,
         })
+}
+
+#[must_use]
+pub fn token_icon_path(chain_id: u64, addr: &Address) -> Option<PathBuf> {
+    lookup_token(chain_id, addr)?;
+    let ext = if (chain_id == 1 && *addr == address!("0x085780639CC2cACd35E474e71f4d000e2405d8f6"))
+        || (chain_id == 42161 && *addr == address!("0x4D15a3A2286D883AF0AA1B3f21367843FAc63E07"))
+    {
+        "svg"
+    } else {
+        "png"
+    };
+
+    Some(TOKEN_ICON_DIR.join(format!("{chain_id}-{addr:#x}.{ext}")))
 }
 
 fn pow10(exp: u8) -> U256 {
@@ -233,6 +253,9 @@ mod tests {
         let info = lookup_token(1, &addr).expect("WETH on Ethereum should be known");
         assert_eq!(info.symbol, "WETH");
         assert_eq!(info.decimals, 18);
+        assert!(token_icon_path(1, &addr).is_some_and(|path| {
+            path.ends_with("assets/tokens/1-0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2.png")
+        }));
     }
 
     #[test]
@@ -254,6 +277,20 @@ mod tests {
         let weth = address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
         // Optimism (10) isn't in the registry.
         assert!(lookup_token(10, &weth).is_none());
+        assert_eq!(token_icon_path(10, &weth), None);
+    }
+
+    #[test]
+    fn token_icon_path_uses_svg_for_vendored_svg_icons() {
+        let fxusd = address!("0x085780639CC2cACd35E474e71f4d000e2405d8f6");
+        assert!(token_icon_path(1, &fxusd).is_some_and(|path| {
+            path.ends_with("assets/tokens/1-0x085780639cc2cacd35e474e71f4d000e2405d8f6.svg")
+        }));
+
+        let tusd = address!("0x4D15a3A2286D883AF0AA1B3f21367843FAc63E07");
+        assert!(token_icon_path(42161, &tusd).is_some_and(|path| {
+            path.ends_with("assets/tokens/42161-0x4d15a3a2286d883af0aa1b3f21367843fac63e07.svg")
+        }));
     }
 
     #[test]

@@ -84,6 +84,7 @@ fn main() -> Result<()> {
         // widgets render, otherwise `cx.theme()` reads an uninitialized
         // global.
         gpui_component::init(app);
+        ui::theme::apply_zenburn_component_theme(app);
         install_quit_behavior(app);
         broadcaster_monitor_gpui::open_monitor_window(
             app,

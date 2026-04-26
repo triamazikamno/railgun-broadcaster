@@ -93,6 +93,7 @@ impl StandaloneMonitorRoot {
     ) -> impl IntoElement {
         let logs_open = self.logs_open;
         let tooltip = if logs_open { "Hide logs" } else { "Show logs" };
+
         div()
             .w(ACTIVITY_RAIL_WIDTH)
             .h_full()
@@ -114,7 +115,7 @@ impl StandaloneMonitorRoot {
                     .justify_center()
                     .rounded_md()
                     .cursor_pointer()
-                    .when(logs_open, |this| this.bg(rgb(theme::PRIMARY)))
+                    .when(logs_open, |this| this.bg(rgb(theme::SELECTED_SURFACE)))
                     .when(!logs_open, |this| {
                         this.bg(rgb(theme::SURFACE))
                             .hover(|this| this.bg(rgb(theme::SURFACE_HOVER)))

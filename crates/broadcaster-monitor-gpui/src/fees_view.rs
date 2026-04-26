@@ -16,7 +16,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use broadcaster_monitor::FeeRow;
-use railgun_ui::{chain_icon_path, chain_name, format_token_amount, lookup_token, short_address};
+use railgun_ui::{
+    chain_icon_path, chain_name, format_token_amount, lookup_token, short_address, token_icon_path,
+};
 use ui::clipboard::copy_with_toast;
 use ui::theme;
 
@@ -246,6 +248,19 @@ fn icon_label_row(chain_id: u64, label: SharedString, icon_size: Pixels) -> impl
     row.child(label)
 }
 
+fn token_label_row(
+    chain_id: u64,
+    addr: &Address,
+    label: SharedString,
+    icon_size: Pixels,
+) -> gpui::Div {
+    let mut row = div().flex().items_center().gap_1();
+    if let Some(path) = token_icon_path(chain_id, addr) {
+        row = row.child(img(path).size(icon_size).rounded_full().flex_none());
+    }
+    row.child(label)
+}
+
 fn trigger_content(
     chain_id: Option<u64>,
     label: SharedString,
@@ -258,6 +273,26 @@ fn trigger_content(
         row = row.child(label);
     }
     row
+}
+
+fn token_trigger_content(
+    chain_id: Option<u64>,
+    token: Option<(u64, Address)>,
+    label: SharedString,
+    icon_size: Pixels,
+) -> impl IntoElement {
+    let mut row = div().w_full().flex().items_center().gap_1().text_left();
+    if let Some(chain_id) = chain_id
+        && let Some(path) = chain_icon_path(chain_id)
+    {
+        row = row.child(img(path).size(icon_size).flex_none());
+    }
+    if let Some((chain_id, addr)) = token
+        && let Some(path) = token_icon_path(chain_id, &addr)
+    {
+        row = row.child(img(path).size(icon_size).rounded_full().flex_none());
+    }
+    row.child(label)
 }
 
 const FILTER_POPOVER_MAX_HEIGHT: Pixels = px(850.0);
@@ -341,7 +376,7 @@ impl TableDelegate for FeesDelegate {
                         "broadcaster-addr-cell-{row_ix}"
                     )))
                     .cursor_pointer()
-                    .text_color(rgb(theme::TEXT))
+                    .text_color(rgb(theme::PURPLE))
                     .child(SharedString::from(label))
                     .on_click(move |_event, window, cx| {
                         copy_with_toast(addr.clone(), window, cx);
@@ -360,7 +395,12 @@ impl TableDelegate for FeesDelegate {
                     .id(SharedString::from(format!("token-cell-{row_ix}")))
                     .cursor_pointer()
                     .text_color(rgb(theme::TEXT))
-                    .child(SharedString::from(label))
+                    .child(token_label_row(
+                        row.chain_id,
+                        &row.token_address,
+                        SharedString::from(label),
+                        px(14.0),
+                    ))
                     .on_click(move |_event, window, cx| {
                         copy_with_toast(addr_for_clipboard.clone(), window, cx);
                     })
@@ -515,10 +555,11 @@ fn render_token_header(
     // `BSC: USDC`). The trigger label uses the same rule so a pinned
     // cross-chain token is self-describing.
     let show_chain = matches!(chain, FeesFilter::All);
-    let (trigger_chain, trigger_label) = match current {
-        FeesFilter::All => (None, SharedString::from("token: All")),
+    let (trigger_chain, trigger_token, trigger_label) = match current {
+        FeesFilter::All => (None, None, SharedString::from("token: All")),
         FeesFilter::One((chain_id, addr)) => (
             show_chain.then_some(chain_id),
+            Some((chain_id, addr)),
             SharedString::from(format!(
                 "token: {}",
                 token_menu_label(chain_id, &addr, show_chain)
@@ -532,7 +573,12 @@ fn render_token_header(
                 .ghost()
                 .xsmall()
                 .justify_start()
-                .child(trigger_content(trigger_chain, trigger_label, px(16.0))),
+                .child(token_trigger_content(
+                    trigger_chain,
+                    trigger_token,
+                    trigger_label,
+                    px(16.0),
+                )),
         )
         .content(move |_state, window, cx| {
             let table = table.clone();
@@ -552,7 +598,12 @@ fn render_token_header(
                         .xsmall()
                         .w_full()
                         .justify_start()
-                        .child(trigger_content(None, SharedString::from("All"), px(16.0)))
+                        .child(token_trigger_content(
+                            None,
+                            None,
+                            SharedString::from("All"),
+                            px(16.0),
+                        ))
                         .on_click(move |_event, window, cx| {
                             table.update(cx, |state, cx| {
                                 state.delegate_mut().set_token_filter(FeesFilter::All);
@@ -570,8 +621,9 @@ fn render_token_header(
                         .xsmall()
                         .w_full()
                         .justify_start()
-                        .child(trigger_content(
+                        .child(token_trigger_content(
                             show_chain.then_some(chain_id),
+                            Some((chain_id, addr)),
                             SharedString::from(token_menu_label(chain_id, &addr, false)),
                             px(16.0),
                         ))

@@ -11,7 +11,7 @@ use gpui::{
     prelude::FluentBuilder as _, px, relative, rgb, size,
 };
 use gpui_component::{
-    Disableable, Root, Sizable,
+    Disableable, Root, Sizable, StyledExt,
     button::ButtonVariants,
     input::{InputEvent, InputState},
     popover::Popover,
@@ -23,6 +23,7 @@ use gpui_component::{
 };
 use railgun_ui::{
     DEFAULT_CHAINS, chain_icon_path, chain_name, format_token_amount, lookup_token, short_address,
+    token_icon_path,
 };
 use reqwest::Url;
 use tokio::runtime::Handle;
@@ -1125,7 +1126,7 @@ impl WalletRoot {
             .justify_center()
             .rounded_md()
             .cursor_pointer()
-            .when(active, |this| this.bg(rgb(theme::PRIMARY)))
+            .when(active, |this| this.bg(rgb(theme::SELECTED_SURFACE)))
             .when(!active, |this| {
                 this.bg(rgb(theme::SURFACE))
                     .hover(|this| this.bg(rgb(theme::SURFACE_HOVER)))
@@ -1186,7 +1187,7 @@ impl WalletRoot {
         let submit_root = root;
         let mut card = vault_card(
             "Unlock wallet vault",
-            "Enter the vault password to view wallet balances, history, and receive data.",
+            "Enter the vault password to view wallet balances and history.",
         );
         if let Some(error) = self.render_vault_error() {
             card = card.child(error);
@@ -1433,9 +1434,8 @@ impl WalletRoot {
             .view_session
             .as_ref()
             .and_then(|session| session.receive_address().ok());
-        let summary = match self.chain_states.get(&self.selected_chain) {
+        let (summary, totals) = match self.chain_states.get(&self.selected_chain) {
             Some(ChainUtxoState::Ready { snapshot, .. }) => {
-                let totals = totals_label(self.selected_chain, &snapshot.totals);
                 let counts = if snapshot.spent_count == 0 {
                     format!("{} unspent UTXOs", snapshot.unspent_count)
                 } else {
@@ -1444,15 +1444,14 @@ impl WalletRoot {
                         snapshot.unspent_count, snapshot.spent_count
                     )
                 };
-                if totals.is_empty() {
-                    counts
-                } else {
-                    format!("{counts} · Totals: {totals}")
-                }
+                (
+                    counts,
+                    render_totals_row(self.selected_chain, &snapshot.totals),
+                )
             }
-            Some(ChainUtxoState::Loading { progress }) => loading_summary(*progress),
-            Some(ChainUtxoState::Error(_)) => "Failed to load UTXOs".to_string(),
-            _ => "Ready to load UTXOs".to_string(),
+            Some(ChainUtxoState::Loading { progress }) => (loading_summary(*progress), None),
+            Some(ChainUtxoState::Error(_)) => ("Failed to load UTXOs".to_string(), None),
+            _ => ("Ready to load UTXOs".to_string(), None),
         };
 
         div()
@@ -1468,15 +1467,17 @@ impl WalletRoot {
             .child(self.render_chain_selector(root.clone()))
             .child(app_strong_text("Wallet UTXOs"))
             .child(app_muted_text(SharedString::from(summary)))
+            .children(totals)
             .child(div().flex_1())
             .children(receive_address.map(|address| {
                 let copy_address = address.clone();
                 app_button(
                     "wallet-receive-address",
-                    SharedString::from(format!("Receive {}", short_hash(&address))),
+                    SharedString::from(short_hash(&address)),
                 )
                 .ghost()
                 .xsmall()
+                .text_color(rgb(theme::TEAL))
                 .tooltip("Copy receive address")
                 .on_click(move |_event, window, cx| {
                     copy_with_toast(copy_address.clone(), window, cx);
@@ -1531,11 +1532,6 @@ impl WalletRoot {
                 v_flex()
                     .w(px(320.0))
                     .gap_3()
-                    .p_3()
-                    .bg(rgb(theme::SURFACE))
-                    .border_1()
-                    .border_color(rgb(theme::BORDER))
-                    .rounded_md()
                     .child(app_strong_text("Repair wallet cache"))
                     .child(app_muted_text(
                         "Rewind and rescan this chain's wallet cache. Use 0 for deployment block.",
@@ -1900,6 +1896,7 @@ struct UtxoDisplayRow {
     tree: u32,
     position: u64,
     token: String,
+    token_icon_path: Option<PathBuf>,
     amount: String,
     source_tx_hash: String,
     spent_tx_hash: Option<String>,
@@ -1965,7 +1962,7 @@ impl TableDelegate for UtxoDelegate {
     ) -> gpui::Stateful<gpui::Div> {
         let row = div().id(("row", row_ix));
         if self.rows.get(row_ix).is_some_and(|row| row.is_spent) {
-            return row.bg(rgb(theme::DANGER_BG));
+            return row.bg(rgb(theme::SPENT_ROW_BG));
         }
         row
     }
@@ -1980,11 +1977,11 @@ impl TableDelegate for UtxoDelegate {
         let row = &self.rows[row_ix];
         match col_ix {
             0 => div()
-                .text_color(utxo_cell_text_color(row, rgb(theme::TEXT_MUTED)))
+                .text_color(utxo_cell_text_color(row, rgb(theme::TEXT)))
                 .child(SharedString::from(row.tree.to_string()))
                 .into_any_element(),
             1 => div()
-                .text_color(utxo_cell_text_color(row, rgb(theme::TEXT_MUTED)))
+                .text_color(utxo_cell_text_color(row, rgb(theme::TEXT)))
                 .child(SharedString::from(row.position.to_string()))
                 .into_any_element(),
             2 => {
@@ -1992,8 +1989,13 @@ impl TableDelegate for UtxoDelegate {
                 div()
                     .id(SharedString::from(format!("wallet-token-cell-{row_ix}")))
                     .cursor_pointer()
+                    .font_bold()
                     .text_color(utxo_cell_text_color(row, rgb(theme::TEXT)))
-                    .child(SharedString::from(row.token.clone()))
+                    .child(token_label_row(
+                        SharedString::from(row.token.clone()),
+                        row.token_icon_path.clone(),
+                        px(14.0),
+                    ))
                     .on_click(move |_event, window, cx| {
                         copy_with_toast(address.clone(), window, cx);
                     })
@@ -2226,26 +2228,80 @@ fn chain_label_row(chain_id: u64) -> impl IntoElement {
     row.child(SharedString::from(label))
 }
 
-fn totals_label(chain_id: u64, totals: &[TokenTotal]) -> String {
-    totals
-        .iter()
-        .map(|total| format_total(chain_id, total))
-        .collect::<Vec<_>>()
-        .join(" · ")
+fn token_label_row(
+    label: SharedString,
+    icon_path: Option<PathBuf>,
+    icon_size: Pixels,
+) -> gpui::Div {
+    let mut row = div().flex().items_center().gap_1();
+    if let Some(path) = icon_path {
+        row = row.child(img(path).size(icon_size).rounded_full().flex_none());
+    }
+    row.child(label)
 }
 
+struct FormattedTokenTotal {
+    label: String,
+    amount: String,
+    icon_path: Option<PathBuf>,
+}
+
+fn render_totals_row(chain_id: u64, totals: &[TokenTotal]) -> Option<gpui::Div> {
+    if totals.is_empty() {
+        return None;
+    }
+
+    Some(
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .text_size(APP_TEXT_SIZE)
+            .text_color(rgb(theme::TEXT_MUTED))
+            .child(app_muted_text("· Totals:"))
+            .children(totals.iter().enumerate().map(move |(ix, total)| {
+                let formatted = format_total_parts(chain_id, total);
+                let label = SharedString::from(format!("{} {}", formatted.label, formatted.amount));
+                let item = token_label_row(label, formatted.icon_path, px(14.0));
+                if ix == 0 {
+                    div().child(item)
+                } else {
+                    div().flex().items_center().gap_1().child("·").child(item)
+                }
+            })),
+    )
+}
+
+#[cfg(test)]
 fn format_total(chain_id: u64, total: &TokenTotal) -> String {
+    let formatted = format_total_parts(chain_id, total);
+    format!("{} {}", formatted.label, formatted.amount)
+}
+
+fn format_total_parts(chain_id: u64, total: &TokenTotal) -> FormattedTokenTotal {
     let Some(address) = parse_address(&total.token) else {
-        return format!("{} {}", total.token, total.total);
+        return FormattedTokenTotal {
+            label: total.token.clone(),
+            amount: total.total.clone(),
+            icon_path: None,
+        };
     };
     let Some(token) = lookup_token(chain_id, &address) else {
-        return format!("{} {}", short_address(&address), total.total);
+        return FormattedTokenTotal {
+            label: short_address(&address),
+            amount: total.total.clone(),
+            icon_path: None,
+        };
     };
     let amount = U256::from_str_radix(&total.total, 10).map_or_else(
         |_| total.total.clone(),
         |value| format_token_amount(value, token.decimals),
     );
-    format!("{} {amount}", token.symbol)
+    FormattedTokenTotal {
+        label: token.symbol.to_owned(),
+        amount,
+        icon_path: token_icon_path(chain_id, &address),
+    }
 }
 
 fn display_rows_from_output(
@@ -2282,6 +2338,7 @@ fn display_row_from_utxo(chain_id: u64, row: &UtxoOutput) -> UtxoDisplayRow {
             tree: row.tree,
             position: row.position,
             token: row.token.clone(),
+            token_icon_path: None,
             amount: row.value.clone(),
             source_tx_hash: row.source_tx_hash.clone(),
             spent_tx_hash: row.spent_tx_hash.clone(),
@@ -2290,20 +2347,25 @@ fn display_row_from_utxo(chain_id: u64, row: &UtxoOutput) -> UtxoDisplayRow {
         };
     };
 
-    let (token, amount) = if let Some(token) = lookup_token(chain_id, &address) {
+    let (token, amount, token_icon_path) = if let Some(token) = lookup_token(chain_id, &address) {
         let amount = U256::from_str_radix(&row.value, 10).map_or_else(
             |_| row.value.clone(),
             |value| format_token_amount(value, token.decimals),
         );
-        (token.symbol.to_owned(), amount)
+        (
+            token.symbol.to_owned(),
+            amount,
+            token_icon_path(chain_id, &address),
+        )
     } else {
-        (short_address(&address), row.value.clone())
+        (short_address(&address), row.value.clone(), None)
     };
 
     UtxoDisplayRow {
         tree: row.tree,
         position: row.position,
         token,
+        token_icon_path,
         amount,
         source_tx_hash: row.source_tx_hash.clone(),
         spent_tx_hash: row.spent_tx_hash.clone(),
@@ -2432,6 +2494,7 @@ mod tests {
         let rows = display_rows_from_output(&output, "", true);
         assert_eq!(rows[0].token, "USDC");
         assert_eq!(rows[0].amount, "1.23");
+        assert!(rows[0].token_icon_path.is_some());
         assert!(!rows[0].is_spent);
     }
 
@@ -2457,6 +2520,7 @@ mod tests {
             rows[0].token_address,
             "0x1111111111111111111111111111111111111111"
         );
+        assert_eq!(rows[0].token_icon_path, None);
     }
 
     #[test]
