@@ -3,7 +3,7 @@ mod fee_note_assurance;
 mod utxo_consolidation;
 
 use alloy::eips::Encodable2718;
-use alloy::network::{EthereumWallet, TransactionBuilder};
+use alloy::network::{EthereumWallet, NetworkTransactionBuilder, TransactionBuilder};
 use alloy::primitives::{Address, Bytes, ChainId, FixedBytes, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::TransactionRequest;

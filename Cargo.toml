@@ -31,15 +31,15 @@ edition = "2024"
 rust-version = "1.89"
 
 [workspace.dependencies]
-alloy = { version = "1", features = ["serde", "signer-mnemonic"] }
-alloy-provider = "1"
-alloy-rpc-types-eth = "1"
-alloy-transport = "1"
+alloy = { version = "2", features = ["serde", "signer-mnemonic"] }
+alloy-provider = "2"
+alloy-rpc-types-eth = "2"
+alloy-transport = "2"
 eyre = "0.6"
 gpui = "=0.2.2"
 gpui-component = "=0.5.1"
-rand = "0.9"
-reqwest = { version = "0.12", features = ["socks"] }
+rand = "0.10"
+reqwest = { version = "0.13", features = ["socks"] }
 ruint = { version = "1.17", features = ["num-bigint"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -65,9 +65,14 @@ panic = "unwind"
 codegen-units = 8
 
 [profile.dev]
+incremental = true
+codegen-units = 16
 debug = true
 panic = "abort"
 strip = "none"
+
+[profile.dev.build-override]
+opt-level = 3
 
 [workspace.lints]
 rust.unreachable_pub = "warn"

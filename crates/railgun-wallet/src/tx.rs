@@ -1,6 +1,6 @@
 use alloy::primitives::{Address, Bytes, FixedBytes, U256};
 use alloy::sol_types::SolCall;
-use rand::RngCore;
+use rand::Rng;
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelIterator;
 use thiserror::Error;

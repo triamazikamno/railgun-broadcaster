@@ -8,7 +8,7 @@ use broadcaster_core::serde_helpers;
 use broadcaster_core::transact::ParsedTransactCalldata;
 use config::FeeRate;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use rand::Rng;
+use rand::RngExt;
 use rand::distr::Alphanumeric;
 use ruint::uint;
 use serde::{Deserialize, Serialize};
