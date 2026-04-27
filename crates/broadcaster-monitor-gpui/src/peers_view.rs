@@ -187,7 +187,7 @@ impl TableDelegate for PeersDelegate {
     }
 }
 
-/// Compose the peers pane: summary line above the resizable-column `Table`.
+/// Compose the peers pane: lightweight summary metadata above the peer table.
 pub(crate) fn render_pane(
     summary: &PeerSummary,
     state: &Entity<TableState<PeersDelegate>>,
@@ -205,14 +205,13 @@ pub(crate) fn render_pane(
         .size_full()
         .flex()
         .flex_col()
+        .gap_1()
         .min_h_0()
         .min_w_0()
         .child(
             div()
                 .flex_none()
-                .px_3()
-                .py_1()
-                .bg(rgb(theme::SURFACE_HOVER))
+                .px_2()
                 .text_color(rgb(theme::TEXT_MUTED))
                 .child(SharedString::from(subtitle)),
         )

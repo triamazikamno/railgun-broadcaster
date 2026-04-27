@@ -32,6 +32,9 @@ const ACTIVITY_RAIL_WIDTH: Pixels = px(48.0);
 const LOGS_DRAWER_HEIGHT: Pixels = px(260.0);
 const LOGS_DRAWER_MIN_HEIGHT: Pixels = px(160.0);
 const LOGS_DRAWER_MAX_HEIGHT: Pixels = px(600.0);
+const MONITOR_PANE_GUTTER: Pixels = px(8.0);
+const MONITOR_SPLIT_GUTTER: Pixels = px(6.0);
+const MONITOR_SPLIT_COVER_WIDTH: Pixels = px(7.0);
 
 pub fn open_monitor_window(
     app: &mut App,
@@ -379,7 +382,7 @@ impl BroadcasterMonitorPane {
         };
 
         self.peers_table.update(cx, |s, cx| {
-            let target = peers_pane_width - s.delegate().addr_chrome();
+            let target = peers_pane_width - MONITOR_SPLIT_GUTTER - s.delegate().addr_chrome();
             if s.delegate().addr_width() != target.max(px(120.0)) {
                 s.delegate_mut().set_addr_width(target);
                 s.refresh(cx);
@@ -408,37 +411,76 @@ impl Render for BroadcasterMonitorPane {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let entity = cx.entity();
         let peer_summary = self.shared.read().peer_summary();
+        let split_boundary = self.top_split.read(cx).sizes().first().copied();
 
         div()
-            .relative()
             .size_full()
             .min_w(px(0.0))
             .min_h(px(0.0))
             .bg(rgb(theme::SURFACE_ELEVATED))
+            .p(MONITOR_PANE_GUTTER)
             .child(
-                h_resizable("broadcaster-monitor-top")
-                    .with_state(&self.top_split)
-                    .child(resizable_panel().child(Table::new(&self.fees_table)))
+                div()
+                    .relative()
+                    .size_full()
+                    .min_w(px(0.0))
+                    .min_h(px(0.0))
                     .child(
-                        resizable_panel()
-                            .child(peers_view::render_pane(&peer_summary, &self.peers_table)),
+                        h_resizable("broadcaster-monitor-top")
+                            .with_state(&self.top_split)
+                            .child(
+                                resizable_panel().child(
+                                    div()
+                                        .size_full()
+                                        .min_w(px(0.0))
+                                        .min_h(px(0.0))
+                                        .pr(MONITOR_SPLIT_GUTTER)
+                                        .child(Table::new(&self.fees_table)),
+                                ),
+                            )
+                            .child(
+                                resizable_panel().child(
+                                    div()
+                                        .size_full()
+                                        .min_w(px(0.0))
+                                        .min_h(px(0.0))
+                                        .pl(MONITOR_SPLIT_GUTTER)
+                                        .child(peers_view::render_pane(
+                                            &peer_summary,
+                                            &self.peers_table,
+                                        )),
+                                ),
+                            ),
+                    )
+                    .when_some(split_boundary, |this, split_boundary| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left(
+                                    split_boundary - px(f32::from(MONITOR_SPLIT_COVER_WIDTH) / 2.0),
+                                )
+                                .h_full()
+                                .w(MONITOR_SPLIT_COVER_WIDTH)
+                                .bg(rgb(theme::SURFACE_ELEVATED)),
+                        )
+                    })
+                    .child(
+                        canvas(
+                            move |bounds, _, cx| {
+                                entity.update(cx, |this, cx| {
+                                    let pane_width = bounds.size.width;
+                                    if this.last_pane_width != Some(pane_width) {
+                                        this.last_pane_width = Some(pane_width);
+                                        this.sync_peers_addr_width(Some(pane_width), cx);
+                                    }
+                                });
+                            },
+                            |_, (), _, _| {},
+                        )
+                        .absolute()
+                        .size_full(),
                     ),
-            )
-            .child(
-                canvas(
-                    move |bounds, _, cx| {
-                        entity.update(cx, |this, cx| {
-                            let pane_width = bounds.size.width;
-                            if this.last_pane_width != Some(pane_width) {
-                                this.last_pane_width = Some(pane_width);
-                                this.sync_peers_addr_width(Some(pane_width), cx);
-                            }
-                        });
-                    },
-                    |_, (), _, _| {},
-                )
-                .absolute()
-                .size_full(),
             )
     }
 }
