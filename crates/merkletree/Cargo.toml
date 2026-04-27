@@ -9,8 +9,8 @@ license = "MIT"
 alloy = { workspace = true }
 alloy-rpc-types-eth = { workspace = true }
 broadcaster-core = { path = "../core" }
-reqwest = { workspace = true, features = ["json"] }
-rmp-serde = { version = "1.3" }
+reqwest = { workspace = true }
+rmp-serde = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

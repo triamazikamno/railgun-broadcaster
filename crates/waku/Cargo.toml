@@ -10,14 +10,14 @@ tracing = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 
-bytes = "1"
+bytes = { workspace = true }
 futures = "0.3"
 regex = "1"
 
-base64 = "0.22"
+base64 = { workspace = true }
 data-encoding = "2"
 sha3 = "0.10"
-k256 = { version = "0.13", features = ["ecdsa"] }
+k256 = { workspace = true }
 enr = { version = "0.13", features = ["ed25519", "k256"] }
 alloy-rlp = "0.3"
 
@@ -25,15 +25,15 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 hickory-resolver = { version = "0.25", default-features = false, features = ["tokio", "system-config"] }
 
 prost = "0.14"
-async-trait = "0.1"
+async-trait = { workspace = true }
 unsigned-varint = { version = "0.8", features = ["futures"] }
 uuid = { version = "1", features = ["v4"] }
-parking_lot = "0.12"
-thiserror = "2"
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
 ahash = "0.8"
-lru = "0.16"
+lru = { workspace = true }
 
-libp2p = { version = "0.56", features = [
+libp2p = { workspace = true, features = [
   "tokio",
   "tcp",
   "dns",

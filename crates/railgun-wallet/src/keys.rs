@@ -7,7 +7,7 @@ use ark_ff::{AdditiveGroup, Field, MontFp};
 use bloock_blake_rs::Blake512;
 use curve25519_dalek::edwards::CompressedEdwardsY;
 use curve25519_dalek::scalar::Scalar;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use num_bigint::BigUint;
 use num_traits::{One, Zero};
 use ruint::uint;

@@ -9,7 +9,7 @@ use ark_bn254::{Bn254, Fr};
 use ark_circom::{CircomReduction, WitnessCalculator};
 use ark_ff::UniformRand;
 use ark_groth16::{Groth16, Proof, prepare_verifying_key};
-use ark_relations::r1cs::SynthesisError;
+use ark_relations::gr1cs::SynthesisError;
 use ark_std::rand::thread_rng;
 use num_bigint::{BigInt, Sign};
 use thiserror::Error;
@@ -295,6 +295,9 @@ fn prove_unshield_blocking(
     let (proving_key, matrices) =
         load_or_parse_zkey(db_store, &variant, expected_hash_bytes, &paths.zkey)
             .map_err(|e| ProverError::Zkey(e.to_string()))?;
+    let num_instance_variables = matrices.num_instance_variables;
+    let num_constraints = matrices.num_constraints;
+    let proof_matrices = [matrices.a, matrices.b, matrices.c];
 
     let mut store = Store::default();
     let module = Module::new(&store, wasm).map_err(color_eyre::Report::from)?;
@@ -314,14 +317,14 @@ fn prove_unshield_blocking(
         &proving_key,
         r,
         s,
-        &matrices,
-        matrices.num_instance_variables,
-        matrices.num_constraints,
+        &proof_matrices,
+        num_instance_variables,
+        num_constraints,
         &witness,
     )?;
 
     if verify_proof {
-        let public_inputs = public_inputs_from_witness(&witness, matrices.num_instance_variables);
+        let public_inputs = public_inputs_from_witness(&witness, num_instance_variables);
         let pvk = prepare_verifying_key(&proving_key.vk);
         let verified =
             Groth16::<Bn254, CircomReduction>::verify_proof(&pvk, &proof, &public_inputs)

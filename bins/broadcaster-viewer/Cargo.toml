@@ -15,14 +15,14 @@ gpui-component = { workspace = true }
 
 # Async runtime / CLI / diagnostics.
 eyre = { workspace = true }
-humantime = "2"
-structopt = "0.3"
+humantime = { workspace = true }
+structopt = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net"] }
 tracing = { workspace = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter", "parking_lot"] }
+tracing-subscriber = { workspace = true, features = ["env-filter", "parking_lot"] }
 
 # Diagnostic profiling endpoint (ported from liquidator-rust/utils/src/pprof.rs).
-axum = "0.8"
+axum = { workspace = true }
 pprof = { version = "0.15", default-features = false, features = ["flamegraph", "prost-codec", "frame-pointer"] }
 serde = { workspace = true }
 serde_urlencoded = "0.7"

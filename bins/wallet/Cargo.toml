@@ -14,10 +14,10 @@ eyre = { workspace = true }
 gpui = { workspace = true }
 gpui-component = { workspace = true }
 reqwest = { workspace = true }
-structopt = "0.3"
+structopt = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 tracing = { workspace = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter", "parking_lot"] }
+tracing-subscriber = { workspace = true, features = ["env-filter", "parking_lot"] }
 zeroize = { workspace = true }
 
 broadcaster-monitor = { path = "../../crates/broadcaster-monitor" }

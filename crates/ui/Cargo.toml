@@ -7,9 +7,9 @@ rust-version.workspace = true
 [dependencies]
 gpui = { workspace = true }
 gpui-component = { workspace = true }
-parking_lot = "0.12"
+parking_lot = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { version = "0.3", features = ["parking_lot"] }
+tracing-subscriber = { workspace = true, features = ["parking_lot"] }
 
 [lints]
 workspace = true

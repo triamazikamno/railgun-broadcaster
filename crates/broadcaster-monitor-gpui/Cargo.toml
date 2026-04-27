@@ -9,7 +9,7 @@ alloy = { workspace = true }
 broadcaster-monitor = { path = "../broadcaster-monitor" }
 gpui = { workspace = true }
 gpui-component = { workspace = true }
-humantime = "2"
+humantime = { workspace = true }
 railgun-ui = { path = "../railgun-ui" }
 tokio = { workspace = true, features = ["sync", "time", "macros"] }
 tracing = { workspace = true }

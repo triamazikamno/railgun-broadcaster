@@ -9,7 +9,7 @@ broadcaster-monitor = { path = "../broadcaster-monitor" }
 config = { path = "../config" }
 eyre = { workspace = true }
 fees = { path = "../fees" }
-humantime-serde = "1"
+humantime-serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "macros", "rt"] }
 tracing = { workspace = true }
@@ -17,7 +17,7 @@ waku = { path = "../waku" }
 waku-relay = { path = "../waku-relay" }
 
 [dev-dependencies]
-libp2p = { version = "0.56" }
+libp2p = { workspace = true }
 
 [lints]
 workspace = true

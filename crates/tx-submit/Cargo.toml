@@ -8,10 +8,10 @@ rust-version.workspace = true
 alloy = { workspace = true }
 broadcaster-core = { path = "../core" }
 config = { path = "../config" }
-reqwest = { workspace = true, features = ["json"] }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-thiserror = { version = "2" }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [lints]

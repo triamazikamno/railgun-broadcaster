@@ -6,7 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 alloy = { workspace = true }
-parking_lot = "0.12"
+parking_lot = { workspace = true }
 ruint = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 

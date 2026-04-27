@@ -3,7 +3,7 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use getrandom::fill;
 use hkdf::Hkdf;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit as HmacKeyInit, Mac};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -1197,7 +1197,7 @@ impl CacheKeys {
     /// unreachable for the selected MAC implementation.
     #[must_use]
     pub fn row_id(&self, tree: u32, position: u64, stable_utxo_identity: &[u8]) -> [u8; KEY_LEN] {
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(self.index.expose_secret())
+        let mut mac = HmacSha256::new_from_slice(self.index.expose_secret())
             .expect("HMAC accepts any key length");
         mac.update(b"wallet-cache-row:v1");
         mac.update(&tree.to_be_bytes());

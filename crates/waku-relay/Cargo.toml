@@ -6,9 +6,9 @@ rust-version.workspace = true
 
 [dependencies]
 alloy = { workspace = true }
-base64 = { version = "0.22" }
-lru = { version = "0.16" }
-reqwest = { workspace = true, features = ["json"] }
+base64 = { workspace = true }
+lru = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "macros", "rt", "rt-multi-thread"] }

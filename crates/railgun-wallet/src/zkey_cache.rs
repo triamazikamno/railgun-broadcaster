@@ -3,9 +3,9 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use ark_bn254::{Bn254, Fr};
-use ark_circom::read_zkey;
+use ark_circom::{index::NPIndex, read_zkey};
 use ark_groth16::ProvingKey;
-use ark_relations::r1cs::{ConstraintMatrices, Matrix};
+use ark_relations::utils::matrix::Matrix;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, SerializationError};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use local_db::{DbError, DbStore, ZkeyMeta};
@@ -13,7 +13,7 @@ use thiserror::Error;
 
 const ZKEY_CACHE_MAGIC: &[u8; 8] = b"RZKCACHE";
 const ZKEY_CACHE_VERSION: u32 = 1;
-const ZKEY_CACHE_FORMAT_VERSION: u32 = 1;
+const ZKEY_CACHE_FORMAT_VERSION: u32 = 2;
 
 #[derive(Debug, Error)]
 pub enum ZkeyCacheError {
@@ -29,7 +29,7 @@ pub enum ZkeyCacheError {
     VersionMismatch,
 }
 
-type ZkeyCachePayload = (ProvingKey<Bn254>, ConstraintMatrices<Fr>);
+type ZkeyCachePayload = (ProvingKey<Bn254>, NPIndex<Fr>);
 type ZkeyCacheLoadResult = Result<Option<ZkeyCachePayload>, ZkeyCacheError>;
 
 pub trait ZkeyCacheDbExt {
@@ -39,7 +39,7 @@ pub trait ZkeyCacheDbExt {
         variant: &str,
         expected_hash: [u8; 32],
         proving_key: &ProvingKey<Bn254>,
-        matrices: &ConstraintMatrices<Fr>,
+        matrices: &NPIndex<Fr>,
     ) -> Result<(), ZkeyCacheError>;
 }
 
@@ -84,7 +84,7 @@ impl ZkeyCacheDbExt for DbStore {
         variant: &str,
         expected_hash: [u8; 32],
         proving_key: &ProvingKey<Bn254>,
-        matrices: &ConstraintMatrices<Fr>,
+        matrices: &NPIndex<Fr>,
     ) -> Result<(), ZkeyCacheError> {
         self.ensure_blob_dir("zkey")?;
         let file_name = format!("{variant}.ark");
@@ -141,10 +141,7 @@ pub fn load_or_parse_zkey(
     Ok((proving_key, matrices))
 }
 
-fn write_matrices<W: Write>(
-    writer: &mut W,
-    matrices: &ConstraintMatrices<Fr>,
-) -> Result<(), ZkeyCacheError> {
+fn write_matrices<W: Write>(writer: &mut W, matrices: &NPIndex<Fr>) -> Result<(), ZkeyCacheError> {
     writer.write_u64::<LittleEndian>(matrices.num_instance_variables as u64)?;
     writer.write_u64::<LittleEndian>(matrices.num_witness_variables as u64)?;
     writer.write_u64::<LittleEndian>(matrices.num_constraints as u64)?;
@@ -170,7 +167,7 @@ fn write_matrix<W: Write>(writer: &mut W, matrix: &Matrix<Fr>) -> Result<(), Zke
     Ok(())
 }
 
-fn read_matrices<R: Read>(reader: &mut R) -> Result<ConstraintMatrices<Fr>, ZkeyCacheError> {
+fn read_matrices<R: Read>(reader: &mut R) -> Result<NPIndex<Fr>, ZkeyCacheError> {
     let num_instance_variables = reader.read_u64::<LittleEndian>()?;
     let num_witness_variables = reader.read_u64::<LittleEndian>()?;
     let num_constraints = reader.read_u64::<LittleEndian>()?;
@@ -182,7 +179,7 @@ fn read_matrices<R: Read>(reader: &mut R) -> Result<ConstraintMatrices<Fr>, Zkey
     let b = read_matrix(reader)?;
     let c = read_matrix(reader)?;
 
-    Ok(ConstraintMatrices {
+    Ok(NPIndex {
         num_instance_variables: num_instance_variables as usize,
         num_witness_variables: num_witness_variables as usize,
         num_constraints: num_constraints as usize,

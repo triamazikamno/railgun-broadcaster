@@ -10,10 +10,10 @@ eyre = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-structopt = { version = "0.3" }
+structopt = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
 tracing = { workspace = true }
-tracing-appender = { version = "0.2" }
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "parking_lot"] }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "json", "parking_lot"] }
 
 wallet-ops = { path = "../../crates/wallet-ops" }
