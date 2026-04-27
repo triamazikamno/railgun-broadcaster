@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 alloy = { workspace = true }
+chrono = { workspace = true }
 eyre = { workspace = true }
 gpui = { workspace = true }
 gpui-component = { workspace = true }

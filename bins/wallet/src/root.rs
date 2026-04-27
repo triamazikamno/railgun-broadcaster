@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, U256};
 use broadcaster_monitor::{EventRx, Shared};
+use chrono::{DateTime, Local, Utc};
 use gpui::{
     App, AppContext, Bounds, Context, Entity, Focusable, InteractiveElement, IntoElement,
     KeyBinding, MouseButton, ParentElement, Pixels, Point, Render, SharedString,
@@ -48,6 +50,12 @@ const LOGS_DRAWER_HEIGHT: Pixels = px(260.0);
 const LOGS_DRAWER_MIN_HEIGHT: Pixels = px(160.0);
 const LOGS_DRAWER_MAX_HEIGHT: Pixels = px(600.0);
 const FILTER_POPOVER_MAX_HEIGHT: Pixels = px(450.0);
+const UTXO_AGE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const SECONDS_PER_MINUTE: u64 = 60;
+const SECONDS_PER_HOUR: u64 = 60 * SECONDS_PER_MINUTE;
+const SECONDS_PER_DAY: u64 = 24 * SECONDS_PER_HOUR;
+const SECONDS_PER_MONTH: u64 = 30 * SECONDS_PER_DAY;
+const SECONDS_PER_YEAR: u64 = 365 * SECONDS_PER_DAY;
 const TABLE_KEY_CONTEXT: &str = "Table";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, gpui::Action)]
@@ -432,6 +440,28 @@ impl WalletRoot {
                 }
             },
         )
+        .detach();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(UTXO_AGE_REFRESH_INTERVAL)
+                    .await;
+                if this
+                    .update(cx, |root, cx| {
+                        if matches!(
+                            root.chain_states.get(&root.selected_chain),
+                            Some(ChainUtxoState::Ready { .. })
+                        ) {
+                            root.utxo_table.update(cx, |state, cx| state.refresh(cx));
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
         .detach();
         root
     }
@@ -1893,12 +1923,12 @@ impl Render for WalletRoot {
 
 #[derive(Clone)]
 struct UtxoDisplayRow {
-    tree: u32,
-    position: u64,
+    tree_position: String,
     token: String,
     token_icon_path: Option<PathBuf>,
     amount: String,
     source_tx_hash: String,
+    source_block_timestamp: u64,
     spent_tx_hash: Option<String>,
     token_address: String,
     is_spent: bool,
@@ -1915,9 +1945,11 @@ impl UtxoDelegate {
         Self {
             rows: Arc::from(Vec::<UtxoDisplayRow>::new()),
             columns: [
-                Column::new("tree", "tree").width(px(70.0)).movable(false),
-                Column::new("position", "position")
-                    .width(px(110.0))
+                Column::new("tree_position", "tree/position")
+                    .width(px(120.0))
+                    .movable(false),
+                Column::new("generated", "generated")
+                    .width(px(130.0))
                     .movable(false),
                 Column::new("token", "token")
                     .width(px(150.0))
@@ -1978,12 +2010,19 @@ impl TableDelegate for UtxoDelegate {
         match col_ix {
             0 => div()
                 .text_color(utxo_cell_text_color(row, rgb(theme::TEXT)))
-                .child(SharedString::from(row.tree.to_string()))
+                .child(SharedString::from(row.tree_position.clone()))
                 .into_any_element(),
-            1 => div()
-                .text_color(utxo_cell_text_color(row, rgb(theme::TEXT)))
-                .child(SharedString::from(row.position.to_string()))
-                .into_any_element(),
+            1 => {
+                let tooltip = SharedString::from(local_datetime_label(row.source_block_timestamp));
+                div()
+                    .id(SharedString::from(format!("wallet-generated-{row_ix}")))
+                    .text_color(utxo_cell_text_color(row, rgb(theme::TEXT_MUTED)))
+                    .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                    .child(SharedString::from(generated_age_label(
+                        row.source_block_timestamp,
+                    )))
+                    .into_any_element()
+            }
             2 => {
                 let address = row.token_address.clone();
                 div()
@@ -2335,12 +2374,12 @@ fn matches_utxo_filters(row: &UtxoOutput, tx_query: &str, show_spent_utxos: bool
 fn display_row_from_utxo(chain_id: u64, row: &UtxoOutput) -> UtxoDisplayRow {
     let Some(address) = parse_address(&row.token) else {
         return UtxoDisplayRow {
-            tree: row.tree,
-            position: row.position,
+            tree_position: format_tree_position(row.tree, row.position),
             token: row.token.clone(),
             token_icon_path: None,
             amount: row.value.clone(),
             source_tx_hash: row.source_tx_hash.clone(),
+            source_block_timestamp: row.source_block_timestamp,
             spent_tx_hash: row.spent_tx_hash.clone(),
             token_address: row.token.clone(),
             is_spent: row.is_spent,
@@ -2362,16 +2401,117 @@ fn display_row_from_utxo(chain_id: u64, row: &UtxoOutput) -> UtxoDisplayRow {
     };
 
     UtxoDisplayRow {
-        tree: row.tree,
-        position: row.position,
+        tree_position: format_tree_position(row.tree, row.position),
         token,
         token_icon_path,
         amount,
         source_tx_hash: row.source_tx_hash.clone(),
+        source_block_timestamp: row.source_block_timestamp,
         spent_tx_hash: row.spent_tx_hash.clone(),
         token_address: address.to_checksum(None),
         is_spent: row.is_spent,
     }
+}
+
+fn format_tree_position(tree: u32, position: u64) -> String {
+    format!("{tree}/{position}")
+}
+
+fn generated_age_label(timestamp: u64) -> String {
+    let age_secs = now_epoch_secs().saturating_sub(timestamp);
+    format!("{} ago", format_compact_age(age_secs))
+}
+
+fn format_compact_age(age_secs: u64) -> String {
+    if age_secs < SECONDS_PER_MINUTE {
+        return format!("{age_secs}s");
+    }
+
+    if age_secs < SECONDS_PER_HOUR {
+        return format!("{}m", age_secs / SECONDS_PER_MINUTE);
+    }
+
+    if age_secs < 3 * SECONDS_PER_HOUR {
+        return format_age_parts(
+            age_secs / SECONDS_PER_HOUR,
+            "h",
+            (age_secs % SECONDS_PER_HOUR) / SECONDS_PER_MINUTE,
+            "m",
+        );
+    }
+
+    if age_secs < SECONDS_PER_DAY {
+        return format!("{}h", age_secs / SECONDS_PER_HOUR);
+    }
+
+    if age_secs < 3 * SECONDS_PER_DAY {
+        return format_age_parts(
+            age_secs / SECONDS_PER_DAY,
+            "d",
+            (age_secs % SECONDS_PER_DAY) / SECONDS_PER_HOUR,
+            "h",
+        );
+    }
+
+    if age_secs < 30 * SECONDS_PER_DAY {
+        return format!("{}d", age_secs / SECONDS_PER_DAY);
+    }
+
+    if age_secs < 3 * SECONDS_PER_MONTH {
+        return format_age_parts(
+            age_secs / SECONDS_PER_MONTH,
+            "mo",
+            (age_secs % SECONDS_PER_MONTH) / SECONDS_PER_DAY,
+            "d",
+        );
+    }
+
+    if age_secs < SECONDS_PER_YEAR {
+        return format!("{}mo", age_secs / SECONDS_PER_MONTH);
+    }
+
+    if age_secs < 3 * SECONDS_PER_YEAR {
+        return format_age_parts(
+            age_secs / SECONDS_PER_YEAR,
+            "y",
+            (age_secs % SECONDS_PER_YEAR) / SECONDS_PER_MONTH,
+            "mo",
+        );
+    }
+
+    format!("{}y", age_secs / SECONDS_PER_YEAR)
+}
+
+fn format_age_parts(
+    primary: u64,
+    primary_unit: &str,
+    secondary: u64,
+    secondary_unit: &str,
+) -> String {
+    if secondary == 0 {
+        format!("{primary}{primary_unit}")
+    } else {
+        format!("{primary}{primary_unit} {secondary}{secondary_unit}")
+    }
+}
+
+fn local_datetime_label(timestamp: u64) -> String {
+    let Ok(seconds) = i64::try_from(timestamp) else {
+        return format!("Unix timestamp {timestamp}");
+    };
+    let Some(utc) = DateTime::<Utc>::from_timestamp(seconds, 0) else {
+        return format!("Unix timestamp {timestamp}");
+    };
+    utc.with_timezone(&Local)
+        .format("%Y-%m-%d %H:%M:%S %Z")
+        .to_string()
+}
+
+fn now_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn short_hash(hash: &str) -> String {
@@ -2424,8 +2564,10 @@ mod tests {
     use wallet_ops::{ListUtxosOutput, SyncProgressStage, SyncProgressUpdate, UtxoOutput};
 
     use super::{
-        ChainLoadSource, WalletAppOptions, chain_load_overrides, display_rows_from_output,
-        format_total, loading_summary, parse_repair_cache_block, progress_detail,
+        ChainLoadSource, SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_MINUTE, SECONDS_PER_MONTH,
+        SECONDS_PER_YEAR, WalletAppOptions, chain_load_overrides, display_rows_from_output,
+        format_compact_age, format_total, loading_summary, parse_repair_cache_block,
+        progress_detail,
     };
 
     fn wallet_options_with_overrides() -> WalletAppOptions {
@@ -2469,6 +2611,7 @@ mod tests {
             value: value.to_string(),
             source_tx_hash: source_tx_hash.to_string(),
             source_block_number: 11,
+            source_block_timestamp: 1_700_000_011,
             is_spent,
             spent_tx_hash: spent_tx_hash.map(str::to_string),
             spent_block_number: spent_tx_hash.map(|_| 21),
@@ -2494,8 +2637,39 @@ mod tests {
         let rows = display_rows_from_output(&output, "", true);
         assert_eq!(rows[0].token, "USDC");
         assert_eq!(rows[0].amount, "1.23");
+        assert_eq!(rows[0].tree_position, "0/7");
+        assert_eq!(rows[0].source_block_timestamp, 1_700_000_011);
         assert!(rows[0].token_icon_path.is_some());
         assert!(!rows[0].is_spent);
+    }
+
+    #[test]
+    fn compact_age_uses_expected_thresholds() {
+        const M: u64 = SECONDS_PER_MINUTE;
+        const H: u64 = SECONDS_PER_HOUR;
+        const D: u64 = SECONDS_PER_DAY;
+        const MO: u64 = SECONDS_PER_MONTH;
+        const Y: u64 = SECONDS_PER_YEAR;
+
+        assert_eq!(format_compact_age(0), "0s");
+        assert_eq!(format_compact_age(59), "59s");
+        assert_eq!(format_compact_age(M), "1m");
+        assert_eq!(format_compact_age(59 * M + 59), "59m");
+        assert_eq!(format_compact_age(H), "1h");
+        assert_eq!(format_compact_age(2 * H + 14 * M), "2h 14m");
+        assert_eq!(format_compact_age(3 * H), "3h");
+        assert_eq!(format_compact_age(23 * H + 59 * M), "23h");
+        assert_eq!(format_compact_age(D), "1d");
+        assert_eq!(format_compact_age(2 * D + 3 * H), "2d 3h");
+        assert_eq!(format_compact_age(3 * D), "3d");
+        assert_eq!(format_compact_age(29 * D), "29d");
+        assert_eq!(format_compact_age(30 * D), "1mo");
+        assert_eq!(format_compact_age(2 * MO + 4 * D), "2mo 4d");
+        assert_eq!(format_compact_age(3 * MO), "3mo");
+        assert_eq!(format_compact_age(11 * MO), "11mo");
+        assert_eq!(format_compact_age(Y), "1y");
+        assert_eq!(format_compact_age(2 * Y + 3 * MO), "2y 3mo");
+        assert_eq!(format_compact_age(3 * Y), "3y");
     }
 
     #[test]

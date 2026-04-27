@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -361,6 +362,7 @@ pub struct LogBatch {
     pub from_block: u64,
     pub to_block: u64,
     pub logs: Vec<Log>,
+    pub block_timestamps: HashMap<u64, u64>,
     pub to_block_hash: Option<[u8; 32]>,
 }
 

@@ -54,6 +54,8 @@ pub struct IndexedTransactCommitment {
     pub transaction_hash: FixedBytes<32>,
     #[serde(rename = "blockNumber")]
     pub block_number: U256,
+    #[serde(rename = "blockTimestamp")]
+    pub block_timestamp: U256,
     #[serde(rename = "treeNumber")]
     pub tree_number: U256,
     #[serde(rename = "treePosition")]
@@ -71,6 +73,8 @@ pub struct IndexedLegacyEncryptedCommitment {
     pub transaction_hash: FixedBytes<32>,
     #[serde(rename = "blockNumber")]
     pub block_number: U256,
+    #[serde(rename = "blockTimestamp")]
+    pub block_timestamp: U256,
     #[serde(rename = "treeNumber")]
     pub tree_number: U256,
     #[serde(rename = "treePosition")]
@@ -101,6 +105,8 @@ pub struct IndexedLegacyGeneratedCommitment {
     pub transaction_hash: FixedBytes<32>,
     #[serde(rename = "blockNumber")]
     pub block_number: U256,
+    #[serde(rename = "blockTimestamp")]
+    pub block_timestamp: U256,
     #[serde(rename = "treeNumber")]
     pub tree_number: U256,
     #[serde(rename = "treePosition")]
@@ -133,6 +139,8 @@ pub struct IndexedShieldCommitment {
     pub transaction_hash: FixedBytes<32>,
     #[serde(rename = "blockNumber")]
     pub block_number: U256,
+    #[serde(rename = "blockTimestamp")]
+    pub block_timestamp: U256,
     #[serde(rename = "treeNumber")]
     pub tree_number: U256,
     #[serde(rename = "treePosition")]
@@ -462,7 +470,33 @@ pub struct IndexedNullifier {
     pub transaction_hash: FixedBytes<32>,
     #[serde(rename = "blockNumber")]
     pub block_number: U256,
+    #[serde(rename = "blockTimestamp")]
+    pub block_timestamp: U256,
     #[serde(rename = "treeNumber")]
     pub tree_number: U256,
     pub nullifier: U256,
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::primitives::U256;
+    use serde_json::json;
+
+    use super::IndexedNullifier;
+
+    #[test]
+    fn indexed_nullifier_deserializes_block_timestamp() {
+        let item: IndexedNullifier = serde_json::from_value(json!({
+            "id": "0x01",
+            "transactionHash": "0x02",
+            "blockNumber": "123",
+            "blockTimestamp": "1700000123",
+            "treeNumber": "4",
+            "nullifier": "0x05",
+        }))
+        .expect("deserialize indexed nullifier");
+
+        assert_eq!(item.block_number, U256::from(123_u64));
+        assert_eq!(item.block_timestamp, U256::from(1_700_000_123_u64));
+    }
 }

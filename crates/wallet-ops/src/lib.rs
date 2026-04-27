@@ -216,6 +216,7 @@ pub struct UtxoOutput {
     pub value: String,
     pub source_tx_hash: String,
     pub source_block_number: u64,
+    pub source_block_timestamp: u64,
     pub is_spent: bool,
     pub spent_tx_hash: Option<String>,
     pub spent_block_number: Option<u64>,
@@ -737,6 +738,7 @@ pub fn utxo_outputs_from_utxos(mut utxos: Vec<WalletUtxo>) -> (Vec<UtxoOutput>, 
                 value: utxo.note.value.to_string(),
                 source_tx_hash: source_tx_hash(source),
                 source_block_number: source.block_number,
+                source_block_timestamp: source.block_timestamp,
                 is_spent: wallet_utxo.spent.is_some(),
                 spent_tx_hash: spent.map(source_tx_hash),
                 spent_block_number: spent.map(|source| source.block_number),
@@ -1146,6 +1148,7 @@ mod tests {
         UtxoSource {
             tx_hash: FixedBytes::from([byte; 32]),
             block_number: u64::from(byte),
+            block_timestamp: 1_700_000_000 + u64::from(byte),
         }
     }
 
@@ -1207,6 +1210,14 @@ mod tests {
     }
 
     #[test]
+    fn utxo_outputs_include_generation_timestamp() {
+        let token = address(0x11);
+        let (outputs, _) = utxo_outputs_from_utxos(vec![utxo(token, 1, 0, 7)]);
+
+        assert_eq!(outputs[0].source_block_timestamp, 1_700_000_008);
+    }
+
+    #[test]
     fn list_utxos_output_serializes_existing_field_names() {
         let output = ListUtxosOutput {
             chain_id: 1,
@@ -1222,6 +1233,7 @@ mod tests {
                 source_tx_hash:
                     "0x1111111111111111111111111111111111111111111111111111111111111111".to_string(),
                 source_block_number: 11,
+                source_block_timestamp: 1_700_000_011,
                 is_spent: true,
                 spent_tx_hash: Some(
                     "0x2222222222222222222222222222222222222222222222222222222222222222"
@@ -1250,6 +1262,7 @@ mod tests {
                     "value": "4",
                     "source_tx_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
                     "source_block_number": 11,
+                    "source_block_timestamp": 1700000011,
                     "is_spent": true,
                     "spent_tx_hash": "0x2222222222222222222222222222222222222222222222222222222222222222",
                     "spent_block_number": 21,

@@ -12467,6 +12467,7 @@ dependencies = [
  "broadcaster-monitor",
  "broadcaster-monitor-gpui",
  "broadcaster-monitor-waku",
+ "chrono",
  "eyre",
  "gpui",
  "gpui-component",

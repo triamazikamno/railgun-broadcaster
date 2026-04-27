@@ -42,6 +42,7 @@ fn source(byte: u8) -> UtxoSource {
     UtxoSource {
         tx_hash: FixedBytes::from([byte; 32]),
         block_number: u64::from(byte),
+        block_timestamp: 1_700_000_000 + u64::from(byte),
     }
 }
 

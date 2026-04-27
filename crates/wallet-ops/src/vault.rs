@@ -2364,11 +2364,13 @@ mod tests {
                 source: UtxoSource {
                     tx_hash: FixedBytes::from([0x88; KEY_LEN]),
                     block_number: 123,
+                    block_timestamp: 1_700_000_123,
                 },
             },
             spent: Some(UtxoSource {
                 tx_hash: FixedBytes::from([0x99; KEY_LEN]),
                 block_number: 124,
+                block_timestamp: 1_700_000_124,
             }),
         };
 
@@ -2481,6 +2483,7 @@ mod tests {
                 source: UtxoSource {
                     tx_hash: FixedBytes::from([0x44; KEY_LEN]),
                     block_number: 101,
+                    block_timestamp: 1_700_000_101,
                 },
             },
             spent: None,
@@ -2493,6 +2496,7 @@ mod tests {
         rewound_source.utxo.source = UtxoSource {
             tx_hash: FixedBytes::from([0x66; KEY_LEN]),
             block_number: 170,
+            block_timestamp: 1_700_000_170,
         };
         let mut rewound_spend = first.clone();
         rewound_spend.utxo.position = 4;
@@ -2500,6 +2504,7 @@ mod tests {
         rewound_spend.spent = Some(UtxoSource {
             tx_hash: FixedBytes::from([0x88; KEY_LEN]),
             block_number: 170,
+            block_timestamp: 1_700_000_170,
         });
 
         cache_store

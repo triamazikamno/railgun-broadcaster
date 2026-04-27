@@ -7,6 +7,7 @@ use crate::notes::Note;
 pub struct UtxoSource {
     pub tx_hash: FixedBytes<32>,
     pub block_number: u64,
+    pub block_timestamp: u64,
 }
 
 #[derive(Debug, Clone)]

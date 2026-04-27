@@ -34,6 +34,7 @@ struct CachedNote {
 struct CachedUtxoSource {
     tx_hash: [u8; 32],
     block_number: u64,
+    block_timestamp: u64,
 }
 
 impl From<&UtxoSource> for CachedUtxoSource {
@@ -41,6 +42,7 @@ impl From<&UtxoSource> for CachedUtxoSource {
         Self {
             tx_hash: source.tx_hash.0,
             block_number: source.block_number,
+            block_timestamp: source.block_timestamp,
         }
     }
 }
@@ -50,6 +52,7 @@ impl CachedUtxoSource {
         UtxoSource {
             tx_hash: FixedBytes::from(self.tx_hash),
             block_number: self.block_number,
+            block_timestamp: self.block_timestamp,
         }
     }
 }
@@ -193,4 +196,48 @@ fn now_epoch_secs() -> Result<u64, std::io::Error> {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .map_err(std::io::Error::other)
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::primitives::{FixedBytes, U256};
+    use broadcaster_core::notes::Note;
+
+    use super::{deserialize_wallet_utxo, serialize_wallet_utxo};
+    use crate::{Utxo, UtxoSource, WalletUtxo};
+
+    fn source(byte: u8) -> UtxoSource {
+        UtxoSource {
+            tx_hash: FixedBytes::from([byte; 32]),
+            block_number: u64::from(byte),
+            block_timestamp: 1_700_000_000 + u64::from(byte),
+        }
+    }
+
+    #[test]
+    fn wallet_cache_roundtrips_source_timestamps() {
+        let wallet_utxo = WalletUtxo {
+            utxo: Utxo {
+                note: Note {
+                    token_hash: U256::from(1_u8),
+                    value: U256::from(2_u8),
+                    random: [3_u8; 16],
+                    npk: U256::from(4_u8),
+                },
+                tree: 5,
+                position: 6,
+                source: source(7),
+            },
+            spent: Some(source(8)),
+        };
+
+        let encoded = serialize_wallet_utxo(&wallet_utxo).expect("serialize wallet UTXO");
+        let decoded = deserialize_wallet_utxo(&encoded).expect("deserialize wallet UTXO");
+
+        assert_eq!(decoded.utxo.source.block_timestamp, 1_700_000_007);
+        assert_eq!(
+            decoded.spent.expect("spent source").block_timestamp,
+            1_700_000_008
+        );
+    }
 }

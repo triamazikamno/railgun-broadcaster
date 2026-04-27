@@ -760,10 +760,15 @@ where
         .saturating_sub(1)
 }
 
-fn indexed_source(tx_hash: alloy::primitives::FixedBytes<32>, block_number: u64) -> UtxoSource {
+fn indexed_source(
+    tx_hash: alloy::primitives::FixedBytes<32>,
+    block_number: u64,
+    block_timestamp: u64,
+) -> UtxoSource {
     UtxoSource {
         tx_hash,
         block_number,
+        block_timestamp,
     }
 }
 
@@ -775,7 +780,11 @@ fn indexed_transact_input(item: IndexedTransactCommitment) -> IndexedTransactCom
         ciphertext: item.ciphertext.ciphertext,
         blinded_sender_viewing_key: item.ciphertext.blinded_sender_viewing_key,
         memo: item.ciphertext.memo,
-        source: indexed_source(item.transaction_hash, item.block_number.to()),
+        source: indexed_source(
+            item.transaction_hash,
+            item.block_number.to(),
+            item.block_timestamp.to(),
+        ),
     }
 }
 
@@ -785,7 +794,11 @@ fn indexed_shield_input(item: IndexedShieldCommitment) -> IndexedShieldCommitmen
         tree_position: item.tree_position.to(),
         preimage: item.preimage(),
         shield_ciphertext: item.shield_ciphertext(),
-        source: indexed_source(item.transaction_hash, item.block_number.to()),
+        source: indexed_source(
+            item.transaction_hash,
+            item.block_number.to(),
+            item.block_timestamp.to(),
+        ),
     }
 }
 
@@ -793,7 +806,11 @@ fn indexed_nullifier_input(item: IndexedNullifier) -> IndexedNullifierInput {
     IndexedNullifierInput {
         tree_number: item.tree_number.to(),
         nullifier: item.nullifier,
-        source: indexed_source(item.transaction_hash, item.block_number.to()),
+        source: indexed_source(
+            item.transaction_hash,
+            item.block_number.to(),
+            item.block_timestamp.to(),
+        ),
     }
 }
 
@@ -807,7 +824,11 @@ fn indexed_legacy_encrypted_input(
         ciphertext: item.ciphertext.ciphertext,
         ephemeral_keys: item.ciphertext.ephemeral_keys,
         memo: item.ciphertext.memo,
-        source: indexed_source(item.transaction_hash, item.block_number.to()),
+        source: indexed_source(
+            item.transaction_hash,
+            item.block_number.to(),
+            item.block_timestamp.to(),
+        ),
     }
 }
 
@@ -819,7 +840,11 @@ fn indexed_legacy_generated_input(
         tree_position: item.tree_position.to(),
         preimage: item.preimage.into(),
         encrypted_random: item.encrypted_random,
-        source: indexed_source(item.transaction_hash, item.block_number.to()),
+        source: indexed_source(
+            item.transaction_hash,
+            item.block_number.to(),
+            item.block_timestamp.to(),
+        ),
     }
 }
 
@@ -1226,6 +1251,26 @@ fn spawn_live_log_loop(
                 {
                     Ok(mut logs) => {
                         sort_logs(&mut logs);
+                        let block_timestamps = if service.live_log_tx.receiver_count() > 0 {
+                            match service
+                                .chain
+                                .fetch_log_block_timestamps(
+                                    &rpc.provider,
+                                    archive_provider.as_ref(),
+                                    &logs,
+                                )
+                                .await
+                            {
+                                Ok(block_timestamps) => block_timestamps,
+                                Err(err) => {
+                                    warn!(?err, "failed to fetch log block timestamps");
+                                    rpcs.mark_bad_provider(&rpc);
+                                    continue;
+                                }
+                            }
+                        } else {
+                            HashMap::new()
+                        };
                         let to_block_hash = service
                             .chain
                             .fetch_block_hash(&rpc.provider, archive_provider.as_ref(), to_block)
@@ -1238,6 +1283,7 @@ fn spawn_live_log_loop(
                             from_block,
                             to_block,
                             logs,
+                            block_timestamps,
                             to_block_hash,
                         });
 
@@ -1388,6 +1434,18 @@ fn spawn_backfill_loop(
                 Ok(mut logs) => {
                     info!(from_block, to_block, num_logs=logs.len(), "fetched backfill logs");
                     sort_logs(&mut logs);
+                    let block_timestamps = match service
+                        .chain
+                        .fetch_log_block_timestamps(&rpc.provider, archive_provider.as_ref(), &logs)
+                        .await
+                    {
+                        Ok(block_timestamps) => block_timestamps,
+                        Err(err) => {
+                            warn!(?err, "failed to fetch backfill log block timestamps");
+                            rpcs.mark_bad_provider(&rpc);
+                            continue;
+                        }
+                    };
                     let to_block_hash = service.chain.fetch_block_hash(
                         &rpc.provider,
                         archive_provider.as_ref(),
@@ -1402,6 +1460,7 @@ fn spawn_backfill_loop(
                         from_block,
                         to_block,
                         logs,
+                        block_timestamps,
                         to_block_hash,
                     });
 
@@ -1736,6 +1795,48 @@ impl ChainConfig {
             .get_block_by_number(BlockNumberOrTag::Number(block_number))
             .await?;
         Ok(block.map(|block| block.header.hash.0))
+    }
+
+    async fn fetch_block_timestamp(
+        &self,
+        provider: &DynProvider,
+        archive_provider: Option<&DynProvider>,
+        block_number: u64,
+    ) -> Result<Option<u64>, ChainError> {
+        let provider = if self.archive_until_block > 0 && block_number <= self.archive_until_block {
+            archive_provider.ok_or(ChainError::ArchiveRpcRequired(self.archive_until_block))?
+        } else {
+            provider
+        };
+        let block = provider
+            .get_block_by_number(BlockNumberOrTag::Number(block_number))
+            .await?;
+        Ok(block.map(|block| block.header.timestamp))
+    }
+
+    async fn fetch_log_block_timestamps(
+        &self,
+        provider: &DynProvider,
+        archive_provider: Option<&DynProvider>,
+        logs: &[Log],
+    ) -> Result<HashMap<u64, u64>, ChainError> {
+        let mut block_numbers = logs
+            .iter()
+            .filter_map(|log| log.block_number)
+            .collect::<Vec<_>>();
+        block_numbers.sort_unstable();
+        block_numbers.dedup();
+
+        let mut timestamps = HashMap::with_capacity(block_numbers.len());
+        for block_number in block_numbers {
+            if let Some(timestamp) = self
+                .fetch_block_timestamp(provider, archive_provider, block_number)
+                .await?
+            {
+                timestamps.insert(block_number, timestamp);
+            }
+        }
+        Ok(timestamps)
     }
 
     async fn fetch_logs_for_range(

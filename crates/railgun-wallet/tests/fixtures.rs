@@ -152,6 +152,7 @@ fn build_valid_unshield_plan() -> UnshieldPlan {
                 source: railgun_wallet::UtxoSource {
                     tx_hash: FixedBytes::from([1u8; 32]),
                     block_number: 1,
+                    block_timestamp: 1_700_000_001,
                 },
             };
             let mut forest = MerkleForest::new();

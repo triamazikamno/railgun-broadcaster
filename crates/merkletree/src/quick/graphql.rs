@@ -52,6 +52,7 @@ query WalletProbe($fromBlock: BigInt = 0, $toBlock: BigInt = 0, $limit: Int = 1)
     id
     transactionHash
     blockNumber
+    blockTimestamp
     treeNumber
     treePosition
     hash
@@ -73,6 +74,7 @@ query WalletProbe($fromBlock: BigInt = 0, $toBlock: BigInt = 0, $limit: Int = 1)
     id
     transactionHash
     blockNumber
+    blockTimestamp
     treeNumber
     treePosition
     preimage {
@@ -95,6 +97,7 @@ query WalletProbe($fromBlock: BigInt = 0, $toBlock: BigInt = 0, $limit: Int = 1)
     id
     transactionHash
     blockNumber
+    blockTimestamp
     treeNumber
     nullifier
   }
@@ -106,6 +109,7 @@ query WalletProbe($fromBlock: BigInt = 0, $toBlock: BigInt = 0, $limit: Int = 1)
     id
     transactionHash
     blockNumber
+    blockTimestamp
     treeNumber
     treePosition
     hash
@@ -127,6 +131,7 @@ query WalletProbe($fromBlock: BigInt = 0, $toBlock: BigInt = 0, $limit: Int = 1)
     id
     transactionHash
     blockNumber
+    blockTimestamp
     treeNumber
     treePosition
     hash
@@ -154,6 +159,7 @@ query IndexedWalletPage($fromBlock: BigInt = 0, $toBlock: BigInt = 0, $limit: In
     id
     transactionHash
     blockNumber
+    blockTimestamp
     treeNumber
     treePosition
     hash
@@ -175,6 +181,7 @@ query IndexedWalletPage($fromBlock: BigInt = 0, $toBlock: BigInt = 0, $limit: In
     id
     transactionHash
     blockNumber
+    blockTimestamp
     treeNumber
     treePosition
     preimage {
@@ -197,6 +204,7 @@ query IndexedWalletPage($fromBlock: BigInt = 0, $toBlock: BigInt = 0, $limit: In
     id
     transactionHash
     blockNumber
+    blockTimestamp
     treeNumber
     nullifier
   }
@@ -213,6 +221,7 @@ query IndexedLegacyWalletPage($fromBlock: BigInt = 0, $toBlock: BigInt = 0, $lim
     id
     transactionHash
     blockNumber
+    blockTimestamp
     treeNumber
     treePosition
     hash
@@ -234,6 +243,7 @@ query IndexedLegacyWalletPage($fromBlock: BigInt = 0, $toBlock: BigInt = 0, $lim
     id
     transactionHash
     blockNumber
+    blockTimestamp
     treeNumber
     treePosition
     hash
@@ -256,6 +266,7 @@ query IndexedLegacyWalletPage($fromBlock: BigInt = 0, $toBlock: BigInt = 0, $lim
     id
     transactionHash
     blockNumber
+    blockTimestamp
     treeNumber
     nullifier
   }
@@ -272,6 +283,7 @@ query TransactCommitments($fromBlock: BigInt = 0, $toBlock: BigInt = 0, $limit: 
     id
     transactionHash
     blockNumber
+    blockTimestamp
     treeNumber
     treePosition
     hash
@@ -298,6 +310,7 @@ query ShieldCommitments($fromBlock: BigInt = 0, $toBlock: BigInt = 0, $limit: In
     id
     transactionHash
     blockNumber
+    blockTimestamp
     treeNumber
     treePosition
     preimage {
@@ -325,6 +338,7 @@ query IndexedNullifiers($fromBlock: BigInt = 0, $toBlock: BigInt = 0, $limit: In
     id
     transactionHash
     blockNumber
+    blockTimestamp
     treeNumber
     nullifier
   }

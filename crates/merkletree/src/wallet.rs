@@ -94,6 +94,7 @@ pub struct IndexedLegacyGeneratedCommitmentInput {
 
 pub fn parse_wallet_delta_from_logs(
     logs: &[Log],
+    block_timestamps: &HashMap<u64, u64>,
     keys: &WalletScanKeys,
 ) -> Result<WalletLogDelta, WalletScanError> {
     let mut utxos = Vec::new();
@@ -107,7 +108,7 @@ pub fn parse_wallet_delta_from_logs(
             let tree_number: u32 = event.treeNumber.to();
             let start_pos: u64 = event.startPosition.to();
             let commitment_hashes = &event.hash;
-            let source = source_from_log(raw_log)?;
+            let source = source_from_log(raw_log, block_timestamps)?;
             for (index, ciphertext) in event.ciphertext.iter().enumerate() {
                 let position = start_pos + index as u64;
                 if let Some(expected_hash) = commitment_hashes
@@ -132,7 +133,7 @@ pub fn parse_wallet_delta_from_logs(
 
             let tree_number: u32 = event.treeNumber.to();
             let start_pos: u64 = event.startPosition.to();
-            let source = source_from_log(raw_log)?;
+            let source = source_from_log(raw_log, block_timestamps)?;
             for (index, preimage) in event.commitments.iter().enumerate() {
                 let position = start_pos + index as u64;
                 if let Some(ciphertext) = event.shieldCiphertext.get(index)
@@ -153,7 +154,7 @@ pub fn parse_wallet_delta_from_logs(
 
             let tree_number: u32 = event.treeNumber.to();
             let start_pos: u64 = event.startPosition.to();
-            let source = source_from_log(raw_log)?;
+            let source = source_from_log(raw_log, block_timestamps)?;
             for (index, preimage) in event.commitments.iter().enumerate() {
                 let position = start_pos + index as u64;
                 if let Some(ciphertext) = event.shieldCiphertext.get(index)
@@ -172,7 +173,7 @@ pub fn parse_wallet_delta_from_logs(
         } else if topic0 == Nullifiers::SIGNATURE_HASH {
             let event = Nullifiers::decode_log(&raw_log.inner)?.data;
             let tree_number: u32 = event.treeNumber.to();
-            let source = source_from_log(raw_log)?;
+            let source = source_from_log(raw_log, block_timestamps)?;
             for nullifier in event.nullifier {
                 nullifiers
                     .entry((tree_number, nullifier))
@@ -181,7 +182,7 @@ pub fn parse_wallet_delta_from_logs(
         } else if topic0 == Nullified::SIGNATURE_HASH {
             let event = Nullified::decode_log(&raw_log.inner)?.data;
             let tree_number: u32 = event.treeNumber.into();
-            let source = source_from_log(raw_log)?;
+            let source = source_from_log(raw_log, block_timestamps)?;
             for nullifier in event.nullifier {
                 nullifiers
                     .entry((tree_number, U256::from_be_bytes(nullifier.0)))
@@ -192,7 +193,7 @@ pub fn parse_wallet_delta_from_logs(
 
             let tree_number: u32 = event.treeNumber.to();
             let start_pos: u64 = event.startPosition.to();
-            let source = source_from_log(raw_log)?;
+            let source = source_from_log(raw_log, block_timestamps)?;
             for (index, ciphertext) in event.ciphertext.iter().enumerate() {
                 let Some(expected_hash) = event.hash.get(index).copied() else {
                     continue;
@@ -221,7 +222,7 @@ pub fn parse_wallet_delta_from_logs(
 
             let tree_number: u32 = event.treeNumber.to();
             let start_pos: u64 = event.startPosition.to();
-            let source = source_from_log(raw_log)?;
+            let source = source_from_log(raw_log, block_timestamps)?;
             for (index, preimage) in event.commitments.iter().enumerate() {
                 let Some(encrypted_random) = event.encryptedRandom.get(index) else {
                     continue;
@@ -442,14 +443,24 @@ fn scan_shield_commitment(
     })
 }
 
-fn source_from_log(log: &Log) -> Result<UtxoSource, WalletScanError> {
+fn source_from_log(
+    log: &Log,
+    block_timestamps: &HashMap<u64, u64>,
+) -> Result<UtxoSource, WalletScanError> {
+    let block_number = log
+        .block_number
+        .ok_or(WalletScanError::MissingLogMetadata("block_number"))?;
+    let block_timestamp = block_timestamps
+        .get(&block_number)
+        .copied()
+        .ok_or(WalletScanError::MissingLogMetadata("block_timestamp"))?;
+
     Ok(UtxoSource {
         tx_hash: log
             .transaction_hash
             .ok_or(WalletScanError::MissingLogMetadata("transaction_hash"))?,
-        block_number: log
-            .block_number
-            .ok_or(WalletScanError::MissingLogMetadata("block_number"))?,
+        block_number,
+        block_timestamp,
     })
 }
 

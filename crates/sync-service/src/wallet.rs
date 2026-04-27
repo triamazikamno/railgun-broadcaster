@@ -42,7 +42,7 @@ async fn apply_wallet_logs(
             nullifiers: Vec::new(),
         }
     } else {
-        parse_wallet_delta_from_logs(&filtered_logs, &cfg.scan_keys)?
+        parse_wallet_delta_from_logs(&filtered_logs, &batch.block_timestamps, &cfg.scan_keys)?
     };
 
     let changed = apply_wallet_delta(
@@ -477,6 +477,7 @@ mod tests {
         UtxoSource {
             tx_hash: FixedBytes::from([byte; 32]),
             block_number: u64::from(byte),
+            block_timestamp: 1_700_000_000 + u64::from(byte),
         }
     }
 
