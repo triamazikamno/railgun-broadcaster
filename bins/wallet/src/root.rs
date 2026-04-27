@@ -157,11 +157,47 @@ enum ChainUtxoState {
     Loading {
         progress: Option<SyncProgressUpdate>,
     },
+    Syncing {
+        snapshot: Arc<ListUtxosOutput>,
+        progress: Option<SyncProgressUpdate>,
+        session: Arc<wallet_ops::WalletSession>,
+    },
     Ready {
         snapshot: Arc<ListUtxosOutput>,
-        _session: Arc<wallet_ops::WalletSession>,
+        session: Arc<wallet_ops::WalletSession>,
     },
     Error(Arc<str>),
+}
+
+impl ChainUtxoState {
+    const fn snapshot(&self) -> Option<&Arc<ListUtxosOutput>> {
+        match self {
+            Self::Syncing { snapshot, .. } | Self::Ready { snapshot, .. } => Some(snapshot),
+            Self::Idle | Self::Loading { .. } | Self::Error(_) => None,
+        }
+    }
+
+    const fn progress(&self) -> Option<SyncProgressUpdate> {
+        match self {
+            Self::Loading { progress } | Self::Syncing { progress, .. } => *progress,
+            Self::Idle | Self::Ready { .. } | Self::Error(_) => None,
+        }
+    }
+
+    const fn renders_table(&self) -> bool {
+        matches!(
+            self,
+            Self::Loading { .. } | Self::Syncing { .. } | Self::Ready { .. }
+        )
+    }
+
+    const fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready { .. })
+    }
+
+    const fn is_syncing(&self) -> bool {
+        matches!(self, Self::Loading { .. } | Self::Syncing { .. })
+    }
 }
 
 enum VaultState {
@@ -450,9 +486,9 @@ impl WalletRoot {
                     .update(cx, |root, cx| {
                         if matches!(
                             root.chain_states.get(&root.selected_chain),
-                            Some(ChainUtxoState::Ready { .. })
+                            Some(state) if state.snapshot().is_some()
                         ) {
-                            root.utxo_table.update(cx, |state, cx| state.refresh(cx));
+                            root.utxo_table.update(cx, TableState::refresh);
                             cx.notify();
                         }
                     })
@@ -485,7 +521,11 @@ impl WalletRoot {
     ) {
         if matches!(
             self.chain_states.get(&chain_id),
-            Some(ChainUtxoState::Loading { .. } | ChainUtxoState::Ready { .. })
+            Some(
+                ChainUtxoState::Loading { .. }
+                    | ChainUtxoState::Syncing { .. }
+                    | ChainUtxoState::Ready { .. }
+            )
         ) && !force
         {
             return;
@@ -493,9 +533,9 @@ impl WalletRoot {
 
         let previous_session = if force {
             match self.chain_states.remove(&chain_id) {
-                Some(ChainUtxoState::Ready {
-                    _session: session, ..
-                }) => Some(session),
+                Some(
+                    ChainUtxoState::Syncing { session, .. } | ChainUtxoState::Ready { session, .. },
+                ) => Some(session),
                 Some(state) => {
                     self.chain_states.insert(chain_id, state);
                     None
@@ -552,7 +592,7 @@ impl WalletRoot {
                 .await?
                 .clone();
             store
-                .start_view_wallet_session(request, rpc_url, &http)
+                .start_view_wallet_session_immediate(request, rpc_url, &http)
                 .await
         });
 
@@ -563,12 +603,20 @@ impl WalletRoot {
                 }
                 let progress = *progress_rx.borrow();
                 let should_continue = this.update(cx, |root, cx| {
-                    let Some(ChainUtxoState::Loading { progress: state }) =
-                        root.chain_states.get_mut(&chain_id)
-                    else {
-                        return false;
-                    };
-                    *state = progress;
+                    match root.chain_states.get_mut(&chain_id) {
+                        Some(
+                            ChainUtxoState::Loading { progress: state }
+                            | ChainUtxoState::Syncing {
+                                progress: state, ..
+                            },
+                        ) => *state = progress,
+                        Some(
+                            ChainUtxoState::Idle
+                            | ChainUtxoState::Ready { .. }
+                            | ChainUtxoState::Error(_),
+                        )
+                        | None => return false,
+                    }
                     cx.notify();
                     true
                 });
@@ -613,16 +661,28 @@ impl WalletRoot {
             };
 
             let mut snapshots_rx = session.snapshots_rx.clone();
+            let mut ready_rx = session.ready_rx.clone();
             let initial_snapshot = snapshots_rx.borrow().clone();
+            let mut ready = *ready_rx.borrow();
 
             let _ = this.update(cx, |root, cx| {
-                root.chain_states.insert(
-                    chain_id,
+                let progress = root
+                    .chain_states
+                    .get(&chain_id)
+                    .and_then(ChainUtxoState::progress);
+                let state = if ready {
                     ChainUtxoState::Ready {
-                        snapshot: initial_snapshot,
-                        _session: session.clone(),
-                    },
-                );
+                        snapshot: initial_snapshot.clone(),
+                        session: session.clone(),
+                    }
+                } else {
+                    ChainUtxoState::Syncing {
+                        snapshot: initial_snapshot.clone(),
+                        progress,
+                        session: session.clone(),
+                    }
+                };
+                root.chain_states.insert(chain_id, state);
                 if root.selected_chain == chain_id {
                     root.sync_utxo_table(cx);
                     root.focus_utxo_table_on_render = true;
@@ -631,27 +691,76 @@ impl WalletRoot {
             });
 
             loop {
-                if snapshots_rx.changed().await.is_err() {
-                    break;
-                }
-                let snapshot = snapshots_rx.borrow().clone();
-                if this
-                    .update(cx, |root, cx| {
-                        root.chain_states.insert(
-                            chain_id,
-                            ChainUtxoState::Ready {
-                                snapshot,
-                                _session: session.clone(),
-                            },
-                        );
-                        if root.selected_chain == chain_id {
-                            root.sync_utxo_table(cx);
+                tokio::select! {
+                    changed = snapshots_rx.changed() => {
+                        if changed.is_err() {
+                            break;
                         }
-                        cx.notify();
-                    })
-                    .is_err()
-                {
-                    break;
+                        let snapshot = snapshots_rx.borrow().clone();
+                        let should_continue = this.update(cx, |root, cx| {
+                            let Some(state) = root.chain_states.get_mut(&chain_id) else {
+                                return false;
+                            };
+                            match state {
+                                ChainUtxoState::Syncing { snapshot: current, .. }
+                                | ChainUtxoState::Ready { snapshot: current, .. } => {
+                                    *current = snapshot;
+                                }
+                                ChainUtxoState::Idle
+                                | ChainUtxoState::Loading { .. }
+                                | ChainUtxoState::Error(_) => return false,
+                            }
+                            if root.selected_chain == chain_id {
+                                root.sync_utxo_table(cx);
+                            }
+                            cx.notify();
+                            true
+                        });
+                        if !matches!(should_continue, Ok(true)) {
+                            break;
+                        }
+                    }
+                    changed = ready_rx.changed(), if !ready => {
+                        if changed.is_err() {
+                            ready = true;
+                            continue;
+                        }
+                        ready = *ready_rx.borrow();
+                        if !ready {
+                            continue;
+                        }
+                        let should_continue = this.update(cx, |root, cx| {
+                            let Some(state) = root.chain_states.remove(&chain_id) else {
+                                return false;
+                            };
+                            match state {
+                                ChainUtxoState::Syncing { snapshot, session, .. } => {
+                                    root.chain_states.insert(
+                                        chain_id,
+                                        ChainUtxoState::Ready { snapshot, session },
+                                    );
+                                    if root.selected_chain == chain_id {
+                                        root.sync_utxo_table(cx);
+                                    }
+                                    cx.notify();
+                                    true
+                                }
+                                ChainUtxoState::Ready { .. } => {
+                                    root.chain_states.insert(chain_id, state);
+                                    true
+                                }
+                                ChainUtxoState::Idle
+                                | ChainUtxoState::Loading { .. }
+                                | ChainUtxoState::Error(_) => {
+                                    root.chain_states.insert(chain_id, state);
+                                    false
+                                }
+                            }
+                        });
+                        if !matches!(should_continue, Ok(true)) {
+                            break;
+                        }
+                    }
                 }
             }
         })
@@ -660,11 +769,13 @@ impl WalletRoot {
 
     fn sync_utxo_table(&self, cx: &mut Context<'_, Self>) {
         let rows = match self.chain_states.get(&self.selected_chain) {
-            Some(ChainUtxoState::Ready { snapshot, .. }) => display_rows_from_output(
-                snapshot,
-                self.tx_search_query.as_ref(),
-                self.show_spent_utxos,
-            ),
+            Some(state) => state.snapshot().map_or_else(Vec::new, |snapshot| {
+                display_rows_from_output(
+                    snapshot,
+                    self.tx_search_query.as_ref(),
+                    self.show_spent_utxos,
+                )
+            }),
             _ => Vec::new(),
         };
         self.utxo_table.update(cx, |state, cx| {
@@ -679,10 +790,11 @@ impl WalletRoot {
         }
         self.selected_chain = chain_id;
         self.sync_utxo_table(cx);
-        if matches!(
-            self.chain_states.get(&chain_id),
-            Some(ChainUtxoState::Ready { .. })
-        ) {
+        if self
+            .chain_states
+            .get(&chain_id)
+            .is_some_and(ChainUtxoState::renders_table)
+        {
             self.focus_utxo_table_on_render = true;
         }
         self.ensure_chain_load(chain_id, ChainLoadSource::Selection, cx);
@@ -696,6 +808,18 @@ impl WalletRoot {
     }
 
     fn repair_wallet_cache_from_input(&mut self, cx: &mut Context<'_, Self>) -> bool {
+        if self
+            .chain_states
+            .get(&self.selected_chain)
+            .is_some_and(ChainUtxoState::is_syncing)
+        {
+            self.repair_cache_error = Some(Arc::from(
+                "Wait for wallet sync to finish before repairing the cache",
+            ));
+            cx.notify();
+            return false;
+        }
+
         let raw_block = self.repair_cache_block_input.read(cx).value();
         let rewind_from = match parse_repair_cache_block(raw_block.as_ref()) {
             Ok(rewind_from) => rewind_from,
@@ -723,7 +847,7 @@ impl WalletRoot {
         }
         if !matches!(
             self.chain_states.get(&self.selected_chain),
-            Some(ChainUtxoState::Ready { .. })
+            Some(state) if state.renders_table()
         ) {
             return;
         }
@@ -1001,6 +1125,18 @@ impl WalletRoot {
     }
 
     fn authorize_spend_from_input(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if !self
+            .chain_states
+            .get(&self.selected_chain)
+            .is_some_and(ChainUtxoState::is_ready)
+        {
+            self.spend_status = None;
+            self.set_vault_error(
+                "Wait for wallet sync to finish before authorizing a spend",
+                cx,
+            );
+            return;
+        }
         let Some(store) = self.vault_store.as_ref() else {
             self.set_vault_error("Wallet vault storage is unavailable", cx);
             return;
@@ -1088,7 +1224,7 @@ impl WalletRoot {
             .child(Self::render_activity_button(
                 "activity-wallet",
                 icons::wallet_icon_path(),
-                "Wallet",
+                "Wallets",
                 self.active_activity == Activity::Wallet,
                 false,
                 {
@@ -1105,7 +1241,7 @@ impl WalletRoot {
             .child(Self::render_activity_button(
                 "activity-broadcaster",
                 icons::robot_icon_path(),
-                "Broadcaster monitor",
+                "Public broadcasters",
                 self.active_activity == Activity::Broadcaster,
                 false,
                 {
@@ -1456,6 +1592,16 @@ impl WalletRoot {
                     .p(px(12.0))
                     .child(self.render_utxo_body(root, window)),
             )
+            .children(self.render_sync_status_bar())
+    }
+
+    fn render_sync_status_bar(&self) -> Option<gpui::AnyElement> {
+        let progress = self
+            .chain_states
+            .get(&self.selected_chain)
+            .filter(|state| state.is_syncing())
+            .map(ChainUtxoState::progress)?;
+        Some(sync_status_bar(progress).into_any_element())
     }
 
     fn render_wallet_header(&self, root: &Entity<Self>) -> impl IntoElement {
@@ -1465,7 +1611,9 @@ impl WalletRoot {
             .as_ref()
             .and_then(|session| session.receive_address().ok());
         let (summary, totals) = match self.chain_states.get(&self.selected_chain) {
-            Some(ChainUtxoState::Ready { snapshot, .. }) => {
+            Some(
+                ChainUtxoState::Syncing { snapshot, .. } | ChainUtxoState::Ready { snapshot, .. },
+            ) => {
                 let counts = if snapshot.spent_count == 0 {
                     format!("{} unspent UTXOs", snapshot.unspent_count)
                 } else {
@@ -1535,7 +1683,7 @@ impl WalletRoot {
         let error = self.repair_cache_error.clone();
         let disabled = matches!(
             self.chain_states.get(&self.selected_chain),
-            Some(ChainUtxoState::Loading { .. })
+            Some(state) if state.is_syncing()
         );
 
         Popover::new("wallet-repair-cache")
@@ -1649,12 +1797,11 @@ impl WalletRoot {
 
     fn render_utxo_body(&self, root: &Entity<Self>, window: &Window) -> impl IntoElement {
         match self.chain_states.get(&self.selected_chain) {
-            Some(ChainUtxoState::Loading { progress }) => loading_progress(*progress),
             Some(ChainUtxoState::Error(error)) => error_message(error.as_ref()),
             Some(ChainUtxoState::Ready { snapshot, .. }) if snapshot.utxo_count == 0 => {
                 centered_message("No UTXOs found")
             }
-            Some(ChainUtxoState::Ready { .. }) => div()
+            Some(state) if state.renders_table() => div()
                 .size_full()
                 .min_w(px(0.0))
                 .min_h(px(0.0))
@@ -1688,6 +1835,10 @@ impl WalletRoot {
     fn render_utxo_controls(&self, root: Entity<Self>) -> impl IntoElement {
         let spend_root = root.clone();
         let search_active = !self.tx_search_query.is_empty();
+        let chain_ready = self
+            .chain_states
+            .get(&self.selected_chain)
+            .is_some_and(ChainUtxoState::is_ready);
         let clear_search_input = self.tx_search_input.clone();
         let clear_search_table = self.utxo_table.clone();
         let search_input = app_input(&self.tx_search_input).when(search_active, |input| {
@@ -1746,13 +1897,14 @@ impl WalletRoot {
             .child(
                 div()
                     .w(px(180.0))
-                    .child(app_input(&self.spend_password_input)),
+                    .child(app_input(&self.spend_password_input).disabled(!chain_ready)),
             )
             .child(
                 app_button("wallet-authorize-spend", "Authorize spend")
                     .xsmall()
                     .outline()
                     .p(px(12.0))
+                    .disabled(!chain_ready)
                     .on_click(move |_event, window, cx| {
                         spend_root.update(cx, |root, cx| {
                             root.authorize_spend_from_input(window, cx);
@@ -2168,7 +2320,7 @@ fn loading_summary(progress: Option<SyncProgressUpdate>) -> String {
     )
 }
 
-fn loading_progress(progress: Option<SyncProgressUpdate>) -> gpui::Div {
+fn sync_status_bar(progress: Option<SyncProgressUpdate>) -> gpui::Div {
     let title = progress.map_or("Preparing wallet sync", |progress| progress.stage.label());
     let percent = progress.map_or(0, SyncProgressUpdate::percent);
     let detail = progress.map_or_else(
@@ -2178,60 +2330,51 @@ fn loading_progress(progress: Option<SyncProgressUpdate>) -> gpui::Div {
     let fill_width = relative(f32::from(percent) / 100.0);
 
     div()
-        .size_full()
+        .h(px(36.0))
+        .flex_none()
         .flex()
         .items_center()
-        .justify_center()
+        .gap_3()
+        .px(px(12.0))
+        .bg(rgb(theme::SURFACE))
+        .border_t_1()
+        .border_color(rgb(theme::BORDER))
         .child(
             div()
-                .w(px(460.0))
-                .flex()
-                .flex_col()
-                .gap_3()
-                .p(px(18.0))
+                .min_w(px(170.0))
+                .text_color(rgb(theme::TEXT))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child(title),
+        )
+        .child(
+            div()
+                .w(px(190.0))
+                .h(px(6.0))
                 .rounded_md()
-                .bg(rgb(theme::SURFACE))
-                .border_1()
-                .border_color(rgb(theme::BORDER))
+                .overflow_hidden()
+                .bg(rgb(theme::SURFACE_HOVER))
                 .child(
                     div()
-                        .flex()
-                        .items_center()
-                        .child(
-                            div()
-                                .text_color(rgb(theme::TEXT))
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .child(title),
-                        )
-                        .child(div().flex_1())
-                        .child(
-                            div()
-                                .text_color(rgb(theme::INFO))
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .child(SharedString::from(format!("{percent}%"))),
-                        ),
-                )
-                .child(
-                    div()
-                        .h(px(9.0))
-                        .w_full()
+                        .h_full()
+                        .w(fill_width)
                         .rounded_md()
-                        .overflow_hidden()
-                        .bg(rgb(theme::SURFACE_HOVER))
-                        .child(
-                            div()
-                                .h_full()
-                                .w(fill_width)
-                                .rounded_md()
-                                .bg(rgb(theme::INFO)),
-                        ),
-                )
-                .child(
-                    div()
-                        .text_color(rgb(theme::TEXT_MUTED))
-                        .text_size(APP_TEXT_SIZE)
-                        .child(SharedString::from(detail)),
+                        .bg(rgb(theme::INFO)),
                 ),
+        )
+        .child(
+            div()
+                .w(px(42.0))
+                .text_color(rgb(theme::INFO))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child(SharedString::from(format!("{percent}%"))),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .text_color(rgb(theme::TEXT_MUTED))
+                .text_size(APP_TEXT_SIZE)
+                .child(SharedString::from(detail)),
         )
 }
 
@@ -2564,10 +2707,10 @@ mod tests {
     use wallet_ops::{ListUtxosOutput, SyncProgressStage, SyncProgressUpdate, UtxoOutput};
 
     use super::{
-        ChainLoadSource, SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_MINUTE, SECONDS_PER_MONTH,
-        SECONDS_PER_YEAR, WalletAppOptions, chain_load_overrides, display_rows_from_output,
-        format_compact_age, format_total, loading_summary, parse_repair_cache_block,
-        progress_detail,
+        ChainLoadSource, ChainUtxoState, SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_MINUTE,
+        SECONDS_PER_MONTH, SECONDS_PER_YEAR, WalletAppOptions, chain_load_overrides,
+        display_rows_from_output, format_compact_age, format_total, loading_summary,
+        parse_repair_cache_block, progress_detail,
     };
 
     fn wallet_options_with_overrides() -> WalletAppOptions {
@@ -2918,6 +3061,16 @@ mod tests {
             loading_summary(Some(progress)),
             "Synchronizing commitments · 25%"
         );
+    }
+
+    #[test]
+    fn loading_chain_state_keeps_utxo_table_available() {
+        let state = ChainUtxoState::Loading { progress: None };
+
+        assert!(state.renders_table());
+        assert!(state.is_syncing());
+        assert!(!state.is_ready());
+        assert!(state.snapshot().is_none());
     }
 
     #[test]

@@ -323,8 +323,13 @@ impl TableDelegate for FeesDelegate {
         let table = cx.entity();
         match col_ix {
             0 => render_chain_header(&self.chain_ids, self.chain_filter, table).into_any_element(),
-            1 => Input::new(&self.broadcaster_input)
-                .with_size(Size::XSmall)
+            1 => div()
+                .id("fees-broadcaster-filter-input")
+                .size_full()
+                .on_click(|_event, _window, cx| {
+                    cx.stop_propagation();
+                })
+                .child(Input::new(&self.broadcaster_input).with_size(Size::XSmall))
                 .into_any_element(),
             2 => {
                 let options = self.token_options();
@@ -491,6 +496,9 @@ fn render_chain_header(
                 .ghost()
                 .xsmall()
                 .justify_start()
+                .on_click(|_event, _window, cx| {
+                    cx.stop_propagation();
+                })
                 .child(trigger_content(trigger_chain, trigger_label, px(16.0))),
         )
         .content(move |_state, window, cx| {
@@ -513,6 +521,7 @@ fn render_chain_header(
                         .justify_start()
                         .child(trigger_content(None, SharedString::from("All"), px(16.0)))
                         .on_click(move |_event, window, cx| {
+                            cx.stop_propagation();
                             table.update(cx, |state, cx| {
                                 state.delegate_mut().set_chain_filter(FeesFilter::All);
                                 cx.notify();
@@ -534,6 +543,7 @@ fn render_chain_header(
                             px(16.0),
                         ))
                         .on_click(move |_event, window, cx| {
+                            cx.stop_propagation();
                             table.update(cx, |state, cx| {
                                 state.delegate_mut().set_chain_filter(FeesFilter::One(id));
                                 cx.notify();
@@ -573,6 +583,9 @@ fn render_token_header(
                 .ghost()
                 .xsmall()
                 .justify_start()
+                .on_click(|_event, _window, cx| {
+                    cx.stop_propagation();
+                })
                 .child(token_trigger_content(
                     trigger_chain,
                     trigger_token,
@@ -605,6 +618,7 @@ fn render_token_header(
                             px(16.0),
                         ))
                         .on_click(move |_event, window, cx| {
+                            cx.stop_propagation();
                             table.update(cx, |state, cx| {
                                 state.delegate_mut().set_token_filter(FeesFilter::All);
                                 cx.notify();
@@ -628,6 +642,7 @@ fn render_token_header(
                             px(16.0),
                         ))
                         .on_click(move |_event, window, cx| {
+                            cx.stop_propagation();
                             table.update(cx, |state, cx| {
                                 state
                                     .delegate_mut()

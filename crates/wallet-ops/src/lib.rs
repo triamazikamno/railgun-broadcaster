@@ -369,6 +369,27 @@ impl WalletSessionStore {
         rpc_url_override: Option<Url>,
         http: &HttpContext,
     ) -> Result<WalletSession> {
+        self.start_view_wallet_session_with_wait(request, rpc_url_override, http, true)
+            .await
+    }
+
+    pub async fn start_view_wallet_session_immediate(
+        &self,
+        request: ViewWalletChainSessionRequest,
+        rpc_url_override: Option<Url>,
+        http: &HttpContext,
+    ) -> Result<WalletSession> {
+        self.start_view_wallet_session_with_wait(request, rpc_url_override, http, false)
+            .await
+    }
+
+    async fn start_view_wallet_session_with_wait(
+        &self,
+        request: ViewWalletChainSessionRequest,
+        rpc_url_override: Option<Url>,
+        http: &HttpContext,
+        wait_until_ready: bool,
+    ) -> Result<WalletSession> {
         let chain_id = request.chain_id;
         let synced = setup_synced_view_wallet_with_store(
             request.view_session,
@@ -381,6 +402,7 @@ impl WalletSessionStore {
             http,
             UnsupportedChainMessage::WalletCliV1,
             request.progress_tx.clone(),
+            wait_until_ready,
             Arc::clone(&self.db),
             Arc::clone(&self.sync_manager),
         )
@@ -449,12 +471,12 @@ async fn wallet_session_from_parts(
     chain_key: ChainKey,
     handle: WalletHandle,
 ) -> Result<WalletSession> {
+    let mut rev_rx = handle.rev_rx.clone();
     let initial_snapshot = Arc::new(snapshot_from_handle(chain_id, &handle).await);
     let (snapshots_tx, snapshots_rx) = watch::channel(initial_snapshot);
     let cache_key = handle.cache_key.clone();
     let ready_rx = handle.ready_rx.clone();
     let snapshot_handle = handle.clone();
-    let mut rev_rx = handle.rev_rx.clone();
     tokio::spawn(async move {
         loop {
             if rev_rx.changed().await.is_err() {
@@ -908,6 +930,7 @@ async fn setup_synced_view_wallet_with_store(
     http: &HttpContext,
     unsupported_chain_message: UnsupportedChainMessage,
     progress_tx: Option<SyncProgressSender>,
+    wait_until_ready: bool,
     db: Arc<DbStore>,
     sync_manager: Arc<SyncManager>,
 ) -> Result<SyncedViewWallet> {
@@ -982,7 +1005,9 @@ async fn setup_synced_view_wallet_with_store(
         .add_wallet(wallet_cfg)
         .await
         .wrap_err("register wallet sync worker")?;
-    handle.wait_until_ready().await;
+    if wait_until_ready {
+        handle.wait_until_ready().await;
+    }
 
     Ok(SyncedViewWallet {
         db,
@@ -1262,7 +1287,7 @@ mod tests {
                     "value": "4",
                     "source_tx_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
                     "source_block_number": 11,
-                    "source_block_timestamp": 1700000011,
+                    "source_block_timestamp": 1_700_000_011,
                     "is_spent": true,
                     "spent_tx_hash": "0x2222222222222222222222222222222222222222222222222222222222222222",
                     "spent_block_number": 21,

@@ -18,6 +18,7 @@ pub struct WalletHandle {
     pub utxos: Arc<RwLock<Vec<WalletUtxo>>>,
     pub ready_rx: watch::Receiver<bool>,
     pub rev_rx: watch::Receiver<u64>,
+    rev_tx: watch::Sender<u64>,
 }
 
 async fn apply_wallet_logs(
@@ -130,12 +131,16 @@ impl WalletHandle {
             }
         }
     }
+
+    pub(crate) fn notify_changed(&self) {
+        notify_wallet_rev(self);
+    }
 }
 
-fn notify_wallet_rev(rev_tx: &watch::Sender<u64>, rev: &mut u64, cache_key: &str) {
-    *rev = rev.wrapping_add(1);
-    if let Err(err) = rev_tx.send(*rev) {
-        debug!(?err, cache_key, "failed to send wallet revision");
+fn notify_wallet_rev(handle: &WalletHandle) {
+    let rev = handle.rev_rx.borrow().wrapping_add(1);
+    if let Err(err) = handle.rev_tx.send(rev) {
+        debug!(?err, cache_key = %handle.cache_key, "failed to send wallet revision");
     }
 }
 
@@ -197,8 +202,10 @@ pub(crate) fn spawn_wallet_worker(
     mut live_rx: broadcast::Receiver<SharedLogBatch>,
     mut backfill_rx: mpsc::Receiver<BackfillEvent>,
     cancel: CancellationToken,
+    initial_utxos: Vec<WalletUtxo>,
+    initial_last_scanned: u64,
 ) -> WalletHandle {
-    let utxos = Arc::new(RwLock::new(Vec::new()));
+    let utxos = Arc::new(RwLock::new(initial_utxos));
     let cache_store = wallet_cache_store(&db, &cfg);
     let (ready_tx, ready_rx) = watch::channel(false);
     let (rev_tx, rev_rx) = watch::channel(0_u64);
@@ -207,45 +214,24 @@ pub(crate) fn spawn_wallet_worker(
         utxos: utxos.clone(),
         ready_rx,
         rev_rx,
+        rev_tx,
     };
 
     let chain_id = cfg.chain.chain_id;
+    let worker_handle = handle.clone();
     tokio::spawn(async move {
-        let mut rev = 0_u64;
-        let start_block = cfg.start_block.unwrap_or(0);
-        let mut last_scanned = start_block.saturating_sub(1);
-
-        match cache_store.load_wallet_utxos(&cfg.cache_key) {
-            Ok(cached) => {
-                let (unspent, spent) = wallet_utxo_counts(&cached);
-                info!(
-                    cache_key = %cfg.cache_key,
-                    total = cached.len(),
-                    unspent,
-                    spent,
-                    "loaded wallet cache"
-                );
-                let mut locked = utxos.write().await;
-                *locked = cached;
-                notify_wallet_rev(&rev_tx, &mut rev, &cfg.cache_key);
-            }
-            Err(err) => {
-                warn!(?err, cache_key = %cfg.cache_key, "failed to load wallet cache");
-            }
-        }
-
-        if let Ok(Some(meta)) = cache_store.get_wallet_meta(&cfg.cache_key) {
-            last_scanned = meta.last_scanned_block;
-            debug!(
-                cache_key = %cfg.cache_key,
-                last_scanned,
-                last_scanned_block_hash = ?meta.last_scanned_block_hash,
-                "loaded wallet cache metadata"
-            );
-        }
-        if last_scanned < start_block {
-            last_scanned = start_block.saturating_sub(1);
-        }
+        let mut last_scanned = initial_last_scanned;
+        let snapshot = utxos.read().await;
+        let (unspent, spent) = wallet_utxo_counts(&snapshot);
+        info!(
+            cache_key = %cfg.cache_key,
+            total = snapshot.len(),
+            unspent,
+            spent,
+            last_scanned,
+            "loaded wallet cache"
+        );
+        drop(snapshot);
 
         let mut backfill_complete_block: Option<u64> = None;
         let mut persist_state = WalletPersistState::default();
@@ -301,7 +287,7 @@ pub(crate) fn spawn_wallet_worker(
                                         "wallet backfill batch complete"
                                     );
                                     if changed {
-                                        notify_wallet_rev(&rev_tx, &mut rev, &cfg.cache_key);
+                                        worker_handle.notify_changed();
                                     }
                                 }
                                 Err(err) => {
@@ -361,7 +347,7 @@ pub(crate) fn spawn_wallet_worker(
                                     warn!(?err, cache_key = %cfg.cache_key, "failed to reset wallet cache");
                                 }
                             }
-                            notify_wallet_rev(&rev_tx, &mut rev, &cfg.cache_key);
+                            worker_handle.notify_changed();
                             backfill_complete_block = None;
                             if let Err(err) = ready_tx.send(false) {
                                 debug!(?err, cache_key = %cfg.cache_key, "failed to send ready state");
@@ -415,7 +401,7 @@ pub(crate) fn spawn_wallet_worker(
                                         "wallet live batch complete"
                                     );
                                     if changed {
-                                        notify_wallet_rev(&rev_tx, &mut rev, &cfg.cache_key);
+                                        worker_handle.notify_changed();
                                     }
                                 }
                                 Err(err) => {
@@ -458,8 +444,8 @@ fn wallet_utxo_counts(utxos: &[WalletUtxo]) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::{
-        WalletPersistState, WalletProgressPersist, apply_wallet_delta_to_vec, notify_wallet_rev,
-        persist_wallet_progress, spent_source_for_utxo,
+        WalletHandle, WalletPersistState, WalletProgressPersist, apply_wallet_delta_to_vec,
+        notify_wallet_rev, persist_wallet_progress, spent_source_for_utxo,
     };
     use crate::types::{ChainKey, WalletCacheStore, WalletConfig};
     use alloy::primitives::{Address, FixedBytes, U256};
@@ -470,8 +456,8 @@ mod tests {
     use railgun_wallet::wallet_cache::WalletCacheError;
     use railgun_wallet::{Utxo, UtxoSource, WalletUtxo};
     use std::collections::HashMap;
-    use std::sync::Mutex;
-    use tokio::sync::watch;
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::{RwLock, watch};
 
     fn source(byte: u8) -> UtxoSource {
         UtxoSource {
@@ -693,14 +679,22 @@ mod tests {
 
     #[test]
     fn notify_wallet_rev_increments_revision() {
-        let (tx, rx) = watch::channel(0_u64);
-        let mut rev = 0_u64;
+        let (ready_tx, ready_rx) = watch::channel(false);
+        drop(ready_tx);
+        let (rev_tx, rev_rx) = watch::channel(0_u64);
+        let handle = WalletHandle {
+            cache_key: "cache-key".to_string(),
+            utxos: Arc::new(RwLock::new(Vec::new())),
+            ready_rx,
+            rev_rx,
+            rev_tx,
+        };
 
-        notify_wallet_rev(&tx, &mut rev, "cache-key");
-        assert_eq!(*rx.borrow(), 1);
+        notify_wallet_rev(&handle);
+        assert_eq!(*handle.rev_rx.borrow(), 1);
 
-        notify_wallet_rev(&tx, &mut rev, "cache-key");
-        assert_eq!(*rx.borrow(), 2);
+        notify_wallet_rev(&handle);
+        assert_eq!(*handle.rev_rx.borrow(), 2);
     }
 
     #[test]

@@ -266,7 +266,7 @@ impl ChainService {
         Ok(())
     }
 
-    pub async fn register_wallet(&self, cfg: WalletConfig) -> WalletHandle {
+    pub async fn register_wallet(self: &Arc<Self>, cfg: WalletConfig) -> WalletHandle {
         let cache_key = cfg.cache_key.clone();
         if let Some(existing) = self.wallets.read().await.get(&cache_key) {
             return existing.handle.clone();
@@ -295,12 +295,16 @@ impl ChainService {
             indexed_wallet_catch_up = cfg.use_indexed_wallet_catch_up,
             "registering wallet sync"
         );
-        if cfg.use_indexed_wallet_catch_up {
-            last_scanned = self
-                .indexed_wallet_catch_up(&cfg, start_block, last_scanned, sync_target)
-                .await;
-        } else {
-            debug!(cache_key = %cfg.cache_key, "indexed wallet catch-up disabled");
+
+        let initial_utxos = match cache_store.load_wallet_utxos(&cfg.cache_key) {
+            Ok(cached) => cached,
+            Err(err) => {
+                warn!(?err, cache_key = %cfg.cache_key, "failed to load wallet cache");
+                Vec::new()
+            }
+        };
+        if last_scanned < start_block {
+            last_scanned = start_block.saturating_sub(1);
         }
 
         let cancel = self.cancel.child_token();
@@ -312,21 +316,78 @@ impl ChainService {
             live_rx,
             backfill_rx,
             cancel.clone(),
+            initial_utxos,
+            last_scanned,
         );
+
+        self.wallets.write().await.insert(
+            cache_key,
+            WalletRegistration {
+                handle: handle.clone(),
+                cancel: cancel.clone(),
+                backfill_sender: backfill_sender.clone(),
+                start_block,
+                sync_to_block: cfg.sync_to_block,
+            },
+        );
+
+        let service = Arc::clone(self);
+        let catch_up_cfg = cfg.clone();
+        let catch_up_handle = handle.clone();
+        let catch_up_cancel = cancel;
+        tokio::spawn(async move {
+            let mut checkpoint = last_scanned;
+            if catch_up_cfg.use_indexed_wallet_catch_up {
+                checkpoint = service
+                    .indexed_wallet_catch_up(
+                        &catch_up_cfg,
+                        start_block,
+                        checkpoint,
+                        sync_target,
+                        &catch_up_handle,
+                        &catch_up_cancel,
+                    )
+                    .await;
+            } else {
+                debug!(cache_key = %catch_up_cfg.cache_key, "indexed wallet catch-up disabled");
+            }
+            if catch_up_cancel.is_cancelled() {
+                return;
+            }
+            service
+                .enqueue_wallet_backfill(
+                    &catch_up_cfg.cache_key,
+                    start_block,
+                    checkpoint,
+                    sync_target,
+                    backfill_sender,
+                )
+                .await;
+        });
+
+        handle
+    }
+
+    async fn enqueue_wallet_backfill(
+        &self,
+        cache_key: &str,
+        start_block: u64,
+        last_scanned: u64,
+        sync_target: u64,
+        backfill_sender: mpsc::Sender<BackfillEvent>,
+    ) {
         let from_block = wallet_backfill_from_block(last_scanned, start_block);
 
-        // When safe_head has not been set yet (still 0) we cannot tell
-        // whether the wallet is caught up, so we always enqueue a backfill
-        // request and let the backfill loop wait for safe_head to become
-        // available.  This avoids prematurely marking the wallet as ready
-        // with stale cached data.
+        // When safe_head has not been set yet (still 0) we cannot tell whether
+        // the wallet is caught up, so we always enqueue a backfill request and
+        // let the backfill loop wait for safe_head to become available.
         let needs_backfill = sync_target == 0 || from_block <= sync_target;
 
         if needs_backfill {
             if self
                 .backfill_tx
                 .send(BackfillRequest::Add {
-                    cache_key: cfg.cache_key.clone(),
+                    cache_key: cache_key.to_string(),
                     from_block,
                     to_block: sync_target,
                     sender: backfill_sender.clone(),
@@ -334,10 +395,13 @@ impl ChainService {
                 .await
                 .is_err()
             {
-                warn!(cache_key = %cfg.cache_key, "backfill loop unavailable, sending done as fallback");
+                warn!(
+                    cache_key,
+                    "backfill loop unavailable, sending done as fallback"
+                );
                 let _ = backfill_sender
                     .send(BackfillEvent::Done {
-                        last_block: safe_head,
+                        last_block: sync_target,
                     })
                     .await;
             }
@@ -347,21 +411,8 @@ impl ChainService {
             })
             .await
         {
-            debug!(?err, cache_key = %cfg.cache_key, "failed to send backfill done");
+            debug!(?err, cache_key, "failed to send backfill done");
         }
-
-        self.wallets.write().await.insert(
-            cache_key,
-            WalletRegistration {
-                handle: handle.clone(),
-                cancel,
-                backfill_sender,
-                start_block,
-                sync_to_block: cfg.sync_to_block,
-            },
-        );
-
-        handle
     }
 
     pub async fn unregister_wallet(&self, cache_key: &str) {
@@ -390,6 +441,8 @@ impl ChainService {
         start_block: u64,
         last_scanned: u64,
         safe_head: u64,
+        handle: &WalletHandle,
+        cancel: &CancellationToken,
     ) -> u64 {
         if safe_head == 0 {
             debug!(cache_key = %cfg.cache_key, "safe head unavailable; skipping indexed wallet catch-up");
@@ -444,19 +497,11 @@ impl ChainService {
         );
 
         let cache_store = wallet_cache_store(&self.db, cfg);
-        let mut wallet_utxos = match cache_store.load_wallet_utxos(&cfg.cache_key) {
-            Ok(wallet_utxos) => wallet_utxos,
-            Err(err) => {
-                warn!(
-                    ?err,
-                    cache_key = %cfg.cache_key,
-                    "failed to load wallet cache for indexed catch-up; using RPC backfill"
-                );
-                return last_scanned;
-            }
-        };
         let mut checkpoint = last_scanned;
         while from_block <= target {
+            if cancel.is_cancelled() {
+                return checkpoint;
+            }
             let page_kind = indexed_wallet_page_kind(from_block, self.chain.v2_start_block);
             let to_block = indexed_wallet_to_block(
                 from_block,
@@ -477,6 +522,9 @@ impl ChainService {
                         return checkpoint;
                     }
                 };
+            if cancel.is_cancelled() {
+                return checkpoint;
+            }
             let delta = parse_indexed_wallet_delta(
                 &page.transact_commitments,
                 &page.shield_commitments,
@@ -485,22 +533,29 @@ impl ChainService {
                 &page.nullifiers,
                 &cfg.scan_keys,
             );
-            let _ = apply_wallet_delta_to_vec(cfg, &mut wallet_utxos, delta);
-            let indexed_spent = wallet_utxos.iter().filter(|utxo| utxo.is_spent()).count();
-            let indexed_unspent = wallet_utxos.len().saturating_sub(indexed_spent);
-            if let Err(err) = cache_store.store_wallet_utxos(
-                &cfg.cache_key,
-                &wallet_utxos,
-                Some(page.checkpoint_block),
-                None,
-            ) {
-                warn!(
-                    ?err,
-                    cache_key = %cfg.cache_key,
-                    fallback_from = checkpoint,
-                    "failed to persist indexed wallet checkpoint; using RPC backfill"
-                );
-                return checkpoint;
+            let (indexed_total, indexed_unspent, indexed_spent, changed) = {
+                let mut wallet_utxos = handle.utxos.write().await;
+                let changed = apply_wallet_delta_to_vec(cfg, &mut wallet_utxos, delta);
+                let indexed_spent = wallet_utxos.iter().filter(|utxo| utxo.is_spent()).count();
+                let indexed_unspent = wallet_utxos.len().saturating_sub(indexed_spent);
+                if let Err(err) = cache_store.store_wallet_utxos(
+                    &cfg.cache_key,
+                    &wallet_utxos,
+                    Some(page.checkpoint_block),
+                    None,
+                ) {
+                    warn!(
+                        ?err,
+                        cache_key = %cfg.cache_key,
+                        fallback_from = checkpoint,
+                        "failed to persist indexed wallet checkpoint; using RPC backfill"
+                    );
+                    return checkpoint;
+                }
+                (wallet_utxos.len(), indexed_unspent, indexed_spent, changed)
+            };
+            if changed {
+                handle.notify_changed();
             }
             checkpoint = page.checkpoint_block;
             info!(
@@ -514,7 +569,7 @@ impl ChainService {
                 legacy_encrypted_rows = page.legacy_encrypted_rows,
                 legacy_generated_rows = page.legacy_generated_rows,
                 nullifier_rows = page.nullifier_rows,
-                total = wallet_utxos.len(),
+                total = indexed_total,
                 unspent = indexed_unspent,
                 spent = indexed_spent,
                 "indexed wallet catch-up page complete"
