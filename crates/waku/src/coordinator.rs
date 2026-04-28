@@ -5,10 +5,9 @@ use crate::error::WakuError;
 use crate::proto;
 use crate::proto::HashKey;
 use crate::protocols;
-use crate::protocols::filter::FilterPushAck;
 use crate::transport::{ReqId, Transport, TransportCmd, TransportEvent};
 use crate::types::OpId;
-use libp2p::request_response::{OutboundFailure, ResponseChannel};
+use libp2p::request_response::OutboundFailure;
 use libp2p::{Multiaddr, PeerId};
 use lru::LruCache;
 use parking_lot::RwLock;
@@ -657,12 +656,8 @@ impl NodeInner {
                 self.handle_filter_subscribe_response(req_id, peer_id, result)
                     .await;
             }
-            TransportEvent::FilterPush {
-                peer_id,
-                push,
-                channel,
-            } => {
-                self.handle_filter_push(peer_id, *push, channel).await;
+            TransportEvent::FilterPush { peer_id, push } => {
+                self.handle_filter_push(peer_id, *push).await;
             }
         }
     }
@@ -1024,20 +1019,7 @@ impl NodeInner {
         }
     }
 
-    async fn handle_filter_push(
-        &self,
-        peer_id: PeerId,
-        push: proto::filter::MessagePush,
-        channel: ResponseChannel<FilterPushAck>,
-    ) {
-        // Ack the push immediately
-        if let Err(error) = self
-            .transport_tx
-            .try_send(TransportCmd::SendFilterPushAck { channel })
-        {
-            debug!(%error, "failed to send filter push ack");
-        }
-
+    async fn handle_filter_push(&self, peer_id: PeerId, push: proto::filter::MessagePush) {
         let Some(message) = push.waku_message else {
             debug!(%peer_id, "received filter push without message");
             return;

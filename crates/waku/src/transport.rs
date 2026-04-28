@@ -2,7 +2,7 @@ use crate::config::NodeConfig;
 use crate::error::TransportInitError;
 use crate::proto;
 use crate::protocols;
-use crate::protocols::filter::FilterPushAck;
+use crate::protocols::codec::ProstLengthDelimitedCodec;
 use futures::StreamExt;
 use libp2p::core::transport::Boxed;
 use libp2p::core::upgrade;
@@ -16,7 +16,7 @@ use libp2p::swarm::{NetworkBehaviour, Swarm, SwarmEvent};
 use libp2p::tcp;
 use libp2p::websocket;
 use libp2p::yamux;
-use libp2p::{Multiaddr, PeerId, Transport as _};
+use libp2p::{Multiaddr, PeerId, StreamProtocol, Transport as _};
 use libp2p_mplex as mplex;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -61,9 +61,6 @@ pub enum TransportCmd {
         req_id: ReqId,
         peer_id: PeerId,
         request: proto::filter::FilterSubscribeRequest,
-    },
-    SendFilterPushAck {
-        channel: ResponseChannel<FilterPushAck>,
     },
 }
 
@@ -114,7 +111,6 @@ pub enum TransportEvent {
     FilterPush {
         peer_id: PeerId,
         push: Box<proto::filter::MessagePush>,
-        channel: ResponseChannel<FilterPushAck>,
     },
 }
 
@@ -126,7 +122,7 @@ pub(crate) struct Behaviour {
     lightpush: request_response::Behaviour<protocols::lightpush::LightPushCodec>,
     peer_exchange: request_response::Behaviour<protocols::peer_exchange::PeerExchangeCodec>,
     filter_subscribe: request_response::Behaviour<protocols::filter::FilterSubscribeCodec>,
-    filter_push: request_response::Behaviour<protocols::filter::FilterPushCodec>,
+    filter_push: libp2p_stream::Behaviour,
 }
 
 /// Transport layer that owns the libp2p Swarm.
@@ -156,7 +152,7 @@ impl Transport {
             lightpush: protocols::lightpush::behaviour(),
             peer_exchange: protocols::peer_exchange::behaviour(),
             filter_subscribe: protocols::filter::filter_subscribe_behaviour(),
-            filter_push: protocols::filter::filter_push_behaviour(),
+            filter_push: libp2p_stream::Behaviour::new(),
         };
 
         let swarm = Swarm::new(
@@ -182,8 +178,23 @@ impl Transport {
         mut cmd_rx: mpsc::Receiver<TransportCmd>,
         event_tx: mpsc::Sender<TransportEvent>,
     ) {
+        let mut filter_push_control = self.swarm.behaviour().filter_push.new_control();
+        let Ok(mut filter_push_streams) =
+            filter_push_control.accept(StreamProtocol::new(protocols::filter::FILTER_PUSH_CODEC))
+        else {
+            error!("failed to register filter push stream protocol");
+            return;
+        };
+
         loop {
             tokio::select! {
+                stream = filter_push_streams.next() => {
+                    let Some((peer_id, stream)) = stream else {
+                        error!("filter push stream acceptor closed, stopping transport loop");
+                        break;
+                    };
+                    tokio::spawn(handle_filter_push_stream(peer_id, stream, event_tx.clone()));
+                }
                 cmd = cmd_rx.recv() => {
                     let Some(cmd) = cmd else {
                         error!("transport command channel closed, stopping transport loop");
@@ -278,16 +289,6 @@ impl Transport {
                     .filter_subscribe
                     .send_request(&peer_id, request);
                 self.pending_filter.insert(out_id, (req_id, peer_id));
-            }
-            TransportCmd::SendFilterPushAck { channel } => {
-                if let Err(error) = self
-                    .swarm
-                    .behaviour_mut()
-                    .filter_push
-                    .send_response(channel, FilterPushAck)
-                {
-                    debug!(?error, "failed to send filter push ack");
-                }
             }
         }
     }
@@ -415,22 +416,32 @@ impl Transport {
                     result: Err(error),
                 })
             }
-            // Filter push events (incoming pushes from server)
-            SwarmEvent::Behaviour(BehaviourEvent::FilterPush(
-                request_response::Event::Message {
-                    peer,
-                    message:
-                        request_response::Message::Request {
-                            request, channel, ..
-                        },
-                    ..
-                },
-            )) => Some(TransportEvent::FilterPush {
-                peer_id: peer,
-                push: Box::new(request),
-                channel,
-            }),
             _ => None,
+        }
+    }
+}
+
+async fn handle_filter_push_stream(
+    peer_id: PeerId,
+    mut stream: libp2p::Stream,
+    event_tx: mpsc::Sender<TransportEvent>,
+) {
+    while let Ok(push) = ProstLengthDelimitedCodec::<
+        proto::filter::MessagePush,
+        proto::filter::FilterSubscribeResponse,
+    >::read_request(&mut stream)
+    .await
+    {
+        if event_tx
+            .send(TransportEvent::FilterPush {
+                peer_id,
+                push: Box::new(push),
+            })
+            .await
+            .is_err()
+        {
+            error!(%peer_id, "transport event channel closed, stopping filter push stream");
+            break;
         }
     }
 }
@@ -438,23 +449,31 @@ impl Transport {
 fn build_transport(
     local_key: &identity::Keypair,
 ) -> Result<Boxed<(PeerId, libp2p::core::muxing::StreamMuxerBox)>, TransportInitError> {
-    let noise = noise::Config::new(local_key)?;
-    let yamux = yamux::Config::default();
-    let mplex = mplex::Config::new();
-    let muxer = upgrade::SelectUpgrade::new(yamux, mplex);
-
-    let tcp_transport = tcp::tokio::Transport::new(tcp::Config::default().nodelay(true));
-    let ws_transport = websocket::Config::new(tcp::tokio::Transport::new(
+    let tcp_transport = dns::tokio::Transport::system(tcp::tokio::Transport::new(
         tcp::Config::default().nodelay(true),
-    ));
+    ))?
+    .upgrade(upgrade::Version::V1)
+    .authenticate(noise::Config::new(local_key)?)
+    .multiplex(upgrade::SelectUpgrade::new(
+        yamux::Config::default(),
+        mplex::Config::new(),
+    ))
+    .timeout(Duration::from_secs(20))
+    .boxed();
 
-    let tcp_ws = tcp_transport
-        .or_transport(ws_transport)
-        .upgrade(upgrade::Version::V1)
-        .authenticate(noise)
-        .multiplex(muxer)
-        .timeout(Duration::from_secs(20))
-        .boxed();
+    // Secure websockets must own DNS resolution so TLS validates the DNS name,
+    // not the resolved IP address.
+    let ws_transport = websocket::Config::new(dns::tokio::Transport::system(
+        tcp::tokio::Transport::new(tcp::Config::default().nodelay(true)),
+    )?)
+    .upgrade(upgrade::Version::V1)
+    .authenticate(noise::Config::new(local_key)?)
+    .multiplex(upgrade::SelectUpgrade::new(
+        yamux::Config::default(),
+        mplex::Config::new(),
+    ))
+    .timeout(Duration::from_secs(20))
+    .boxed();
 
     let quic_transport = {
         let config = libp2p::quic::Config::new(local_key);
@@ -463,13 +482,18 @@ fn build_transport(
             .boxed()
     };
 
-    let transport = quic_transport
-        .or_transport(tcp_ws)
+    let ws_quic = ws_transport
+        .or_transport(quic_transport)
+        .map(|either, _| match either {
+            futures::future::Either::Left(v) | futures::future::Either::Right(v) => v,
+        })
+        .boxed();
+
+    let transport = ws_quic
+        .or_transport(tcp_transport)
         .map(|either, _| match either {
             futures::future::Either::Left(v) | futures::future::Either::Right(v) => v,
         });
-
-    let transport = dns::tokio::Transport::system(transport)?;
 
     Ok(transport.boxed())
 }
