@@ -36,8 +36,9 @@ use ui::icons;
 use ui::logs::{LogStore, LogsPane};
 use ui::theme::{self, APP_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
-    HttpContext, ListUtxosOutput, SyncProgressUpdate, TokenTotal, UtxoOutput,
-    ViewWalletChainSessionRequest, WalletSessionStore,
+    DesktopUnshieldCalldataRequest, HttpContext, ListUtxosOutput, PreparedUnshieldCall,
+    SyncProgressUpdate, TokenTotal, UtxoOutput, ViewWalletChainSessionRequest, WalletSessionStore,
+    is_wrapped_native_token, parse_unshield_amount, prepare_desktop_unshield_calldata,
     vault::{
         DesktopVaultStore, DesktopViewSession, GeneratedSeedMaterial, VaultError,
         WalletMetadataBundle, generate_opaque_id, generate_seed_material,
@@ -51,6 +52,8 @@ const LOGS_DRAWER_MIN_HEIGHT: Pixels = px(160.0);
 const LOGS_DRAWER_MAX_HEIGHT: Pixels = px(600.0);
 const FILTER_POPOVER_MAX_HEIGHT: Pixels = px(450.0);
 const PRIVATE_ASSET_LIST_WIDTH: Pixels = px(760.0);
+const MAX_UNSHIELD_INPUTS: usize = 13;
+const UNSHIELD_SPINNER_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const UTXO_AGE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const SECONDS_PER_MINUTE: u64 = 60;
 const SECONDS_PER_HOUR: u64 = 60 * SECONDS_PER_MINUTE;
@@ -189,6 +192,44 @@ impl WalletTab {
 struct WalletOption {
     wallet_id: Arc<str>,
     label: Arc<str>,
+}
+
+#[derive(Clone)]
+struct UnshieldAsset {
+    chain_id: u64,
+    token: Address,
+    label: String,
+    decimals: Option<u8>,
+    total: U256,
+    max_single: U256,
+    icon_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct UnshieldAssetKey {
+    chain_id: u64,
+    token: Address,
+}
+
+impl UnshieldAssetKey {
+    const fn new(chain_id: u64, token: Address) -> Self {
+        Self { chain_id, token }
+    }
+
+    const fn from_asset(asset: &UnshieldAsset) -> Self {
+        Self::new(asset.chain_id, asset.token)
+    }
+}
+
+struct UnshieldFormState {
+    asset: UnshieldAsset,
+    recipient_input: Entity<InputState>,
+    amount_input: Entity<InputState>,
+    password_input: Entity<InputState>,
+    unwrap: bool,
+    generating: bool,
+    error: Option<Arc<str>>,
+    result: Option<PreparedUnshieldCall>,
 }
 
 enum ChainUtxoState {
@@ -330,6 +371,8 @@ pub(crate) struct WalletRoot {
     confirm_password_input: Entity<InputState>,
     import_mnemonic_input: Entity<InputState>,
     spend_password_input: Entity<InputState>,
+    unshield_forms: BTreeMap<UnshieldAssetKey, UnshieldFormState>,
+    unshield_spinner_tick: usize,
     repair_cache_block_input: Entity<InputState>,
     tx_search_input: Entity<InputState>,
     tx_search_query: Arc<str>,
@@ -439,6 +482,8 @@ impl WalletRoot {
             confirm_password_input,
             import_mnemonic_input,
             spend_password_input,
+            unshield_forms: BTreeMap::new(),
+            unshield_spinner_tick: 0,
             repair_cache_block_input,
             tx_search_input: tx_search_input.clone(),
             tx_search_query: Arc::from(""),
@@ -534,6 +579,25 @@ impl WalletRoot {
                             Some(state) if state.snapshot().is_some()
                         ) {
                             root.utxo_table.update(cx, TableState::refresh);
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(UNSHIELD_SPINNER_REFRESH_INTERVAL)
+                    .await;
+                if this
+                    .update(cx, |root, cx| {
+                        if root.unshield_forms.values().any(|form| form.generating) {
+                            root.unshield_spinner_tick = root.unshield_spinner_tick.wrapping_add(1);
                             cx.notify();
                         }
                     })
@@ -838,6 +902,7 @@ impl WalletRoot {
             return;
         }
         self.selected_chain = chain_id;
+        self.unshield_forms.clear();
         self.sync_utxo_table(cx);
         if should_focus_utxo_table(
             self.active_activity,
@@ -855,6 +920,7 @@ impl WalletRoot {
             return;
         }
         self.selected_wallet_id = Some(wallet_id);
+        self.unshield_forms.clear();
         cx.notify();
     }
 
@@ -1178,6 +1244,7 @@ impl WalletRoot {
             label: Arc::from("Primary wallet"),
         }];
         self.selected_wallet_id = Some(wallet_id);
+        self.unshield_forms.clear();
         self.active_wallet_tab = WalletTab::default();
         self.setup_password = None;
         self.generated_seed = None;
@@ -1206,6 +1273,7 @@ impl WalletRoot {
         self.view_session = None;
         self.wallet_options.clear();
         self.selected_wallet_id = None;
+        self.unshield_forms.clear();
         self.active_wallet_tab = WalletTab::default();
         self.setup_password = None;
         self.generated_seed = None;
@@ -1275,6 +1343,236 @@ impl WalletRoot {
                 self.spend_status = None;
                 self.handle_vault_error(&error, cx);
             }
+        }
+    }
+
+    fn open_unshield_form(
+        &mut self,
+        asset: UnshieldAsset,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let key = UnshieldAssetKey::from_asset(&asset);
+        if self.unshield_forms.contains_key(&key) {
+            return;
+        }
+        self.unshield_forms.retain(|existing_key, form| {
+            *existing_key == key || Self::unshield_form_is_dirty(form, cx)
+        });
+        let amount = format_unshield_amount_input(asset.max_single, asset.decimals);
+        let amount_input = cx.new(|cx| {
+            let mut input = InputState::new(window, cx).placeholder("amount");
+            input.set_value(&amount, window, cx);
+            input
+        });
+        let recipient_input = cx.new(|cx| InputState::new(window, cx).placeholder("0x recipient"));
+        let password_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("vault password")
+                .masked(true)
+        });
+        cx.subscribe_in(
+            &password_input,
+            window,
+            move |this, _input, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.generate_unshield_calldata_from_form(key, window, cx);
+                }
+            },
+        )
+        .detach();
+        self.unshield_forms.insert(
+            key,
+            UnshieldFormState {
+                asset,
+                recipient_input,
+                amount_input,
+                password_input,
+                unwrap: false,
+                generating: false,
+                error: None,
+                result: None,
+            },
+        );
+        cx.notify();
+    }
+
+    fn unshield_form_is_dirty(form: &UnshieldFormState, cx: &mut Context<'_, Self>) -> bool {
+        if form.generating || form.unwrap || form.error.is_some() || form.result.is_some() {
+            return true;
+        }
+        if !form.recipient_input.read(cx).value().trim().is_empty() {
+            return true;
+        }
+        if !form.password_input.read(cx).value().trim().is_empty() {
+            return true;
+        }
+
+        let default_amount =
+            format_unshield_amount_input(form.asset.max_single, form.asset.decimals);
+        form.amount_input.read(cx).value().trim() != default_amount
+    }
+
+    fn toggle_unshield_unwrap(&mut self, key: UnshieldAssetKey, cx: &mut Context<'_, Self>) {
+        let Some(form) = self.unshield_forms.get_mut(&key) else {
+            return;
+        };
+        if !is_wrapped_native_token(form.asset.chain_id, form.asset.token) || form.generating {
+            return;
+        }
+        form.unwrap = !form.unwrap;
+        form.error = None;
+        form.result = None;
+        cx.notify();
+    }
+
+    fn generate_unshield_calldata_from_form(
+        &mut self,
+        key: UnshieldAssetKey,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(form) = self.unshield_forms.get(&key) else {
+            return;
+        };
+        if form.generating {
+            return;
+        }
+        let asset = form.asset.clone();
+        let unwrap = form.unwrap;
+        let recipient_input = form.recipient_input.clone();
+        let amount_input = form.amount_input.clone();
+        let password_input = form.password_input.clone();
+
+        let Some(view_session) = self.view_session.as_ref().cloned() else {
+            self.set_unshield_form_error(key, "Unlock the wallet vault before unshielding", cx);
+            return;
+        };
+        let Some(vault_store) = self.vault_store.as_ref().cloned() else {
+            self.set_unshield_form_error(key, "Wallet vault storage is unavailable", cx);
+            return;
+        };
+        let session = match self.chain_states.get(&asset.chain_id) {
+            Some(ChainUtxoState::Ready { session, .. }) => Arc::clone(session),
+            _ => {
+                self.set_unshield_form_error(
+                    key,
+                    "Wait for wallet sync to finish before unshielding",
+                    cx,
+                );
+                return;
+            }
+        };
+        if asset.max_single.is_zero() {
+            self.set_unshield_form_error(
+                key,
+                "No private notes are spendable in one transaction",
+                cx,
+            );
+            return;
+        }
+
+        let recipient_raw = recipient_input.read(cx).value().to_string();
+        let Some(recipient) = parse_address(recipient_raw.trim()) else {
+            self.set_unshield_form_error(key, "Enter a valid public EVM recipient address", cx);
+            return;
+        };
+        let amount_raw = amount_input.read(cx).value().to_string();
+        let amount = match parse_unshield_amount(amount_raw.as_str(), asset.decimals) {
+            Ok(amount) if !amount.is_zero() => amount,
+            Ok(_) => {
+                self.set_unshield_form_error(key, "Enter an amount greater than zero", cx);
+                return;
+            }
+            Err(error) => {
+                self.set_unshield_form_error(key, error.to_string(), cx);
+                return;
+            }
+        };
+        if amount > asset.max_single {
+            self.set_unshield_form_error(
+                key,
+                format!(
+                    "Amount exceeds max one transaction: {}",
+                    format_unshield_amount_input(asset.max_single, asset.decimals)
+                ),
+                cx,
+            );
+            return;
+        }
+
+        let password_empty = password_input.read(cx).value().trim().is_empty();
+        if password_empty {
+            self.set_unshield_form_error(key, "Enter the vault password to generate calldata", cx);
+            return;
+        }
+        let vault_password = Self::read_and_clear_input(&password_input, window, cx);
+
+        if let Some(form) = self.unshield_forms.get_mut(&key) {
+            form.generating = true;
+            form.error = None;
+            form.result = None;
+        }
+        cx.notify();
+
+        let http = self.http.clone();
+        let chain_id = asset.chain_id;
+        let token = asset.token;
+        let request = DesktopUnshieldCalldataRequest {
+            chain_id,
+            view_session,
+            session,
+            vault_store,
+            vault_password,
+            token,
+            amount,
+            recipient,
+            unwrap,
+            verify_proof: true,
+        };
+        let join = self
+            .runtime
+            .spawn(async move { prepare_desktop_unshield_calldata(request, &http).await });
+        cx.spawn(async move |this, cx| {
+            let result = match join.await {
+                Ok(result) => result,
+                Err(error) => Err(eyre::eyre!("unshield generation task failed: {error}")),
+            };
+            let _ = this.update(cx, |root, cx| {
+                let Some(form) = root.unshield_forms.get_mut(&key) else {
+                    return;
+                };
+                if form.asset.chain_id != chain_id || form.asset.token != token {
+                    return;
+                }
+                form.generating = false;
+                match result {
+                    Ok(call) => {
+                        form.error = None;
+                        form.result = Some(call);
+                    }
+                    Err(error) => {
+                        form.result = None;
+                        form.error = Some(Arc::from(error.to_string()));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn set_unshield_form_error(
+        &mut self,
+        key: UnshieldAssetKey,
+        message: impl Into<Arc<str>>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if let Some(form) = self.unshield_forms.get_mut(&key) {
+            form.generating = false;
+            form.result = None;
+            form.error = Some(message.into());
+            cx.notify();
         }
     }
 
@@ -1955,23 +2253,23 @@ impl WalletRoot {
 
     fn render_wallet_content(&self, root: &Entity<Self>, window: &Window) -> gpui::AnyElement {
         match self.active_wallet_tab {
-            WalletTab::Private => self.render_private_assets_body(),
+            WalletTab::Private => self.render_private_assets_body(root),
             WalletTab::Public => Self::render_public_wallet_body().into_any_element(),
             WalletTab::Activity => self.render_utxo_body(root, window).into_any_element(),
         }
     }
 
-    fn render_private_assets_body(&self) -> gpui::AnyElement {
+    fn render_private_assets_body(&self, root: &Entity<Self>) -> gpui::AnyElement {
         match self.chain_states.get(&self.selected_chain) {
             Some(ChainUtxoState::Error(error)) => error_message(error.as_ref()).into_any_element(),
             Some(ChainUtxoState::Loading { .. }) => {
                 centered_message("Loading private balances...").into_any_element()
             }
             Some(ChainUtxoState::Syncing { snapshot, .. }) => {
-                Self::render_private_asset_snapshot(snapshot, false, true)
+                self.render_private_asset_snapshot(root, snapshot, false, true)
             }
             Some(ChainUtxoState::Ready { snapshot, .. }) => {
-                Self::render_private_asset_snapshot(snapshot, true, false)
+                self.render_private_asset_snapshot(root, snapshot, true, false)
             }
             Some(ChainUtxoState::Idle) | None => {
                 centered_message("Select a chain to load private balances").into_any_element()
@@ -1980,6 +2278,8 @@ impl WalletRoot {
     }
 
     fn render_private_asset_snapshot(
+        &self,
+        root: &Entity<Self>,
         snapshot: &ListUtxosOutput,
         chain_ready: bool,
         syncing: bool,
@@ -2007,25 +2307,46 @@ impl WalletRoot {
                     .flex()
                     .flex_col()
                     .gap_3()
-                    .children(
-                        assets.into_iter().enumerate().map(|(ix, asset)| {
-                            Self::render_private_asset_row(ix, asset, chain_ready)
-                        }),
-                    ),
+                    .children(assets.into_iter().enumerate().map(|(ix, asset)| {
+                        let form_key = unshield_asset_key_from_formatted(&asset);
+                        if let Some(key) = form_key
+                            && self.unshield_forms.contains_key(&key)
+                        {
+                            self.render_unshield_form(root.clone(), key)
+                                .into_any_element()
+                        } else {
+                            self.render_private_asset_row(
+                                root.clone(),
+                                ix,
+                                asset,
+                                snapshot,
+                                chain_ready,
+                            )
+                            .into_any_element()
+                        }
+                    })),
             )
             .into_any_element()
     }
 
     fn render_private_asset_row(
+        &self,
+        root: Entity<Self>,
         ix: usize,
         asset: FormattedTokenTotal,
+        snapshot: &ListUtxosOutput,
         chain_ready: bool,
     ) -> gpui::Div {
-        let action_tooltip = if chain_ready {
-            "Transaction flow coming soon"
+        let unshield_asset = build_unshield_asset(snapshot, &asset);
+        let can_unshield = chain_ready && unshield_asset.is_some();
+        let action_tooltip = if can_unshield {
+            "Prepare unshield calldata"
+        } else if chain_ready {
+            "Token cannot be unshielded from this row"
         } else {
             "Available after wallet sync finishes"
         };
+        let unshield_opacity = if can_unshield { 1.0 } else { 0.5 };
 
         div()
             .w_full()
@@ -2046,10 +2367,9 @@ impl WalletRoot {
                     .text_size(theme::ASSET_SYMBOL_TEXT_SIZE)
                     .text_color(rgb(theme::TEXT))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child(token_label_row(
+                    .child(private_asset_label_row(
                         SharedString::from(asset.label.clone()),
                         asset.icon_path,
-                        px(22.0),
                     )),
             )
             .child(
@@ -2084,11 +2404,207 @@ impl WalletRoot {
                         )
                         .xsmall()
                         .outline()
-                        .disabled(true)
-                        .opacity(0.5)
-                        .tooltip(action_tooltip),
+                        .disabled(!can_unshield)
+                        .opacity(unshield_opacity)
+                        .tooltip(action_tooltip)
+                        .on_click(move |_event, window, cx| {
+                            let Some(asset) = unshield_asset.clone() else {
+                                return;
+                            };
+                            root.update(cx, |root, cx| {
+                                root.open_unshield_form(asset, window, cx);
+                            });
+                        }),
                     ),
             )
+    }
+
+    fn render_unshield_form(&self, root: Entity<Self>, key: UnshieldAssetKey) -> gpui::Div {
+        let Some(form) = self.unshield_forms.get(&key) else {
+            return div();
+        };
+        let asset = &form.asset;
+        let unwrap_supported = is_wrapped_native_token(asset.chain_id, asset.token);
+        let total_display = format_unshield_amount_input(asset.total, asset.decimals);
+        let max_display = format_unshield_amount_input(asset.max_single, asset.decimals);
+        let unit_hint = if asset.decimals.is_some() {
+            format!("{} amount", asset.label)
+        } else {
+            "Raw base units for this unknown token".to_string()
+        };
+
+        let submit_root = root.clone();
+        let cancel_root = root.clone();
+        let toggle_root = root;
+
+        let mut card = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p(px(16.0))
+            .rounded_lg()
+            .bg(rgb(theme::SURFACE))
+            .border_1()
+            .border_color(rgb(theme::BORDER_STRONG))
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_color(rgb(theme::TEXT))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(private_asset_label_row(
+                                        SharedString::from(format!("Unshield {}", asset.label)),
+                                        asset.icon_path.clone(),
+                                    )),
+                            )
+                            .child(app_muted_text(
+                                "Generate calldata only. This does not submit a public transaction.",
+                            )),
+                    )
+                    .child(
+                        app_button(unshield_element_id(key, "cancel"), "Cancel")
+                            .ghost()
+                            .xsmall()
+                            .disabled(form.generating)
+                            .on_click(move |_event, _window, cx| {
+                                cancel_root.update(cx, |root, cx| {
+                                    root.unshield_forms.remove(&key);
+                                    cx.notify();
+                                });
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_3()
+                    .child(unshield_metric("Total private balance", total_display))
+                    .child(unshield_metric("Max one transaction", max_display)),
+            );
+
+        if asset.total > asset.max_single {
+            card = card.child(
+                div()
+                    .p(px(10.0))
+                    .rounded_md()
+                    .bg(rgb(theme::WARNING_BG))
+                    .border_1()
+                    .border_color(rgb(theme::WARNING))
+                    .text_color(rgb(theme::WARNING))
+                    .text_size(APP_TEXT_SIZE)
+                    .child("Balance is split across private notes. One unshield can spend only a limited number of notes."),
+            );
+        }
+
+        card = card
+            .child(
+                div()
+                    .flex()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(app_muted_text("Recipient"))
+                            .child(app_input(&form.recipient_input).disabled(form.generating)),
+                    )
+                    .child(
+                        div()
+                            .w(px(220.0))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(app_muted_text(unit_hint))
+                            .child(app_input(&form.amount_input).disabled(form.generating)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_end()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(app_muted_text("Vault password"))
+                            .child(app_input(&form.password_input).disabled(form.generating)),
+                    )
+                    .children(unwrap_supported.then(|| {
+                        app_button(unshield_element_id(key, "unwrap"), "Unwrap to native")
+                            .xsmall()
+                            .outline()
+                            .disabled(form.generating)
+                            .when(form.unwrap, |button| button.primary())
+                            .on_click(move |_event, _window, cx| {
+                                toggle_root.update(cx, |root, cx| {
+                                    root.toggle_unshield_unwrap(key, cx);
+                                });
+                            })
+                    }))
+                    .child(
+                        app_button(
+                            unshield_element_id(key, "generate"),
+                            if form.generating {
+                                "Generating..."
+                            } else {
+                                "Generate calldata"
+                            },
+                        )
+                        .primary()
+                        .xsmall()
+                        .loading(form.generating)
+                        .disabled(form.generating)
+                        .on_click(move |_event, window, cx| {
+                            submit_root.update(cx, |root, cx| {
+                                root.generate_unshield_calldata_from_form(key, window, cx);
+                            });
+                        }),
+                    ),
+            );
+
+        if form.generating {
+            card = card.child(render_unshield_generating_status(
+                self.unshield_spinner_tick,
+            ));
+        }
+
+        if let Some(error) = form.error.as_ref() {
+            card = card.child(
+                div()
+                    .p(px(10.0))
+                    .rounded_md()
+                    .bg(rgb(theme::DANGER_BG))
+                    .border_1()
+                    .border_color(rgb(theme::DANGER))
+                    .text_color(rgb(theme::DANGER))
+                    .text_size(APP_TEXT_SIZE)
+                    .child(SharedString::from(error.to_string())),
+            );
+        }
+
+        if let Some(result) = form.result.as_ref() {
+            card = card.child(render_unshield_result(key, result));
+        }
+
+        card
     }
 
     fn render_public_wallet_body() -> gpui::Div {
@@ -2817,9 +3333,22 @@ fn token_label_row(
     row.child(label)
 }
 
+fn private_asset_label_row(label: SharedString, icon_path: Option<PathBuf>) -> gpui::Div {
+    let mut row = div().flex().items_center().gap_2();
+    if let Some(path) = icon_path {
+        row = row.child(img(path).size(px(32.0)).rounded_full().flex_none());
+    }
+    row.child(label)
+}
+
+#[derive(Clone)]
 struct FormattedTokenTotal {
+    chain_id: u64,
+    token: Option<Address>,
     label: String,
     amount: String,
+    total: Option<U256>,
+    decimals: Option<u8>,
     icon_path: Option<PathBuf>,
 }
 
@@ -2839,27 +3368,258 @@ fn format_total(chain_id: u64, total: &TokenTotal) -> String {
 fn format_total_parts(chain_id: u64, total: &TokenTotal) -> FormattedTokenTotal {
     let Some(address) = parse_address(&total.token) else {
         return FormattedTokenTotal {
+            chain_id,
+            token: None,
             label: total.token.clone(),
             amount: total.total.clone(),
+            total: U256::from_str_radix(&total.total, 10).ok(),
+            decimals: None,
             icon_path: None,
         };
     };
     let Some(token) = lookup_token(chain_id, &address) else {
         return FormattedTokenTotal {
+            chain_id,
+            token: Some(address),
             label: short_address(&address),
             amount: total.total.clone(),
+            total: U256::from_str_radix(&total.total, 10).ok(),
+            decimals: None,
             icon_path: None,
         };
     };
-    let amount = U256::from_str_radix(&total.total, 10).map_or_else(
-        |_| total.total.clone(),
+    let total_raw = U256::from_str_radix(&total.total, 10).ok();
+    let amount = total_raw.map_or_else(
+        || total.total.clone(),
         |value| format_token_amount(value, token.decimals),
     );
     FormattedTokenTotal {
+        chain_id,
+        token: Some(address),
         label: token.symbol.to_owned(),
         amount,
+        total: total_raw,
+        decimals: Some(token.decimals),
         icon_path: token_icon_path(chain_id, &address),
     }
+}
+
+fn build_unshield_asset(
+    snapshot: &ListUtxosOutput,
+    asset: &FormattedTokenTotal,
+) -> Option<UnshieldAsset> {
+    let token = asset.token?;
+    let total = asset.total?;
+    let max_single = max_unshield_amount_from_snapshot(snapshot, token);
+    if max_single.is_zero() {
+        return None;
+    }
+    Some(UnshieldAsset {
+        chain_id: asset.chain_id,
+        token,
+        label: asset.label.clone(),
+        decimals: asset.decimals,
+        total,
+        max_single,
+        icon_path: asset.icon_path.clone(),
+    })
+}
+
+fn unshield_asset_key_from_formatted(asset: &FormattedTokenTotal) -> Option<UnshieldAssetKey> {
+    asset
+        .token
+        .map(|token| UnshieldAssetKey::new(asset.chain_id, token))
+}
+
+#[cfg(test)]
+fn unshield_key_matches_asset(key: UnshieldAssetKey, asset: &FormattedTokenTotal) -> bool {
+    unshield_asset_key_from_formatted(asset) == Some(key)
+}
+
+fn unshield_element_id(key: UnshieldAssetKey, action: &str) -> SharedString {
+    SharedString::from(format!(
+        "wallet-unshield-{}-{}-{action}",
+        key.chain_id,
+        key.token.to_checksum(None)
+    ))
+}
+
+fn max_unshield_amount_from_snapshot(snapshot: &ListUtxosOutput, token: Address) -> U256 {
+    let mut by_tree: BTreeMap<u32, Vec<U256>> = BTreeMap::new();
+    for row in snapshot.utxos.iter().filter(|row| !row.is_spent) {
+        let Some(row_token) = parse_address(&row.token) else {
+            continue;
+        };
+        if row_token != token {
+            continue;
+        }
+        let Ok(value) = U256::from_str_radix(&row.value, 10) else {
+            continue;
+        };
+        if !value.is_zero() {
+            by_tree.entry(row.tree).or_default().push(value);
+        }
+    }
+
+    by_tree
+        .into_values()
+        .map(|mut values| {
+            values.sort_by(|a, b| b.cmp(a));
+            values
+                .into_iter()
+                .take(MAX_UNSHIELD_INPUTS)
+                .fold(U256::ZERO, |sum, value| sum + value)
+        })
+        .max()
+        .unwrap_or(U256::ZERO)
+}
+
+fn format_unshield_amount_input(amount: U256, decimals: Option<u8>) -> String {
+    let Some(decimals) = decimals else {
+        return amount.to_string();
+    };
+    if decimals == 0 {
+        return amount.to_string();
+    }
+
+    let divisor = U256::from(10_u8).pow(U256::from(decimals));
+    let whole = amount / divisor;
+    let fractional = amount % divisor;
+    if fractional.is_zero() {
+        return whole.to_string();
+    }
+
+    let fractional = fractional.to_string();
+    let padded = format!("{fractional:0>width$}", width = decimals as usize);
+    format!("{whole}.{}", padded.trim_end_matches('0'))
+}
+
+fn unshield_metric(label: &'static str, value: String) -> gpui::Div {
+    div()
+        .flex_1()
+        .min_w(px(0.0))
+        .p(px(10.0))
+        .rounded_md()
+        .bg(rgb(theme::SURFACE_ELEVATED))
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(app_muted_text(label))
+        .child(
+            div()
+                .text_color(rgb(theme::WARNING))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child(SharedString::from(value)),
+        )
+}
+
+fn render_unshield_generating_status(tick: usize) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_3()
+        .p(px(10.0))
+        .rounded_md()
+        .bg(rgb(theme::SURFACE_ELEVATED))
+        .border_1()
+        .border_color(rgb(theme::INFO))
+        .child(
+            div()
+                .size(px(22.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .bg(rgb(theme::BACKGROUND))
+                .text_color(rgb(theme::INFO))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child(unshield_spinner_frame(tick)),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_color(rgb(theme::TEXT))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .child("Generating calldata..."),
+                )
+                .child(app_muted_text(
+                    "Selecting private notes, proving, and encoding the transaction. This can take a minute.",
+                )),
+        )
+}
+
+fn unshield_spinner_frame(tick: usize) -> &'static str {
+    const FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
+    FRAMES[tick % FRAMES.len()]
+}
+
+fn render_unshield_result(key: UnshieldAssetKey, result: &PreparedUnshieldCall) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .p(px(12.0))
+        .rounded_md()
+        .bg(rgb(theme::SURFACE_ELEVATED))
+        .border_1()
+        .border_color(rgb(theme::SUCCESS))
+        .child(app_strong_text("Prepared calldata"))
+        .child(app_muted_text(
+            "Submit this transaction externally. The wallet has not broadcast it.",
+        ))
+        .child(render_unshield_copy_field(
+            "To",
+            result.to.to_checksum(None),
+            unshield_element_id(key, "copy-to"),
+        ))
+        .child(render_unshield_copy_field(
+            "Calldata",
+            result.data.clone(),
+            unshield_element_id(key, "copy-data"),
+        ))
+}
+
+fn render_unshield_copy_field(
+    label: &'static str,
+    value: String,
+    button_id: SharedString,
+) -> gpui::Div {
+    let copy_value = value.clone();
+    div()
+        .flex()
+        .items_start()
+        .gap_2()
+        .child(
+            div()
+                .w(px(72.0))
+                .flex_none()
+                .text_color(rgb(theme::TEXT_MUTED))
+                .child(label),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .p(px(8.0))
+                .rounded_sm()
+                .bg(rgb(theme::BACKGROUND))
+                .border_1()
+                .border_color(rgb(theme::BORDER))
+                .font_family(APP_FONT_FAMILY)
+                .text_size(APP_TEXT_SIZE)
+                .child(SharedString::from(value)),
+        )
+        .child(app_button(button_id, "Copy").xsmall().outline().on_click(
+            move |_event, window, cx| {
+                copy_with_toast(copy_value.clone(), window, cx);
+            },
+        ))
 }
 
 fn display_rows_from_output(
@@ -3080,14 +3840,18 @@ const fn vault_error_kind(error: &VaultError) -> &'static str {
 mod tests {
     use std::path::PathBuf;
 
+    use alloy::primitives::{Address, U256};
     use wallet_ops::{ListUtxosOutput, SyncProgressStage, SyncProgressUpdate, UtxoOutput};
 
     use super::{
         Activity, ChainLoadSource, ChainUtxoState, SECONDS_PER_DAY, SECONDS_PER_HOUR,
-        SECONDS_PER_MINUTE, SECONDS_PER_MONTH, SECONDS_PER_YEAR, WalletAppOptions, WalletTab,
-        chain_load_overrides, display_rows_from_output, format_compact_age,
-        format_private_asset_rows, format_total, loading_summary, parse_repair_cache_block,
-        progress_detail, should_focus_utxo_table,
+        SECONDS_PER_MINUTE, SECONDS_PER_MONTH, SECONDS_PER_YEAR, UnshieldAssetKey,
+        WalletAppOptions, WalletTab, build_unshield_asset, chain_load_overrides,
+        display_rows_from_output, format_compact_age, format_private_asset_rows, format_total,
+        format_unshield_amount_input, loading_summary, max_unshield_amount_from_snapshot,
+        parse_repair_cache_block, progress_detail, should_focus_utxo_table,
+        unshield_asset_key_from_formatted, unshield_element_id, unshield_key_matches_asset,
+        unshield_spinner_frame,
     };
 
     fn wallet_options_with_overrides() -> WalletAppOptions {
@@ -3135,6 +3899,22 @@ mod tests {
             is_spent,
             spent_tx_hash: spent_tx_hash.map(str::to_string),
             spent_block_number: spent_tx_hash.map(|_| 21),
+        }
+    }
+
+    fn unshield_utxo_output(token: Address, value: u64, tree: u32, position: u64) -> UtxoOutput {
+        UtxoOutput {
+            tree,
+            position,
+            token: token.to_checksum(None),
+            value: value.to_string(),
+            source_tx_hash: "0x1111111111111111111111111111111111111111111111111111111111111111"
+                .to_string(),
+            source_block_number: 11,
+            source_block_timestamp: 1_700_000_011,
+            is_spent: false,
+            spent_tx_hash: None,
+            spent_block_number: None,
         }
     }
 
@@ -3265,6 +4045,121 @@ mod tests {
         assert_eq!(rows[0].label, "USDC");
         assert_eq!(rows[0].amount, "1.23");
         assert!(rows[0].icon_path.is_some());
+    }
+
+    #[test]
+    fn unshield_amount_input_formats_exact_token_units() {
+        assert_eq!(
+            format_unshield_amount_input(U256::from(1_230_000_u64), Some(6)),
+            "1.23"
+        );
+        assert_eq!(
+            format_unshield_amount_input(U256::from(1_000_000_u64), Some(6)),
+            "1"
+        );
+        assert_eq!(format_unshield_amount_input(U256::from(42_u8), None), "42");
+    }
+
+    #[test]
+    fn unshield_spinner_frames_cycle() {
+        assert_eq!(unshield_spinner_frame(0), "|");
+        assert_eq!(unshield_spinner_frame(1), "/");
+        assert_eq!(unshield_spinner_frame(2), "-");
+        assert_eq!(unshield_spinner_frame(3), "\\");
+        assert_eq!(unshield_spinner_frame(4), "|");
+    }
+
+    #[test]
+    fn max_unshield_amount_from_snapshot_uses_top_thirteen_by_tree() {
+        let token = Address::from([0x11; 20]);
+        let other = Address::from([0x22; 20]);
+        let mut utxos = (0..20)
+            .map(|position| unshield_utxo_output(token, 1, 0, position))
+            .collect::<Vec<_>>();
+        utxos.extend((0..5).map(|position| unshield_utxo_output(token, 3, 1, position)));
+        utxos.push(unshield_utxo_output(other, 100, 1, 99));
+        let snapshot = ListUtxosOutput {
+            chain_id: 1,
+            cache_key: "cache".to_string(),
+            utxo_count: utxos.len(),
+            unspent_count: utxos.len(),
+            spent_count: 0,
+            utxos,
+            totals: Vec::new(),
+        };
+
+        assert_eq!(
+            max_unshield_amount_from_snapshot(&snapshot, token),
+            U256::from(15_u8)
+        );
+    }
+
+    #[test]
+    fn build_unshield_asset_includes_max_single_transaction() {
+        let token = Address::from([0x33; 20]);
+        let snapshot = ListUtxosOutput {
+            chain_id: 1,
+            cache_key: "cache".to_string(),
+            utxo_count: 2,
+            unspent_count: 2,
+            spent_count: 0,
+            utxos: vec![
+                unshield_utxo_output(token, 5, 0, 1),
+                unshield_utxo_output(token, 7, 0, 2),
+            ],
+            totals: vec![wallet_ops::TokenTotal {
+                token: token.to_checksum(None),
+                total: "12".to_string(),
+            }],
+        };
+        let row = format_private_asset_rows(1, &snapshot.totals)
+            .into_iter()
+            .next()
+            .expect("asset row");
+
+        let asset = build_unshield_asset(&snapshot, &row).expect("unshield asset");
+
+        assert_eq!(asset.total, U256::from(12_u8));
+        assert_eq!(asset.max_single, U256::from(12_u8));
+    }
+
+    #[test]
+    fn unshield_key_matches_only_selected_asset() {
+        let token = Address::from([0x44; 20]);
+        let other = Address::from([0x45; 20]);
+        let rows = format_private_asset_rows(
+            1,
+            &[
+                wallet_ops::TokenTotal {
+                    token: token.to_checksum(None),
+                    total: "5".to_string(),
+                },
+                wallet_ops::TokenTotal {
+                    token: other.to_checksum(None),
+                    total: "7".to_string(),
+                },
+            ],
+        );
+        let key = UnshieldAssetKey::new(1, token);
+
+        assert_eq!(unshield_asset_key_from_formatted(&rows[0]), Some(key));
+        assert!(unshield_key_matches_asset(key, &rows[0]));
+        assert!(!unshield_key_matches_asset(key, &rows[1]));
+    }
+
+    #[test]
+    fn unshield_element_ids_are_asset_scoped() {
+        let first = UnshieldAssetKey::new(1, Address::from([0x11; 20]));
+        let second = UnshieldAssetKey::new(1, Address::from([0x22; 20]));
+
+        assert_ne!(
+            unshield_element_id(first, "cancel").as_ref(),
+            unshield_element_id(second, "cancel").as_ref()
+        );
+        assert_ne!(
+            unshield_element_id(first, "copy-to").as_ref(),
+            unshield_element_id(first, "copy-data").as_ref()
+        );
     }
 
     #[test]

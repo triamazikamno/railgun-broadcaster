@@ -6,7 +6,7 @@ use std::time::Duration;
 use alloy::eips::Encodable2718;
 use alloy::hex;
 use alloy::network::{EthereumWallet, NetworkTransactionBuilder, TransactionBuilder as _};
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, U256, address};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::k256::ecdsa::SigningKey;
@@ -19,7 +19,9 @@ use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use eyre::{Result, WrapErr, eyre};
 use local_db::{DbConfig, DbStore};
 use railgun_wallet::artifacts::ArtifactSource;
-use railgun_wallet::tx::{UnshieldMode, UnshieldRequest as RailgunUnshieldRequest};
+use railgun_wallet::tx::{
+    UnshieldMode, UnshieldRequest as RailgunUnshieldRequest, unshield_selection_info,
+};
 use railgun_wallet::wallet_cache::wallet_cache_key;
 use railgun_wallet::{ProverService, TransactionBuilder, Utxo, UtxoSource, WalletKeys, WalletUtxo};
 use reqwest::Url;
@@ -30,7 +32,7 @@ use sync_service::{
 };
 pub use sync_service::{SyncProgressStage, SyncProgressUpdate};
 use tokio::sync::watch;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 pub mod vault;
 
@@ -158,6 +160,19 @@ pub struct UnshieldRequest {
     pub private_key: Option<String>,
 }
 
+pub struct DesktopUnshieldCalldataRequest {
+    pub chain_id: u64,
+    pub view_session: Arc<vault::DesktopViewSession>,
+    pub session: Arc<WalletSession>,
+    pub vault_store: Arc<vault::DesktopVaultStore>,
+    pub vault_password: Zeroizing<String>,
+    pub token: Address,
+    pub amount: U256,
+    pub recipient: Address,
+    pub unwrap: bool,
+    pub verify_proof: bool,
+}
+
 pub trait EvmTransactionSigner {
     fn address(&self) -> Address;
 
@@ -245,6 +260,19 @@ pub struct UnshieldOutput {
     pub data: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedUnshieldCall {
+    pub chain_id: u64,
+    pub token: Address,
+    pub amount: U256,
+    pub recipient: Address,
+    pub unwrap: bool,
+    pub max_spendable: U256,
+    pub input_count: usize,
+    pub to: Address,
+    pub data: String,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct UnshieldSendOutput {
     pub tx_hash: String,
@@ -318,6 +346,86 @@ impl WalletSession {
             .await
             .wrap_err("remove wallet sync worker")
     }
+
+    pub async fn unspent_utxos(&self) -> Vec<Utxo> {
+        self._handle
+            .utxos
+            .read()
+            .await
+            .iter()
+            .filter(|entry| !entry.is_spent())
+            .map(|entry| entry.utxo.clone())
+            .collect()
+    }
+}
+
+pub fn parse_unshield_amount(input: &str, decimals: Option<u8>) -> Result<U256> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err(eyre!("amount is required"));
+    }
+
+    match decimals {
+        Some(decimals) => parse_scaled_amount(input, decimals),
+        None => {
+            if !input.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(eyre!("unknown token amounts must be raw integer units"));
+            }
+            U256::from_str_radix(input, 10).wrap_err("invalid raw amount")
+        }
+    }
+}
+
+#[must_use]
+pub fn wrapped_native_token_for_chain(chain_id: u64) -> Option<Address> {
+    match chain_id {
+        1 => Some(address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2")),
+        56 => Some(address!("0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c")),
+        137 => Some(address!("0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270")),
+        42161 => Some(address!("0x82aF49447D8a07e3bd95BD0d56f35241523fBab1")),
+        _ => None,
+    }
+}
+
+#[must_use]
+pub fn is_wrapped_native_token(chain_id: u64, token: Address) -> bool {
+    wrapped_native_token_for_chain(chain_id).is_some_and(|wrapped| wrapped == token)
+}
+
+fn parse_scaled_amount(input: &str, decimals: u8) -> Result<U256> {
+    let (whole, fractional) = input
+        .split_once('.')
+        .map_or((input, ""), |(whole, fractional)| (whole, fractional));
+    if whole.is_empty() && fractional.is_empty() {
+        return Err(eyre!("amount is required"));
+    }
+    if !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fractional.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(eyre!("amount must contain only decimal digits"));
+    }
+    if fractional.len() > usize::from(decimals) {
+        return Err(eyre!("amount has too many decimal places"));
+    }
+
+    let whole_value = if whole.is_empty() {
+        U256::ZERO
+    } else {
+        U256::from_str_radix(whole, 10).wrap_err("invalid whole amount")?
+    };
+    let scale = U256::from(10_u8).pow(U256::from(decimals));
+    let fractional_value = if decimals == 0 || fractional.is_empty() {
+        U256::ZERO
+    } else {
+        let mut padded = fractional.to_owned();
+        padded.extend(std::iter::repeat_n(
+            '0',
+            usize::from(decimals) - fractional.len(),
+        ));
+        U256::from_str_radix(&padded, 10).wrap_err("invalid fractional amount")?
+    };
+
+    Ok(whole_value * scale + fractional_value)
 }
 
 pub struct WalletSessionStore {
@@ -635,6 +743,9 @@ pub async fn unshield(
 ) -> Result<UnshieldResult> {
     let amount = U256::from_str_radix(&request.amount, 10)
         .map_err(|e| eyre!("invalid amount '{}': {e}", request.amount))?;
+    if request.unwrap && !is_wrapped_native_token(request.chain_id, request.token) {
+        return Err(eyre!("selected token does not support unwrap-to-native"));
+    }
 
     let synced = setup_synced_wallet(
         &request.mnemonic,
@@ -732,6 +843,92 @@ pub async fn unshield(
         block_number: receipt.block_number,
         gas_used: receipt.gas_used,
     }))
+}
+
+pub async fn prepare_desktop_unshield_calldata(
+    request: DesktopUnshieldCalldataRequest,
+    http: &HttpContext,
+) -> Result<PreparedUnshieldCall> {
+    if request.session.chain_id != request.chain_id {
+        return Err(eyre!(
+            "selected wallet session is for chain {}, not {}",
+            request.session.chain_id,
+            request.chain_id
+        ));
+    }
+    if request.unwrap && !is_wrapped_native_token(request.chain_id, request.token) {
+        return Err(eyre!("selected token does not support unwrap-to-native"));
+    }
+
+    let chain_defaults =
+        chain_defaults_for_chain(request.chain_id, UnsupportedChainMessage::Generic)?;
+    let artifact_source = artifact_source(http);
+    let prover = ProverService::new_with_db(artifact_source, Arc::clone(&request.session._db));
+    let chain_handle = request
+        .session
+        .sync_manager
+        .chain_handle(&request.session.chain_key)
+        .await
+        .ok_or_else(|| eyre!("chain handle not found for chain {}", request.chain_id))?;
+    let mut forest = chain_handle.forest.read().await.clone();
+    forest.compute_roots();
+
+    let utxos = request.session.unspent_utxos().await;
+    let mode = if request.unwrap {
+        UnshieldMode::UnwrapBase
+    } else {
+        UnshieldMode::Token
+    };
+    let unshield_request = RailgunUnshieldRequest {
+        token_address: request.token,
+        amount: request.amount,
+        recipient: request.recipient,
+        mode,
+        verify_proof: request.verify_proof,
+        spend_up_to: false,
+    };
+    let selection_info = unshield_selection_info(&utxos, request.token, request.amount, false)
+        .wrap_err("select unshield notes")?;
+
+    let mut grant = request
+        .vault_store
+        .create_spend_grant(request.vault_password.as_str())
+        .wrap_err("authorize unshield spend")?;
+    let signer = request
+        .vault_store
+        .railgun_spend_signer(&mut grant, request.view_session.wallet_id())
+        .wrap_err("load unshield spend signer")?;
+
+    let tx_builder = TransactionBuilder {
+        chain_type: 0,
+        chain_id: request.chain_id,
+        railgun_contract: chain_defaults.contract,
+        relay_adapt_contract: chain_defaults.relay_adapt_contract,
+    };
+
+    let plan = tx_builder
+        .build_unshield_plan_with_signer(
+            &request.view_session.scan_keys(),
+            &signer,
+            &forest,
+            &utxos,
+            unshield_request,
+            &prover,
+        )
+        .await
+        .wrap_err("build desktop unshield calldata")?;
+
+    Ok(PreparedUnshieldCall {
+        chain_id: request.chain_id,
+        token: request.token,
+        amount: request.amount,
+        recipient: request.recipient,
+        unwrap: request.unwrap,
+        max_spendable: selection_info.max_spendable,
+        input_count: plan.inputs.len(),
+        to: plan.call.to,
+        data: format!("0x{}", hex::encode(&plan.call.data)),
+    })
 }
 
 #[must_use]
@@ -1162,7 +1359,8 @@ mod tests {
 
     use super::{
         EvmMessageSigner, EvmTransactionSigner, ListUtxosOutput, SoftwareEvmSigner, TokenTotal,
-        UtxoOutput, utxo_outputs_from_utxos,
+        UtxoOutput, is_wrapped_native_token, parse_unshield_amount, utxo_outputs_from_utxos,
+        wrapped_native_token_for_chain,
     };
 
     fn address(byte: u8) -> Address {
@@ -1320,5 +1518,39 @@ mod tests {
 
         exercise_boundaries(&signer);
         assert!(SoftwareEvmSigner::from_private_key_hex("0x1234").is_err());
+    }
+
+    #[test]
+    fn parse_unshield_amount_scales_known_token_decimals() {
+        assert_eq!(
+            parse_unshield_amount("1.23", Some(6)).expect("parsed amount"),
+            U256::from(1_230_000_u64)
+        );
+        assert_eq!(
+            parse_unshield_amount(".5", Some(18)).expect("parsed amount"),
+            U256::from(5_u8) * U256::from(10_u8).pow(U256::from(17_u8))
+        );
+    }
+
+    #[test]
+    fn parse_unshield_amount_rejects_too_much_precision() {
+        assert!(parse_unshield_amount("1.2345678", Some(6)).is_err());
+    }
+
+    #[test]
+    fn parse_unshield_amount_requires_raw_units_for_unknown_tokens() {
+        assert_eq!(
+            parse_unshield_amount("123", None).expect("parsed raw amount"),
+            U256::from(123_u8)
+        );
+        assert!(parse_unshield_amount("1.23", None).is_err());
+    }
+
+    #[test]
+    fn wrapped_native_detection_matches_supported_chains() {
+        let weth = wrapped_native_token_for_chain(1).expect("ethereum wrapped native");
+        assert!(is_wrapped_native_token(1, weth));
+        assert!(!is_wrapped_native_token(1, address(0x11)));
+        assert!(wrapped_native_token_for_chain(999_999).is_none());
     }
 }

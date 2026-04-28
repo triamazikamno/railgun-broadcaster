@@ -1,3 +1,6 @@
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
+
 use alloy::primitives::{Address, Bytes, FixedBytes, U256};
 use alloy::sol_types::SolCall;
 use rand::Rng;
@@ -9,20 +12,21 @@ use broadcaster_core::contracts::railgun::{
     ActionData, BoundParams, CommitmentPreimage, SnarkProof, Transaction, relayCall, transactCall,
 };
 use broadcaster_core::crypto::poseidon::poseidon;
+use broadcaster_core::crypto::railgun::ViewingKeyData;
+use broadcaster_core::utxo::Utxo;
 use merkletree::tree::{MerkleForest, MerkleProof};
 
 use crate::keys::{RailgunSpendSigner, WalletKeys};
 use crate::notes::{Note, NoteCiphertext};
 use crate::prover::ProverService;
-use broadcaster_core::utxo::Utxo;
 
 pub const UNRELAYED_ADAPT_PARAMS: FixedBytes<32> = FixedBytes::ZERO;
 
 /// Maximum number of UTXOs that can be used as inputs in a single transaction.
-const MAX_CIRCUIT_INPUTS: usize = 13;
+pub const MAX_CIRCUIT_INPUTS: usize = 13;
 
 /// Maximum total inputs to the signature hash (inputs + outputs + 2 for root and bound params).
-const MAX_SIGNATURE_INPUTS: usize = 16;
+pub const MAX_SIGNATURE_INPUTS: usize = 16;
 
 #[derive(Debug, Error)]
 pub enum BuildError {
@@ -152,7 +156,8 @@ impl PrivateInputs {
         token_address: Address,
         inputs: &[InputWitness],
         outputs: &[Note],
-        wallet: &WalletKeys,
+        viewing: &ViewingKeyData,
+        signer: &impl RailgunSpendSigner,
     ) -> Self {
         let token_address = U256::from_be_slice(token_address.as_slice());
         let mut path_elements = Vec::with_capacity(inputs.len() * merkletree::tree::TREE_DEPTH);
@@ -177,9 +182,9 @@ impl PrivateInputs {
             path_elements,
             leaves_indices,
             value_out,
-            public_key: wallet.spending_public_key,
+            public_key: signer.spending_public_key(),
             npk_out,
-            nullifying_key: wallet.viewing.nullifying_key,
+            nullifying_key: viewing.nullifying_key,
         }
     }
 }
@@ -200,6 +205,13 @@ pub struct UnshieldRequest {
     pub spend_up_to: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnshieldSelectionInfo {
+    pub total: U256,
+    pub input_count: usize,
+    pub max_spendable: U256,
+}
+
 #[derive(Debug, Clone)]
 pub struct TransactionBuilder {
     pub chain_type: u8,
@@ -218,11 +230,38 @@ impl TransactionBuilder {
         request: UnshieldRequest,
         prover: &ProverService,
     ) -> Result<UnshieldPlan, BuildError> {
-        let (selected_utxos, total) = select_utxos(utxos, request.token_address, request.amount)?;
+        self.build_unshield_plan_with_signer(
+            &wallet.viewing,
+            wallet,
+            forest,
+            utxos,
+            request,
+            prover,
+        )
+        .await
+    }
+
+    /// Build an unshield plan using externally scoped viewing data and spend signer.
+    pub async fn build_unshield_plan_with_signer(
+        &self,
+        viewing: &ViewingKeyData,
+        signer: &impl RailgunSpendSigner,
+        forest: &MerkleForest,
+        utxos: &[Utxo],
+        request: UnshieldRequest,
+        prover: &ProverService,
+    ) -> Result<UnshieldPlan, BuildError> {
+        let (selected_utxos, total) = select_utxos(
+            utxos,
+            request.token_address,
+            request.amount,
+            request.spend_up_to,
+        )?;
 
         let plan_builder = TransactionPlanBuilder::new(
             self,
-            wallet,
+            viewing,
+            signer,
             forest,
             prover,
             selected_utxos,
@@ -243,6 +282,7 @@ impl TransactionBuilder {
     ) -> Result<TransactPlan, BuildError> {
         let plan_builder = TransactionPlanBuilder::new(
             self,
+            &wallet.viewing,
             wallet,
             forest,
             prover,
@@ -255,20 +295,22 @@ impl TransactionBuilder {
 }
 
 /// Builder for constructing Railgun transaction plans.
-struct TransactionPlanBuilder<'a> {
+struct TransactionPlanBuilder<'a, S: RailgunSpendSigner> {
     builder: &'a TransactionBuilder,
-    wallet: &'a WalletKeys,
+    viewing: &'a ViewingKeyData,
+    signer: &'a S,
     forest: &'a MerkleForest,
     prover: &'a ProverService,
     inputs: Vec<Utxo>,
     token_address: Address,
 }
 
-impl<'a> TransactionPlanBuilder<'a> {
+impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
     /// Create a new builder with validated inputs.
     fn new(
         builder: &'a TransactionBuilder,
-        wallet: &'a WalletKeys,
+        viewing: &'a ViewingKeyData,
+        signer: &'a S,
         forest: &'a MerkleForest,
         prover: &'a ProverService,
         inputs: Vec<Utxo>,
@@ -293,7 +335,8 @@ impl<'a> TransactionPlanBuilder<'a> {
 
         Ok(Self {
             builder,
-            wallet,
+            viewing,
+            signer,
             forest,
             prover,
             inputs,
@@ -329,7 +372,7 @@ impl<'a> TransactionPlanBuilder<'a> {
             .iter()
             .map(|utxo| {
                 FixedBytes::from(
-                    utxo.nullifier(self.wallet.viewing.nullifying_key)
+                    utxo.nullifier(self.viewing.nullifying_key)
                         .to_be_bytes::<32>(),
                 )
             })
@@ -395,7 +438,7 @@ impl<'a> TransactionPlanBuilder<'a> {
         }
 
         let change = total - unshield_amount;
-        let receiver = self.wallet.address_data();
+        let receiver = self.viewing.address_data();
 
         tracing::info!(
             %unshield_amount,
@@ -420,7 +463,7 @@ impl<'a> TransactionPlanBuilder<'a> {
                 &note,
                 &receiver,
                 &receiver,
-                &self.wallet.viewing.viewing_private_key,
+                &self.viewing.viewing_private_key,
             )?;
             outputs.push(note.clone());
             commitment_ciphertext.push(ciphertext);
@@ -492,9 +535,14 @@ impl<'a> TransactionPlanBuilder<'a> {
         // Build witnesses and inputs
         let inputs = self.build_input_witnesses()?;
         let public_inputs = PublicInputs::from_transaction(root, &transaction, &outputs);
-        let private_inputs =
-            PrivateInputs::from_inputs(request.token_address, &inputs, &outputs, self.wallet);
-        let signature = public_inputs.signature(self.wallet);
+        let private_inputs = PrivateInputs::from_inputs(
+            request.token_address,
+            &inputs,
+            &outputs,
+            self.viewing,
+            self.signer,
+        );
+        let signature = public_inputs.signature(self.signer);
 
         // Generate proof
         tracing::info!("proving");
@@ -554,7 +602,7 @@ impl<'a> TransactionPlanBuilder<'a> {
             return Err(BuildError::InsufficientBalance(total));
         }
 
-        let receiver = self.wallet.address_data();
+        let receiver = self.viewing.address_data();
         let random = rand_array();
         let output = Note::new_change(
             receiver.master_public_key,
@@ -567,7 +615,7 @@ impl<'a> TransactionPlanBuilder<'a> {
             &output,
             &receiver,
             &receiver,
-            &self.wallet.viewing.viewing_private_key,
+            &self.viewing.viewing_private_key,
         )?;
 
         let outputs = vec![output];
@@ -603,9 +651,14 @@ impl<'a> TransactionPlanBuilder<'a> {
         // Build witnesses and inputs
         let inputs = self.build_input_witnesses()?;
         let public_inputs = PublicInputs::from_transaction(root, &transaction, &outputs);
-        let private_inputs =
-            PrivateInputs::from_inputs(self.token_address, &inputs, &outputs, self.wallet);
-        let signature = public_inputs.signature(self.wallet);
+        let private_inputs = PrivateInputs::from_inputs(
+            self.token_address,
+            &inputs,
+            &outputs,
+            self.viewing,
+            self.signer,
+        );
+        let signature = public_inputs.signature(self.signer);
 
         let proof = self
             .prover
@@ -636,49 +689,283 @@ impl<'a> TransactionPlanBuilder<'a> {
     }
 }
 
+#[derive(Debug, Clone)]
+struct UtxoSelection {
+    utxos: Vec<Utxo>,
+    total: U256,
+}
+
+#[must_use]
+pub fn max_unshield_spendable(utxos: &[Utxo], token_address: Address) -> U256 {
+    max_unshield_selection(utxos, token_address).map_or(U256::ZERO, |selection| selection.total)
+}
+
+pub fn unshield_selection_info(
+    utxos: &[Utxo],
+    token_address: Address,
+    amount: U256,
+    spend_up_to: bool,
+) -> Result<UnshieldSelectionInfo, BuildError> {
+    let max_spendable = max_unshield_spendable(utxos, token_address);
+    let (selected, total) = select_utxos(utxos, token_address, amount, spend_up_to)?;
+    Ok(UnshieldSelectionInfo {
+        total,
+        input_count: selected.len(),
+        max_spendable,
+    })
+}
+
 fn select_utxos(
     utxos: &[Utxo],
     token_address: Address,
     amount: U256,
+    spend_up_to: bool,
 ) -> Result<(Vec<Utxo>, U256), BuildError> {
-    let token_hash = U256::from_be_slice(token_address.as_slice());
-    let mut candidates: Vec<_> = utxos
-        .iter()
-        .filter(|utxo| utxo.note.token_hash == token_hash)
-        .cloned()
-        .collect();
-    candidates.sort_by_key(|b| std::cmp::Reverse(b.note.value));
+    let max_selection = max_unshield_selection(utxos, token_address);
+    let max_spendable = max_selection
+        .as_ref()
+        .map_or(U256::ZERO, |selection| selection.total);
 
-    let mut best: Option<(Vec<Utxo>, U256)> = None;
-    for tree in candidates
-        .iter()
-        .map(|utxo| utxo.tree)
-        .collect::<std::collections::BTreeSet<_>>()
+    if amount.is_zero() {
+        return Err(BuildError::InsufficientBalance(max_spendable));
+    }
+
+    if let Some(selection) = best_unshield_selection(utxos, token_address, amount) {
+        return Ok((selection.utxos, selection.total));
+    }
+
+    if spend_up_to
+        && max_selection
+            .as_ref()
+            .is_some_and(|selection| !selection.total.is_zero() && selection.total < amount)
     {
-        let mut selected = Vec::with_capacity(MAX_CIRCUIT_INPUTS);
-        let mut total = U256::ZERO;
-        for utxo in candidates.iter().filter(|utxo| utxo.tree == tree) {
-            if selected.len() >= MAX_CIRCUIT_INPUTS {
-                break;
-            }
-            selected.push(utxo.clone());
-            total += utxo.note.value;
-            if total >= amount {
-                return Ok((selected, total));
-            }
+        let selection = max_selection.expect("checked above");
+        return Ok((selection.utxos, selection.total));
+    }
+
+    Err(BuildError::InsufficientBalance(max_spendable))
+}
+
+fn best_unshield_selection(
+    utxos: &[Utxo],
+    token_address: Address,
+    amount: U256,
+) -> Option<UtxoSelection> {
+    let mut best: Option<UtxoSelection> = None;
+    for candidates in token_utxos_by_tree(utxos, token_address).into_values() {
+        if let Some(selection) = best_tree_selection(candidates, amount)
+            && best
+                .as_ref()
+                .is_none_or(|best| selection_is_better(&selection, best, amount))
+        {
+            best = Some(selection);
         }
-        if selected.is_empty() {
+    }
+    best
+}
+
+fn max_unshield_selection(utxos: &[Utxo], token_address: Address) -> Option<UtxoSelection> {
+    let mut best: Option<UtxoSelection> = None;
+    for mut candidates in token_utxos_by_tree(utxos, token_address).into_values() {
+        sort_search_candidates(&mut candidates);
+        candidates.truncate(MAX_CIRCUIT_INPUTS);
+        let total = candidates
+            .iter()
+            .fold(U256::ZERO, |sum, utxo| sum + utxo.note.value);
+        if total.is_zero() {
             continue;
         }
+        normalize_selection(&mut candidates);
+        let selection = UtxoSelection {
+            utxos: candidates,
+            total,
+        };
         if best
             .as_ref()
-            .is_none_or(|(_, best_total)| total > *best_total)
+            .is_none_or(|best| max_selection_is_better(&selection, best))
         {
-            best = Some((selected, total));
+            best = Some(selection);
+        }
+    }
+    best
+}
+
+fn token_utxos_by_tree(utxos: &[Utxo], token_address: Address) -> BTreeMap<u32, Vec<Utxo>> {
+    let token_hash = U256::from_be_slice(token_address.as_slice());
+    let mut by_tree: BTreeMap<u32, Vec<Utxo>> = BTreeMap::new();
+    for utxo in utxos
+        .iter()
+        .filter(|utxo| utxo.note.token_hash == token_hash && !utxo.note.value.is_zero())
+    {
+        by_tree.entry(utxo.tree).or_default().push(utxo.clone());
+    }
+    by_tree
+}
+
+fn best_tree_selection(mut candidates: Vec<Utxo>, amount: U256) -> Option<UtxoSelection> {
+    sort_search_candidates(&mut candidates);
+
+    for input_count in 1..=MAX_CIRCUIT_INPUTS {
+        let mut search = SelectionSearch::new(&candidates, amount, input_count);
+        search.run();
+        if let Some(selection) = search.best {
+            return Some(selection);
+        }
+    }
+    None
+}
+
+fn sort_search_candidates(candidates: &mut [Utxo]) {
+    candidates.sort_by(|a, b| {
+        b.note
+            .value
+            .cmp(&a.note.value)
+            .then_with(|| a.tree.cmp(&b.tree))
+            .then_with(|| a.position.cmp(&b.position))
+    });
+}
+
+fn normalize_selection(utxos: &mut [Utxo]) {
+    utxos.sort_by_key(|utxo| (utxo.tree, utxo.position));
+}
+
+fn selection_is_better(candidate: &UtxoSelection, best: &UtxoSelection, amount: U256) -> bool {
+    match candidate.utxos.len().cmp(&best.utxos.len()) {
+        Ordering::Less => return true,
+        Ordering::Greater => return false,
+        Ordering::Equal => {}
+    }
+
+    let candidate_excess = candidate.total - amount;
+    let best_excess = best.total - amount;
+    match candidate_excess.cmp(&best_excess) {
+        Ordering::Less => true,
+        Ordering::Greater => false,
+        Ordering::Equal => {
+            selection_position_key(&candidate.utxos) < selection_position_key(&best.utxos)
+        }
+    }
+}
+
+fn max_selection_is_better(candidate: &UtxoSelection, best: &UtxoSelection) -> bool {
+    match candidate.total.cmp(&best.total) {
+        Ordering::Greater => return true,
+        Ordering::Less => return false,
+        Ordering::Equal => {}
+    }
+
+    match candidate.utxos.len().cmp(&best.utxos.len()) {
+        Ordering::Less => true,
+        Ordering::Greater => false,
+        Ordering::Equal => {
+            selection_position_key(&candidate.utxos) < selection_position_key(&best.utxos)
+        }
+    }
+}
+
+fn selection_position_key(utxos: &[Utxo]) -> Vec<(u32, u64)> {
+    utxos
+        .iter()
+        .map(|utxo| (utxo.tree, utxo.position))
+        .collect()
+}
+
+struct SelectionSearch<'a> {
+    candidates: &'a [Utxo],
+    amount: U256,
+    target_count: usize,
+    selected: Vec<usize>,
+    best: Option<UtxoSelection>,
+}
+
+impl<'a> SelectionSearch<'a> {
+    fn new(candidates: &'a [Utxo], amount: U256, target_count: usize) -> Self {
+        Self {
+            candidates,
+            amount,
+            target_count,
+            selected: Vec::with_capacity(target_count),
+            best: None,
         }
     }
 
-    best.ok_or(BuildError::InsufficientBalance(U256::ZERO))
+    fn run(&mut self) {
+        self.search(0, self.target_count, U256::ZERO);
+    }
+
+    fn search(&mut self, start: usize, remaining: usize, total: U256) {
+        if remaining == 0 {
+            self.record_if_valid(total);
+            return;
+        }
+        if self.candidates.len().saturating_sub(start) < remaining {
+            return;
+        }
+        if self.exact_only() && total > self.amount {
+            return;
+        }
+        if !self.exact_only() && self.best.as_ref().is_some_and(|best| total >= best.total) {
+            return;
+        }
+        if total + self.max_possible_from(start, remaining) < self.amount {
+            return;
+        }
+
+        let end = self.candidates.len() - remaining;
+        for index in start..=end {
+            let next_total = total + self.candidates[index].note.value;
+            if self.exact_only() && next_total > self.amount {
+                continue;
+            }
+            if !self.exact_only()
+                && self
+                    .best
+                    .as_ref()
+                    .is_some_and(|best| next_total >= best.total)
+            {
+                continue;
+            }
+            self.selected.push(index);
+            self.search(index + 1, remaining - 1, next_total);
+            self.selected.pop();
+        }
+    }
+
+    fn max_possible_from(&self, start: usize, remaining: usize) -> U256 {
+        self.candidates[start..]
+            .iter()
+            .take(remaining)
+            .fold(U256::ZERO, |sum, utxo| sum + utxo.note.value)
+    }
+
+    fn exact_only(&self) -> bool {
+        2 + self.target_count + 2 > MAX_SIGNATURE_INPUTS
+    }
+
+    fn record_if_valid(&mut self, total: U256) {
+        if total < self.amount {
+            return;
+        }
+        let output_count = if total == self.amount { 1 } else { 2 };
+        if 2 + self.target_count + output_count > MAX_SIGNATURE_INPUTS {
+            return;
+        }
+
+        let mut utxos = self
+            .selected
+            .iter()
+            .map(|index| self.candidates[*index].clone())
+            .collect::<Vec<_>>();
+        normalize_selection(&mut utxos);
+        let selection = UtxoSelection { utxos, total };
+        if self
+            .best
+            .as_ref()
+            .is_none_or(|best| selection_is_better(&selection, best, self.amount))
+        {
+            self.best = Some(selection);
+        }
+    }
 }
 
 fn rand_array<const N: usize>() -> [u8; N] {
@@ -692,6 +979,7 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+    use broadcaster_core::utxo::UtxoSource;
 
     struct MockSpendSigner {
         signed_msg: Cell<Option<U256>>,
@@ -706,6 +994,23 @@ mod tests {
             self.signed_msg.set(Some(msg));
             [U256::from(1_u8), U256::from(2_u8), U256::from(3_u8)]
         }
+    }
+
+    fn test_utxo(token: Address, value: u64, tree: u32, position: u64) -> Utxo {
+        Utxo {
+            note: Note::new_unshield(Address::ZERO, token, U256::from(value)),
+            tree,
+            position,
+            source: UtxoSource {
+                tx_hash: FixedBytes::ZERO,
+                block_number: 1,
+                block_timestamp: 1,
+            },
+        }
+    }
+
+    fn selected_positions(selection: &[Utxo]) -> Vec<u64> {
+        selection.iter().map(|utxo| utxo.position).collect()
     }
 
     #[test]
@@ -730,5 +1035,100 @@ mod tests {
             signer.signed_msg.get(),
             Some(poseidon(public_inputs.signature_message()))
         );
+    }
+
+    #[test]
+    fn unshield_selection_prefers_fewest_inputs() {
+        let token = Address::from([1_u8; 20]);
+        let utxos = vec![
+            test_utxo(token, 40, 0, 1),
+            test_utxo(token, 30, 0, 2),
+            test_utxo(token, 5, 0, 3),
+        ];
+
+        let (selected, total) = select_utxos(&utxos, token, U256::from(35_u8), false).unwrap();
+
+        assert_eq!(total, U256::from(40_u8));
+        assert_eq!(selected_positions(&selected), vec![1]);
+    }
+
+    #[test]
+    fn unshield_selection_prefers_exact_match_with_same_input_count() {
+        let token = Address::from([2_u8; 20]);
+        let utxos = vec![
+            test_utxo(token, 12, 0, 1),
+            test_utxo(token, 10, 0, 2),
+            test_utxo(token, 6, 0, 3),
+            test_utxo(token, 5, 0, 4),
+        ];
+
+        let (selected, total) = select_utxos(&utxos, token, U256::from(16_u8), false).unwrap();
+
+        assert_eq!(total, U256::from(16_u8));
+        assert_eq!(selected_positions(&selected), vec![2, 3]);
+    }
+
+    #[test]
+    fn unshield_selection_minimizes_change_with_same_input_count() {
+        let token = Address::from([3_u8; 20]);
+        let utxos = vec![
+            test_utxo(token, 10, 0, 1),
+            test_utxo(token, 7, 0, 2),
+            test_utxo(token, 6, 0, 3),
+        ];
+
+        let (selected, total) = select_utxos(&utxos, token, U256::from(12_u8), false).unwrap();
+
+        assert_eq!(total, U256::from(13_u8));
+        assert_eq!(selected_positions(&selected), vec![2, 3]);
+    }
+
+    #[test]
+    fn partial_unshield_uses_at_most_twelve_inputs_when_change_is_needed() {
+        let token = Address::from([4_u8; 20]);
+        let utxos = (0..13)
+            .map(|position| test_utxo(token, 2, 0, position))
+            .collect::<Vec<_>>();
+
+        let (selected, total) = select_utxos(&utxos, token, U256::from(23_u8), false).unwrap();
+
+        assert_eq!(selected.len(), 12);
+        assert_eq!(total, U256::from(24_u8));
+    }
+
+    #[test]
+    fn exact_unshield_can_use_thirteen_inputs() {
+        let token = Address::from([5_u8; 20]);
+        let utxos = (0..13)
+            .map(|position| test_utxo(token, 2, 0, position))
+            .collect::<Vec<_>>();
+
+        let (selected, total) = select_utxos(&utxos, token, U256::from(26_u8), false).unwrap();
+
+        assert_eq!(selected.len(), 13);
+        assert_eq!(total, U256::from(26_u8));
+    }
+
+    #[test]
+    fn max_unshield_spendable_uses_largest_single_tree_top_thirteen() {
+        let token = Address::from([6_u8; 20]);
+        let mut utxos = (0..20)
+            .map(|position| test_utxo(token, 1, 0, position))
+            .collect::<Vec<_>>();
+        utxos.extend((0..5).map(|position| test_utxo(token, 3, 1, position)));
+
+        assert_eq!(max_unshield_spendable(&utxos, token), U256::from(15_u8));
+    }
+
+    #[test]
+    fn unshield_selection_error_reports_max_single_transaction_amount() {
+        let token = Address::from([7_u8; 20]);
+        let utxos = (0..13)
+            .map(|position| test_utxo(token, 1, 0, position))
+            .collect::<Vec<_>>();
+
+        let error = select_utxos(&utxos, token, U256::from(14_u8), false).unwrap_err();
+
+        assert!(matches!(error, BuildError::InsufficientBalance(max) if max == U256::from(13_u8)));
     }
 }

@@ -29,6 +29,7 @@ pub const INFO: u32 = 0x93e0e3;
 pub const SUCCESS: u32 = 0x7f9f7f;
 pub const WARNING: u32 = 0xf0dfaf;
 pub const WARNING_STRONG: u32 = 0xdfaf8f;
+pub const WARNING_BG: u32 = 0x4f4632;
 pub const DANGER: u32 = 0xcc9393;
 pub const DANGER_BG: u32 = 0x4f2f2f;
 pub const PURPLE: u32 = 0xdc8cc3;
