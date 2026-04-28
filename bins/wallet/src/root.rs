@@ -50,6 +50,7 @@ const LOGS_DRAWER_HEIGHT: Pixels = px(260.0);
 const LOGS_DRAWER_MIN_HEIGHT: Pixels = px(160.0);
 const LOGS_DRAWER_MAX_HEIGHT: Pixels = px(600.0);
 const FILTER_POPOVER_MAX_HEIGHT: Pixels = px(450.0);
+const PRIVATE_ASSET_LIST_WIDTH: Pixels = px(760.0);
 const UTXO_AGE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const SECONDS_PER_MINUTE: u64 = 60;
 const SECONDS_PER_HOUR: u64 = 60 * SECONDS_PER_MINUTE;
@@ -150,6 +151,44 @@ pub(crate) fn open_wallet_window(
 enum Activity {
     Wallet,
     Broadcaster,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum WalletTab {
+    #[default]
+    Private,
+    Public,
+    Activity,
+}
+
+impl WalletTab {
+    const ALL: [Self; 3] = [Self::Private, Self::Public, Self::Activity];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Private => "Private",
+            Self::Public => "Public",
+            Self::Activity => "Activity",
+        }
+    }
+
+    fn icon_path(self) -> PathBuf {
+        match self {
+            Self::Private => icons::shield_check_icon_path(),
+            Self::Public => icons::globe_icon_path(),
+            Self::Activity => icons::activity_icon_path(),
+        }
+    }
+
+    const fn shows_utxos(self) -> bool {
+        matches!(self, Self::Activity)
+    }
+}
+
+#[derive(Clone)]
+struct WalletOption {
+    wallet_id: Arc<str>,
+    label: Arc<str>,
 }
 
 enum ChainUtxoState {
@@ -279,6 +318,9 @@ pub(crate) struct WalletRoot {
     monitor: Entity<broadcaster_monitor_gpui::BroadcasterMonitorPane>,
     logs: Entity<LogsPane>,
     active_activity: Activity,
+    active_wallet_tab: WalletTab,
+    wallet_options: Vec<WalletOption>,
+    selected_wallet_id: Option<Arc<str>>,
     selected_chain: u64,
     chain_ids: Vec<u64>,
     chain_states: BTreeMap<u64, ChainUtxoState>,
@@ -386,6 +428,9 @@ impl WalletRoot {
             monitor,
             logs,
             active_activity: Activity::Wallet,
+            active_wallet_tab: WalletTab::default(),
+            wallet_options: Vec::new(),
+            selected_wallet_id: None,
             chain_ids,
             chain_states,
             session_store: Arc::new(OnceCell::new()),
@@ -685,7 +730,11 @@ impl WalletRoot {
                 root.chain_states.insert(chain_id, state);
                 if root.selected_chain == chain_id {
                     root.sync_utxo_table(cx);
-                    root.focus_utxo_table_on_render = true;
+                    root.focus_utxo_table_on_render = should_focus_utxo_table(
+                        root.active_activity,
+                        root.active_wallet_tab,
+                        root.chain_states.get(&chain_id),
+                    );
                 }
                 cx.notify();
             });
@@ -790,15 +839,50 @@ impl WalletRoot {
         }
         self.selected_chain = chain_id;
         self.sync_utxo_table(cx);
-        if self
-            .chain_states
-            .get(&chain_id)
-            .is_some_and(ChainUtxoState::renders_table)
-        {
+        if should_focus_utxo_table(
+            self.active_activity,
+            self.active_wallet_tab,
+            self.chain_states.get(&chain_id),
+        ) {
             self.focus_utxo_table_on_render = true;
         }
         self.ensure_chain_load(chain_id, ChainLoadSource::Selection, cx);
         cx.notify();
+    }
+
+    fn select_wallet(&mut self, wallet_id: Arc<str>, cx: &mut Context<'_, Self>) {
+        if self.selected_wallet_id.as_deref() == Some(wallet_id.as_ref()) {
+            return;
+        }
+        self.selected_wallet_id = Some(wallet_id);
+        cx.notify();
+    }
+
+    fn select_wallet_tab(&mut self, tab: WalletTab, cx: &mut Context<'_, Self>) {
+        if self.active_wallet_tab == tab {
+            return;
+        }
+        self.active_wallet_tab = tab;
+        self.focus_utxo_table_on_render = should_focus_utxo_table(
+            self.active_activity,
+            self.active_wallet_tab,
+            self.chain_states.get(&self.selected_chain),
+        );
+        cx.notify();
+    }
+
+    fn selected_wallet_label(&self) -> SharedString {
+        self.selected_wallet_id
+            .as_ref()
+            .and_then(|selected| {
+                self.wallet_options
+                    .iter()
+                    .find(|option| option.wallet_id.as_ref() == selected.as_ref())
+            })
+            .map_or_else(
+                || SharedString::from("Primary wallet"),
+                |option| SharedString::from(option.label.to_string()),
+            )
     }
 
     fn toggle_spent_visibility(&mut self, cx: &mut Context<'_, Self>) {
@@ -842,13 +926,13 @@ impl WalletRoot {
     }
 
     fn focus_utxo_table_if_requested(&mut self, window: &mut Window, cx: &Context<'_, Self>) {
-        if !self.focus_utxo_table_on_render || self.active_activity != Activity::Wallet {
-            return;
-        }
-        if !matches!(
-            self.chain_states.get(&self.selected_chain),
-            Some(state) if state.renders_table()
-        ) {
+        if !self.focus_utxo_table_on_render
+            || !should_focus_utxo_table(
+                self.active_activity,
+                self.active_wallet_tab,
+                self.chain_states.get(&self.selected_chain),
+            )
+        {
             return;
         }
         if self
@@ -1085,8 +1169,16 @@ impl WalletRoot {
         }
     }
 
-    fn enter_view_unlocked(&mut self, session: DesktopViewSession, cx: &mut Context<'_, Self>) {
-        self.view_session = Some(Arc::new(session));
+    fn install_view_session(&mut self, session: DesktopViewSession, cx: &mut Context<'_, Self>) {
+        let session = Arc::new(session);
+        let wallet_id: Arc<str> = Arc::from(session.wallet_id().to_owned());
+        self.view_session = Some(session);
+        self.wallet_options = vec![WalletOption {
+            wallet_id: Arc::clone(&wallet_id),
+            label: Arc::from("Primary wallet"),
+        }];
+        self.selected_wallet_id = Some(wallet_id);
+        self.active_wallet_tab = WalletTab::default();
         self.setup_password = None;
         self.generated_seed = None;
         self.vault_error = None;
@@ -1101,6 +1193,10 @@ impl WalletRoot {
         cx.notify();
     }
 
+    fn enter_view_unlocked(&mut self, session: DesktopViewSession, cx: &mut Context<'_, Self>) {
+        self.install_view_session(session, cx);
+    }
+
     fn lock_vault(&mut self, cx: &mut Context<'_, Self>) {
         if let Some(store) = self.session_store.get().cloned() {
             self.runtime.spawn(async move {
@@ -1108,6 +1204,9 @@ impl WalletRoot {
             });
         }
         self.view_session = None;
+        self.wallet_options.clear();
+        self.selected_wallet_id = None;
+        self.active_wallet_tab = WalletTab::default();
         self.setup_password = None;
         self.generated_seed = None;
         self.vault_error = None;
@@ -1232,7 +1331,11 @@ impl WalletRoot {
                     move |_event, _window, cx| {
                         root.update(cx, |root, cx| {
                             root.active_activity = Activity::Wallet;
-                            root.focus_utxo_table_on_render = true;
+                            root.focus_utxo_table_on_render = should_focus_utxo_table(
+                                root.active_activity,
+                                root.active_wallet_tab,
+                                root.chain_states.get(&root.selected_chain),
+                            );
                             cx.notify();
                         });
                     }
@@ -1584,13 +1687,14 @@ impl WalletRoot {
             .flex_col()
             .bg(rgb(theme::SURFACE_ELEVATED))
             .child(self.render_wallet_header(root))
+            .child(self.render_wallet_tabs(root))
             .child(
                 div()
                     .flex_1()
                     .min_w(px(0.0))
                     .min_h(px(0.0))
                     .p(px(12.0))
-                    .child(self.render_utxo_body(root, window)),
+                    .child(self.render_wallet_content(root, window)),
             )
             .children(self.render_sync_status_bar())
     }
@@ -1610,27 +1714,6 @@ impl WalletRoot {
             .view_session
             .as_ref()
             .and_then(|session| session.receive_address().ok());
-        let (summary, totals) = match self.chain_states.get(&self.selected_chain) {
-            Some(
-                ChainUtxoState::Syncing { snapshot, .. } | ChainUtxoState::Ready { snapshot, .. },
-            ) => {
-                let counts = if snapshot.spent_count == 0 {
-                    format!("{} unspent UTXOs", snapshot.unspent_count)
-                } else {
-                    format!(
-                        "{} unspent · {} spent",
-                        snapshot.unspent_count, snapshot.spent_count
-                    )
-                };
-                (
-                    counts,
-                    render_totals_row(self.selected_chain, &snapshot.totals),
-                )
-            }
-            Some(ChainUtxoState::Loading { progress }) => (loading_summary(*progress), None),
-            Some(ChainUtxoState::Error(_)) => ("Failed to load UTXOs".to_string(), None),
-            _ => ("Ready to load UTXOs".to_string(), None),
-        };
 
         div()
             .h(px(52.0))
@@ -1642,10 +1725,8 @@ impl WalletRoot {
             .bg(rgb(theme::SURFACE))
             .border_b_1()
             .border_color(rgb(theme::BORDER))
+            .child(self.render_wallet_selector(root.clone()))
             .child(self.render_chain_selector(root.clone()))
-            .child(app_strong_text("Wallet UTXOs"))
-            .child(app_muted_text(SharedString::from(summary)))
-            .children(totals)
             .child(div().flex_1())
             .children(receive_address.map(|address| {
                 let copy_address = address.clone();
@@ -1752,6 +1833,290 @@ impl WalletRoot {
                             ),
                     )
             })
+    }
+
+    fn render_wallet_selector(&self, root: Entity<Self>) -> impl IntoElement {
+        let selected_label = self.selected_wallet_label();
+        let selected_wallet_id = self.selected_wallet_id.clone();
+        let wallet_options = self.wallet_options.clone();
+
+        Popover::new("wallet-selector")
+            .trigger(
+                app_button_base("wallet-selector-trigger")
+                    .ghost()
+                    .small()
+                    .justify_start()
+                    .child(wallet_label_row(selected_label)),
+            )
+            .content(move |_state, _window, cx| {
+                let popover = cx.entity();
+                let root = root.clone();
+                let selected_wallet_id = selected_wallet_id.clone();
+                v_flex()
+                    .gap_1()
+                    .min_w(px(190.0))
+                    .children(wallet_options.clone().into_iter().map(move |option| {
+                        let root = root.clone();
+                        let popover = popover.clone();
+                        let wallet_id = Arc::clone(&option.wallet_id);
+                        let is_selected = selected_wallet_id
+                            .as_ref()
+                            .is_some_and(|selected| selected.as_ref() == option.wallet_id.as_ref());
+                        app_button_base(SharedString::from(format!(
+                            "wallet-selector-option-{}",
+                            option.wallet_id
+                        )))
+                        .ghost()
+                        .small()
+                        .w_full()
+                        .justify_start()
+                        .when(is_selected, |button| {
+                            button.bg(rgb(theme::SELECTED_SURFACE))
+                        })
+                        .child(wallet_label_row(SharedString::from(
+                            option.label.to_string(),
+                        )))
+                        .on_click(move |_event, window, cx| {
+                            root.update(cx, |root, cx| {
+                                root.select_wallet(Arc::clone(&wallet_id), cx);
+                            });
+                            popover.update(cx, |state, cx| state.dismiss(window, cx));
+                        })
+                    }))
+            })
+    }
+
+    fn render_wallet_tabs(&self, root: &Entity<Self>) -> impl IntoElement {
+        div()
+            .h(px(40.0))
+            .flex_none()
+            .flex()
+            .items_end()
+            .gap_2()
+            .px(px(14.0))
+            .pt(px(7.0))
+            .bg(rgb(theme::SURFACE))
+            .children(WalletTab::ALL.into_iter().map(|tab| {
+                Self::render_wallet_tab_button(root.clone(), tab, self.active_wallet_tab == tab)
+            }))
+    }
+
+    fn render_wallet_tab_button(
+        root: Entity<Self>,
+        tab: WalletTab,
+        active: bool,
+    ) -> impl IntoElement {
+        let label = tab.label();
+        div()
+            .id(SharedString::from(format!(
+                "wallet-tab-{}",
+                label.to_ascii_lowercase()
+            )))
+            .h(px(34.0))
+            .min_w(px(92.0))
+            .px(px(16.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .cursor_pointer()
+            .text_size(APP_TEXT_SIZE)
+            .rounded_t_md()
+            .when(active, |button| {
+                button
+                    .bg(rgb(theme::SURFACE_ELEVATED))
+                    .border_t_1()
+                    .border_l_1()
+                    .border_r_1()
+                    .border_color(rgb(theme::BORDER))
+                    .text_color(rgb(theme::TEXT))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+            })
+            .when(!active, |button| {
+                button.text_color(rgb(theme::TEXT_MUTED)).hover(|button| {
+                    button
+                        .bg(rgb(theme::SURFACE_HOVER_SUBTLE))
+                        .text_color(rgb(theme::TEXT))
+                })
+            })
+            .child(
+                img(tab.icon_path())
+                    .size(px(18.0))
+                    .flex_none()
+                    .opacity(if active { 1.0 } else { 0.75 }),
+            )
+            .child(label)
+            .on_click(move |_event, _window, cx| {
+                root.update(cx, |root, cx| {
+                    root.select_wallet_tab(tab, cx);
+                });
+            })
+    }
+
+    fn render_wallet_content(&self, root: &Entity<Self>, window: &Window) -> gpui::AnyElement {
+        match self.active_wallet_tab {
+            WalletTab::Private => self.render_private_assets_body(),
+            WalletTab::Public => Self::render_public_wallet_body().into_any_element(),
+            WalletTab::Activity => self.render_utxo_body(root, window).into_any_element(),
+        }
+    }
+
+    fn render_private_assets_body(&self) -> gpui::AnyElement {
+        match self.chain_states.get(&self.selected_chain) {
+            Some(ChainUtxoState::Error(error)) => error_message(error.as_ref()).into_any_element(),
+            Some(ChainUtxoState::Loading { .. }) => {
+                centered_message("Loading private balances...").into_any_element()
+            }
+            Some(ChainUtxoState::Syncing { snapshot, .. }) => {
+                Self::render_private_asset_snapshot(snapshot, false, true)
+            }
+            Some(ChainUtxoState::Ready { snapshot, .. }) => {
+                Self::render_private_asset_snapshot(snapshot, true, false)
+            }
+            Some(ChainUtxoState::Idle) | None => {
+                centered_message("Select a chain to load private balances").into_any_element()
+            }
+        }
+    }
+
+    fn render_private_asset_snapshot(
+        snapshot: &ListUtxosOutput,
+        chain_ready: bool,
+        syncing: bool,
+    ) -> gpui::AnyElement {
+        let assets = format_private_asset_rows(snapshot.chain_id, &snapshot.totals);
+        if assets.is_empty() {
+            return centered_message(if syncing {
+                "Syncing private balances..."
+            } else {
+                "No private assets found"
+            })
+            .into_any_element();
+        }
+
+        div()
+            .size_full()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .overflow_y_scrollbar()
+            .child(
+                div()
+                    .w(PRIVATE_ASSET_LIST_WIDTH)
+                    .max_w_full()
+                    .mx_auto()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .children(
+                        assets.into_iter().enumerate().map(|(ix, asset)| {
+                            Self::render_private_asset_row(ix, asset, chain_ready)
+                        }),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_private_asset_row(
+        ix: usize,
+        asset: FormattedTokenTotal,
+        chain_ready: bool,
+    ) -> gpui::Div {
+        let action_tooltip = if chain_ready {
+            "Transaction flow coming soon"
+        } else {
+            "Available after wallet sync finishes"
+        };
+
+        div()
+            .w_full()
+            .flex()
+            .items_center()
+            .gap_4()
+            .p(px(16.0))
+            .rounded_lg()
+            .bg(rgb(theme::SURFACE))
+            .border_1()
+            .border_color(rgb(theme::BORDER))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .flex()
+                    .items_center()
+                    .text_size(theme::ASSET_SYMBOL_TEXT_SIZE)
+                    .text_color(rgb(theme::TEXT))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(token_label_row(
+                        SharedString::from(asset.label.clone()),
+                        asset.icon_path,
+                        px(22.0),
+                    )),
+            )
+            .child(
+                div().min_w(px(120.0)).flex().flex_col().items_end().child(
+                    div()
+                        .text_color(rgb(theme::WARNING))
+                        .text_size(theme::BALANCE_TEXT_SIZE)
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .child(SharedString::from(asset.amount)),
+                ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        app_button(
+                            SharedString::from(format!("wallet-asset-send-{ix}")),
+                            "Send",
+                        )
+                        .xsmall()
+                        .outline()
+                        .disabled(true)
+                        .opacity(0.5)
+                        .tooltip(action_tooltip),
+                    )
+                    .child(
+                        app_button(
+                            SharedString::from(format!("wallet-asset-unshield-{ix}")),
+                            "Unshield",
+                        )
+                        .xsmall()
+                        .outline()
+                        .disabled(true)
+                        .opacity(0.5)
+                        .tooltip(action_tooltip),
+                    ),
+            )
+    }
+
+    fn render_public_wallet_body() -> gpui::Div {
+        div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(480.0))
+                    .max_w_full()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p(px(20.0))
+                    .rounded_lg()
+                    .bg(rgb(theme::SURFACE))
+                    .border_1()
+                    .border_color(rgb(theme::BORDER))
+                    .child(app_strong_text("Public accounts"))
+                    .child(
+                        app_muted_text(
+                            "Public EVM account management, shielding, and related workflows will appear here.",
+                        )
+                        .line_height(px(18.0)),
+                    ),
+            )
     }
 
     fn render_chain_selector(&self, root: Entity<Self>) -> impl IntoElement {
@@ -1946,6 +2311,14 @@ impl WalletRoot {
     }
 
     fn navigate_utxo_table(&self, navigation: UtxoNavigation, cx: &mut Context<'_, Self>) {
+        if !should_focus_utxo_table(
+            self.active_activity,
+            self.active_wallet_tab,
+            self.chain_states.get(&self.selected_chain),
+        ) {
+            return;
+        }
+
         self.utxo_table.update(cx, |table, cx| {
             let rows_count = table.delegate().rows_count(cx);
             if rows_count == 0 {
@@ -2286,6 +2659,16 @@ fn utxo_cell_text_color(row: &UtxoDisplayRow, color: gpui::Rgba) -> gpui::Rgba {
     }
 }
 
+fn should_focus_utxo_table(
+    active_activity: Activity,
+    active_wallet_tab: WalletTab,
+    state: Option<&ChainUtxoState>,
+) -> bool {
+    active_activity == Activity::Wallet
+        && active_wallet_tab.shows_utxos()
+        && state.is_some_and(ChainUtxoState::renders_table)
+}
+
 fn centered_message(message: &'static str) -> gpui::Div {
     div()
         .size_full()
@@ -2313,6 +2696,7 @@ fn vault_card(title: &'static str, subtitle: impl Into<SharedString>) -> gpui::D
         .child(app_muted_text(subtitle).line_height(px(18.0)))
 }
 
+#[cfg(test)]
 fn loading_summary(progress: Option<SyncProgressUpdate>) -> String {
     progress.map_or_else(
         || "Preparing wallet sync...".to_string(),
@@ -2410,6 +2794,17 @@ fn chain_label_row(chain_id: u64) -> impl IntoElement {
     row.child(SharedString::from(label))
 }
 
+fn wallet_label_row(label: SharedString) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .text_color(rgb(theme::TEXT))
+        .text_size(APP_TEXT_SIZE)
+        .child(img(icons::wallet_icon_path()).size(px(16.0)).flex_none())
+        .child(label)
+}
+
 fn token_label_row(
     label: SharedString,
     icon_path: Option<PathBuf>,
@@ -2428,30 +2823,11 @@ struct FormattedTokenTotal {
     icon_path: Option<PathBuf>,
 }
 
-fn render_totals_row(chain_id: u64, totals: &[TokenTotal]) -> Option<gpui::Div> {
-    if totals.is_empty() {
-        return None;
-    }
-
-    Some(
-        div()
-            .flex()
-            .items_center()
-            .gap_1()
-            .text_size(APP_TEXT_SIZE)
-            .text_color(rgb(theme::TEXT_MUTED))
-            .child(app_muted_text("· Totals:"))
-            .children(totals.iter().enumerate().map(move |(ix, total)| {
-                let formatted = format_total_parts(chain_id, total);
-                let label = SharedString::from(format!("{} {}", formatted.label, formatted.amount));
-                let item = token_label_row(label, formatted.icon_path, px(14.0));
-                if ix == 0 {
-                    div().child(item)
-                } else {
-                    div().flex().items_center().gap_1().child("·").child(item)
-                }
-            })),
-    )
+fn format_private_asset_rows(chain_id: u64, totals: &[TokenTotal]) -> Vec<FormattedTokenTotal> {
+    totals
+        .iter()
+        .map(|total| format_total_parts(chain_id, total))
+        .collect()
 }
 
 #[cfg(test)]
@@ -2707,10 +3083,11 @@ mod tests {
     use wallet_ops::{ListUtxosOutput, SyncProgressStage, SyncProgressUpdate, UtxoOutput};
 
     use super::{
-        ChainLoadSource, ChainUtxoState, SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_MINUTE,
-        SECONDS_PER_MONTH, SECONDS_PER_YEAR, WalletAppOptions, chain_load_overrides,
-        display_rows_from_output, format_compact_age, format_total, loading_summary,
-        parse_repair_cache_block, progress_detail,
+        Activity, ChainLoadSource, ChainUtxoState, SECONDS_PER_DAY, SECONDS_PER_HOUR,
+        SECONDS_PER_MINUTE, SECONDS_PER_MONTH, SECONDS_PER_YEAR, WalletAppOptions, WalletTab,
+        chain_load_overrides, display_rows_from_output, format_compact_age,
+        format_private_asset_rows, format_total, loading_summary, parse_repair_cache_block,
+        progress_detail, should_focus_utxo_table,
     };
 
     fn wallet_options_with_overrides() -> WalletAppOptions {
@@ -2848,6 +3225,46 @@ mod tests {
         };
 
         assert_eq!(format_total(1, &total), "USDC 1.23");
+    }
+
+    #[test]
+    fn private_tab_is_default_wallet_tab() {
+        assert_eq!(WalletTab::default(), WalletTab::Private);
+    }
+
+    #[test]
+    fn utxo_table_focus_is_activity_scoped() {
+        let state = ChainUtxoState::Loading { progress: None };
+
+        assert!(!should_focus_utxo_table(
+            Activity::Wallet,
+            WalletTab::Private,
+            Some(&state)
+        ));
+        assert!(!should_focus_utxo_table(
+            Activity::Broadcaster,
+            WalletTab::Activity,
+            Some(&state)
+        ));
+        assert!(should_focus_utxo_table(
+            Activity::Wallet,
+            WalletTab::Activity,
+            Some(&state)
+        ));
+    }
+
+    #[test]
+    fn private_asset_rows_use_totals_formatting() {
+        let totals = [wallet_ops::TokenTotal {
+            token: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string(),
+            total: "1234567".to_string(),
+        }];
+
+        let rows = format_private_asset_rows(1, &totals);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "USDC");
+        assert_eq!(rows[0].amount, "1.23");
+        assert!(rows[0].icon_path.is_some());
     }
 
     #[test]

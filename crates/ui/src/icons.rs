@@ -9,6 +9,14 @@ pub fn logs_icon_path() -> PathBuf {
 }
 
 #[must_use]
+pub fn activity_icon_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("icons")
+        .join("activity.svg")
+}
+
+#[must_use]
 pub fn close_icon_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("assets")
@@ -30,6 +38,22 @@ pub fn wallet_icon_path() -> PathBuf {
         .join("assets")
         .join("icons")
         .join("wallet.svg")
+}
+
+#[must_use]
+pub fn shield_check_icon_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("icons")
+        .join("shield-check.svg")
+}
+
+#[must_use]
+pub fn globe_icon_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("icons")
+        .join("globe.svg")
 }
 
 #[must_use]
