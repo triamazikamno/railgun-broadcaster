@@ -12,7 +12,7 @@ use broadcaster_core::contracts::railgun::{
     ActionData, BoundParams, CommitmentPreimage, SnarkProof, Transaction, relayCall, transactCall,
 };
 use broadcaster_core::crypto::poseidon::poseidon;
-use broadcaster_core::crypto::railgun::ViewingKeyData;
+use broadcaster_core::crypto::railgun::{AddressData, ViewingKeyData};
 use broadcaster_core::utxo::Utxo;
 use merkletree::tree::{MerkleForest, MerkleProof};
 
@@ -72,6 +72,20 @@ pub struct UnshieldPlan {
     pub inputs: Vec<InputWitness>,
     pub outputs: Vec<Note>,
     pub unshield_note: Note,
+    pub change_note: Option<Note>,
+    pub public_inputs: PublicInputs,
+    pub private_inputs: PrivateInputs,
+    pub signature: [U256; 3],
+}
+
+#[derive(Debug, Clone)]
+pub struct SendPlan {
+    pub call: TransactionCall,
+    pub tree_number: u32,
+    pub merkle_root: U256,
+    pub inputs: Vec<InputWitness>,
+    pub outputs: Vec<Note>,
+    pub recipient_note: Note,
     pub change_note: Option<Note>,
     pub public_inputs: PublicInputs,
     pub private_inputs: PrivateInputs,
@@ -205,6 +219,15 @@ pub struct UnshieldRequest {
     pub spend_up_to: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct SendRequest {
+    pub token_address: Address,
+    pub amount: U256,
+    pub recipient: AddressData,
+    pub verify_proof: bool,
+    pub spend_up_to: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnshieldSelectionInfo {
     pub total: U256,
@@ -269,6 +292,49 @@ impl TransactionBuilder {
         )?;
 
         plan_builder.build_unshield(request, total).await
+    }
+
+    /// Build a private send plan using token selection from available UTXOs.
+    pub async fn build_send_plan(
+        &self,
+        wallet: &WalletKeys,
+        forest: &MerkleForest,
+        utxos: &[Utxo],
+        request: SendRequest,
+        prover: &ProverService,
+    ) -> Result<SendPlan, BuildError> {
+        self.build_send_plan_with_signer(&wallet.viewing, wallet, forest, utxos, request, prover)
+            .await
+    }
+
+    /// Build a private send plan using externally scoped viewing data and spend signer.
+    pub async fn build_send_plan_with_signer(
+        &self,
+        viewing: &ViewingKeyData,
+        signer: &impl RailgunSpendSigner,
+        forest: &MerkleForest,
+        utxos: &[Utxo],
+        request: SendRequest,
+        prover: &ProverService,
+    ) -> Result<SendPlan, BuildError> {
+        let (selected_utxos, total) = select_utxos(
+            utxos,
+            request.token_address,
+            request.amount,
+            request.spend_up_to,
+        )?;
+
+        let plan_builder = TransactionPlanBuilder::new(
+            self,
+            viewing,
+            signer,
+            forest,
+            prover,
+            selected_utxos,
+            request.token_address,
+        )?;
+
+        plan_builder.build_send(request, total).await
     }
 
     /// Build a transact plan for UTXO consolidation.
@@ -595,6 +661,121 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
         })
     }
 
+    /// Build a private send plan.
+    async fn build_send(self, request: SendRequest, total: U256) -> Result<SendPlan, BuildError> {
+        if !request.spend_up_to && total < request.amount {
+            return Err(BuildError::InsufficientBalance(total));
+        }
+        let send_amount = if request.spend_up_to {
+            total.min(request.amount)
+        } else {
+            request.amount
+        };
+        if send_amount.is_zero() {
+            return Err(BuildError::InsufficientBalance(total));
+        }
+
+        let change = total - send_amount;
+        let sender = self.viewing.address_data();
+
+        tracing::info!(
+            %send_amount,
+            %change,
+            len = self.inputs.len(),
+            "selected send utxos"
+        );
+
+        let SendOutputs {
+            outputs,
+            commitment_ciphertext,
+            recipient_note,
+            change_note,
+        } = build_send_outputs(
+            request.token_address,
+            send_amount,
+            change,
+            &sender,
+            &request.recipient,
+            &self.viewing.viewing_private_key,
+        )?;
+
+        self.validate_signature_limit(outputs.len())?;
+
+        let tree_number = self.tree_number();
+        let root = self.get_root()?;
+
+        let nullifiers = self.compute_nullifiers();
+        let commitments = Self::compute_commitments(&outputs);
+        let commitment_ciphertext: Vec<_> = commitment_ciphertext
+            .into_iter()
+            .map(NoteCiphertext::into_commitment_ciphertext)
+            .collect();
+
+        let bound_params = BoundParams::new_transact(
+            tree_number,
+            self.builder.chain_type,
+            self.builder.chain_id,
+            commitment_ciphertext,
+            Address::ZERO,
+            UNRELAYED_ADAPT_PARAMS,
+        );
+
+        let mut transaction = Transaction {
+            proof: SnarkProof::default(),
+            merkleRoot: FixedBytes::from(root.to_be_bytes::<32>()),
+            nullifiers,
+            commitments,
+            boundParams: bound_params,
+            unshieldPreimage: CommitmentPreimage::empty(),
+        };
+
+        let inputs = self.build_input_witnesses()?;
+        let public_inputs = PublicInputs::from_transaction(root, &transaction, &outputs);
+        let private_inputs = PrivateInputs::from_inputs(
+            request.token_address,
+            &inputs,
+            &outputs,
+            self.viewing,
+            self.signer,
+        );
+        let signature = public_inputs.signature(self.signer);
+
+        tracing::info!("proving private send");
+        let proof = self
+            .prover
+            .prove_unshield(
+                &public_inputs,
+                &private_inputs,
+                &signature,
+                request.verify_proof,
+            )
+            .await?;
+        transaction.proof = proof;
+
+        tracing::info!("building send transaction call");
+        let data = transactCall {
+            _transactions: vec![transaction],
+        }
+        .abi_encode();
+        let call = TransactionCall {
+            to: self.builder.railgun_contract,
+            data: data.into(),
+        };
+
+        Ok(SendPlan {
+            call,
+            tree_number,
+            merkle_root: root,
+            inputs,
+            outputs,
+            recipient_note,
+            change_note,
+            public_inputs,
+            private_inputs,
+            signature,
+        })
+    }
+
     /// Build a transact plan.
     async fn build_transact(self) -> Result<TransactPlan, BuildError> {
         let total = self.total_value();
@@ -689,6 +870,62 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
     }
 }
 
+struct SendOutputs {
+    outputs: Vec<Note>,
+    commitment_ciphertext: Vec<NoteCiphertext>,
+    recipient_note: Note,
+    change_note: Option<Note>,
+}
+
+fn build_send_outputs(
+    token_address: Address,
+    send_amount: U256,
+    change: U256,
+    sender: &AddressData,
+    recipient: &AddressData,
+    sender_viewing_private_key: &[u8; 32],
+) -> Result<SendOutputs, BuildError> {
+    let mut outputs = Vec::with_capacity(2);
+    let mut commitment_ciphertext = Vec::with_capacity(2);
+
+    let recipient_note = Note::new_change(
+        recipient.master_public_key,
+        token_address,
+        send_amount,
+        rand_array(),
+    );
+    let recipient_ciphertext = NoteCiphertext::try_from_note(
+        &recipient_note,
+        sender,
+        recipient,
+        sender_viewing_private_key,
+    )?;
+    outputs.push(recipient_note.clone());
+    commitment_ciphertext.push(recipient_ciphertext);
+
+    let mut change_note = None;
+    if !change.is_zero() {
+        let note = Note::new_change(
+            sender.master_public_key,
+            token_address,
+            change,
+            rand_array(),
+        );
+        let ciphertext =
+            NoteCiphertext::try_from_note(&note, sender, sender, sender_viewing_private_key)?;
+        outputs.push(note.clone());
+        commitment_ciphertext.push(ciphertext);
+        change_note = Some(note);
+    }
+
+    Ok(SendOutputs {
+        outputs,
+        commitment_ciphertext,
+        recipient_note,
+        change_note,
+    })
+}
+
 #[derive(Debug, Clone)]
 struct UtxoSelection {
     utxos: Vec<Utxo>,
@@ -713,6 +950,20 @@ pub fn unshield_selection_info(
         input_count: selected.len(),
         max_spendable,
     })
+}
+
+#[must_use]
+pub fn max_send_spendable(utxos: &[Utxo], token_address: Address) -> U256 {
+    max_unshield_spendable(utxos, token_address)
+}
+
+pub fn send_selection_info(
+    utxos: &[Utxo],
+    token_address: Address,
+    amount: U256,
+    spend_up_to: bool,
+) -> Result<UnshieldSelectionInfo, BuildError> {
+    unshield_selection_info(utxos, token_address, amount, spend_up_to)
 }
 
 fn select_utxos(
@@ -1013,6 +1264,13 @@ mod tests {
         selection.iter().map(|utxo| utxo.position).collect()
     }
 
+    fn sample_address_data(seed: u8) -> ViewingKeyData {
+        ViewingKeyData::from_spending_public_key(
+            [seed; 32],
+            [U256::from(seed), U256::from(seed + 1)],
+        )
+    }
+
     #[test]
     fn public_inputs_signature_uses_spend_signer_boundary() {
         let public_inputs = PublicInputs {
@@ -1130,5 +1388,112 @@ mod tests {
         let error = select_utxos(&utxos, token, U256::from(14_u8), false).unwrap_err();
 
         assert!(matches!(error, BuildError::InsufficientBalance(max) if max == U256::from(13_u8)));
+    }
+
+    #[test]
+    fn send_outputs_create_recipient_and_change_notes() {
+        let token = Address::from([8_u8; 20]);
+        let sender_viewing = sample_address_data(10);
+        let sender = sender_viewing.address_data();
+        let recipient = sample_address_data(20).address_data();
+
+        let outputs = build_send_outputs(
+            token,
+            U256::from(7_u8),
+            U256::from(3_u8),
+            &sender,
+            &recipient,
+            &sender_viewing.viewing_private_key,
+        )
+        .expect("send outputs");
+
+        assert_eq!(outputs.outputs.len(), 2);
+        assert_eq!(outputs.recipient_note.value, U256::from(7_u8));
+        assert_eq!(
+            outputs.recipient_note.npk,
+            crate::notes::note_public_key(
+                recipient.master_public_key,
+                outputs.recipient_note.random
+            )
+        );
+        let change_note = outputs.change_note.expect("change note");
+        assert_eq!(change_note.value, U256::from(3_u8));
+        assert_eq!(
+            change_note.npk,
+            crate::notes::note_public_key(sender.master_public_key, change_note.random)
+        );
+    }
+
+    #[test]
+    fn send_outputs_omit_change_for_exact_send() {
+        let token = Address::from([9_u8; 20]);
+        let sender_viewing = sample_address_data(11);
+        let sender = sender_viewing.address_data();
+        let recipient = sample_address_data(21).address_data();
+
+        let outputs = build_send_outputs(
+            token,
+            U256::from(7_u8),
+            U256::ZERO,
+            &sender,
+            &recipient,
+            &sender_viewing.viewing_private_key,
+        )
+        .expect("send outputs");
+
+        assert_eq!(outputs.outputs.len(), 1);
+        assert!(outputs.change_note.is_none());
+    }
+
+    #[test]
+    fn send_selection_prefers_fewest_inputs() {
+        let token = Address::from([10_u8; 20]);
+        let utxos = vec![
+            test_utxo(token, 40, 0, 1),
+            test_utxo(token, 30, 0, 2),
+            test_utxo(token, 5, 0, 3),
+        ];
+
+        let (selected, total) = select_utxos(&utxos, token, U256::from(35_u8), false).unwrap();
+
+        assert_eq!(total, U256::from(40_u8));
+        assert_eq!(selected_positions(&selected), vec![1]);
+    }
+
+    #[test]
+    fn partial_send_uses_at_most_twelve_inputs_when_change_is_needed() {
+        let token = Address::from([11_u8; 20]);
+        let utxos = (0..13)
+            .map(|position| test_utxo(token, 2, 0, position))
+            .collect::<Vec<_>>();
+
+        let info = send_selection_info(&utxos, token, U256::from(23_u8), false).unwrap();
+
+        assert_eq!(info.input_count, 12);
+        assert_eq!(info.total, U256::from(24_u8));
+    }
+
+    #[test]
+    fn exact_send_can_use_thirteen_inputs() {
+        let token = Address::from([12_u8; 20]);
+        let utxos = (0..13)
+            .map(|position| test_utxo(token, 2, 0, position))
+            .collect::<Vec<_>>();
+
+        let info = send_selection_info(&utxos, token, U256::from(26_u8), false).unwrap();
+
+        assert_eq!(info.input_count, 13);
+        assert_eq!(info.total, U256::from(26_u8));
+    }
+
+    #[test]
+    fn max_send_spendable_uses_largest_single_tree_top_thirteen() {
+        let token = Address::from([13_u8; 20]);
+        let mut utxos = (0..20)
+            .map(|position| test_utxo(token, 1, 0, position))
+            .collect::<Vec<_>>();
+        utxos.extend((0..5).map(|position| test_utxo(token, 3, 1, position)));
+
+        assert_eq!(max_send_spendable(&utxos, token), U256::from(15_u8));
     }
 }

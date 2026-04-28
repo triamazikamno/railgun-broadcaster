@@ -20,7 +20,8 @@ use eyre::{Result, WrapErr, eyre};
 use local_db::{DbConfig, DbStore};
 use railgun_wallet::artifacts::ArtifactSource;
 use railgun_wallet::tx::{
-    UnshieldMode, UnshieldRequest as RailgunUnshieldRequest, unshield_selection_info,
+    SendRequest as RailgunSendRequest, UnshieldMode, UnshieldRequest as RailgunUnshieldRequest,
+    send_selection_info, unshield_selection_info,
 };
 use railgun_wallet::wallet_cache::wallet_cache_key;
 use railgun_wallet::{ProverService, TransactionBuilder, Utxo, UtxoSource, WalletKeys, WalletUtxo};
@@ -173,6 +174,18 @@ pub struct DesktopUnshieldCalldataRequest {
     pub verify_proof: bool,
 }
 
+pub struct DesktopSendCalldataRequest {
+    pub chain_id: u64,
+    pub view_session: Arc<vault::DesktopViewSession>,
+    pub session: Arc<WalletSession>,
+    pub vault_store: Arc<vault::DesktopVaultStore>,
+    pub vault_password: Zeroizing<String>,
+    pub token: Address,
+    pub amount: U256,
+    pub recipient: String,
+    pub verify_proof: bool,
+}
+
 pub trait EvmTransactionSigner {
     fn address(&self) -> Address;
 
@@ -267,6 +280,18 @@ pub struct PreparedUnshieldCall {
     pub amount: U256,
     pub recipient: Address,
     pub unwrap: bool,
+    pub max_spendable: U256,
+    pub input_count: usize,
+    pub to: Address,
+    pub data: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedSendCall {
+    pub chain_id: u64,
+    pub token: Address,
+    pub amount: U256,
+    pub recipient: String,
     pub max_spendable: U256,
     pub input_count: usize,
     pub to: Address,
@@ -374,6 +399,19 @@ pub fn parse_unshield_amount(input: &str, decimals: Option<u8>) -> Result<U256> 
             U256::from_str_radix(input, 10).wrap_err("invalid raw amount")
         }
     }
+}
+
+pub fn parse_send_amount(input: &str, decimals: Option<u8>) -> Result<U256> {
+    parse_unshield_amount(input, decimals)
+}
+
+pub fn parse_railgun_recipient(input: &str) -> Result<AddressData> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err(eyre!("recipient 0zk address is required"));
+    }
+    let railgun_addr = RailgunAddress::from(input);
+    AddressData::try_from(&railgun_addr).wrap_err("invalid recipient 0zk address")
 }
 
 #[must_use]
@@ -931,6 +969,84 @@ pub async fn prepare_desktop_unshield_calldata(
     })
 }
 
+pub async fn prepare_desktop_send_calldata(
+    request: DesktopSendCalldataRequest,
+    http: &HttpContext,
+) -> Result<PreparedSendCall> {
+    if request.session.chain_id != request.chain_id {
+        return Err(eyre!(
+            "selected wallet session is for chain {}, not {}",
+            request.session.chain_id,
+            request.chain_id
+        ));
+    }
+
+    let recipient = request.recipient.trim().to_string();
+    let recipient_data = parse_railgun_recipient(&recipient)?;
+    let chain_defaults =
+        chain_defaults_for_chain(request.chain_id, UnsupportedChainMessage::Generic)?;
+    let artifact_source = artifact_source(http);
+    let prover = ProverService::new_with_db(artifact_source, Arc::clone(&request.session._db));
+    let chain_handle = request
+        .session
+        .sync_manager
+        .chain_handle(&request.session.chain_key)
+        .await
+        .ok_or_else(|| eyre!("chain handle not found for chain {}", request.chain_id))?;
+    let mut forest = chain_handle.forest.read().await.clone();
+    forest.compute_roots();
+
+    let utxos = request.session.unspent_utxos().await;
+    let send_request = RailgunSendRequest {
+        token_address: request.token,
+        amount: request.amount,
+        recipient: recipient_data,
+        verify_proof: request.verify_proof,
+        spend_up_to: false,
+    };
+    let selection_info = send_selection_info(&utxos, request.token, request.amount, false)
+        .wrap_err("select send notes")?;
+
+    let mut grant = request
+        .vault_store
+        .create_spend_grant(request.vault_password.as_str())
+        .wrap_err("authorize send spend")?;
+    let signer = request
+        .vault_store
+        .railgun_spend_signer(&mut grant, request.view_session.wallet_id())
+        .wrap_err("load send spend signer")?;
+
+    let tx_builder = TransactionBuilder {
+        chain_type: 0,
+        chain_id: request.chain_id,
+        railgun_contract: chain_defaults.contract,
+        relay_adapt_contract: chain_defaults.relay_adapt_contract,
+    };
+
+    let plan = tx_builder
+        .build_send_plan_with_signer(
+            &request.view_session.scan_keys(),
+            &signer,
+            &forest,
+            &utxos,
+            send_request,
+            &prover,
+        )
+        .await
+        .wrap_err("build desktop send calldata")?;
+
+    Ok(PreparedSendCall {
+        chain_id: request.chain_id,
+        token: request.token,
+        amount: request.amount,
+        recipient,
+        max_spendable: selection_info.max_spendable,
+        input_count: plan.inputs.len(),
+        to: plan.call.to,
+        data: format!("0x{}", hex::encode(&plan.call.data)),
+    })
+}
+
 #[must_use]
 pub fn utxo_outputs_from_utxos(mut utxos: Vec<WalletUtxo>) -> (Vec<UtxoOutput>, Vec<TokenTotal>) {
     utxos.sort_by(|a, b| match a.utxo.tree.cmp(&b.utxo.tree) {
@@ -1354,13 +1470,13 @@ async fn sign_send_wait(
 mod tests {
     use alloy::primitives::{Address, FixedBytes, U256};
     use broadcaster_core::notes::Note;
-    use railgun_wallet::{Utxo, UtxoSource, WalletUtxo};
+    use railgun_wallet::{Utxo, UtxoSource, WalletKeys, WalletUtxo};
     use serde_json::json;
 
     use super::{
         EvmMessageSigner, EvmTransactionSigner, ListUtxosOutput, SoftwareEvmSigner, TokenTotal,
-        UtxoOutput, is_wrapped_native_token, parse_unshield_amount, utxo_outputs_from_utxos,
-        wrapped_native_token_for_chain,
+        UtxoOutput, is_wrapped_native_token, parse_railgun_recipient, parse_send_amount,
+        parse_unshield_amount, utxo_outputs_from_utxos, wrapped_native_token_for_chain,
     };
 
     fn address(byte: u8) -> Address {
@@ -1544,6 +1660,50 @@ mod tests {
             U256::from(123_u8)
         );
         assert!(parse_unshield_amount("1.23", None).is_err());
+    }
+
+    #[test]
+    fn parse_send_amount_reuses_token_aware_amount_parsing() {
+        assert_eq!(
+            parse_send_amount("1.23", Some(6)).expect("parsed amount"),
+            U256::from(1_230_000_u64)
+        );
+        assert_eq!(
+            parse_send_amount("123", None).expect("parsed raw amount"),
+            U256::from(123_u8)
+        );
+        assert!(parse_send_amount("1.23", None).is_err());
+    }
+
+    #[test]
+    fn parse_railgun_recipient_accepts_valid_0zk_address() {
+        let wallet = WalletKeys::from_mnemonic(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            0,
+        )
+        .expect("derive wallet");
+        let address = wallet
+            .viewing
+            .derive_address(None)
+            .expect("derive all-chain address")
+            .to_string();
+
+        let recipient = parse_railgun_recipient(&address).expect("valid 0zk recipient");
+
+        assert_eq!(
+            recipient.master_public_key,
+            wallet.viewing.master_public_key
+        );
+        assert_eq!(
+            recipient.viewing_public_key,
+            wallet.viewing.viewing_public_key
+        );
+    }
+
+    #[test]
+    fn parse_railgun_recipient_rejects_invalid_address() {
+        assert!(parse_railgun_recipient("0x0000000000000000000000000000000000000000").is_err());
+        assert!(parse_railgun_recipient("").is_err());
     }
 
     #[test]

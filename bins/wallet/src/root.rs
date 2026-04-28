@@ -36,9 +36,11 @@ use ui::icons;
 use ui::logs::{LogStore, LogsPane};
 use ui::theme::{self, APP_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
-    DesktopUnshieldCalldataRequest, HttpContext, ListUtxosOutput, PreparedUnshieldCall,
-    SyncProgressUpdate, TokenTotal, UtxoOutput, ViewWalletChainSessionRequest, WalletSessionStore,
-    is_wrapped_native_token, parse_unshield_amount, prepare_desktop_unshield_calldata,
+    DesktopSendCalldataRequest, DesktopUnshieldCalldataRequest, HttpContext, ListUtxosOutput,
+    PreparedSendCall, PreparedUnshieldCall, SyncProgressUpdate, TokenTotal, UtxoOutput,
+    ViewWalletChainSessionRequest, WalletSessionStore, is_wrapped_native_token,
+    parse_railgun_recipient, parse_send_amount, parse_unshield_amount,
+    prepare_desktop_send_calldata, prepare_desktop_unshield_calldata,
     vault::{
         DesktopVaultStore, DesktopViewSession, GeneratedSeedMaterial, VaultError,
         WalletMetadataBundle, generate_opaque_id, generate_seed_material,
@@ -232,6 +234,17 @@ struct UnshieldFormState {
     result: Option<PreparedUnshieldCall>,
 }
 
+struct SendFormState {
+    asset: UnshieldAsset,
+    recipient_input: Entity<InputState>,
+    amount_input: Entity<InputState>,
+    password_input: Entity<InputState>,
+    generation_id: u64,
+    generating: bool,
+    error: Option<Arc<str>>,
+    result: Option<PreparedSendCall>,
+}
+
 enum ChainUtxoState {
     Idle,
     Loading {
@@ -371,6 +384,8 @@ pub(crate) struct WalletRoot {
     confirm_password_input: Entity<InputState>,
     import_mnemonic_input: Entity<InputState>,
     spend_password_input: Entity<InputState>,
+    send_forms: BTreeMap<UnshieldAssetKey, SendFormState>,
+    send_generation_seq: u64,
     unshield_forms: BTreeMap<UnshieldAssetKey, UnshieldFormState>,
     unshield_spinner_tick: usize,
     repair_cache_block_input: Entity<InputState>,
@@ -482,6 +497,8 @@ impl WalletRoot {
             confirm_password_input,
             import_mnemonic_input,
             spend_password_input,
+            send_forms: BTreeMap::new(),
+            send_generation_seq: 0,
             unshield_forms: BTreeMap::new(),
             unshield_spinner_tick: 0,
             repair_cache_block_input,
@@ -596,7 +613,9 @@ impl WalletRoot {
                     .await;
                 if this
                     .update(cx, |root, cx| {
-                        if root.unshield_forms.values().any(|form| form.generating) {
+                        if root.send_forms.values().any(|form| form.generating)
+                            || root.unshield_forms.values().any(|form| form.generating)
+                        {
                             root.unshield_spinner_tick = root.unshield_spinner_tick.wrapping_add(1);
                             cx.notify();
                         }
@@ -902,6 +921,7 @@ impl WalletRoot {
             return;
         }
         self.selected_chain = chain_id;
+        self.send_forms.clear();
         self.unshield_forms.clear();
         self.sync_utxo_table(cx);
         if should_focus_utxo_table(
@@ -920,6 +940,7 @@ impl WalletRoot {
             return;
         }
         self.selected_wallet_id = Some(wallet_id);
+        self.send_forms.clear();
         self.unshield_forms.clear();
         cx.notify();
     }
@@ -1244,6 +1265,7 @@ impl WalletRoot {
             label: Arc::from("Primary wallet"),
         }];
         self.selected_wallet_id = Some(wallet_id);
+        self.send_forms.clear();
         self.unshield_forms.clear();
         self.active_wallet_tab = WalletTab::default();
         self.setup_password = None;
@@ -1273,6 +1295,7 @@ impl WalletRoot {
         self.view_session = None;
         self.wallet_options.clear();
         self.selected_wallet_id = None;
+        self.send_forms.clear();
         self.unshield_forms.clear();
         self.active_wallet_tab = WalletTab::default();
         self.setup_password = None;
@@ -1343,6 +1366,253 @@ impl WalletRoot {
                 self.spend_status = None;
                 self.handle_vault_error(&error, cx);
             }
+        }
+    }
+
+    fn open_send_form(
+        &mut self,
+        asset: UnshieldAsset,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let key = UnshieldAssetKey::from_asset(&asset);
+        if self.send_forms.contains_key(&key) {
+            return;
+        }
+        self.send_forms.retain(|existing_key, form| {
+            *existing_key == key || Self::send_form_is_dirty(form, cx)
+        });
+        let amount = format_send_amount_input(asset.max_single, asset.decimals);
+        let amount_input = cx.new(|cx| {
+            let mut input = InputState::new(window, cx).placeholder("amount");
+            input.set_value(&amount, window, cx);
+            input
+        });
+        let recipient_input = cx.new(|cx| InputState::new(window, cx).placeholder("0zk recipient"));
+        let password_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("vault password")
+                .masked(true)
+        });
+        cx.subscribe_in(
+            &password_input,
+            window,
+            move |this, _input, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.generate_send_calldata_from_form(key, window, cx);
+                }
+            },
+        )
+        .detach();
+        cx.subscribe(
+            &recipient_input,
+            move |this, _input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.clear_send_form_prepared_output(key, cx);
+                }
+            },
+        )
+        .detach();
+        cx.subscribe(
+            &amount_input,
+            move |this, _input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.clear_send_form_prepared_output(key, cx);
+                }
+            },
+        )
+        .detach();
+        self.send_forms.insert(
+            key,
+            SendFormState {
+                asset,
+                recipient_input,
+                amount_input,
+                password_input,
+                generation_id: 0,
+                generating: false,
+                error: None,
+                result: None,
+            },
+        );
+        cx.notify();
+    }
+
+    fn send_form_is_dirty(form: &SendFormState, cx: &mut Context<'_, Self>) -> bool {
+        if form.generating || form.error.is_some() || form.result.is_some() {
+            return true;
+        }
+        if !form.recipient_input.read(cx).value().trim().is_empty() {
+            return true;
+        }
+        if !form.password_input.read(cx).value().trim().is_empty() {
+            return true;
+        }
+
+        let default_amount = format_send_amount_input(form.asset.max_single, form.asset.decimals);
+        form.amount_input.read(cx).value().trim() != default_amount
+    }
+
+    fn clear_send_form_prepared_output(
+        &mut self,
+        key: UnshieldAssetKey,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(form) = self.send_forms.get_mut(&key) else {
+            return;
+        };
+        if form.generating || (form.result.is_none() && form.error.is_none()) {
+            return;
+        }
+        form.result = None;
+        form.error = None;
+        cx.notify();
+    }
+
+    fn generate_send_calldata_from_form(
+        &mut self,
+        key: UnshieldAssetKey,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(form) = self.send_forms.get(&key) else {
+            return;
+        };
+        if form.generating {
+            return;
+        }
+        let asset = form.asset.clone();
+        let recipient_input = form.recipient_input.clone();
+        let amount_input = form.amount_input.clone();
+        let password_input = form.password_input.clone();
+
+        let Some(view_session) = self.view_session.as_ref().cloned() else {
+            self.set_send_form_error(key, "Unlock the wallet vault before sending", cx);
+            return;
+        };
+        let Some(vault_store) = self.vault_store.as_ref().cloned() else {
+            self.set_send_form_error(key, "Wallet vault storage is unavailable", cx);
+            return;
+        };
+        let session = match self.chain_states.get(&asset.chain_id) {
+            Some(ChainUtxoState::Ready { session, .. }) => Arc::clone(session),
+            _ => {
+                self.set_send_form_error(key, "Wait for wallet sync to finish before sending", cx);
+                return;
+            }
+        };
+        if asset.max_single.is_zero() {
+            self.set_send_form_error(key, "No private notes are spendable in one transaction", cx);
+            return;
+        }
+
+        let recipient_raw = recipient_input.read(cx).value().to_string();
+        if let Err(error) = parse_railgun_recipient(recipient_raw.as_str()) {
+            self.set_send_form_error(key, error.to_string(), cx);
+            return;
+        }
+        let recipient = recipient_raw.trim().to_string();
+        let amount_raw = amount_input.read(cx).value().to_string();
+        let amount = match parse_send_amount(amount_raw.as_str(), asset.decimals) {
+            Ok(amount) if !amount.is_zero() => amount,
+            Ok(_) => {
+                self.set_send_form_error(key, "Enter an amount greater than zero", cx);
+                return;
+            }
+            Err(error) => {
+                self.set_send_form_error(key, error.to_string(), cx);
+                return;
+            }
+        };
+        if amount > asset.max_single {
+            self.set_send_form_error(
+                key,
+                format!(
+                    "Amount exceeds max one transaction: {}",
+                    format_send_amount_input(asset.max_single, asset.decimals)
+                ),
+                cx,
+            );
+            return;
+        }
+
+        let password_empty = password_input.read(cx).value().trim().is_empty();
+        if password_empty {
+            self.set_send_form_error(key, "Enter the vault password to generate calldata", cx);
+            return;
+        }
+        let vault_password = Self::read_and_clear_input(&password_input, window, cx);
+
+        self.send_generation_seq = self.send_generation_seq.wrapping_add(1);
+        let generation_id = self.send_generation_seq;
+        if let Some(form) = self.send_forms.get_mut(&key) {
+            form.generation_id = generation_id;
+            form.generating = true;
+            form.error = None;
+            form.result = None;
+        }
+        cx.notify();
+
+        let http = self.http.clone();
+        let chain_id = asset.chain_id;
+        let token = asset.token;
+        let request = DesktopSendCalldataRequest {
+            chain_id,
+            view_session,
+            session,
+            vault_store,
+            vault_password,
+            token,
+            amount,
+            recipient,
+            verify_proof: true,
+        };
+        let join = self
+            .runtime
+            .spawn(async move { prepare_desktop_send_calldata(request, &http).await });
+        cx.spawn(async move |this, cx| {
+            let result = match join.await {
+                Ok(result) => result,
+                Err(error) => Err(eyre::eyre!("send generation task failed: {error}")),
+            };
+            let _ = this.update(cx, |root, cx| {
+                let Some(form) = root.send_forms.get_mut(&key) else {
+                    return;
+                };
+                if form.asset.chain_id != chain_id || form.asset.token != token {
+                    return;
+                }
+                if form.generation_id != generation_id || !form.generating {
+                    return;
+                }
+                form.generating = false;
+                match result {
+                    Ok(call) => {
+                        form.error = None;
+                        form.result = Some(call);
+                    }
+                    Err(error) => {
+                        form.result = None;
+                        form.error = Some(Arc::from(error.to_string()));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn set_send_form_error(
+        &mut self,
+        key: UnshieldAssetKey,
+        message: impl Into<Arc<str>>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if let Some(form) = self.send_forms.get_mut(&key) {
+            form.generating = false;
+            form.result = None;
+            form.error = Some(message.into());
+            cx.notify();
         }
     }
 
@@ -2308,6 +2578,12 @@ impl WalletRoot {
                     .flex_col()
                     .gap_3()
                     .children(assets.into_iter().enumerate().map(|(ix, asset)| {
+                        let send_form_key = send_asset_key_from_formatted(&asset);
+                        if let Some(key) = send_form_key
+                            && self.send_forms.contains_key(&key)
+                        {
+                            return self.render_send_form(root.clone(), key).into_any_element();
+                        }
                         let form_key = unshield_asset_key_from_formatted(&asset);
                         if let Some(key) = form_key
                             && self.unshield_forms.contains_key(&key)
@@ -2337,16 +2613,28 @@ impl WalletRoot {
         snapshot: &ListUtxosOutput,
         chain_ready: bool,
     ) -> gpui::Div {
+        let send_asset = build_send_asset(snapshot, &asset);
+        let can_send = chain_ready && send_asset.is_some();
         let unshield_asset = build_unshield_asset(snapshot, &asset);
         let can_unshield = chain_ready && unshield_asset.is_some();
-        let action_tooltip = if can_unshield {
+        let send_tooltip = if can_send {
+            "Prepare private send calldata"
+        } else if chain_ready {
+            "Token cannot be sent from this row"
+        } else {
+            "Available after wallet sync finishes"
+        };
+        let unshield_tooltip = if can_unshield {
             "Prepare unshield calldata"
         } else if chain_ready {
             "Token cannot be unshielded from this row"
         } else {
             "Available after wallet sync finishes"
         };
+        let send_opacity = if can_send { 1.0 } else { 0.5 };
         let unshield_opacity = if can_unshield { 1.0 } else { 0.5 };
+        let send_root = root.clone();
+        let unshield_root = root;
 
         div()
             .w_full()
@@ -2393,9 +2681,17 @@ impl WalletRoot {
                         )
                         .xsmall()
                         .outline()
-                        .disabled(true)
-                        .opacity(0.5)
-                        .tooltip(action_tooltip),
+                        .disabled(!can_send)
+                        .opacity(send_opacity)
+                        .tooltip(send_tooltip)
+                        .on_click(move |_event, window, cx| {
+                            let Some(asset) = send_asset.clone() else {
+                                return;
+                            };
+                            send_root.update(cx, |root, cx| {
+                                root.open_send_form(asset, window, cx);
+                            });
+                        }),
                     )
                     .child(
                         app_button(
@@ -2406,17 +2702,191 @@ impl WalletRoot {
                         .outline()
                         .disabled(!can_unshield)
                         .opacity(unshield_opacity)
-                        .tooltip(action_tooltip)
+                        .tooltip(unshield_tooltip)
                         .on_click(move |_event, window, cx| {
                             let Some(asset) = unshield_asset.clone() else {
                                 return;
                             };
-                            root.update(cx, |root, cx| {
+                            unshield_root.update(cx, |root, cx| {
                                 root.open_unshield_form(asset, window, cx);
                             });
                         }),
                     ),
             )
+    }
+
+    fn render_send_form(&self, root: Entity<Self>, key: UnshieldAssetKey) -> gpui::Div {
+        let Some(form) = self.send_forms.get(&key) else {
+            return div();
+        };
+        let asset = &form.asset;
+        let total_display = format_send_amount_input(asset.total, asset.decimals);
+        let max_display = format_send_amount_input(asset.max_single, asset.decimals);
+        let unit_hint = if asset.decimals.is_some() {
+            format!("{} amount", asset.label)
+        } else {
+            "Raw base units for this unknown token".to_string()
+        };
+
+        let submit_root = root.clone();
+        let cancel_root = root;
+
+        let mut card = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p(px(16.0))
+            .rounded_lg()
+            .bg(rgb(theme::SURFACE))
+            .border_1()
+            .border_color(rgb(theme::BORDER_STRONG))
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_color(rgb(theme::TEXT))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(private_asset_label_row(
+                                        SharedString::from(format!("Send {}", asset.label)),
+                                        asset.icon_path.clone(),
+                                    )),
+                            )
+                            .child(app_muted_text(
+                                "Generate calldata for a private transfer to another 0zk address.",
+                            )),
+                    )
+                    .child(
+                        app_button(send_element_id(key, "cancel"), "Cancel")
+                            .ghost()
+                            .xsmall()
+                            .disabled(form.generating)
+                            .on_click(move |_event, _window, cx| {
+                                cancel_root.update(cx, |root, cx| {
+                                    root.send_forms.remove(&key);
+                                    cx.notify();
+                                });
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_3()
+                    .child(unshield_metric("Total private balance", total_display))
+                    .child(unshield_metric("Max one transaction", max_display)),
+            );
+
+        if asset.total > asset.max_single {
+            card = card.child(
+                div()
+                    .p(px(10.0))
+                    .rounded_md()
+                    .bg(rgb(theme::WARNING_BG))
+                    .border_1()
+                    .border_color(rgb(theme::WARNING))
+                    .text_color(rgb(theme::WARNING))
+                    .text_size(APP_TEXT_SIZE)
+                    .child("Balance is split across private notes. One send can spend only a limited number of notes."),
+            );
+        }
+
+        card = card
+            .child(
+                div()
+                    .flex()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(app_muted_text("Recipient 0zk address"))
+                            .child(app_input(&form.recipient_input).disabled(form.generating)),
+                    )
+                    .child(
+                        div()
+                            .w(px(220.0))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(app_muted_text(unit_hint))
+                            .child(app_input(&form.amount_input).disabled(form.generating)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_end()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(app_muted_text("Vault password"))
+                            .child(app_input(&form.password_input).disabled(form.generating)),
+                    )
+                    .child(
+                        app_button(
+                            send_element_id(key, "generate"),
+                            if form.generating {
+                                "Generating..."
+                            } else {
+                                "Generate calldata"
+                            },
+                        )
+                        .primary()
+                        .xsmall()
+                        .loading(form.generating)
+                        .disabled(form.generating)
+                        .on_click(move |_event, window, cx| {
+                            submit_root.update(cx, |root, cx| {
+                                root.generate_send_calldata_from_form(key, window, cx);
+                            });
+                        }),
+                    ),
+            );
+
+        if form.generating {
+            card = card.child(render_unshield_generating_status(
+                self.unshield_spinner_tick,
+            ));
+        }
+
+        if let Some(error) = form.error.as_ref() {
+            card = card.child(
+                div()
+                    .p(px(10.0))
+                    .rounded_md()
+                    .bg(rgb(theme::DANGER_BG))
+                    .border_1()
+                    .border_color(rgb(theme::DANGER))
+                    .text_color(rgb(theme::DANGER))
+                    .text_size(APP_TEXT_SIZE)
+                    .child(SharedString::from(error.to_string())),
+            );
+        }
+
+        if let Some(result) = form.result.as_ref() {
+            card = card.child(render_send_result(key, result));
+        }
+
+        card
     }
 
     fn render_unshield_form(&self, root: Entity<Self>, key: UnshieldAssetKey) -> gpui::Div {
@@ -3425,6 +3895,44 @@ fn build_unshield_asset(
     })
 }
 
+fn build_send_asset(
+    snapshot: &ListUtxosOutput,
+    asset: &FormattedTokenTotal,
+) -> Option<UnshieldAsset> {
+    let token = asset.token?;
+    let total = asset.total?;
+    let max_single = max_send_amount_from_snapshot(snapshot, token);
+    if max_single.is_zero() {
+        return None;
+    }
+    Some(UnshieldAsset {
+        chain_id: asset.chain_id,
+        token,
+        label: asset.label.clone(),
+        decimals: asset.decimals,
+        total,
+        max_single,
+        icon_path: asset.icon_path.clone(),
+    })
+}
+
+fn send_asset_key_from_formatted(asset: &FormattedTokenTotal) -> Option<UnshieldAssetKey> {
+    unshield_asset_key_from_formatted(asset)
+}
+
+#[cfg(test)]
+fn send_key_matches_asset(key: UnshieldAssetKey, asset: &FormattedTokenTotal) -> bool {
+    send_asset_key_from_formatted(asset) == Some(key)
+}
+
+fn send_element_id(key: UnshieldAssetKey, action: &str) -> SharedString {
+    SharedString::from(format!(
+        "wallet-send-{}-{}-{action}",
+        key.chain_id,
+        key.token.to_checksum(None)
+    ))
+}
+
 fn unshield_asset_key_from_formatted(asset: &FormattedTokenTotal) -> Option<UnshieldAssetKey> {
     asset
         .token
@@ -3474,6 +3982,10 @@ fn max_unshield_amount_from_snapshot(snapshot: &ListUtxosOutput, token: Address)
         .unwrap_or(U256::ZERO)
 }
 
+fn max_send_amount_from_snapshot(snapshot: &ListUtxosOutput, token: Address) -> U256 {
+    max_unshield_amount_from_snapshot(snapshot, token)
+}
+
 fn format_unshield_amount_input(amount: U256, decimals: Option<u8>) -> String {
     let Some(decimals) = decimals else {
         return amount.to_string();
@@ -3492,6 +4004,10 @@ fn format_unshield_amount_input(amount: U256, decimals: Option<u8>) -> String {
     let fractional = fractional.to_string();
     let padded = format!("{fractional:0>width$}", width = decimals as usize);
     format!("{whole}.{}", padded.trim_end_matches('0'))
+}
+
+fn format_send_amount_input(amount: U256, decimals: Option<u8>) -> String {
+    format_unshield_amount_input(amount, decimals)
 }
 
 fn unshield_metric(label: &'static str, value: String) -> gpui::Div {
@@ -3557,6 +4073,37 @@ fn render_unshield_generating_status(tick: usize) -> gpui::Div {
 fn unshield_spinner_frame(tick: usize) -> &'static str {
     const FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
     FRAMES[tick % FRAMES.len()]
+}
+
+#[cfg(test)]
+fn send_spinner_frame(tick: usize) -> &'static str {
+    unshield_spinner_frame(tick)
+}
+
+fn render_send_result(key: UnshieldAssetKey, result: &PreparedSendCall) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .p(px(12.0))
+        .rounded_md()
+        .bg(rgb(theme::SURFACE_ELEVATED))
+        .border_1()
+        .border_color(rgb(theme::SUCCESS))
+        .child(app_strong_text("Prepared send calldata"))
+        .child(app_muted_text(
+            "Submit this transaction externally. The wallet has not broadcast it.",
+        ))
+        .child(render_unshield_copy_field(
+            "To",
+            result.to.to_checksum(None),
+            send_element_id(key, "copy-to"),
+        ))
+        .child(render_unshield_copy_field(
+            "Calldata",
+            result.data.clone(),
+            send_element_id(key, "copy-data"),
+        ))
 }
 
 fn render_unshield_result(key: UnshieldAssetKey, result: &PreparedUnshieldCall) -> gpui::Div {
@@ -3846,12 +4393,13 @@ mod tests {
     use super::{
         Activity, ChainLoadSource, ChainUtxoState, SECONDS_PER_DAY, SECONDS_PER_HOUR,
         SECONDS_PER_MINUTE, SECONDS_PER_MONTH, SECONDS_PER_YEAR, UnshieldAssetKey,
-        WalletAppOptions, WalletTab, build_unshield_asset, chain_load_overrides,
-        display_rows_from_output, format_compact_age, format_private_asset_rows, format_total,
-        format_unshield_amount_input, loading_summary, max_unshield_amount_from_snapshot,
-        parse_repair_cache_block, progress_detail, should_focus_utxo_table,
-        unshield_asset_key_from_formatted, unshield_element_id, unshield_key_matches_asset,
-        unshield_spinner_frame,
+        WalletAppOptions, WalletTab, build_send_asset, build_unshield_asset, chain_load_overrides,
+        display_rows_from_output, format_compact_age, format_private_asset_rows,
+        format_send_amount_input, format_total, format_unshield_amount_input, loading_summary,
+        max_send_amount_from_snapshot, max_unshield_amount_from_snapshot, parse_repair_cache_block,
+        progress_detail, send_asset_key_from_formatted, send_element_id, send_key_matches_asset,
+        send_spinner_frame, should_focus_utxo_table, unshield_asset_key_from_formatted,
+        unshield_element_id, unshield_key_matches_asset, unshield_spinner_frame,
     };
 
     fn wallet_options_with_overrides() -> WalletAppOptions {
@@ -4061,12 +4609,34 @@ mod tests {
     }
 
     #[test]
+    fn send_amount_input_formats_exact_token_units() {
+        assert_eq!(
+            format_send_amount_input(U256::from(1_230_000_u64), Some(6)),
+            "1.23"
+        );
+        assert_eq!(
+            format_send_amount_input(U256::from(1_000_000_u64), Some(6)),
+            "1"
+        );
+        assert_eq!(format_send_amount_input(U256::from(42_u8), None), "42");
+    }
+
+    #[test]
     fn unshield_spinner_frames_cycle() {
         assert_eq!(unshield_spinner_frame(0), "|");
         assert_eq!(unshield_spinner_frame(1), "/");
         assert_eq!(unshield_spinner_frame(2), "-");
         assert_eq!(unshield_spinner_frame(3), "\\");
         assert_eq!(unshield_spinner_frame(4), "|");
+    }
+
+    #[test]
+    fn send_spinner_frames_cycle() {
+        assert_eq!(send_spinner_frame(0), "|");
+        assert_eq!(send_spinner_frame(1), "/");
+        assert_eq!(send_spinner_frame(2), "-");
+        assert_eq!(send_spinner_frame(3), "\\");
+        assert_eq!(send_spinner_frame(4), "|");
     }
 
     #[test]
@@ -4090,6 +4660,31 @@ mod tests {
 
         assert_eq!(
             max_unshield_amount_from_snapshot(&snapshot, token),
+            U256::from(15_u8)
+        );
+    }
+
+    #[test]
+    fn max_send_amount_from_snapshot_uses_top_thirteen_by_tree() {
+        let token = Address::from([0x12; 20]);
+        let other = Address::from([0x22; 20]);
+        let mut utxos = (0..20)
+            .map(|position| unshield_utxo_output(token, 1, 0, position))
+            .collect::<Vec<_>>();
+        utxos.extend((0..5).map(|position| unshield_utxo_output(token, 3, 1, position)));
+        utxos.push(unshield_utxo_output(other, 100, 1, 99));
+        let snapshot = ListUtxosOutput {
+            chain_id: 1,
+            cache_key: "cache".to_string(),
+            utxo_count: utxos.len(),
+            unspent_count: utxos.len(),
+            spent_count: 0,
+            utxos,
+            totals: Vec::new(),
+        };
+
+        assert_eq!(
+            max_send_amount_from_snapshot(&snapshot, token),
             U256::from(15_u8)
         );
     }
@@ -4124,6 +4719,35 @@ mod tests {
     }
 
     #[test]
+    fn build_send_asset_includes_max_single_transaction() {
+        let token = Address::from([0x34; 20]);
+        let snapshot = ListUtxosOutput {
+            chain_id: 1,
+            cache_key: "cache".to_string(),
+            utxo_count: 2,
+            unspent_count: 2,
+            spent_count: 0,
+            utxos: vec![
+                unshield_utxo_output(token, 5, 0, 1),
+                unshield_utxo_output(token, 7, 0, 2),
+            ],
+            totals: vec![wallet_ops::TokenTotal {
+                token: token.to_checksum(None),
+                total: "12".to_string(),
+            }],
+        };
+        let row = format_private_asset_rows(1, &snapshot.totals)
+            .into_iter()
+            .next()
+            .expect("asset row");
+
+        let asset = build_send_asset(&snapshot, &row).expect("send asset");
+
+        assert_eq!(asset.total, U256::from(12_u8));
+        assert_eq!(asset.max_single, U256::from(12_u8));
+    }
+
+    #[test]
     fn unshield_key_matches_only_selected_asset() {
         let token = Address::from([0x44; 20]);
         let other = Address::from([0x45; 20]);
@@ -4148,6 +4772,30 @@ mod tests {
     }
 
     #[test]
+    fn send_key_matches_only_selected_asset() {
+        let token = Address::from([0x46; 20]);
+        let other = Address::from([0x47; 20]);
+        let rows = format_private_asset_rows(
+            1,
+            &[
+                wallet_ops::TokenTotal {
+                    token: token.to_checksum(None),
+                    total: "5".to_string(),
+                },
+                wallet_ops::TokenTotal {
+                    token: other.to_checksum(None),
+                    total: "7".to_string(),
+                },
+            ],
+        );
+        let key = UnshieldAssetKey::new(1, token);
+
+        assert_eq!(send_asset_key_from_formatted(&rows[0]), Some(key));
+        assert!(send_key_matches_asset(key, &rows[0]));
+        assert!(!send_key_matches_asset(key, &rows[1]));
+    }
+
+    #[test]
     fn unshield_element_ids_are_asset_scoped() {
         let first = UnshieldAssetKey::new(1, Address::from([0x11; 20]));
         let second = UnshieldAssetKey::new(1, Address::from([0x22; 20]));
@@ -4159,6 +4807,21 @@ mod tests {
         assert_ne!(
             unshield_element_id(first, "copy-to").as_ref(),
             unshield_element_id(first, "copy-data").as_ref()
+        );
+    }
+
+    #[test]
+    fn send_element_ids_are_asset_scoped() {
+        let first = UnshieldAssetKey::new(1, Address::from([0x11; 20]));
+        let second = UnshieldAssetKey::new(1, Address::from([0x22; 20]));
+
+        assert_ne!(
+            send_element_id(first, "cancel").as_ref(),
+            send_element_id(second, "cancel").as_ref()
+        );
+        assert_ne!(
+            send_element_id(first, "copy-to").as_ref(),
+            send_element_id(first, "copy-data").as_ref()
         );
     }
 
