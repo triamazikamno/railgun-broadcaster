@@ -17,6 +17,7 @@ waku = { path = "../waku" }
 waku-relay = { path = "../waku-relay" }
 
 [dev-dependencies]
+alloy = { workspace = true }
 libp2p = { workspace = true }
 
 [lints]

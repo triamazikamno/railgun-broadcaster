@@ -8,6 +8,7 @@ fn main() {
             format!("{proto_dir}/peer_exchange.proto"),
             format!("{proto_dir}/metadata.proto"),
             format!("{proto_dir}/filter.proto"),
+            format!("{proto_dir}/store.proto"),
         ],
         &[proto_dir],
     )
@@ -18,4 +19,5 @@ fn main() {
     println!("cargo:rerun-if-changed={proto_dir}/peer_exchange.proto");
     println!("cargo:rerun-if-changed={proto_dir}/metadata.proto");
     println!("cargo:rerun-if-changed={proto_dir}/filter.proto");
+    println!("cargo:rerun-if-changed={proto_dir}/store.proto");
 }

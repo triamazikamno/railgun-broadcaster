@@ -77,7 +77,7 @@ pub async fn spawn_workers(
     );
 
     let msg_rx = waku
-        .subscribe(PUBSUB_PATH, content_topics)
+        .subscribe_with_fee_history(PUBSUB_PATH, content_topics)
         .await
         .wrap_err("subscribe to fees content topics")?;
 
@@ -141,6 +141,12 @@ pub fn handle_fees_message(
     let railgun_address: Arc<str> = Arc::from(body.railgun_address.as_ref());
     let fees_id: Arc<str> = Arc::from(body.fees_id.as_str());
     let identifier: Option<Arc<str>> = body.identifier.map(|s| Arc::from(s.as_str()));
+    let version: Arc<str> = Arc::from(body.version.as_str());
+    let required_poi_list_keys: Vec<Arc<str>> = body
+        .required_poi_list_keys
+        .into_iter()
+        .map(|key| Arc::from(key.as_str()))
+        .collect();
     let fee_expiration = SystemTime::UNIX_EPOCH + Duration::from_millis(body.fee_expiration);
     let now = SystemTime::now();
 
@@ -154,6 +160,11 @@ pub fn handle_fees_message(
             signature_valid,
             fees_id: fees_id.clone(),
             fee_expiration,
+            available_wallets: body.available_wallets,
+            version: version.clone(),
+            relay_adapt: body.relay_adapt,
+            relay_adapt_7702: body.relay_adapt_7702,
+            required_poi_list_keys: required_poi_list_keys.clone(),
             identifier: identifier.clone(),
             last_seen: now,
             reliability: body.reliability,
@@ -215,6 +226,9 @@ pub fn peer_row_from_snapshot(snapshot: &PeerSnapshot) -> PeerRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    use alloy::primitives::{U256, address};
     use broadcaster_monitor::{event_channel, shared};
 
     #[test]
@@ -305,5 +319,48 @@ mod tests {
         let produced = handle_fees_message(1, b"not-json", &shared, &tx);
         assert_eq!(produced, 0);
         assert!(shared.read().fee_rows().is_empty());
+    }
+
+    #[test]
+    fn handle_fees_message_retains_fee_metadata() {
+        const RAILGUN_ADDRESS: &str = "0zk1qy4v02p5zkq0zfpaxhz79j5tslrv8c44d80d8jr2fuecrtxlp8lemrv7j6fe3z53ll0jm7u592n0hr8elesd0xzv6y9jpdvsyln80m95jcxhvnmagfqg5p6e9mp";
+
+        let token = address!("0000000000000000000000000000000000000001");
+        let relay_adapt = address!("0000000000000000000000000000000000000002");
+        let relay_adapt_7702 = address!("0000000000000000000000000000000000000003");
+        let body = fees::Body {
+            fees: HashMap::from([(token, U256::from(42u64))]),
+            fee_expiration: 1_900_000_000_000,
+            fees_id: "fees-id".to_string(),
+            railgun_address: RAILGUN_ADDRESS.into(),
+            available_wallets: 3,
+            version: "8.2.3".to_string(),
+            relay_adapt,
+            relay_adapt_7702: Some(relay_adapt_7702),
+            required_poi_list_keys: vec!["poi-list".to_string()],
+            reliability: 0.91,
+            identifier: Some("broadcaster-one".to_string()),
+        };
+        let payload = fees::Payload {
+            data: serde_json::to_vec(&body).expect("serialize fees body"),
+            signature: vec![0; 64],
+        };
+        let payload = serde_json::to_vec(&payload).expect("serialize fees payload");
+        let shared = shared();
+        let (tx, _rx) = event_channel(16);
+
+        let produced = handle_fees_message(1, &payload, &shared, &tx);
+
+        assert_eq!(produced, 1);
+        let rows = shared.read().fee_rows();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.available_wallets, 3);
+        assert_eq!(row.version.as_ref(), "8.2.3");
+        assert_eq!(row.relay_adapt, relay_adapt);
+        assert_eq!(row.relay_adapt_7702, Some(relay_adapt_7702));
+        assert_eq!(row.required_poi_list_keys, vec![Arc::from("poi-list")]);
+        assert_eq!(row.identifier.as_deref(), Some("broadcaster-one"));
+        assert!(!row.signature_valid);
     }
 }

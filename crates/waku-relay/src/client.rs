@@ -3,20 +3,29 @@ use crate::msg::Message;
 use base64::Engine;
 use base64::engine::general_purpose;
 use lru::LruCache;
+use std::collections::{HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use waku::discovery::DiscoveredPeer;
 use waku::proto::{HashKey, WakuMessage};
 use waku::types::{parse_multiaddr, parse_peer_id};
-use waku::{PeerSnapshot, PeerStats, WakuConfig, WakuNode};
+use waku::{PeerSnapshot, PeerStats, StoreQueryOptions, WakuConfig, WakuNode};
 
 pub const PUBSUB_PATH: &str = "/waku/2/rs/5/1";
+const FEE_HISTORY_LOOKBACK: Duration = Duration::from_secs(120);
+const FEE_HISTORY_PAGE_LIMIT: u64 = 500;
 const CACHE_SIZE: NonZeroUsize = match NonZeroUsize::new(500) {
     Some(n) => n,
     None => panic!("cache size must be non-zero"),
 };
+
+enum RelayMessageOutcome {
+    Delivered,
+    Duplicate,
+    Dropped,
+}
 
 pub struct Client {
     http_client: reqwest::Client,
@@ -85,6 +94,36 @@ impl Client {
         topic: &str,
         content_topics: Vec<String>,
     ) -> Result<mpsc::Receiver<WakuMessage>, ClientError> {
+        self.subscribe_internal(topic, content_topics, None).await
+    }
+
+    pub async fn subscribe_with_fee_history(
+        &self,
+        topic: &str,
+        content_topics: Vec<String>,
+    ) -> Result<mpsc::Receiver<WakuMessage>, ClientError> {
+        let history_lookback = content_topics
+            .iter()
+            .all(|topic| is_fee_content_topic(topic))
+            .then_some(FEE_HISTORY_LOOKBACK);
+        if history_lookback.is_none() {
+            tracing::warn!(
+                pubsub_path = topic,
+                topics = ?content_topics,
+                "fee history requested for non-fee topics; using live-only subscription"
+            );
+        }
+
+        self.subscribe_internal(topic, content_topics, history_lookback)
+            .await
+    }
+
+    async fn subscribe_internal(
+        &self,
+        topic: &str,
+        content_topics: Vec<String>,
+        history_lookback: Option<Duration>,
+    ) -> Result<mpsc::Receiver<WakuMessage>, ClientError> {
         let mut rx = self
             .waku_fleet
             .filter_subscribe(topic.to_string(), content_topics.clone())
@@ -102,6 +141,9 @@ impl Client {
             {
                 tracing::warn!(%error, "failed to subscribe on nwaku");
             }
+        }
+
+        if self.nwaku_url.is_some() || history_lookback.is_some() {
             {
                 let mut fleet_rx = rx;
                 let (sink_tx, sink_rx) = mpsc::channel(1024);
@@ -109,28 +151,102 @@ impl Client {
                 let mut cache = LruCache::new(CACHE_SIZE);
 
                 let topic = topic.to_string();
-                let nwaku_url = nwaku_url.clone();
+                let nwaku_url = self.nwaku_url.clone();
+                let waku_fleet = Arc::clone(&self.waku_fleet);
                 tokio::spawn(async move {
                     let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
                     let pubsub_path = urlencoding::encode(&topic);
-                    let url = format!("{nwaku_url}/relay/v1/messages/{pubsub_path}");
+                    let nwaku_messages_url = nwaku_url
+                        .as_ref()
+                        .map(|nwaku_url| format!("{nwaku_url}/relay/v1/messages/{pubsub_path}"));
                     let http = reqwest::Client::new();
+                    let mut store_peer_rx =
+                        history_lookback.map(|_| waku_fleet.subscribe_store_peers());
+                    let mut pending_store_peers: VecDeque<_> = if history_lookback.is_some() {
+                        waku_fleet.store_peers().into()
+                    } else {
+                        VecDeque::new()
+                    };
+                    let mut queried_store_peers = HashSet::new();
                     let mut handle_message = |message: WakuMessage| {
                         let hash = message.hash_key();
 
                         if cache.contains(&hash) {
                             tracing::debug!(hash, "duplicate message, ignoring");
-                            return;
+                            return RelayMessageOutcome::Duplicate;
                         }
                         cache.put(hash, ());
                         if let Err(error) = sink_tx.try_send(message) {
                             tracing::warn!(%error, "failed to send message to sink");
+                            return RelayMessageOutcome::Dropped;
                         }
+                        RelayMessageOutcome::Delivered
                     };
+
                     loop {
+                        if let Some(lookback) = history_lookback
+                            && let Some(peer_id) = pending_store_peers.pop_front()
+                        {
+                            if !queried_store_peers.insert(peer_id) {
+                                continue;
+                            }
+
+                            let end = now_nanos();
+                            let start = end.saturating_sub(duration_nanos(lookback));
+                            let query = StoreQueryOptions {
+                                pubsub_topic: topic.clone(),
+                                content_topics: content_topics.clone(),
+                                time_start: Some(start),
+                                time_end: Some(end),
+                                pagination_limit: Some(FEE_HISTORY_PAGE_LIMIT),
+                            };
+
+                            match waku_fleet.store_query_peer(peer_id, query).await {
+                                Ok(messages) => {
+                                    let returned = messages.len();
+                                    let mut matching_topics = 0usize;
+                                    let mut delivered = 0usize;
+                                    let mut deduped = 0usize;
+                                    let mut dropped = 0usize;
+                                    for msg in messages {
+                                        if !content_topics.contains(&msg.content_topic) {
+                                            continue;
+                                        }
+                                        matching_topics += 1;
+                                        tracing::debug!(
+                                            %peer_id,
+                                            msg.content_topic,
+                                            hash = msg.hash_key(),
+                                            "received historical message from store peer"
+                                        );
+                                        match handle_message(msg) {
+                                            RelayMessageOutcome::Delivered => delivered += 1,
+                                            RelayMessageOutcome::Duplicate => deduped += 1,
+                                            RelayMessageOutcome::Dropped => dropped += 1,
+                                        }
+                                    }
+                                    tracing::debug!(
+                                        %peer_id,
+                                        returned,
+                                        matching_topics,
+                                        delivered,
+                                        deduped,
+                                        dropped,
+                                        lookback_secs = lookback.as_secs(),
+                                        "queried historical fee messages from store peer"
+                                    );
+                                }
+                                Err(error) => {
+                                    tracing::warn!(%peer_id, %error, "failed to query historical fee messages from store peer");
+                                }
+                            }
+                            continue;
+                        }
+
                         tokio::select! {
-                            _ = tick.tick() => {
-                                match http.get(&url).send().await.and_then(reqwest::Response::error_for_status) {
+                            _ = tick.tick(), if nwaku_messages_url.is_some() => {
+                                let Some(url) = &nwaku_messages_url else { continue };
+                                match http.get(url).send().await.and_then(reqwest::Response::error_for_status) {
                                     Ok(resp) => {
                                         match resp.json::<Vec<Message>>().await {
                                             Ok(messages) => {
@@ -146,7 +262,7 @@ impl Client {
                                                                 ..Default::default()
                                                             };
                                                             tracing::debug!(msg.content_topic, hash=msg.hash_key(), "received message from nwaku");
-                                                            handle_message(msg);
+                                                            let _ = handle_message(msg);
                                                         }
                                                         Err(error) => {
                                                             tracing::warn!(%error, "failed to decode message payload");
@@ -167,7 +283,32 @@ impl Client {
                             msg = fleet_rx.recv() => {
                                 if let Some(msg) = msg {
                                     tracing::debug!(msg.content_topic, hash=msg.hash_key(), "received message from fleet");
-                                    handle_message(msg);
+                                    let _ = handle_message(msg);
+                                } else {
+                                    tracing::warn!("fleet subscription channel closed");
+                                    break;
+                                }
+                            }
+                            store_peer = async {
+                                match store_peer_rx.as_mut() {
+                                    Some(rx) => Some(rx.recv().await),
+                                    None => None,
+                                }
+                            }, if store_peer_rx.is_some() => {
+                                match store_peer {
+                                    Some(Ok(peer_id)) => {
+                                        tracing::debug!(%peer_id, "queueing store peer for fee history query");
+                                        pending_store_peers.push_back(peer_id);
+                                    }
+                                    Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
+                                        tracing::warn!(skipped, "missed store peer notifications");
+                                        pending_store_peers.extend(waku_fleet.store_peers());
+                                    }
+                                    Some(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                                        tracing::warn!("store peer notification channel closed");
+                                        store_peer_rx = None;
+                                    }
+                                    None => {}
                                 }
                             }
                         }
@@ -185,7 +326,18 @@ impl Client {
         content_topic: &str,
         json_payload_utf8: &[u8],
     ) -> Result<(), ClientError> {
-        tracing::trace!(payload=%String::from_utf8_lossy(json_payload_utf8), "publishing message");
+        tracing::debug!(
+            pubsub_path,
+            content_topic,
+            payload_len = json_payload_utf8.len(),
+            nwaku_configured = self.nwaku_url.is_some(),
+            "publishing Waku message"
+        );
+        tracing::debug!(
+            pubsub_path,
+            content_topic,
+            "publishing Waku message to fleet"
+        );
         if let Err(error) = self
             .waku_fleet
             .lightpush_all(
@@ -195,7 +347,13 @@ impl Client {
             )
             .await
         {
-            tracing::warn!("failed to publish message to waku fleet: {error}");
+            tracing::warn!(%error, pubsub_path, content_topic, "failed to publish message to waku fleet");
+        } else {
+            tracing::debug!(
+                pubsub_path,
+                content_topic,
+                "published Waku message to fleet"
+            );
         }
         if let Some(nwaku_url) = &self.nwaku_url {
             #[derive(Debug, serde::Serialize)]
@@ -216,12 +374,31 @@ impl Client {
                 content_topic,
             };
             let url = format!("{nwaku_url}/relay/v1/messages/{pubsub_path}");
-            // tracing::debug!(body=alloy::consensus::private::serde_json::to_string(&body).unwrap(), "publishing message to nwaku");
+            tracing::debug!(
+                url = %url,
+                content_topic,
+                payload_len = json_payload_utf8.len(),
+                "publishing Waku message to nwaku"
+            );
             let res = self.http_client.post(url).json(&body).send().await?;
-            if res.status() != reqwest::StatusCode::OK {
+            let status = res.status();
+            if status != reqwest::StatusCode::OK {
                 let body = res.text().await?;
+                tracing::warn!(
+                    %status,
+                    body_len = body.len(),
+                    content_topic,
+                    "nwaku publish returned non-OK status"
+                );
                 return Err(ClientError::NwakuStatus { body });
             }
+            tracing::debug!(%status, content_topic, "published Waku message to nwaku");
+        } else {
+            tracing::debug!(
+                pubsub_path,
+                content_topic,
+                "nwaku publish skipped because nwaku_url is not configured"
+            );
         }
         Ok(())
     }
@@ -233,5 +410,39 @@ fn now_micros() -> u64 {
             tracing::warn!(?error, "system time before unix epoch");
             0
         }
+    }
+}
+
+fn now_nanos() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX),
+        Err(error) => {
+            tracing::warn!(?error, "system time before unix epoch");
+            0
+        }
+    }
+}
+
+fn duration_nanos(duration: Duration) -> i64 {
+    i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX)
+}
+
+fn is_fee_content_topic(topic: &str) -> bool {
+    topic.starts_with("/railgun/v2/0-") && topic.ends_with("-fees/json")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_fee_content_topic;
+
+    #[test]
+    fn fee_history_topic_detection_only_matches_fees() {
+        assert!(is_fee_content_topic("/railgun/v2/0-1-fees/json"));
+        assert!(is_fee_content_topic("/railgun/v2/0-42161-fees/json"));
+        assert!(!is_fee_content_topic("/railgun/v2/0-1-transact/json"));
+        assert!(!is_fee_content_topic(
+            "/railgun/v2/0-1-transact-response/json"
+        ));
+        assert!(!is_fee_content_topic("/other/v2/0-1-fees/json"));
     }
 }

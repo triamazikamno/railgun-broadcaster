@@ -1,4 +1,5 @@
 use curve25519_dalek::edwards::CompressedEdwardsY;
+use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -9,7 +10,9 @@ use alloy::sol_types::SolCall;
 use ruint::uint;
 
 use crate::contracts::railgun::{ActionData, Transaction, relayCall, transactCall};
-use crate::crypto::aes_gcm::{AesGcmError, decrypt_in_place_16b_iv, split_iv_tag};
+use crate::crypto::aes_gcm::{
+    AesGcmError, decrypt_in_place_16b_iv, encrypt_in_place_16b_iv, split_iv_tag,
+};
 use crate::crypto::poseidon::poseidon;
 use crate::crypto::shared_key::{ed25519_private_scalar_bytes, shared_symmetric_key};
 use crate::notes::note_public_key;
@@ -20,6 +23,8 @@ pub enum TransactError {
     InvalidEd25519Pubkey,
     #[error("shared key error")]
     SharedKey,
+    #[error("random generation failed")]
+    Random,
     #[error(transparent)]
     AesGcm(#[from] AesGcmError),
     #[error("ivtag must be 32 bytes, got {len}")]
@@ -68,7 +73,18 @@ fn shared_key_32(
     Ok(secret.diffie_hellman(&peer).to_bytes())
 }
 
-#[derive(Debug, Deserialize)]
+fn shared_key_for_broadcaster(
+    client_viewing_priv_seed: &[u8; 32],
+    broadcaster_ed_pub: &[u8; 32],
+) -> Result<[u8; 32], TransactError> {
+    let scalar = ed25519_private_scalar_bytes(client_viewing_priv_seed);
+    let mont_u = ed25519_pub_to_montgomery_u(broadcaster_ed_pub)?;
+    let secret = StaticSecret::from(scalar);
+    let peer = X25519PublicKey::from(mont_u);
+    Ok(secret.diffie_hellman(&peer).to_bytes())
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BroadcasterRawParamsTransact {
     pub chain_type: u64,
@@ -94,6 +110,26 @@ pub struct BroadcasterRawParamsTransact {
     pub pre_transaction_pois_per_txid_leaf_per_list:
         BTreeMap<FixedBytes<32>, BTreeMap<FixedBytes<32>, PreTxPoi>>,
     // pub dev_log: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EncryptedTransactRequest {
+    pub pubkey: [u8; 32],
+    pub encrypted_data: [Bytes; 2],
+    pub shared_key: [u8; 32],
+}
+
+#[derive(Debug, Serialize)]
+struct TransactEnvelope<'a> {
+    method: &'static str,
+    params: TransactEnvelopeParams<'a>,
+}
+
+#[derive(Debug, Serialize)]
+struct TransactEnvelopeParams<'a> {
+    pubkey: FixedBytes<32>,
+    #[serde(rename = "encryptedData")]
+    encrypted_data: &'a [Bytes; 2],
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -143,6 +179,47 @@ pub fn try_decrypt_transact_request(
     } else {
         Ok(None)
     }
+}
+
+pub fn encrypt_transact_request(
+    broadcaster_viewing_pubkey: [u8; 32],
+    params: &BroadcasterRawParamsTransact,
+) -> Result<EncryptedTransactRequest, TransactError> {
+    let mut client_seed = [0u8; 32];
+    getrandom::fill(&mut client_seed).map_err(|_| TransactError::Random)?;
+    encrypt_transact_request_with_seed(broadcaster_viewing_pubkey, params, client_seed)
+}
+
+pub fn encrypt_transact_request_with_seed(
+    broadcaster_viewing_pubkey: [u8; 32],
+    params: &BroadcasterRawParamsTransact,
+    client_seed: [u8; 32],
+) -> Result<EncryptedTransactRequest, TransactError> {
+    let pubkey = SigningKey::from_bytes(&client_seed)
+        .verifying_key()
+        .to_bytes();
+    let shared_key = shared_key_for_broadcaster(&client_seed, &broadcaster_viewing_pubkey)
+        .map_err(|_| TransactError::SharedKey)?;
+    let mut plaintext = serde_json::to_vec(params)?;
+    let iv_tag = encrypt_in_place_16b_iv(&shared_key, &mut plaintext)?;
+    Ok(EncryptedTransactRequest {
+        pubkey,
+        encrypted_data: [Bytes::copy_from_slice(&iv_tag), Bytes::from(plaintext)],
+        shared_key,
+    })
+}
+
+pub fn build_transact_request_payload(
+    request: &EncryptedTransactRequest,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let envelope = TransactEnvelope {
+        method: "transact",
+        params: TransactEnvelopeParams {
+            pubkey: FixedBytes::from(request.pubkey),
+            encrypted_data: &request.encrypted_data,
+        },
+    };
+    serde_json::to_vec(&envelope)
 }
 
 fn decrypt<T: serde::de::DeserializeOwned>(

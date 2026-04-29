@@ -2324,6 +2324,7 @@ dependencies = [
 name = "broadcaster-monitor-waku"
 version = "0.1.0"
 dependencies = [
+ "alloy",
  "broadcaster-monitor",
  "config",
  "eyre",
@@ -12521,6 +12522,7 @@ dependencies = [
  "alloy",
  "argon2",
  "broadcaster-core",
+ "broadcaster-monitor",
  "chacha20poly1305",
  "eyre",
  "getrandom 0.4.2",
@@ -12529,6 +12531,7 @@ dependencies = [
  "libc",
  "local-db",
  "railgun-wallet",
+ "rand 0.10.1",
  "reqwest",
  "rmp-serde",
  "serde",
@@ -12538,6 +12541,8 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "waku",
+ "waku-relay",
  "zeroize",
 ]
 

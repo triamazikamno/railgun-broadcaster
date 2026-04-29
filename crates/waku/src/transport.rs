@@ -62,6 +62,11 @@ pub enum TransportCmd {
         peer_id: PeerId,
         request: proto::filter::FilterSubscribeRequest,
     },
+    SendStoreQuery {
+        req_id: ReqId,
+        peer_id: PeerId,
+        request: proto::store::StoreQueryRequest,
+    },
 }
 
 /// Events emitted from transport to coordinator.
@@ -112,6 +117,10 @@ pub enum TransportEvent {
         peer_id: PeerId,
         push: Box<proto::filter::MessagePush>,
     },
+    StoreQueryResponse {
+        req_id: ReqId,
+        result: Result<proto::store::StoreQueryResponse, request_response::OutboundFailure>,
+    },
 }
 
 #[derive(NetworkBehaviour)]
@@ -122,6 +131,7 @@ pub(crate) struct Behaviour {
     lightpush: request_response::Behaviour<protocols::lightpush::LightPushCodec>,
     peer_exchange: request_response::Behaviour<protocols::peer_exchange::PeerExchangeCodec>,
     filter_subscribe: request_response::Behaviour<protocols::filter::FilterSubscribeCodec>,
+    store_query: request_response::Behaviour<protocols::store::StoreQueryCodec>,
     filter_push: libp2p_stream::Behaviour,
 }
 
@@ -132,6 +142,7 @@ pub struct Transport {
     pending_lightpush: HashMap<OutboundRequestId, (ReqId, PeerId)>,
     pending_px: HashMap<OutboundRequestId, ReqId>,
     pending_filter: HashMap<OutboundRequestId, (ReqId, PeerId)>,
+    pending_store: HashMap<OutboundRequestId, ReqId>,
 }
 
 impl Transport {
@@ -152,6 +163,7 @@ impl Transport {
             lightpush: protocols::lightpush::behaviour(),
             peer_exchange: protocols::peer_exchange::behaviour(),
             filter_subscribe: protocols::filter::filter_subscribe_behaviour(),
+            store_query: protocols::store::behaviour(),
             filter_push: libp2p_stream::Behaviour::new(),
         };
 
@@ -168,6 +180,7 @@ impl Transport {
             pending_lightpush: HashMap::new(),
             pending_px: HashMap::new(),
             pending_filter: HashMap::new(),
+            pending_store: HashMap::new(),
         })
     }
 
@@ -289,6 +302,18 @@ impl Transport {
                     .filter_subscribe
                     .send_request(&peer_id, request);
                 self.pending_filter.insert(out_id, (req_id, peer_id));
+            }
+            TransportCmd::SendStoreQuery {
+                req_id,
+                peer_id,
+                request,
+            } => {
+                let out_id = self
+                    .swarm
+                    .behaviour_mut()
+                    .store_query
+                    .send_request(&peer_id, request);
+                self.pending_store.insert(out_id, req_id);
             }
         }
     }
@@ -413,6 +438,33 @@ impl Transport {
                 Some(TransportEvent::FilterSubscribeResponse {
                     req_id,
                     peer_id,
+                    result: Err(error),
+                })
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::StoreQuery(
+                request_response::Event::Message {
+                    message:
+                        request_response::Message::Response {
+                            request_id,
+                            response,
+                        },
+                    ..
+                },
+            )) => {
+                let req_id = self.pending_store.remove(&request_id)?;
+                Some(TransportEvent::StoreQueryResponse {
+                    req_id,
+                    result: Ok(response),
+                })
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::StoreQuery(
+                request_response::Event::OutboundFailure {
+                    request_id, error, ..
+                },
+            )) => {
+                let req_id = self.pending_store.remove(&request_id)?;
+                Some(TransportEvent::StoreQueryResponse {
+                    req_id,
                     result: Err(error),
                 })
             }

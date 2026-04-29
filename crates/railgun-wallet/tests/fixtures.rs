@@ -178,6 +178,8 @@ fn build_valid_unshield_plan() -> UnshieldPlan {
                 mode: UnshieldMode::Token,
                 verify_proof: true,
                 spend_up_to: false,
+                broadcaster_fee: None,
+                min_gas_price: 0,
             };
             let prover = ProverService::new(ArtifactSource::default());
             builder

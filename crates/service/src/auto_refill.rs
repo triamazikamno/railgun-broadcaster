@@ -206,6 +206,8 @@ impl AutoRefillService {
                 mode: UnshieldMode::UnwrapBase,
                 verify_proof: true,
                 spend_up_to: true,
+                broadcaster_fee: None,
+                min_gas_price: 0,
             };
 
             let plan = match self

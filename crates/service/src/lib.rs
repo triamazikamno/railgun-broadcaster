@@ -1240,26 +1240,38 @@ impl BroadcasterManager {
 
     /// Subscribes to Waku and runs the message processing loop.
     pub async fn run(&self) -> Result<(), BroadcasterManagerError> {
-        let chain_ids: HashSet<ChainId> = self
+        let chain_ids: Vec<ChainId> = self
             .services
             .iter()
             .map(BroadcasterService::chain_id)
-            .collect();
-
-        let content_topics: Vec<String> = chain_ids
+            .collect::<HashSet<_>>()
             .into_iter()
-            .flat_map(|chain_id| {
-                vec![
-                    format!("/railgun/v2/0-{chain_id}-transact/json"),
-                    format!("/railgun/v2/0-{chain_id}-fees/json"),
-                ]
-            })
             .collect();
 
-        let mut msg_rx = self.waku.subscribe(PUBSUB_PATH, content_topics).await?;
+        let transact_content_topics: Vec<String> = chain_ids
+            .iter()
+            .map(|chain_id| format!("/railgun/v2/0-{chain_id}-transact/json"))
+            .collect();
+        let fee_content_topics: Vec<String> = chain_ids
+            .iter()
+            .map(|chain_id| format!("/railgun/v2/0-{chain_id}-fees/json"))
+            .collect();
+
+        let mut transact_rx = self
+            .waku
+            .subscribe(PUBSUB_PATH, transact_content_topics)
+            .await?;
+        let mut fee_rx = self
+            .waku
+            .subscribe_with_fee_history(PUBSUB_PATH, fee_content_topics)
+            .await?;
 
         loop {
-            let Some(msg) = msg_rx.recv().await else {
+            let msg = tokio::select! {
+                msg = transact_rx.recv() => msg,
+                msg = fee_rx.recv() => msg,
+            };
+            let Some(msg) = msg else {
                 warn!("get message failed, retrying...");
                 continue;
             };

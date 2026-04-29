@@ -7,14 +7,14 @@ use alloy::primitives::{Address, U256};
 use broadcaster_monitor::{EventRx, Shared};
 use chrono::{DateTime, Local, Utc};
 use gpui::{
-    App, AppContext, Bounds, Context, Entity, Focusable, InteractiveElement, IntoElement,
-    KeyBinding, MouseButton, ParentElement, Pixels, Point, Render, SharedString,
+    App, AppContext, Bounds, Context, Entity, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, KeyBinding, MouseButton, ParentElement, Pixels, Point, Render, SharedString,
     StatefulInteractiveElement, Styled, Window, WindowBounds, WindowOptions, div, img,
     prelude::FluentBuilder as _, px, relative, rgb, size,
 };
 use gpui_component::{
     Disableable, Root, Sizable, StyledExt,
-    button::ButtonVariants,
+    button::{Button, ButtonVariants},
     input::{InputEvent, InputState},
     popover::Popover,
     resizable::{ResizableState, resizable_panel, v_resizable},
@@ -24,8 +24,8 @@ use gpui_component::{
     v_flex,
 };
 use railgun_ui::{
-    DEFAULT_CHAINS, chain_icon_path, chain_name, format_token_amount, lookup_token, short_address,
-    token_icon_path,
+    DEFAULT_CHAINS, chain_icon_path, chain_name, format_broadcaster_address_label,
+    format_token_amount, lookup_token, short_address, token_icon_path,
 };
 use reqwest::Url;
 use tokio::runtime::Handle;
@@ -36,11 +36,20 @@ use ui::icons;
 use ui::logs::{LogStore, LogsPane};
 use ui::theme::{self, APP_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
-    DesktopSendCalldataRequest, DesktopUnshieldCalldataRequest, HttpContext, ListUtxosOutput,
-    PreparedSendCall, PreparedUnshieldCall, SyncProgressUpdate, TokenTotal, UtxoOutput,
-    ViewWalletChainSessionRequest, WalletSessionStore, is_wrapped_native_token,
+    DesktopSendCalldataRequest, DesktopSendPublicBroadcasterEstimateRequest,
+    DesktopSendPublicBroadcasterRequest, DesktopUnshieldCalldataRequest,
+    DesktopUnshieldPublicBroadcasterEstimateRequest, DesktopUnshieldPublicBroadcasterRequest,
+    HttpContext, ListUtxosOutput, PreparedSendCall, PreparedUnshieldCall,
+    PublicBroadcasterCandidate, PublicBroadcasterCostEstimate, PublicBroadcasterFeeMode,
+    PublicBroadcasterResultKind, PublicBroadcasterSelection, PublicBroadcasterSubmissionResult,
+    PublicBroadcasterWakuClient, SyncProgressUpdate, TokenTotal, UtxoOutput,
+    ViewWalletChainSessionRequest, WalletSessionStore, eligible_public_broadcasters_for_asset,
+    estimate_desktop_send_public_broadcaster_cost,
+    estimate_desktop_unshield_public_broadcaster_cost, is_wrapped_native_token,
     parse_railgun_recipient, parse_send_amount, parse_unshield_amount,
-    prepare_desktop_send_calldata, prepare_desktop_unshield_calldata,
+    prepare_desktop_send_calldata, prepare_desktop_unshield_calldata, select_public_broadcaster,
+    sort_specific_public_broadcasters, submit_desktop_send_public_broadcaster,
+    submit_desktop_unshield_public_broadcaster,
     vault::{
         DesktopVaultStore, DesktopViewSession, GeneratedSeedMaterial, VaultError,
         WalletMetadataBundle, generate_opaque_id, generate_seed_material,
@@ -53,16 +62,21 @@ const LOGS_DRAWER_HEIGHT: Pixels = px(260.0);
 const LOGS_DRAWER_MIN_HEIGHT: Pixels = px(160.0);
 const LOGS_DRAWER_MAX_HEIGHT: Pixels = px(600.0);
 const FILTER_POPOVER_MAX_HEIGHT: Pixels = px(450.0);
+const BROADCASTER_PICKER_MAX_HEIGHT: Pixels = px(680.0);
 const PRIVATE_ASSET_LIST_WIDTH: Pixels = px(760.0);
 const MAX_UNSHIELD_INPUTS: usize = 13;
 const UNSHIELD_SPINNER_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const UTXO_AGE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const COST_ESTIMATE_DEBOUNCE: Duration = Duration::from_secs(1);
+const PUBLIC_BROADCASTER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
 const SECONDS_PER_MINUTE: u64 = 60;
 const SECONDS_PER_HOUR: u64 = 60 * SECONDS_PER_MINUTE;
 const SECONDS_PER_DAY: u64 = 24 * SECONDS_PER_HOUR;
 const SECONDS_PER_MONTH: u64 = 30 * SECONDS_PER_DAY;
 const SECONDS_PER_YEAR: u64 = 365 * SECONDS_PER_DAY;
 const TABLE_KEY_CONTEXT: &str = "Table";
+const BROADCASTER_PICKER_KEY_CONTEXT: &str = "BroadcasterPicker";
+const COST_ESTIMATE_DETAIL_TEXT_SIZE: Pixels = px(11.0);
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, gpui::Action)]
 #[action(no_json)]
@@ -80,12 +94,21 @@ pub(crate) struct UtxoHome;
 #[action(no_json)]
 pub(crate) struct UtxoEnd;
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, gpui::Action)]
+#[action(no_json)]
+pub(crate) struct CloseBroadcasterPicker;
+
 pub(crate) fn install_utxo_navigation_bindings(app: &mut App) {
     app.bind_keys([
         KeyBinding::new("pageup", UtxoPageUp, Some(TABLE_KEY_CONTEXT)),
         KeyBinding::new("pagedown", UtxoPageDown, Some(TABLE_KEY_CONTEXT)),
         KeyBinding::new("home", UtxoHome, Some(TABLE_KEY_CONTEXT)),
         KeyBinding::new("end", UtxoEnd, Some(TABLE_KEY_CONTEXT)),
+        KeyBinding::new(
+            "escape",
+            CloseBroadcasterPicker,
+            Some(BROADCASTER_PICKER_KEY_CONTEXT),
+        ),
     ]);
 }
 
@@ -120,6 +143,7 @@ pub(crate) fn open_wallet_window(
     http: HttpContext,
     runtime: Handle,
     monitor: Shared,
+    waku: Arc<PublicBroadcasterWakuClient>,
     event_rx: EventRx,
     chain_ids: Vec<u64>,
     logs: LogStore,
@@ -139,13 +163,26 @@ pub(crate) fn open_wallet_window(
     };
 
     if let Err(error) = app.open_window(window_options, |window, cx| {
+        let monitor_state = monitor.clone();
         let monitor = cx.new(|cx| {
             broadcaster_monitor_gpui::BroadcasterMonitorPane::new(
                 monitor, event_rx, chain_ids, window, cx,
             )
         });
         let logs = cx.new(|cx| LogsPane::new(logs, window, cx));
-        let root = cx.new(|cx| WalletRoot::new(options, http, runtime, monitor, logs, window, cx));
+        let root = cx.new(|cx| {
+            WalletRoot::new(
+                options,
+                http,
+                runtime,
+                monitor_state,
+                waku,
+                monitor,
+                logs,
+                window,
+                cx,
+            )
+        });
         cx.new(|cx| Root::new(root, window, cx))
     }) {
         tracing::error!(%error, "failed to open wallet window");
@@ -164,6 +201,52 @@ enum WalletTab {
     Private,
     Public,
     Activity,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum DeliveryMode {
+    #[default]
+    ManualCalldata,
+    PublicBroadcaster,
+    SelfBroadcast,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeliveryFormKind {
+    Send,
+    Unshield,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+enum BroadcasterChoice {
+    #[default]
+    Random,
+    Specific {
+        railgun_address: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BroadcasterPickerSort {
+    FeeAscReliabilityDesc,
+}
+
+struct BroadcasterPickerState {
+    kind: DeliveryFormKind,
+    key: UnshieldAssetKey,
+    query_input: Entity<InputState>,
+    focus_handle: FocusHandle,
+    sort: BroadcasterPickerSort,
+}
+
+enum SendResult {
+    Manual(PreparedSendCall),
+    PublicBroadcaster(Box<PublicBroadcasterSubmissionResult>),
+}
+
+enum UnshieldResult {
+    Manual(PreparedUnshieldCall),
+    PublicBroadcaster(Box<PublicBroadcasterSubmissionResult>),
 }
 
 impl WalletTab {
@@ -229,9 +312,16 @@ struct UnshieldFormState {
     amount_input: Entity<InputState>,
     password_input: Entity<InputState>,
     unwrap: bool,
+    delivery_mode: DeliveryMode,
+    broadcaster_choice: BroadcasterChoice,
+    broadcaster_fee_mode: PublicBroadcasterFeeMode,
+    cost_estimate_pending: bool,
+    estimating_cost: bool,
+    cost_estimate: Option<PublicBroadcasterCostEstimate>,
+    estimate_id: u64,
     generating: bool,
     error: Option<Arc<str>>,
-    result: Option<PreparedUnshieldCall>,
+    result: Option<UnshieldResult>,
 }
 
 struct SendFormState {
@@ -239,10 +329,17 @@ struct SendFormState {
     recipient_input: Entity<InputState>,
     amount_input: Entity<InputState>,
     password_input: Entity<InputState>,
+    delivery_mode: DeliveryMode,
+    broadcaster_choice: BroadcasterChoice,
+    broadcaster_fee_mode: PublicBroadcasterFeeMode,
+    cost_estimate_pending: bool,
+    estimating_cost: bool,
+    cost_estimate: Option<PublicBroadcasterCostEstimate>,
+    estimate_id: u64,
     generation_id: u64,
     generating: bool,
     error: Option<Arc<str>>,
-    result: Option<PreparedSendCall>,
+    result: Option<SendResult>,
 }
 
 enum ChainUtxoState {
@@ -369,6 +466,8 @@ pub(crate) struct WalletRoot {
     generated_seed: Option<GeneratedSeedMaterial>,
     http: HttpContext,
     runtime: Handle,
+    monitor_state: Shared,
+    waku: Arc<PublicBroadcasterWakuClient>,
     monitor: Entity<broadcaster_monitor_gpui::BroadcasterMonitorPane>,
     logs: Entity<LogsPane>,
     active_activity: Activity,
@@ -386,7 +485,9 @@ pub(crate) struct WalletRoot {
     spend_password_input: Entity<InputState>,
     send_forms: BTreeMap<UnshieldAssetKey, SendFormState>,
     send_generation_seq: u64,
+    cost_estimate_seq: u64,
     unshield_forms: BTreeMap<UnshieldAssetKey, UnshieldFormState>,
+    broadcaster_picker: Option<BroadcasterPickerState>,
     unshield_spinner_tick: usize,
     repair_cache_block_input: Entity<InputState>,
     tx_search_input: Entity<InputState>,
@@ -404,6 +505,8 @@ impl WalletRoot {
         options: WalletAppOptions,
         http: HttpContext,
         runtime: Handle,
+        monitor_state: Shared,
+        waku: Arc<PublicBroadcasterWakuClient>,
         monitor: Entity<broadcaster_monitor_gpui::BroadcasterMonitorPane>,
         logs: Entity<LogsPane>,
         window: &mut Window,
@@ -483,6 +586,8 @@ impl WalletRoot {
             generated_seed: None,
             http,
             runtime,
+            monitor_state,
+            waku,
             monitor,
             logs,
             active_activity: Activity::Wallet,
@@ -499,7 +604,9 @@ impl WalletRoot {
             spend_password_input,
             send_forms: BTreeMap::new(),
             send_generation_seq: 0,
+            cost_estimate_seq: 0,
             unshield_forms: BTreeMap::new(),
+            broadcaster_picker: None,
             unshield_spinner_tick: 0,
             repair_cache_block_input,
             tx_search_input: tx_search_input.clone(),
@@ -613,9 +720,11 @@ impl WalletRoot {
                     .await;
                 if this
                     .update(cx, |root, cx| {
-                        if root.send_forms.values().any(|form| form.generating)
-                            || root.unshield_forms.values().any(|form| form.generating)
-                        {
+                        if root.send_forms.values().any(|form| {
+                            form.generating || form.cost_estimate_pending || form.estimating_cost
+                        }) || root.unshield_forms.values().any(|form| {
+                            form.generating || form.cost_estimate_pending || form.estimating_cost
+                        }) {
                             root.unshield_spinner_tick = root.unshield_spinner_tick.wrapping_add(1);
                             cx.notify();
                         }
@@ -1049,6 +1158,74 @@ impl WalletRoot {
         self.focus_unlock_password_on_render = false;
     }
 
+    fn apply_public_broadcaster_error_amount_adjustments(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let mut reschedule = Vec::new();
+
+        for (key, form) in &mut self.send_forms {
+            if form.delivery_mode != DeliveryMode::PublicBroadcaster || form.generating {
+                continue;
+            }
+            let Some(max_entered_amount) = form
+                .error
+                .as_deref()
+                .and_then(form_error_public_broadcaster_max_entered_amount)
+            else {
+                continue;
+            };
+            if apply_amount_adjustment_for_max_change(
+                &form.amount_input,
+                &form.asset,
+                None,
+                Some(max_entered_amount),
+                window,
+                cx,
+            ) {
+                form.error = None;
+                form.cost_estimate = None;
+                form.estimate_id = 0;
+                form.cost_estimate_pending = false;
+                form.estimating_cost = false;
+                reschedule.push((DeliveryFormKind::Send, *key));
+            }
+        }
+
+        for (key, form) in &mut self.unshield_forms {
+            if form.delivery_mode != DeliveryMode::PublicBroadcaster || form.generating {
+                continue;
+            }
+            let Some(max_entered_amount) = form
+                .error
+                .as_deref()
+                .and_then(form_error_public_broadcaster_max_entered_amount)
+            else {
+                continue;
+            };
+            if apply_amount_adjustment_for_max_change(
+                &form.amount_input,
+                &form.asset,
+                None,
+                Some(max_entered_amount),
+                window,
+                cx,
+            ) {
+                form.error = None;
+                form.cost_estimate = None;
+                form.estimate_id = 0;
+                form.cost_estimate_pending = false;
+                form.estimating_cost = false;
+                reschedule.push((DeliveryFormKind::Unshield, *key));
+            }
+        }
+
+        for (kind, key) in reschedule {
+            self.schedule_public_broadcaster_cost_estimate(kind, key, cx);
+        }
+    }
+
     fn create_vault_from_inputs(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         let Some(store) = self.vault_store.as_ref() else {
             self.set_vault_error("Wallet vault storage is unavailable", cx);
@@ -1409,6 +1586,7 @@ impl WalletRoot {
             move |this, _input, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
                     this.clear_send_form_prepared_output(key, cx);
+                    this.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
                 }
             },
         )
@@ -1418,6 +1596,7 @@ impl WalletRoot {
             move |this, _input, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
                     this.clear_send_form_prepared_output(key, cx);
+                    this.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
                 }
             },
         )
@@ -1429,6 +1608,13 @@ impl WalletRoot {
                 recipient_input,
                 amount_input,
                 password_input,
+                delivery_mode: DeliveryMode::ManualCalldata,
+                broadcaster_choice: BroadcasterChoice::Random,
+                broadcaster_fee_mode: PublicBroadcasterFeeMode::DeductFromAmount,
+                cost_estimate_pending: false,
+                estimating_cost: false,
+                cost_estimate: None,
+                estimate_id: 0,
                 generation_id: 0,
                 generating: false,
                 error: None,
@@ -1438,7 +1624,7 @@ impl WalletRoot {
         cx.notify();
     }
 
-    fn send_form_is_dirty(form: &SendFormState, cx: &mut Context<'_, Self>) -> bool {
+    fn send_form_is_dirty(form: &SendFormState, cx: &Context<'_, Self>) -> bool {
         if form.generating || form.error.is_some() || form.result.is_some() {
             return true;
         }
@@ -1461,11 +1647,393 @@ impl WalletRoot {
         let Some(form) = self.send_forms.get_mut(&key) else {
             return;
         };
-        if form.generating || (form.result.is_none() && form.error.is_none()) {
+        if form.generating
+            || (form.result.is_none() && form.error.is_none() && form.cost_estimate.is_none())
+        {
             return;
         }
         form.result = None;
         form.error = None;
+        form.cost_estimate = None;
+        form.estimate_id = 0;
+        form.cost_estimate_pending = false;
+        form.estimating_cost = false;
+        cx.notify();
+    }
+
+    fn set_send_delivery_mode(
+        &mut self,
+        key: UnshieldAssetKey,
+        mode: DeliveryMode,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(form) = self.send_forms.get_mut(&key) else {
+            return;
+        };
+        if form.generating || form.delivery_mode == mode || mode == DeliveryMode::SelfBroadcast {
+            return;
+        }
+        let old_max =
+            send_form_max_entered_amount(form, form.delivery_mode, form.broadcaster_fee_mode);
+        let new_max = send_form_max_entered_amount(form, mode, form.broadcaster_fee_mode);
+        let adjusted = apply_amount_adjustment_for_max_change(
+            &form.amount_input,
+            &form.asset,
+            old_max,
+            new_max,
+            window,
+            cx,
+        );
+        form.delivery_mode = mode;
+        form.error = None;
+        form.result = None;
+        if mode == DeliveryMode::PublicBroadcaster || adjusted {
+            form.cost_estimate = None;
+        }
+        form.estimate_id = 0;
+        form.cost_estimate_pending = false;
+        form.estimating_cost = false;
+        cx.notify();
+        self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
+    }
+
+    fn set_send_broadcaster_choice(
+        &mut self,
+        key: UnshieldAssetKey,
+        choice: BroadcasterChoice,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(form) = self.send_forms.get_mut(&key) else {
+            return;
+        };
+        if form.generating || form.broadcaster_choice == choice {
+            return;
+        }
+        form.broadcaster_choice = choice;
+        form.error = None;
+        form.result = None;
+        form.cost_estimate = None;
+        form.estimate_id = 0;
+        form.cost_estimate_pending = false;
+        form.estimating_cost = false;
+        cx.notify();
+        self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
+    }
+
+    fn set_send_broadcaster_fee_mode(
+        &mut self,
+        key: UnshieldAssetKey,
+        fee_mode: PublicBroadcasterFeeMode,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(form) = self.send_forms.get_mut(&key) else {
+            return;
+        };
+        if form.generating || form.broadcaster_fee_mode == fee_mode {
+            return;
+        }
+        let old_max =
+            send_form_max_entered_amount(form, form.delivery_mode, form.broadcaster_fee_mode);
+        let new_max = send_form_max_entered_amount(form, form.delivery_mode, fee_mode);
+        apply_amount_adjustment_for_max_change(
+            &form.amount_input,
+            &form.asset,
+            old_max,
+            new_max,
+            window,
+            cx,
+        );
+        form.broadcaster_fee_mode = fee_mode;
+        form.error = None;
+        form.result = None;
+        form.cost_estimate = None;
+        form.estimate_id = 0;
+        form.cost_estimate_pending = false;
+        form.estimating_cost = false;
+        cx.notify();
+        self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
+    }
+
+    fn schedule_public_broadcaster_cost_estimate(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let should_schedule = match kind {
+            DeliveryFormKind::Send => self.send_forms.get(&key).is_some_and(|form| {
+                !form.generating && form.delivery_mode == DeliveryMode::PublicBroadcaster
+            }),
+            DeliveryFormKind::Unshield => self.unshield_forms.get(&key).is_some_and(|form| {
+                !form.generating && form.delivery_mode == DeliveryMode::PublicBroadcaster
+            }),
+        };
+        if !should_schedule {
+            return;
+        }
+
+        self.cost_estimate_seq = self.cost_estimate_seq.wrapping_add(1);
+        let estimate_id = self.cost_estimate_seq;
+        match kind {
+            DeliveryFormKind::Send => {
+                if let Some(form) = self.send_forms.get_mut(&key) {
+                    form.estimate_id = estimate_id;
+                    form.cost_estimate_pending = true;
+                    form.estimating_cost = false;
+                    form.cost_estimate = None;
+                    form.error = None;
+                }
+            }
+            DeliveryFormKind::Unshield => {
+                if let Some(form) = self.unshield_forms.get_mut(&key) {
+                    form.estimate_id = estimate_id;
+                    form.cost_estimate_pending = true;
+                    form.estimating_cost = false;
+                    form.cost_estimate = None;
+                    form.error = None;
+                }
+            }
+        }
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            tokio::time::sleep(COST_ESTIMATE_DEBOUNCE).await;
+            let _ = this.update(cx, |root, cx| {
+                let current_id = match kind {
+                    DeliveryFormKind::Send => {
+                        root.send_forms.get(&key).map(|form| form.estimate_id)
+                    }
+                    DeliveryFormKind::Unshield => {
+                        root.unshield_forms.get(&key).map(|form| form.estimate_id)
+                    }
+                };
+                if current_id != Some(estimate_id) {
+                    return;
+                }
+                match kind {
+                    DeliveryFormKind::Send => {
+                        root.estimate_send_public_broadcaster_cost_from_form(key, cx);
+                    }
+                    DeliveryFormKind::Unshield => {
+                        root.estimate_unshield_public_broadcaster_cost_from_form(key, cx);
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn clear_pending_public_broadcaster_cost_estimate(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let changed = match kind {
+            DeliveryFormKind::Send => self.send_forms.get_mut(&key).is_some_and(|form| {
+                let changed = form.cost_estimate_pending || form.estimating_cost;
+                form.cost_estimate_pending = false;
+                form.estimating_cost = false;
+                form.estimate_id = 0;
+                changed
+            }),
+            DeliveryFormKind::Unshield => self.unshield_forms.get_mut(&key).is_some_and(|form| {
+                let changed = form.cost_estimate_pending || form.estimating_cost;
+                form.cost_estimate_pending = false;
+                form.estimating_cost = false;
+                form.estimate_id = 0;
+                changed
+            }),
+        };
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn estimate_send_public_broadcaster_cost_from_form(
+        &mut self,
+        key: UnshieldAssetKey,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(form) = self.send_forms.get(&key) else {
+            return;
+        };
+        if form.generating
+            || form.estimating_cost
+            || form.delivery_mode != DeliveryMode::PublicBroadcaster
+        {
+            return;
+        }
+        let asset = form.asset.clone();
+        let recipient = form.recipient_input.read(cx).value().trim().to_string();
+        let amount_raw = form.amount_input.read(cx).value().to_string();
+        let broadcaster_choice = form.broadcaster_choice.clone();
+        let fee_mode = form.broadcaster_fee_mode;
+        if parse_railgun_recipient(recipient.as_str()).is_err() {
+            self.clear_pending_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
+            return;
+        }
+        let amount = match parse_send_amount(amount_raw.as_str(), asset.decimals) {
+            Ok(amount) if !amount.is_zero() => amount,
+            Ok(_) | Err(_) => {
+                self.clear_pending_public_broadcaster_cost_estimate(
+                    DeliveryFormKind::Send,
+                    key,
+                    cx,
+                );
+                return;
+            }
+        };
+        if amount > asset.max_single {
+            self.clear_pending_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
+            return;
+        }
+        let Some(ChainUtxoState::Ready { session, .. }) = self.chain_states.get(&asset.chain_id)
+        else {
+            self.clear_pending_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
+            return;
+        };
+        let session = Arc::clone(session);
+        let fee_rows = self.monitor_fee_rows();
+        let Ok(candidates) =
+            eligible_public_broadcasters_for_asset(&fee_rows, asset.chain_id, asset.token, false)
+        else {
+            self.clear_pending_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
+            return;
+        };
+        let selection = Self::public_broadcaster_selection(&broadcaster_choice);
+        if select_public_broadcaster(&candidates, &selection).is_err() {
+            self.clear_pending_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
+            return;
+        }
+
+        self.cost_estimate_seq = self.cost_estimate_seq.wrapping_add(1);
+        let estimate_id = self.cost_estimate_seq;
+        if let Some(form) = self.send_forms.get_mut(&key) {
+            form.cost_estimate_pending = false;
+            form.estimating_cost = true;
+            form.cost_estimate = None;
+            form.error = None;
+            form.estimate_id = estimate_id;
+        }
+        cx.notify();
+
+        let request = DesktopSendPublicBroadcasterEstimateRequest {
+            chain_id: asset.chain_id,
+            session,
+            token: asset.token,
+            amount,
+            recipient,
+            fee_rows,
+            selection,
+            fee_mode,
+        };
+        let http = self.http.clone();
+        let join = self.runtime.spawn(async move {
+            estimate_desktop_send_public_broadcaster_cost(request, &http).await
+        });
+        cx.spawn(async move |this, cx| {
+            let result = match join.await {
+                Ok(result) => result,
+                Err(error) => Err(eyre::eyre!("send cost estimate task failed: {error}")),
+            };
+            let _ = this.update(cx, |root, cx| {
+                let Some(form) = root.send_forms.get_mut(&key) else {
+                    return;
+                };
+                if form.estimate_id != estimate_id {
+                    return;
+                }
+                form.cost_estimate_pending = false;
+                form.estimating_cost = false;
+                match result {
+                    Ok(estimate) => {
+                        form.error = None;
+                        form.cost_estimate = Some(estimate);
+                    }
+                    Err(error) => {
+                        form.cost_estimate = None;
+                        form.error = Some(Arc::from(error.to_string()));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn monitor_fee_rows(&self) -> Vec<broadcaster_monitor::FeeRow> {
+        self.monitor_state.read().fee_rows()
+    }
+
+    fn public_broadcaster_selection(choice: &BroadcasterChoice) -> PublicBroadcasterSelection {
+        match choice {
+            BroadcasterChoice::Random => PublicBroadcasterSelection::Random,
+            BroadcasterChoice::Specific { railgun_address } => {
+                PublicBroadcasterSelection::Specific {
+                    railgun_address: railgun_address.clone(),
+                }
+            }
+        }
+    }
+
+    fn open_broadcaster_picker(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let form_exists = match kind {
+            DeliveryFormKind::Send => self.send_forms.contains_key(&key),
+            DeliveryFormKind::Unshield => self.unshield_forms.contains_key(&key),
+        };
+        if !form_exists {
+            return;
+        }
+
+        let query_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("search broadcasters"));
+        let focus_handle = cx.focus_handle();
+        cx.subscribe(&query_input, |_this, _input, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        })
+        .detach();
+        self.broadcaster_picker = Some(BroadcasterPickerState {
+            kind,
+            key,
+            query_input,
+            focus_handle,
+            sort: BroadcasterPickerSort::FeeAscReliabilityDesc,
+        });
+        if let Some(picker) = self.broadcaster_picker.as_ref() {
+            picker.query_input.read(cx).focus_handle(cx).focus(window);
+        }
+        cx.notify();
+    }
+
+    fn close_broadcaster_picker(&mut self, cx: &mut Context<'_, Self>) {
+        self.broadcaster_picker = None;
+        cx.notify();
+    }
+
+    fn choose_broadcaster_from_picker(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        railgun_address: String,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let choice = BroadcasterChoice::Specific { railgun_address };
+        match kind {
+            DeliveryFormKind::Send => self.set_send_broadcaster_choice(key, choice, cx),
+            DeliveryFormKind::Unshield => self.set_unshield_broadcaster_choice(key, choice, cx),
+        }
+        self.broadcaster_picker = None;
         cx.notify();
     }
 
@@ -1485,22 +2053,24 @@ impl WalletRoot {
         let recipient_input = form.recipient_input.clone();
         let amount_input = form.amount_input.clone();
         let password_input = form.password_input.clone();
+        let delivery_mode = form.delivery_mode;
+        let broadcaster_choice = form.broadcaster_choice.clone();
+        let broadcaster_fee_mode = form.broadcaster_fee_mode;
 
-        let Some(view_session) = self.view_session.as_ref().cloned() else {
+        let Some(view_session) = self.view_session.clone() else {
             self.set_send_form_error(key, "Unlock the wallet vault before sending", cx);
             return;
         };
-        let Some(vault_store) = self.vault_store.as_ref().cloned() else {
+        let Some(vault_store) = self.vault_store.clone() else {
             self.set_send_form_error(key, "Wallet vault storage is unavailable", cx);
             return;
         };
-        let session = match self.chain_states.get(&asset.chain_id) {
-            Some(ChainUtxoState::Ready { session, .. }) => Arc::clone(session),
-            _ => {
-                self.set_send_form_error(key, "Wait for wallet sync to finish before sending", cx);
-                return;
-            }
+        let Some(ChainUtxoState::Ready { session, .. }) = self.chain_states.get(&asset.chain_id)
+        else {
+            self.set_send_form_error(key, "Wait for wallet sync to finish before sending", cx);
+            return;
         };
+        let session = Arc::clone(session);
         if asset.max_single.is_zero() {
             self.set_send_form_error(key, "No private notes are spendable in one transaction", cx);
             return;
@@ -1536,9 +2106,35 @@ impl WalletRoot {
             return;
         }
 
+        let fee_rows = if delivery_mode == DeliveryMode::PublicBroadcaster {
+            let rows = self.monitor_fee_rows();
+            let candidates = match eligible_public_broadcasters_for_asset(
+                &rows,
+                asset.chain_id,
+                asset.token,
+                false,
+            ) {
+                Ok(candidates) => candidates,
+                Err(error) => {
+                    self.set_send_form_error(key, error.to_string(), cx);
+                    return;
+                }
+            };
+            if let Err(error) = select_public_broadcaster(
+                &candidates,
+                &Self::public_broadcaster_selection(&broadcaster_choice),
+            ) {
+                self.set_send_form_error(key, error.to_string(), cx);
+                return;
+            }
+            rows
+        } else {
+            Vec::new()
+        };
+
         let password_empty = password_input.read(cx).value().trim().is_empty();
         if password_empty {
-            self.set_send_form_error(key, "Enter the vault password to generate calldata", cx);
+            self.set_send_form_error(key, "Enter the vault password to prepare this send", cx);
             return;
         }
         let vault_password = Self::read_and_clear_input(&password_input, window, cx);
@@ -1548,28 +2144,65 @@ impl WalletRoot {
         if let Some(form) = self.send_forms.get_mut(&key) {
             form.generation_id = generation_id;
             form.generating = true;
+            form.cost_estimate_pending = false;
+            form.estimating_cost = false;
+            form.estimate_id = 0;
             form.error = None;
             form.result = None;
         }
         cx.notify();
 
         let http = self.http.clone();
+        let waku = Arc::clone(&self.waku);
         let chain_id = asset.chain_id;
         let token = asset.token;
-        let request = DesktopSendCalldataRequest {
-            chain_id,
-            view_session,
-            session,
-            vault_store,
-            vault_password,
-            token,
-            amount,
-            recipient,
-            verify_proof: true,
+        let join = match delivery_mode {
+            DeliveryMode::ManualCalldata => {
+                let request = DesktopSendCalldataRequest {
+                    chain_id,
+                    view_session,
+                    session,
+                    vault_store,
+                    vault_password,
+                    token,
+                    amount,
+                    recipient,
+                    verify_proof: true,
+                };
+                self.runtime.spawn(async move {
+                    prepare_desktop_send_calldata(request, &http)
+                        .await
+                        .map(SendResult::Manual)
+                })
+            }
+            DeliveryMode::PublicBroadcaster => {
+                let request = DesktopSendPublicBroadcasterRequest {
+                    chain_id,
+                    view_session,
+                    session,
+                    vault_store,
+                    vault_password,
+                    token,
+                    amount,
+                    recipient,
+                    verify_proof: true,
+                    fee_rows,
+                    selection: Self::public_broadcaster_selection(&broadcaster_choice),
+                    fee_mode: broadcaster_fee_mode,
+                    waku,
+                    response_timeout: PUBLIC_BROADCASTER_RESPONSE_TIMEOUT,
+                };
+                self.runtime.spawn(async move {
+                    submit_desktop_send_public_broadcaster(request, &http)
+                        .await
+                        .map(|result| SendResult::PublicBroadcaster(Box::new(result)))
+                })
+            }
+            DeliveryMode::SelfBroadcast => {
+                self.set_send_form_error(key, "Self-broadcast is not available yet", cx);
+                return;
+            }
         };
-        let join = self
-            .runtime
-            .spawn(async move { prepare_desktop_send_calldata(request, &http).await });
         cx.spawn(async move |this, cx| {
             let result = match join.await {
                 Ok(result) => result,
@@ -1587,9 +2220,9 @@ impl WalletRoot {
                 }
                 form.generating = false;
                 match result {
-                    Ok(call) => {
+                    Ok(result) => {
                         form.error = None;
-                        form.result = Some(call);
+                        form.result = Some(result);
                     }
                     Err(error) => {
                         form.result = None;
@@ -1610,6 +2243,9 @@ impl WalletRoot {
     ) {
         if let Some(form) = self.send_forms.get_mut(&key) {
             form.generating = false;
+            form.cost_estimate_pending = false;
+            form.estimating_cost = false;
+            form.estimate_id = 0;
             form.result = None;
             form.error = Some(message.into());
             cx.notify();
@@ -1651,6 +2287,34 @@ impl WalletRoot {
             },
         )
         .detach();
+        cx.subscribe(
+            &recipient_input,
+            move |this, _input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.clear_unshield_form_prepared_output(key, cx);
+                    this.schedule_public_broadcaster_cost_estimate(
+                        DeliveryFormKind::Unshield,
+                        key,
+                        cx,
+                    );
+                }
+            },
+        )
+        .detach();
+        cx.subscribe(
+            &amount_input,
+            move |this, _input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.clear_unshield_form_prepared_output(key, cx);
+                    this.schedule_public_broadcaster_cost_estimate(
+                        DeliveryFormKind::Unshield,
+                        key,
+                        cx,
+                    );
+                }
+            },
+        )
+        .detach();
         self.unshield_forms.insert(
             key,
             UnshieldFormState {
@@ -1659,6 +2323,13 @@ impl WalletRoot {
                 amount_input,
                 password_input,
                 unwrap: false,
+                delivery_mode: DeliveryMode::ManualCalldata,
+                broadcaster_choice: BroadcasterChoice::Random,
+                broadcaster_fee_mode: PublicBroadcasterFeeMode::DeductFromAmount,
+                cost_estimate_pending: false,
+                estimating_cost: false,
+                cost_estimate: None,
+                estimate_id: 0,
                 generating: false,
                 error: None,
                 result: None,
@@ -1667,8 +2338,13 @@ impl WalletRoot {
         cx.notify();
     }
 
-    fn unshield_form_is_dirty(form: &UnshieldFormState, cx: &mut Context<'_, Self>) -> bool {
-        if form.generating || form.unwrap || form.error.is_some() || form.result.is_some() {
+    fn unshield_form_is_dirty(form: &UnshieldFormState, cx: &Context<'_, Self>) -> bool {
+        if form.generating
+            || form.unwrap
+            || form.error.is_some()
+            || form.result.is_some()
+            || form.cost_estimate.is_some()
+        {
             return true;
         }
         if !form.recipient_input.read(cx).value().trim().is_empty() {
@@ -1693,7 +2369,264 @@ impl WalletRoot {
         form.unwrap = !form.unwrap;
         form.error = None;
         form.result = None;
+        form.cost_estimate = None;
+        form.estimate_id = 0;
+        form.cost_estimate_pending = false;
+        form.estimating_cost = false;
         cx.notify();
+        self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
+    }
+
+    fn set_unshield_broadcaster_fee_mode(
+        &mut self,
+        key: UnshieldAssetKey,
+        fee_mode: PublicBroadcasterFeeMode,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(form) = self.unshield_forms.get_mut(&key) else {
+            return;
+        };
+        if form.generating || form.broadcaster_fee_mode == fee_mode {
+            return;
+        }
+        let old_max =
+            unshield_form_max_entered_amount(form, form.delivery_mode, form.broadcaster_fee_mode);
+        let new_max = unshield_form_max_entered_amount(form, form.delivery_mode, fee_mode);
+        apply_amount_adjustment_for_max_change(
+            &form.amount_input,
+            &form.asset,
+            old_max,
+            new_max,
+            window,
+            cx,
+        );
+        form.broadcaster_fee_mode = fee_mode;
+        form.error = None;
+        form.result = None;
+        form.cost_estimate = None;
+        form.estimate_id = 0;
+        form.cost_estimate_pending = false;
+        form.estimating_cost = false;
+        cx.notify();
+        self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
+    }
+
+    fn clear_unshield_form_prepared_output(
+        &mut self,
+        key: UnshieldAssetKey,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(form) = self.unshield_forms.get_mut(&key) else {
+            return;
+        };
+        if form.generating
+            || (form.result.is_none() && form.error.is_none() && form.cost_estimate.is_none())
+        {
+            return;
+        }
+        form.result = None;
+        form.error = None;
+        form.cost_estimate = None;
+        form.estimate_id = 0;
+        form.cost_estimate_pending = false;
+        form.estimating_cost = false;
+        cx.notify();
+        self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
+    }
+
+    fn set_unshield_delivery_mode(
+        &mut self,
+        key: UnshieldAssetKey,
+        mode: DeliveryMode,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(form) = self.unshield_forms.get_mut(&key) else {
+            return;
+        };
+        if form.generating || form.delivery_mode == mode || mode == DeliveryMode::SelfBroadcast {
+            return;
+        }
+        let old_max =
+            unshield_form_max_entered_amount(form, form.delivery_mode, form.broadcaster_fee_mode);
+        let new_max = unshield_form_max_entered_amount(form, mode, form.broadcaster_fee_mode);
+        let adjusted = apply_amount_adjustment_for_max_change(
+            &form.amount_input,
+            &form.asset,
+            old_max,
+            new_max,
+            window,
+            cx,
+        );
+        form.delivery_mode = mode;
+        form.error = None;
+        form.result = None;
+        if mode == DeliveryMode::PublicBroadcaster || adjusted {
+            form.cost_estimate = None;
+        }
+        form.estimate_id = 0;
+        form.cost_estimate_pending = false;
+        form.estimating_cost = false;
+        cx.notify();
+        self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
+    }
+
+    fn set_unshield_broadcaster_choice(
+        &mut self,
+        key: UnshieldAssetKey,
+        choice: BroadcasterChoice,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(form) = self.unshield_forms.get_mut(&key) else {
+            return;
+        };
+        if form.generating || form.broadcaster_choice == choice {
+            return;
+        }
+        form.broadcaster_choice = choice;
+        form.error = None;
+        form.result = None;
+        form.cost_estimate = None;
+        form.estimate_id = 0;
+        form.cost_estimate_pending = false;
+        form.estimating_cost = false;
+        cx.notify();
+        self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
+    }
+
+    fn estimate_unshield_public_broadcaster_cost_from_form(
+        &mut self,
+        key: UnshieldAssetKey,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(form) = self.unshield_forms.get(&key) else {
+            return;
+        };
+        if form.generating
+            || form.estimating_cost
+            || form.delivery_mode != DeliveryMode::PublicBroadcaster
+        {
+            return;
+        }
+        let asset = form.asset.clone();
+        let unwrap = form.unwrap;
+        let recipient_raw = form.recipient_input.read(cx).value().to_string();
+        let amount_raw = form.amount_input.read(cx).value().to_string();
+        let broadcaster_choice = form.broadcaster_choice.clone();
+        let fee_mode = form.broadcaster_fee_mode;
+        let Ok(recipient) = recipient_raw.trim().parse::<Address>() else {
+            self.clear_pending_public_broadcaster_cost_estimate(
+                DeliveryFormKind::Unshield,
+                key,
+                cx,
+            );
+            return;
+        };
+        let amount = match parse_unshield_amount(amount_raw.as_str(), asset.decimals) {
+            Ok(amount) if !amount.is_zero() => amount,
+            Ok(_) | Err(_) => {
+                self.clear_pending_public_broadcaster_cost_estimate(
+                    DeliveryFormKind::Unshield,
+                    key,
+                    cx,
+                );
+                return;
+            }
+        };
+        if amount > asset.max_single {
+            self.clear_pending_public_broadcaster_cost_estimate(
+                DeliveryFormKind::Unshield,
+                key,
+                cx,
+            );
+            return;
+        }
+        let Some(ChainUtxoState::Ready { session, .. }) = self.chain_states.get(&asset.chain_id)
+        else {
+            self.clear_pending_public_broadcaster_cost_estimate(
+                DeliveryFormKind::Unshield,
+                key,
+                cx,
+            );
+            return;
+        };
+        let session = Arc::clone(session);
+        let fee_rows = self.monitor_fee_rows();
+        let Ok(candidates) =
+            eligible_public_broadcasters_for_asset(&fee_rows, asset.chain_id, asset.token, unwrap)
+        else {
+            self.clear_pending_public_broadcaster_cost_estimate(
+                DeliveryFormKind::Unshield,
+                key,
+                cx,
+            );
+            return;
+        };
+        let selection = Self::public_broadcaster_selection(&broadcaster_choice);
+        if select_public_broadcaster(&candidates, &selection).is_err() {
+            self.clear_pending_public_broadcaster_cost_estimate(
+                DeliveryFormKind::Unshield,
+                key,
+                cx,
+            );
+            return;
+        }
+
+        self.cost_estimate_seq = self.cost_estimate_seq.wrapping_add(1);
+        let estimate_id = self.cost_estimate_seq;
+        if let Some(form) = self.unshield_forms.get_mut(&key) {
+            form.cost_estimate_pending = false;
+            form.estimating_cost = true;
+            form.cost_estimate = None;
+            form.error = None;
+            form.estimate_id = estimate_id;
+        }
+        cx.notify();
+
+        let request = DesktopUnshieldPublicBroadcasterEstimateRequest {
+            chain_id: asset.chain_id,
+            session,
+            token: asset.token,
+            amount,
+            recipient,
+            unwrap,
+            fee_rows,
+            selection,
+            fee_mode,
+        };
+        let http = self.http.clone();
+        let join = self.runtime.spawn(async move {
+            estimate_desktop_unshield_public_broadcaster_cost(request, &http).await
+        });
+        cx.spawn(async move |this, cx| {
+            let result = match join.await {
+                Ok(result) => result,
+                Err(error) => Err(eyre::eyre!("unshield cost estimate task failed: {error}")),
+            };
+            let _ = this.update(cx, |root, cx| {
+                let Some(form) = root.unshield_forms.get_mut(&key) else {
+                    return;
+                };
+                if form.estimate_id != estimate_id {
+                    return;
+                }
+                form.cost_estimate_pending = false;
+                form.estimating_cost = false;
+                match result {
+                    Ok(estimate) => {
+                        form.error = None;
+                        form.cost_estimate = Some(estimate);
+                    }
+                    Err(error) => {
+                        form.cost_estimate = None;
+                        form.error = Some(Arc::from(error.to_string()));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn generate_unshield_calldata_from_form(
@@ -1713,26 +2646,28 @@ impl WalletRoot {
         let recipient_input = form.recipient_input.clone();
         let amount_input = form.amount_input.clone();
         let password_input = form.password_input.clone();
+        let delivery_mode = form.delivery_mode;
+        let broadcaster_choice = form.broadcaster_choice.clone();
+        let broadcaster_fee_mode = form.broadcaster_fee_mode;
 
-        let Some(view_session) = self.view_session.as_ref().cloned() else {
+        let Some(view_session) = self.view_session.clone() else {
             self.set_unshield_form_error(key, "Unlock the wallet vault before unshielding", cx);
             return;
         };
-        let Some(vault_store) = self.vault_store.as_ref().cloned() else {
+        let Some(vault_store) = self.vault_store.clone() else {
             self.set_unshield_form_error(key, "Wallet vault storage is unavailable", cx);
             return;
         };
-        let session = match self.chain_states.get(&asset.chain_id) {
-            Some(ChainUtxoState::Ready { session, .. }) => Arc::clone(session),
-            _ => {
-                self.set_unshield_form_error(
-                    key,
-                    "Wait for wallet sync to finish before unshielding",
-                    cx,
-                );
-                return;
-            }
+        let Some(ChainUtxoState::Ready { session, .. }) = self.chain_states.get(&asset.chain_id)
+        else {
+            self.set_unshield_form_error(
+                key,
+                "Wait for wallet sync to finish before unshielding",
+                cx,
+            );
+            return;
         };
+        let session = Arc::clone(session);
         if asset.max_single.is_zero() {
             self.set_unshield_form_error(
                 key,
@@ -1771,38 +2706,106 @@ impl WalletRoot {
             return;
         }
 
+        let fee_rows = if delivery_mode == DeliveryMode::PublicBroadcaster {
+            let rows = self.monitor_fee_rows();
+            let candidates = match eligible_public_broadcasters_for_asset(
+                &rows,
+                asset.chain_id,
+                asset.token,
+                unwrap,
+            ) {
+                Ok(candidates) => candidates,
+                Err(error) => {
+                    self.set_unshield_form_error(key, error.to_string(), cx);
+                    return;
+                }
+            };
+            if let Err(error) = select_public_broadcaster(
+                &candidates,
+                &Self::public_broadcaster_selection(&broadcaster_choice),
+            ) {
+                self.set_unshield_form_error(key, error.to_string(), cx);
+                return;
+            }
+            rows
+        } else {
+            Vec::new()
+        };
+
         let password_empty = password_input.read(cx).value().trim().is_empty();
         if password_empty {
-            self.set_unshield_form_error(key, "Enter the vault password to generate calldata", cx);
+            self.set_unshield_form_error(
+                key,
+                "Enter the vault password to prepare this unshield",
+                cx,
+            );
             return;
         }
         let vault_password = Self::read_and_clear_input(&password_input, window, cx);
 
         if let Some(form) = self.unshield_forms.get_mut(&key) {
             form.generating = true;
+            form.cost_estimate_pending = false;
+            form.estimating_cost = false;
+            form.estimate_id = 0;
             form.error = None;
             form.result = None;
         }
         cx.notify();
 
         let http = self.http.clone();
+        let waku = Arc::clone(&self.waku);
         let chain_id = asset.chain_id;
         let token = asset.token;
-        let request = DesktopUnshieldCalldataRequest {
-            chain_id,
-            view_session,
-            session,
-            vault_store,
-            vault_password,
-            token,
-            amount,
-            recipient,
-            unwrap,
-            verify_proof: true,
+        let join = match delivery_mode {
+            DeliveryMode::ManualCalldata => {
+                let request = DesktopUnshieldCalldataRequest {
+                    chain_id,
+                    view_session,
+                    session,
+                    vault_store,
+                    vault_password,
+                    token,
+                    amount,
+                    recipient,
+                    unwrap,
+                    verify_proof: true,
+                };
+                self.runtime.spawn(async move {
+                    prepare_desktop_unshield_calldata(request, &http)
+                        .await
+                        .map(UnshieldResult::Manual)
+                })
+            }
+            DeliveryMode::PublicBroadcaster => {
+                let request = DesktopUnshieldPublicBroadcasterRequest {
+                    chain_id,
+                    view_session,
+                    session,
+                    vault_store,
+                    vault_password,
+                    token,
+                    amount,
+                    recipient,
+                    unwrap,
+                    verify_proof: true,
+                    fee_rows,
+                    selection: Self::public_broadcaster_selection(&broadcaster_choice),
+                    fee_mode: broadcaster_fee_mode,
+                    waku,
+                    response_timeout: PUBLIC_BROADCASTER_RESPONSE_TIMEOUT,
+                };
+                self.runtime.spawn(async move {
+                    submit_desktop_unshield_public_broadcaster(request, &http)
+                        .await
+                        .map(|result| UnshieldResult::PublicBroadcaster(Box::new(result)))
+                })
+            }
+            DeliveryMode::SelfBroadcast => {
+                self.set_unshield_form_error(key, "Self-broadcast is not available yet", cx);
+                return;
+            }
         };
-        let join = self
-            .runtime
-            .spawn(async move { prepare_desktop_unshield_calldata(request, &http).await });
         cx.spawn(async move |this, cx| {
             let result = match join.await {
                 Ok(result) => result,
@@ -1817,9 +2820,9 @@ impl WalletRoot {
                 }
                 form.generating = false;
                 match result {
-                    Ok(call) => {
+                    Ok(result) => {
                         form.error = None;
-                        form.result = Some(call);
+                        form.result = Some(result);
                     }
                     Err(error) => {
                         form.result = None;
@@ -1840,6 +2843,9 @@ impl WalletRoot {
     ) {
         if let Some(form) = self.unshield_forms.get_mut(&key) {
             form.generating = false;
+            form.cost_estimate_pending = false;
+            form.estimating_cost = false;
+            form.estimate_id = 0;
             form.result = None;
             form.error = Some(message.into());
             cx.notify();
@@ -2591,7 +3597,7 @@ impl WalletRoot {
                             self.render_unshield_form(root.clone(), key)
                                 .into_any_element()
                         } else {
-                            self.render_private_asset_row(
+                            Self::render_private_asset_row(
                                 root.clone(),
                                 ix,
                                 asset,
@@ -2606,7 +3612,6 @@ impl WalletRoot {
     }
 
     fn render_private_asset_row(
-        &self,
         root: Entity<Self>,
         ix: usize,
         asset: FormattedTokenTotal,
@@ -2681,6 +3686,7 @@ impl WalletRoot {
                         )
                         .xsmall()
                         .outline()
+                        .p(px(12.0))
                         .disabled(!can_send)
                         .opacity(send_opacity)
                         .tooltip(send_tooltip)
@@ -2700,6 +3706,7 @@ impl WalletRoot {
                         )
                         .xsmall()
                         .outline()
+                        .p(px(12.0))
                         .disabled(!can_unshield)
                         .opacity(unshield_opacity)
                         .tooltip(unshield_tooltip)
@@ -2727,7 +3734,15 @@ impl WalletRoot {
         } else {
             "Raw base units for this unknown token".to_string()
         };
+        let description = if form.delivery_mode == DeliveryMode::PublicBroadcaster {
+            "Submit a private transfer through a public broadcaster."
+        } else {
+            "Generate calldata for a private transfer to another 0zk address."
+        };
 
+        let delivery_root = root.clone();
+        let chooser_root = root.clone();
+        let fee_mode_root = root.clone();
         let submit_root = root.clone();
         let cancel_root = root;
 
@@ -2762,9 +3777,7 @@ impl WalletRoot {
                                         asset.icon_path.clone(),
                                     )),
                             )
-                            .child(app_muted_text(
-                                "Generate calldata for a private transfer to another 0zk address.",
-                            )),
+                            .child(app_muted_text(description)),
                     )
                     .child(
                         app_button(send_element_id(key, "cancel"), "Cancel")
@@ -2799,6 +3812,38 @@ impl WalletRoot {
                     .text_size(APP_TEXT_SIZE)
                     .child("Balance is split across private notes. One send can spend only a limited number of notes."),
             );
+        }
+
+        card = card.child(render_delivery_selector(
+            delivery_root,
+            key,
+            DeliveryFormKind::Send,
+            form.delivery_mode,
+            form.generating,
+        ));
+        if form.delivery_mode == DeliveryMode::PublicBroadcaster {
+            let candidates = eligible_public_broadcasters_for_asset(
+                &self.monitor_fee_rows(),
+                asset.chain_id,
+                asset.token,
+                false,
+            )
+            .unwrap_or_default();
+            card = card.child(render_broadcaster_chooser(
+                chooser_root,
+                key,
+                DeliveryFormKind::Send,
+                &form.broadcaster_choice,
+                candidates,
+                form.generating,
+            ));
+            card = card.child(render_broadcaster_fee_mode_toggle(
+                fee_mode_root,
+                key,
+                DeliveryFormKind::Send,
+                form.broadcaster_fee_mode,
+                form.generating,
+            ));
         }
 
         card = card
@@ -2845,13 +3890,16 @@ impl WalletRoot {
                         app_button(
                             send_element_id(key, "generate"),
                             if form.generating {
-                                "Generating..."
+                                "Preparing..."
+                            } else if form.delivery_mode == DeliveryMode::PublicBroadcaster {
+                                "Submit via broadcaster"
                             } else {
                                 "Generate calldata"
                             },
                         )
                         .primary()
                         .xsmall()
+                        .p(px(12.0))
                         .loading(form.generating)
                         .disabled(form.generating)
                         .on_click(move |_event, window, cx| {
@@ -2861,6 +3909,16 @@ impl WalletRoot {
                         }),
                     ),
             );
+
+        if form.delivery_mode == DeliveryMode::PublicBroadcaster {
+            if form.cost_estimate_pending || form.estimating_cost {
+                card = card.child(render_public_broadcaster_cost_estimating(
+                    self.unshield_spinner_tick,
+                ));
+            } else if let Some(estimate) = form.cost_estimate.as_ref() {
+                card = card.child(render_public_broadcaster_cost_estimate(asset, estimate));
+            }
+        }
 
         if form.generating {
             card = card.child(render_unshield_generating_status(
@@ -2878,12 +3936,19 @@ impl WalletRoot {
                     .border_color(rgb(theme::DANGER))
                     .text_color(rgb(theme::DANGER))
                     .text_size(APP_TEXT_SIZE)
-                    .child(SharedString::from(error.to_string())),
+                    .child(SharedString::from(format_form_error_for_asset(
+                        error, asset,
+                    ))),
             );
         }
 
         if let Some(result) = form.result.as_ref() {
-            card = card.child(render_send_result(key, result));
+            card = card.child(match result {
+                SendResult::Manual(result) => render_send_result(key, result),
+                SendResult::PublicBroadcaster(result) => {
+                    render_public_broadcaster_result(key, DeliveryFormKind::Send, result)
+                }
+            });
         }
 
         card
@@ -2902,7 +3967,15 @@ impl WalletRoot {
         } else {
             "Raw base units for this unknown token".to_string()
         };
+        let description = if form.delivery_mode == DeliveryMode::PublicBroadcaster {
+            "Submit an unshield transaction through a public broadcaster."
+        } else {
+            "Generate calldata only. This does not submit a public transaction."
+        };
 
+        let delivery_root = root.clone();
+        let chooser_root = root.clone();
+        let fee_mode_root = root.clone();
         let submit_root = root.clone();
         let cancel_root = root.clone();
         let toggle_root = root;
@@ -2938,9 +4011,7 @@ impl WalletRoot {
                                         asset.icon_path.clone(),
                                     )),
                             )
-                            .child(app_muted_text(
-                                "Generate calldata only. This does not submit a public transaction.",
-                            )),
+                            .child(app_muted_text(description)),
                     )
                     .child(
                         app_button(unshield_element_id(key, "cancel"), "Cancel")
@@ -2975,6 +4046,38 @@ impl WalletRoot {
                     .text_size(APP_TEXT_SIZE)
                     .child("Balance is split across private notes. One unshield can spend only a limited number of notes."),
             );
+        }
+
+        card = card.child(render_delivery_selector(
+            delivery_root,
+            key,
+            DeliveryFormKind::Unshield,
+            form.delivery_mode,
+            form.generating,
+        ));
+        if form.delivery_mode == DeliveryMode::PublicBroadcaster {
+            let candidates = eligible_public_broadcasters_for_asset(
+                &self.monitor_fee_rows(),
+                asset.chain_id,
+                asset.token,
+                form.unwrap,
+            )
+            .unwrap_or_default();
+            card = card.child(render_broadcaster_chooser(
+                chooser_root,
+                key,
+                DeliveryFormKind::Unshield,
+                &form.broadcaster_choice,
+                candidates,
+                form.generating,
+            ));
+            card = card.child(render_broadcaster_fee_mode_toggle(
+                fee_mode_root,
+                key,
+                DeliveryFormKind::Unshield,
+                form.broadcaster_fee_mode,
+                form.generating,
+            ));
         }
 
         card = card
@@ -3021,8 +4124,9 @@ impl WalletRoot {
                         app_button(unshield_element_id(key, "unwrap"), "Unwrap to native")
                             .xsmall()
                             .outline()
+                            .p(px(12.0))
                             .disabled(form.generating)
-                            .when(form.unwrap, |button| button.primary())
+                            .when(form.unwrap, ButtonVariants::primary)
                             .on_click(move |_event, _window, cx| {
                                 toggle_root.update(cx, |root, cx| {
                                     root.toggle_unshield_unwrap(key, cx);
@@ -3033,13 +4137,16 @@ impl WalletRoot {
                         app_button(
                             unshield_element_id(key, "generate"),
                             if form.generating {
-                                "Generating..."
+                                "Preparing..."
+                            } else if form.delivery_mode == DeliveryMode::PublicBroadcaster {
+                                "Submit via broadcaster"
                             } else {
                                 "Generate calldata"
                             },
                         )
                         .primary()
                         .xsmall()
+                        .p(px(12.0))
                         .loading(form.generating)
                         .disabled(form.generating)
                         .on_click(move |_event, window, cx| {
@@ -3049,6 +4156,16 @@ impl WalletRoot {
                         }),
                     ),
             );
+
+        if form.delivery_mode == DeliveryMode::PublicBroadcaster {
+            if form.cost_estimate_pending || form.estimating_cost {
+                card = card.child(render_public_broadcaster_cost_estimating(
+                    self.unshield_spinner_tick,
+                ));
+            } else if let Some(estimate) = form.cost_estimate.as_ref() {
+                card = card.child(render_public_broadcaster_cost_estimate(asset, estimate));
+            }
+        }
 
         if form.generating {
             card = card.child(render_unshield_generating_status(
@@ -3066,12 +4183,19 @@ impl WalletRoot {
                     .border_color(rgb(theme::DANGER))
                     .text_color(rgb(theme::DANGER))
                     .text_size(APP_TEXT_SIZE)
-                    .child(SharedString::from(error.to_string())),
+                    .child(SharedString::from(format_form_error_for_asset(
+                        error, asset,
+                    ))),
             );
         }
 
         if let Some(result) = form.result.as_ref() {
-            card = card.child(render_unshield_result(key, result));
+            card = card.child(match result {
+                UnshieldResult::Manual(result) => render_unshield_result(key, result),
+                UnshieldResult::PublicBroadcaster(result) => {
+                    render_public_broadcaster_result(key, DeliveryFormKind::Unshield, result)
+                }
+            });
         }
 
         card
@@ -3296,6 +4420,17 @@ impl WalletRoot {
         self.navigate_utxo_table(UtxoNavigation::End, cx);
     }
 
+    fn on_action_close_broadcaster_picker(
+        &mut self,
+        _: &CloseBroadcasterPicker,
+        _: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.broadcaster_picker.is_some() {
+            self.close_broadcaster_picker(cx);
+        }
+    }
+
     fn navigate_utxo_table(&self, navigation: UtxoNavigation, cx: &mut Context<'_, Self>) {
         if !should_focus_utxo_table(
             self.active_activity,
@@ -3391,10 +4526,260 @@ impl WalletRoot {
                     .child(self.logs.clone()),
             )
     }
+
+    fn render_broadcaster_picker_modal(
+        &self,
+        root: &Entity<Self>,
+        window: &Window,
+        cx: &Context<'_, Self>,
+    ) -> gpui::Div {
+        let Some(picker) = self.broadcaster_picker.as_ref() else {
+            return div();
+        };
+        let Some((asset_label, chain_id, token, unwrap, current_choice, generating)) =
+            (match picker.kind {
+                DeliveryFormKind::Send => self.send_forms.get(&picker.key).map(|form| {
+                    (
+                        form.asset.label.clone(),
+                        form.asset.chain_id,
+                        form.asset.token,
+                        false,
+                        form.broadcaster_choice.clone(),
+                        form.generating,
+                    )
+                }),
+                DeliveryFormKind::Unshield => self.unshield_forms.get(&picker.key).map(|form| {
+                    (
+                        form.asset.label.clone(),
+                        form.asset.chain_id,
+                        form.asset.token,
+                        form.unwrap,
+                        form.broadcaster_choice.clone(),
+                        form.generating,
+                    )
+                }),
+            })
+        else {
+            return div();
+        };
+        let query = picker
+            .query_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_ascii_lowercase();
+        let chain_label = chain_name(chain_id).map_or_else(|| chain_id.to_string(), str::to_owned);
+        let mut candidates = eligible_public_broadcasters_for_asset(
+            &self.monitor_fee_rows(),
+            chain_id,
+            token,
+            unwrap,
+        )
+        .unwrap_or_default();
+        match picker.sort {
+            BroadcasterPickerSort::FeeAscReliabilityDesc => {
+                candidates = sort_specific_public_broadcasters(candidates);
+            }
+        }
+        let total_count = candidates.len();
+        let candidates: Vec<_> = candidates
+            .into_iter()
+            .filter(|candidate| broadcaster_candidate_matches_query(candidate, &query))
+            .collect();
+        let filtered_count = candidates.len();
+        let close_root = root.clone();
+        let modal_action_root = root.clone();
+        let modal_focus = picker.focus_handle.clone();
+        let rows_focus = picker.focus_handle.clone();
+        let sort_focus = picker.focus_handle.clone();
+        let max_height = (window.viewport_size().height * 0.82).min(BROADCASTER_PICKER_MAX_HEIGHT);
+
+        let mut rows = div()
+            .flex_1()
+            .min_h(px(0.0))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .on_mouse_down(MouseButton::Left, move |_event, window, _cx| {
+                rows_focus.focus(window);
+            })
+            .overflow_y_scrollbar();
+
+        if candidates.is_empty() {
+            rows = rows.child(
+                div()
+                    .p(px(16.0))
+                    .rounded_md()
+                    .bg(rgb(theme::SURFACE))
+                    .border_1()
+                    .border_color(rgb(theme::BORDER))
+                    .child(app_muted_text(if total_count == 0 {
+                        "No eligible broadcaster currently advertises this token."
+                    } else {
+                        "No broadcasters match this search."
+                    })),
+            );
+        } else {
+            for candidate in candidates {
+                let candidate_root = root.clone();
+                let railgun_address = candidate.railgun_address.clone();
+                let selected = matches!(
+                    current_choice,
+                    BroadcasterChoice::Specific { railgun_address: ref selected } if selected == &railgun_address
+                );
+                let kind = picker.kind;
+                let key = picker.key;
+                rows = rows.child(
+                    div()
+                        .id(delivery_element_id(
+                            key,
+                            kind,
+                            &format!(
+                                "modal-{}",
+                                stable_broadcaster_element_suffix(&railgun_address)
+                            ),
+                        ))
+                        .w_full()
+                        .min_h(px(58.0))
+                        .p(px(10.0))
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(if selected {
+                            theme::SUCCESS
+                        } else {
+                            theme::BORDER
+                        }))
+                        .bg(rgb(if selected {
+                            theme::SELECTED_SURFACE
+                        } else {
+                            theme::SURFACE
+                        }))
+                        .when(!generating, |row| {
+                            row.cursor_pointer()
+                                .hover(|row| row.bg(rgb(theme::SURFACE_HOVER)))
+                        })
+                        .child(render_broadcaster_picker_row(&candidate, selected))
+                        .on_click(move |_event, _window, cx| {
+                            if generating {
+                                return;
+                            }
+                            candidate_root.update(cx, |root, cx| {
+                                root.choose_broadcaster_from_picker(
+                                    kind,
+                                    key,
+                                    railgun_address.clone(),
+                                    cx,
+                                );
+                            });
+                        }),
+                );
+            }
+        }
+
+        div()
+            .absolute()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .p(px(24.0))
+            .bg(rgb(theme::BACKGROUND))
+            .child(
+                div()
+                    .w(px(760.0))
+                    .max_w_full()
+                    .max_h(max_height)
+                    .tab_group()
+                    .key_context(BROADCASTER_PICKER_KEY_CONTEXT)
+                    .track_focus(&modal_focus)
+                    .on_action(window.listener_for(
+                        &modal_action_root,
+                        Self::on_action_close_broadcaster_picker,
+                    ))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .p(px(18.0))
+                    .rounded_lg()
+                    .bg(rgb(theme::SURFACE_ELEVATED))
+                    .border_1()
+                    .border_color(rgb(theme::BORDER_STRONG))
+                    .child(
+                        div()
+                            .flex()
+                            .items_start()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(app_strong_text("Choose public broadcaster"))
+                                    .child(app_muted_text(format!(
+                                        "{asset_label} on {chain_label}. Specific selection is optional; random remains available."
+                                    ))),
+                            )
+                            .child(
+                                app_button("broadcaster-picker-close", "Close")
+                                    .ghost()
+                                    .xsmall()
+                                    .on_click(move |_event, _window, cx| {
+                                        close_root.update(cx, |root, cx| {
+                                            root.close_broadcaster_picker(cx);
+                                        });
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_end()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(app_muted_text("Search"))
+                                    .child(app_input(&picker.query_input).disabled(generating)),
+                            )
+                            .child(
+                                div()
+                                    .w(px(210.0))
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(app_muted_text("Sort"))
+                                    .child(
+                                        div()
+                                            .p(px(9.0))
+                                            .rounded_md()
+                                            .bg(rgb(theme::SURFACE))
+                                            .border_1()
+                                            .border_color(rgb(theme::BORDER))
+                                            .on_mouse_down(MouseButton::Left, move |_event, window, _cx| {
+                                                sort_focus.focus(window);
+                                            })
+                                            .text_color(rgb(theme::TEXT_MUTED))
+                                            .child("Fee asc, reliability desc"),
+                                    ),
+                            ),
+                    )
+                    .child(app_muted_text(format!(
+                        "Showing {filtered_count} of {total_count} eligible broadcasters"
+                    )))
+                    .child(rows),
+            )
+    }
 }
 
 impl Render for WalletRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        self.apply_public_broadcaster_error_amount_adjustments(window, cx);
         self.focus_unlock_password_if_requested(window, cx);
         self.focus_utxo_table_if_requested(window, cx);
 
@@ -3419,6 +4804,7 @@ impl Render for WalletRoot {
             .text_color(rgb(theme::TEXT))
             .font_family(APP_FONT_FAMILY)
             .text_size(APP_TEXT_SIZE)
+            .on_action(window.listener_for(&root, Self::on_action_close_broadcaster_picker))
             .child(self.render_activity_rail(root.clone()))
             .child(
                 div()
@@ -3427,6 +4813,11 @@ impl Render for WalletRoot {
                     .min_w(px(0.0))
                     .min_h(px(0.0))
                     .child(self.render_workspace(root, window)),
+            )
+            .children(
+                self.broadcaster_picker
+                    .as_ref()
+                    .map(|_| self.render_broadcaster_picker_modal(&cx.entity(), window, cx)),
             )
             .children(Root::render_notification_layer(window, cx))
     }
@@ -3952,6 +5343,345 @@ fn unshield_element_id(key: UnshieldAssetKey, action: &str) -> SharedString {
     ))
 }
 
+fn delivery_element_id(
+    key: UnshieldAssetKey,
+    kind: DeliveryFormKind,
+    action: &str,
+) -> SharedString {
+    match kind {
+        DeliveryFormKind::Send => send_element_id(key, action),
+        DeliveryFormKind::Unshield => unshield_element_id(key, action),
+    }
+}
+
+fn selected_broadcaster_label(
+    choice: &BroadcasterChoice,
+    candidates: &[PublicBroadcasterCandidate],
+) -> String {
+    let BroadcasterChoice::Specific { railgun_address } = choice else {
+        return "Choose specific broadcaster".to_string();
+    };
+    candidates
+        .iter()
+        .find(|candidate| candidate.railgun_address == *railgun_address)
+        .map_or_else(
+            || "Specific broadcaster unavailable".to_string(),
+            |candidate| {
+                format!(
+                    "{} · fee {} · rel {:.0}%",
+                    broadcaster_candidate_label(candidate),
+                    broadcaster_candidate_fee_label(candidate),
+                    candidate.reliability * 100.0
+                )
+            },
+        )
+}
+
+const fn stable_broadcaster_element_suffix(railgun_address: &str) -> &str {
+    railgun_address
+}
+
+fn broadcaster_candidate_label(candidate: &PublicBroadcasterCandidate) -> String {
+    format_broadcaster_address_label(&candidate.railgun_address, candidate.identifier.as_deref())
+}
+
+fn broadcaster_candidate_fee_label(candidate: &PublicBroadcasterCandidate) -> String {
+    lookup_token(candidate.chain_id, &candidate.token).map_or_else(
+        || candidate.fee.to_string(),
+        |info| format_token_amount(candidate.fee, info.decimals),
+    )
+}
+
+fn format_exact_candidate_token_amount(
+    candidate: &PublicBroadcasterCandidate,
+    amount: U256,
+) -> String {
+    lookup_token(candidate.chain_id, &candidate.token).map_or_else(
+        || format!("{amount} raw token units"),
+        |info| {
+            format!(
+                "{} {}",
+                format_send_amount_input(amount, Some(info.decimals)),
+                info.symbol
+            )
+        },
+    )
+}
+
+fn format_exact_asset_amount_for_display(amount: U256, asset: &UnshieldAsset) -> String {
+    asset.decimals.map_or_else(
+        || format!("{amount} raw token units"),
+        |decimals| {
+            format!(
+                "{} {}",
+                format_send_amount_input(amount, Some(decimals)),
+                asset.label
+            )
+        },
+    )
+}
+
+fn should_show_distinct_amount(entered_amount: U256, amount: U256) -> bool {
+    amount != entered_amount
+}
+
+fn public_broadcaster_max_entered_amount_for_mode(
+    max_receiver_amount: U256,
+    fee_amount: U256,
+    fee_mode: PublicBroadcasterFeeMode,
+) -> U256 {
+    match fee_mode {
+        PublicBroadcasterFeeMode::DeductFromAmount => max_receiver_amount + fee_amount,
+        PublicBroadcasterFeeMode::AddToAmount => max_receiver_amount,
+    }
+}
+
+fn cost_estimate_max_entered_amount_for_mode(
+    estimate: &PublicBroadcasterCostEstimate,
+    fee_mode: PublicBroadcasterFeeMode,
+) -> U256 {
+    public_broadcaster_max_entered_amount_for_mode(
+        estimate.max_receiver_amount,
+        estimate.fee_amount,
+        fee_mode,
+    )
+}
+
+fn send_form_max_entered_amount(
+    form: &SendFormState,
+    delivery_mode: DeliveryMode,
+    fee_mode: PublicBroadcasterFeeMode,
+) -> Option<U256> {
+    match delivery_mode {
+        DeliveryMode::ManualCalldata => Some(form.asset.max_single),
+        DeliveryMode::PublicBroadcaster => form
+            .cost_estimate
+            .as_ref()
+            .map(|estimate| cost_estimate_max_entered_amount_for_mode(estimate, fee_mode)),
+        DeliveryMode::SelfBroadcast => None,
+    }
+}
+
+fn unshield_form_max_entered_amount(
+    form: &UnshieldFormState,
+    delivery_mode: DeliveryMode,
+    fee_mode: PublicBroadcasterFeeMode,
+) -> Option<U256> {
+    match delivery_mode {
+        DeliveryMode::ManualCalldata => Some(form.asset.max_single),
+        DeliveryMode::PublicBroadcaster => form
+            .cost_estimate
+            .as_ref()
+            .map(|estimate| cost_estimate_max_entered_amount_for_mode(estimate, fee_mode)),
+        DeliveryMode::SelfBroadcast => None,
+    }
+}
+
+fn adjusted_amount_for_max_change(
+    current_amount: U256,
+    old_max: Option<U256>,
+    new_max: U256,
+) -> Option<U256> {
+    if current_amount > new_max {
+        return Some(new_max);
+    }
+    if let Some(old_max) = old_max
+        && current_amount == old_max
+        && new_max > old_max
+    {
+        return Some(new_max);
+    }
+    None
+}
+
+fn apply_amount_adjustment_for_max_change(
+    input: &Entity<InputState>,
+    asset: &UnshieldAsset,
+    old_max: Option<U256>,
+    new_max: Option<U256>,
+    window: &mut Window,
+    cx: &mut Context<'_, WalletRoot>,
+) -> bool {
+    let Some(new_max) = new_max else {
+        return false;
+    };
+    let current_value = input.read(cx).value().to_string();
+    let Ok(current_amount) = parse_send_amount(current_value.as_str(), asset.decimals) else {
+        return false;
+    };
+    let Some(adjusted_amount) = adjusted_amount_for_max_change(current_amount, old_max, new_max)
+    else {
+        return false;
+    };
+    let adjusted = format_send_amount_input(adjusted_amount, asset.decimals);
+    input.update(cx, |input, cx| input.set_value(adjusted, window, cx));
+    true
+}
+
+fn format_form_error_for_asset(error: &str, asset: &UnshieldAsset) -> String {
+    if let Some(max_spendable) = form_error_public_broadcaster_max_entered_amount(error) {
+        return format!(
+            "Max entered amount for public broadcaster: {}. Try a smaller amount or switch fee mode.",
+            format_exact_asset_amount_for_display(max_spendable, asset)
+        );
+    }
+
+    if let Some(max_spendable) = form_error_max_immediately_spendable(error) {
+        return format!(
+            "Amount exceeds max for public broadcaster: {}. Try a smaller amount or switch fee mode.",
+            format_exact_asset_amount_for_display(max_spendable, asset)
+        );
+    }
+
+    match error {
+        "entered amount must be greater than the broadcaster fee" => format!(
+            "Entered amount must be greater than the broadcaster fee for {}. Choose add fee on top or enter a larger amount.",
+            asset.label
+        ),
+        _ => error.to_string(),
+    }
+}
+
+fn form_error_public_broadcaster_max_entered_amount(error: &str) -> Option<U256> {
+    const MARKER: &str = "public broadcaster max entered amount: ";
+    form_error_decimal_after_marker(error, MARKER)
+}
+
+fn form_error_max_immediately_spendable(error: &str) -> Option<U256> {
+    const MARKER: &str = "max immediately spendable: ";
+    form_error_decimal_after_marker(error, MARKER)
+}
+
+fn form_error_decimal_after_marker(error: &str, marker: &str) -> Option<U256> {
+    let start = error.find(marker)? + marker.len();
+    let digits = error[start..]
+        .trim_start()
+        .split(|ch: char| !ch.is_ascii_digit())
+        .next()?;
+    if digits.is_empty() {
+        return None;
+    }
+    U256::from_str_radix(digits, 10).ok()
+}
+
+fn format_gwei(wei: u128) -> String {
+    format_token_amount(U256::from(wei), 9)
+}
+
+fn public_broadcaster_fee_mode_summary(
+    fee_mode: PublicBroadcasterFeeMode,
+    entered_amount: U256,
+    receiver_amount: U256,
+    protocol_fee_amount: U256,
+    broadcaster: &PublicBroadcasterCandidate,
+) -> String {
+    match fee_mode {
+        PublicBroadcasterFeeMode::AddToAmount => {
+            if protocol_fee_amount.is_zero() {
+                "Recipient receives the full entered amount; broadcaster fee is added to spend."
+                    .to_string()
+            } else {
+                format!(
+                    "Recipient receives the entered amount minus {} RAILGUN protocol fee; broadcaster fee is added to spend.",
+                    format_exact_candidate_token_amount(broadcaster, protocol_fee_amount)
+                )
+            }
+        }
+        PublicBroadcasterFeeMode::DeductFromAmount => {
+            let reduction = entered_amount.saturating_sub(receiver_amount);
+            if reduction.is_zero() && protocol_fee_amount.is_zero() {
+                "Recipient receives the entered amount because the broadcaster fee is zero."
+                    .to_string()
+            } else if protocol_fee_amount.is_zero() {
+                format!(
+                    "Recipient amount is reduced by {} because broadcaster fee is paid from the entered amount.",
+                    format_exact_candidate_token_amount(broadcaster, reduction)
+                )
+            } else if reduction.is_zero() {
+                format!(
+                    "Recipient amount is reduced by {} RAILGUN protocol fee.",
+                    format_exact_candidate_token_amount(broadcaster, protocol_fee_amount)
+                )
+            } else {
+                format!(
+                    "Recipient amount is reduced by {} broadcaster fee and {} RAILGUN protocol fee.",
+                    format_exact_candidate_token_amount(broadcaster, reduction),
+                    format_exact_candidate_token_amount(broadcaster, protocol_fee_amount)
+                )
+            }
+        }
+    }
+}
+
+fn broadcaster_candidate_matches_query(
+    candidate: &PublicBroadcasterCandidate,
+    query: &str,
+) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    candidate
+        .railgun_address
+        .to_ascii_lowercase()
+        .contains(query)
+        || candidate.fees_id.to_ascii_lowercase().contains(query)
+        || candidate
+            .identifier
+            .as_deref()
+            .is_some_and(|identifier| identifier.to_ascii_lowercase().contains(query))
+        || candidate.version.to_ascii_lowercase().contains(query)
+        || candidate
+            .token
+            .to_checksum(None)
+            .to_ascii_lowercase()
+            .contains(query)
+}
+
+fn render_broadcaster_picker_row(
+    candidate: &PublicBroadcasterCandidate,
+    selected: bool,
+) -> gpui::Div {
+    div()
+        .w_full()
+        .flex()
+        .items_center()
+        .gap_3()
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_color(rgb(theme::TEXT))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .child(broadcaster_candidate_label(candidate)),
+                )
+                .child(app_muted_text(format!(
+                    "fee {} · reliability {:.0}% · wallets {} · v{}",
+                    broadcaster_candidate_fee_label(candidate),
+                    candidate.reliability * 100.0,
+                    candidate.available_wallets,
+                    candidate.version
+                ))),
+        )
+        .child(
+            div()
+                .w(px(92.0))
+                .flex_none()
+                .flex()
+                .justify_end()
+                .text_color(rgb(if selected {
+                    theme::SUCCESS
+                } else {
+                    theme::TEXT_MUTED
+                }))
+                .child(if selected { "Selected" } else { "Use" }),
+        )
+}
+
 fn max_unshield_amount_from_snapshot(snapshot: &ListUtxosOutput, token: Address) -> U256 {
     let mut by_tree: BTreeMap<u32, Vec<U256>> = BTreeMap::new();
     for row in snapshot.utxos.iter().filter(|row| !row.is_spent) {
@@ -4070,14 +5800,264 @@ fn render_unshield_generating_status(tick: usize) -> gpui::Div {
         )
 }
 
-fn unshield_spinner_frame(tick: usize) -> &'static str {
+const fn unshield_spinner_frame(tick: usize) -> &'static str {
     const FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
     FRAMES[tick % FRAMES.len()]
 }
 
 #[cfg(test)]
-fn send_spinner_frame(tick: usize) -> &'static str {
+const fn send_spinner_frame(tick: usize) -> &'static str {
     unshield_spinner_frame(tick)
+}
+
+fn render_delivery_selector(
+    root: Entity<WalletRoot>,
+    key: UnshieldAssetKey,
+    kind: DeliveryFormKind,
+    mode: DeliveryMode,
+    generating: bool,
+) -> gpui::Div {
+    let manual_root = root.clone();
+    let public_root = root;
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(app_muted_text("Delivery mode"))
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .child(
+                    app_button(delivery_element_id(key, kind, "manual"), "Manual calldata")
+                        .xsmall()
+                        .outline()
+                        .p(px(12.0))
+                        .when(mode == DeliveryMode::ManualCalldata, |button| {
+                            button.primary()
+                        })
+                        .disabled(generating)
+                        .on_click(move |_event, window, cx| {
+                            manual_root.update(cx, |root, cx| match kind {
+                                DeliveryFormKind::Send => root.set_send_delivery_mode(
+                                    key,
+                                    DeliveryMode::ManualCalldata,
+                                    window,
+                                    cx,
+                                ),
+                                DeliveryFormKind::Unshield => root.set_unshield_delivery_mode(
+                                    key,
+                                    DeliveryMode::ManualCalldata,
+                                    window,
+                                    cx,
+                                ),
+                            });
+                        }),
+                )
+                .child(
+                    app_button(
+                        delivery_element_id(key, kind, "public"),
+                        "Public broadcaster",
+                    )
+                    .xsmall()
+                    .outline()
+                    .p(px(12.0))
+                    .when(mode == DeliveryMode::PublicBroadcaster, |button| {
+                        button.primary()
+                    })
+                    .disabled(generating)
+                    .on_click(move |_event, window, cx| {
+                        public_root.update(cx, |root, cx| match kind {
+                            DeliveryFormKind::Send => root.set_send_delivery_mode(
+                                key,
+                                DeliveryMode::PublicBroadcaster,
+                                window,
+                                cx,
+                            ),
+                            DeliveryFormKind::Unshield => root.set_unshield_delivery_mode(
+                                key,
+                                DeliveryMode::PublicBroadcaster,
+                                window,
+                                cx,
+                            ),
+                        });
+                    }),
+                )
+                .child(
+                    app_button(delivery_element_id(key, kind, "self"), "Self-broadcast")
+                        .xsmall()
+                        .outline()
+                        .p(px(12.0))
+                        .disabled(true),
+                ),
+        )
+}
+
+fn render_broadcaster_chooser(
+    root: Entity<WalletRoot>,
+    key: UnshieldAssetKey,
+    kind: DeliveryFormKind,
+    choice: &BroadcasterChoice,
+    candidates: Vec<PublicBroadcasterCandidate>,
+    generating: bool,
+) -> gpui::Div {
+    let random_root = root.clone();
+    let modal_root = root;
+    let sorted = sort_specific_public_broadcasters(candidates);
+    let specific_label = selected_broadcaster_label(choice, &sorted);
+    let list = div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .p(px(10.0))
+        .rounded_md()
+        .bg(rgb(theme::SURFACE_ELEVATED))
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .child(app_muted_text(format!(
+            "Eligible same-token broadcasters: {}",
+            sorted.len()
+        )))
+        .child(
+            app_button(
+                delivery_element_id(key, kind, "random"),
+                "Random broadcaster",
+            )
+            .xsmall()
+            .outline()
+            .p(px(12.0))
+            .when(matches!(choice, BroadcasterChoice::Random), |button| {
+                button.primary()
+            })
+            .disabled(generating || sorted.is_empty())
+            .on_click(move |_event, _window, cx| {
+                random_root.update(cx, |root, cx| match kind {
+                    DeliveryFormKind::Send => {
+                        root.set_send_broadcaster_choice(key, BroadcasterChoice::Random, cx);
+                    }
+                    DeliveryFormKind::Unshield => {
+                        root.set_unshield_broadcaster_choice(key, BroadcasterChoice::Random, cx);
+                    }
+                });
+            }),
+        )
+        .child(
+            app_button(
+                delivery_element_id(key, kind, "choose-specific"),
+                specific_label,
+            )
+            .xsmall()
+            .outline()
+            .p(px(12.0))
+            .when(
+                matches!(choice, BroadcasterChoice::Specific { .. }),
+                ButtonVariants::primary,
+            )
+            .disabled(generating || sorted.is_empty())
+            .on_click(move |_event, window, cx| {
+                modal_root.update(cx, |root, cx| {
+                    root.open_broadcaster_picker(kind, key, window, cx);
+                });
+            }),
+        );
+
+    if sorted.is_empty() {
+        return list.child(app_muted_text(
+            "No eligible broadcaster currently advertises this token.",
+        ));
+    }
+
+    list.child(app_muted_text(
+        "Open the broadcaster picker to search, inspect, and choose a specific broadcaster.",
+    ))
+}
+
+fn render_broadcaster_fee_mode_toggle(
+    root: Entity<WalletRoot>,
+    key: UnshieldAssetKey,
+    kind: DeliveryFormKind,
+    mode: PublicBroadcasterFeeMode,
+    generating: bool,
+) -> gpui::Div {
+    let helper = match mode {
+        PublicBroadcasterFeeMode::DeductFromAmount => {
+            "Recipient receives the entered amount minus the broadcaster fee."
+        }
+        PublicBroadcasterFeeMode::AddToAmount => {
+            "Recipient receives the full entered amount; broadcaster fee is added to spend."
+        }
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .p(px(10.0))
+        .rounded_md()
+        .bg(rgb(theme::SURFACE_ELEVATED))
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .child(
+            div()
+                .flex()
+                .gap_2()
+                .child(render_broadcaster_fee_mode_button(
+                    root.clone(),
+                    key,
+                    kind,
+                    mode,
+                    PublicBroadcasterFeeMode::DeductFromAmount,
+                    "Deduct fee from amount",
+                    generating,
+                ))
+                .child(render_broadcaster_fee_mode_button(
+                    root,
+                    key,
+                    kind,
+                    mode,
+                    PublicBroadcasterFeeMode::AddToAmount,
+                    "Add fee on top",
+                    generating,
+                )),
+        )
+        .child(app_muted_text(helper))
+}
+
+fn render_broadcaster_fee_mode_button(
+    root: Entity<WalletRoot>,
+    key: UnshieldAssetKey,
+    kind: DeliveryFormKind,
+    current_mode: PublicBroadcasterFeeMode,
+    target_mode: PublicBroadcasterFeeMode,
+    label: &'static str,
+    generating: bool,
+) -> Button {
+    app_button(
+        delivery_element_id(
+            key,
+            kind,
+            match target_mode {
+                PublicBroadcasterFeeMode::DeductFromAmount => "fee-mode-deduct",
+                PublicBroadcasterFeeMode::AddToAmount => "fee-mode-add",
+            },
+        ),
+        label,
+    )
+    .xsmall()
+    .outline()
+    .p(px(12.0))
+    .when(current_mode == target_mode, ButtonVariants::primary)
+    .disabled(generating)
+    .on_click(move |_event, window, cx| {
+        root.update(cx, |root, cx| match kind {
+            DeliveryFormKind::Send => {
+                root.set_send_broadcaster_fee_mode(key, target_mode, window, cx);
+            }
+            DeliveryFormKind::Unshield => {
+                root.set_unshield_broadcaster_fee_mode(key, target_mode, window, cx);
+            }
+        });
+    })
 }
 
 fn render_send_result(key: UnshieldAssetKey, result: &PreparedSendCall) -> gpui::Div {
@@ -4104,6 +6084,242 @@ fn render_send_result(key: UnshieldAssetKey, result: &PreparedSendCall) -> gpui:
             result.data.clone(),
             send_element_id(key, "copy-data"),
         ))
+}
+
+fn render_public_broadcaster_result(
+    key: UnshieldAssetKey,
+    kind: DeliveryFormKind,
+    result: &PublicBroadcasterSubmissionResult,
+) -> gpui::Div {
+    let (title, detail, border, extra) = match &result.result {
+        PublicBroadcasterResultKind::Submitted { tx_hash } => (
+            "Submitted via public broadcaster",
+            format!(
+                "{} accepted the transaction.",
+                broadcaster_candidate_label(&result.broadcaster)
+            ),
+            theme::SUCCESS,
+            Some(("Tx hash", tx_hash.clone(), "copy-public-tx")),
+        ),
+        PublicBroadcasterResultKind::Failed { error } => (
+            "Public broadcaster failed",
+            error.clone(),
+            theme::DANGER,
+            None,
+        ),
+        PublicBroadcasterResultKind::TimedOut => (
+            "Public broadcaster timed out",
+            "No decryptable broadcaster response arrived before the timeout.".to_string(),
+            theme::WARNING,
+            None,
+        ),
+    };
+    let mut card = div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .p(px(12.0))
+        .rounded_md()
+        .bg(rgb(theme::SURFACE_ELEVATED))
+        .border_1()
+        .border_color(rgb(border))
+        .child(app_strong_text(title))
+        .child(app_muted_text(detail))
+        .child(cost_estimate_row(
+            "Entered amount",
+            format_exact_candidate_token_amount(&result.broadcaster, result.entered_amount),
+        ))
+        .child(cost_estimate_row(
+            "Recipient receives",
+            format_exact_candidate_token_amount(&result.broadcaster, result.recipient_amount),
+        ))
+        .child(cost_estimate_row(
+            "Total private spend",
+            format_exact_candidate_token_amount(&result.broadcaster, result.total_private_spend),
+        ))
+        .child(cost_estimate_row(
+            "Broadcaster fee",
+            format_exact_candidate_token_amount(&result.broadcaster, result.fee_amount),
+        ))
+        .when(result.protocol_fee_bps > 0, |card| {
+            card.child(cost_estimate_row(
+                "RAILGUN protocol fee",
+                format!(
+                    "{} ({} bps)",
+                    format_exact_candidate_token_amount(
+                        &result.broadcaster,
+                        result.protocol_fee_amount
+                    ),
+                    result.protocol_fee_bps
+                ),
+            ))
+        })
+        .child(app_muted_text(format!(
+            "Estimated gas: {} gas @ {} gwei",
+            result.gas_limit,
+            format_gwei(result.min_gas_price)
+        )))
+        .child(app_muted_text(public_broadcaster_fee_mode_summary(
+            result.fee_mode,
+            result.entered_amount,
+            result.receiver_amount,
+            result.protocol_fee_amount,
+            &result.broadcaster,
+        )));
+    if let Some((label, value, action)) = extra {
+        card = card.child(render_unshield_copy_field(
+            label,
+            value,
+            delivery_element_id(key, kind, action),
+        ));
+    }
+    card
+}
+
+fn render_public_broadcaster_cost_estimate(
+    asset: &UnshieldAsset,
+    estimate: &PublicBroadcasterCostEstimate,
+) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .p(px(12.0))
+        .rounded_md()
+        .bg(rgb(theme::SURFACE_ELEVATED))
+        .border_1()
+        .border_color(rgb(theme::BORDER_STRONG))
+        .child(app_strong_text("Estimated public broadcaster cost"))
+        .child(cost_estimate_detail_text(
+            "Proof is not generated yet; the final fee may move slightly before publish.",
+        ))
+        .child(cost_estimate_row(
+            "Broadcaster",
+            broadcaster_candidate_label(&estimate.broadcaster),
+        ))
+        .child(cost_estimate_row(
+            "Recipient receives",
+            format_exact_asset_amount_for_display(estimate.recipient_amount, asset),
+        ))
+        .child(cost_estimate_row(
+            "Broadcaster fee",
+            format_exact_asset_amount_for_display(estimate.fee_amount, asset),
+        ))
+        .when(estimate.protocol_fee_bps > 0, |card| {
+            card.child(cost_estimate_row(
+                "RAILGUN protocol fee",
+                format!(
+                    "{} ({} bps)",
+                    format_exact_asset_amount_for_display(estimate.protocol_fee_amount, asset),
+                    estimate.protocol_fee_bps
+                ),
+            ))
+        })
+        .when(
+            should_show_distinct_amount(estimate.entered_amount, estimate.total_private_spend),
+            |card| {
+                card.child(cost_estimate_row(
+                    "Total private spend",
+                    format_exact_asset_amount_for_display(estimate.total_private_spend, asset),
+                ))
+            },
+        )
+        .when(
+            should_show_distinct_amount(estimate.entered_amount, estimate.max_entered_amount),
+            |card| {
+                card.child(cost_estimate_row(
+                    "Max via broadcaster",
+                    format_exact_asset_amount_for_display(estimate.max_entered_amount, asset),
+                ))
+            },
+        )
+        .child(cost_estimate_detail_row(
+            "Network gas",
+            format!(
+                "{} gas @ {} gwei",
+                estimate.gas_limit,
+                format_gwei(estimate.min_gas_price)
+            ),
+        ))
+        .child(cost_estimate_detail_text(format!(
+            "Shape: {} inputs · {} private outputs · {} public outputs",
+            estimate.input_count, estimate.private_output_count, estimate.public_output_count
+        )))
+        .child(cost_estimate_detail_text(
+            public_broadcaster_fee_mode_summary(
+                estimate.fee_mode,
+                estimate.entered_amount,
+                estimate.receiver_amount,
+                estimate.protocol_fee_amount,
+                &estimate.broadcaster,
+            ),
+        ))
+}
+
+fn render_public_broadcaster_cost_estimating(tick: usize) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_3()
+        .p(px(12.0))
+        .rounded_md()
+        .bg(rgb(theme::SURFACE_ELEVATED))
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .child(
+            div()
+                .size(px(22.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .bg(rgb(theme::BACKGROUND))
+                .text_color(rgb(theme::INFO))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child(unshield_spinner_frame(tick)),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(app_strong_text("Estimating public broadcaster cost..."))
+                .child(app_muted_text(
+                    "Using current gas price, broadcaster fee rate, and selected private note shape.",
+                )),
+        )
+}
+
+fn cost_estimate_row(label: &'static str, value: String) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .child(app_muted_text(label))
+        .child(app_strong_text(value))
+}
+
+fn cost_estimate_detail_text(text: impl Into<SharedString>) -> gpui::Div {
+    div()
+        .text_color(rgb(theme::TEXT_SUBTLE))
+        .text_size(COST_ESTIMATE_DETAIL_TEXT_SIZE)
+        .line_height(px(15.0))
+        .child(text.into())
+}
+
+fn cost_estimate_detail_value(text: impl Into<SharedString>) -> gpui::Div {
+    cost_estimate_detail_text(text).font_weight(gpui::FontWeight::SEMIBOLD)
+}
+
+fn cost_estimate_detail_row(label: &'static str, value: String) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .child(cost_estimate_detail_text(label))
+        .child(cost_estimate_detail_value(value))
 }
 
 fn render_unshield_result(key: UnshieldAssetKey, result: &PreparedUnshieldCall) -> gpui::Div {
@@ -4392,13 +6608,15 @@ mod tests {
 
     use super::{
         Activity, ChainLoadSource, ChainUtxoState, SECONDS_PER_DAY, SECONDS_PER_HOUR,
-        SECONDS_PER_MINUTE, SECONDS_PER_MONTH, SECONDS_PER_YEAR, UnshieldAssetKey,
-        WalletAppOptions, WalletTab, build_send_asset, build_unshield_asset, chain_load_overrides,
-        display_rows_from_output, format_compact_age, format_private_asset_rows,
-        format_send_amount_input, format_total, format_unshield_amount_input, loading_summary,
-        max_send_amount_from_snapshot, max_unshield_amount_from_snapshot, parse_repair_cache_block,
-        progress_detail, send_asset_key_from_formatted, send_element_id, send_key_matches_asset,
-        send_spinner_frame, should_focus_utxo_table, unshield_asset_key_from_formatted,
+        SECONDS_PER_MINUTE, SECONDS_PER_MONTH, SECONDS_PER_YEAR, UnshieldAsset, UnshieldAssetKey,
+        WalletAppOptions, WalletTab, adjusted_amount_for_max_change, build_send_asset,
+        build_unshield_asset, chain_load_overrides, display_rows_from_output, format_compact_age,
+        format_exact_asset_amount_for_display, format_form_error_for_asset,
+        format_private_asset_rows, format_send_amount_input, format_total,
+        format_unshield_amount_input, loading_summary, max_send_amount_from_snapshot,
+        max_unshield_amount_from_snapshot, parse_repair_cache_block, progress_detail,
+        send_asset_key_from_formatted, send_element_id, send_key_matches_asset, send_spinner_frame,
+        should_focus_utxo_table, should_show_distinct_amount, unshield_asset_key_from_formatted,
         unshield_element_id, unshield_key_matches_asset, unshield_spinner_frame,
     };
 
@@ -4553,6 +6771,90 @@ mod tests {
         };
 
         assert_eq!(format_total(1, &total), "USDC 1.23");
+    }
+
+    #[test]
+    fn form_error_formats_broadcaster_max_in_token_units() {
+        let asset = UnshieldAsset {
+            chain_id: 1,
+            token: Address::ZERO,
+            label: "USDC".to_string(),
+            decimals: Some(6),
+            total: U256::ZERO,
+            max_single: U256::ZERO,
+            icon_path: None,
+        };
+
+        let formatted = format_form_error_for_asset(
+            "build public broadcaster send proof: public broadcaster max entered amount: 388585770",
+            &asset,
+        );
+
+        assert_eq!(
+            formatted,
+            "Max entered amount for public broadcaster: 388.58577 USDC. Try a smaller amount or switch fee mode."
+        );
+    }
+
+    #[test]
+    fn public_broadcaster_amount_display_is_exact() {
+        let asset = UnshieldAsset {
+            chain_id: 1,
+            token: Address::ZERO,
+            label: "USDC".to_string(),
+            decimals: Some(6),
+            total: U256::ZERO,
+            max_single: U256::ZERO,
+            icon_path: None,
+        };
+
+        assert_eq!(
+            format_exact_asset_amount_for_display(U256::from(388_429_885_u64), &asset),
+            "388.429885 USDC"
+        );
+        assert_eq!(
+            format_exact_asset_amount_for_display(U256::from(14_390_115_u64), &asset),
+            "14.390115 USDC"
+        );
+    }
+
+    #[test]
+    fn public_broadcaster_estimate_hides_duplicate_amount_rows() {
+        let entered = U256::from(388_429_885_u64);
+
+        assert!(!should_show_distinct_amount(entered, entered));
+        assert!(should_show_distinct_amount(
+            entered,
+            entered + U256::from(1_u8)
+        ));
+    }
+
+    #[test]
+    fn amount_adjustment_clamps_or_raises_only_at_mode_max() {
+        assert_eq!(
+            adjusted_amount_for_max_change(
+                U256::from(120_u8),
+                Some(U256::from(120_u8)),
+                U256::from(100_u8),
+            ),
+            Some(U256::from(100_u8))
+        );
+        assert_eq!(
+            adjusted_amount_for_max_change(
+                U256::from(100_u8),
+                Some(U256::from(100_u8)),
+                U256::from(120_u8),
+            ),
+            Some(U256::from(120_u8))
+        );
+        assert_eq!(
+            adjusted_amount_for_max_change(
+                U256::from(90_u8),
+                Some(U256::from(100_u8)),
+                U256::from(120_u8),
+            ),
+            None
+        );
     }
 
     #[test]

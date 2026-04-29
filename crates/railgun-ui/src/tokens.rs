@@ -179,6 +179,18 @@ pub fn short_address(addr: &Address) -> String {
     format!("{}…{}", &hex[..6], &hex[38..])
 }
 
+/// Format a broadcaster Railgun address the same way across wallet and
+/// broadcaster-viewer surfaces. 0zk addresses are ASCII base32, so slicing the
+/// final 4 bytes is safe for current address strings.
+#[must_use]
+pub fn format_broadcaster_address_label(address: &str, identifier: Option<&str>) -> String {
+    let last4 = &address[address.len().saturating_sub(4)..];
+    match identifier {
+        Some(identifier) if !identifier.is_empty() => format!("0zk...{last4} ({identifier})"),
+        _ => format!("0zk...{last4}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,6 +309,19 @@ mod tests {
     fn short_address_preserves_prefix_and_suffix() {
         let weth = address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
         assert_eq!(short_address(&weth), "0xc02a…6cc2");
+    }
+
+    #[test]
+    fn broadcaster_address_label_matches_viewer_style() {
+        let address = "0zk1abcdefghijklmnopqrstuvwxyz";
+        assert_eq!(
+            format_broadcaster_address_label(address, None),
+            "0zk...wxyz"
+        );
+        assert_eq!(
+            format_broadcaster_address_label(address, Some("node")),
+            "0zk...wxyz (node)"
+        );
     }
 
     #[test]

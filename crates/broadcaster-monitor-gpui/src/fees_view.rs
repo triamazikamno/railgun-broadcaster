@@ -17,7 +17,8 @@ use std::time::{Duration, SystemTime};
 
 use broadcaster_monitor::FeeRow;
 use railgun_ui::{
-    chain_icon_path, chain_name, format_token_amount, lookup_token, short_address, token_icon_path,
+    chain_icon_path, chain_name, format_broadcaster_address_label, format_token_amount,
+    lookup_token, short_address, token_icon_path,
 };
 use ui::clipboard::copy_with_toast;
 use ui::theme;
@@ -368,13 +369,8 @@ impl TableDelegate for FeesDelegate {
                 }
             }
             1 => {
-                // 0zk addresses are ASCII base32; byte-slice on the last 4 is safe.
                 let addr = row.railgun_address.as_ref();
-                let last4 = &addr[addr.len().saturating_sub(4)..];
-                let label = match row.identifier.as_deref() {
-                    Some(id) if !id.is_empty() => format!("0zk...{last4} ({id})"),
-                    _ => format!("0zk...{last4}"),
-                };
+                let label = format_broadcaster_address_label(addr, row.identifier.as_deref());
                 let addr = addr.to_string();
                 div()
                     .id(SharedString::from(format!(
@@ -698,6 +694,11 @@ mod tests {
             signature_valid: true,
             fees_id: Arc::from("fid"),
             fee_expiration: SystemTime::now(),
+            available_wallets: 1,
+            version: Arc::from("8.2.3"),
+            relay_adapt: address!("0000000000000000000000000000000000000002"),
+            relay_adapt_7702: None,
+            required_poi_list_keys: Vec::new(),
             identifier: identifier.map(Arc::from),
             last_seen: SystemTime::now(),
             reliability: 1.0,

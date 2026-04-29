@@ -3,3 +3,4 @@ pub mod filter;
 pub mod lightpush;
 pub mod metadata;
 pub mod peer_exchange;
+pub mod store;

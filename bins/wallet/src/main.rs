@@ -4,6 +4,8 @@
 mod cli;
 mod root;
 
+use std::sync::Arc;
+
 use broadcaster_monitor::{DEFAULT_EVENT_CAPACITY, event_channel, shared};
 use broadcaster_monitor_waku::{
     DEFAULT_CLUSTER_ID, WakuViewerConfig, build_waku_client, spawn_workers,
@@ -60,6 +62,7 @@ fn main() -> Result<()> {
 
     let runtime_guard = runtime.enter();
     let waku = build_waku_client(&waku_config)?;
+    let wallet_waku = Arc::clone(&waku);
     let worker_monitor = monitor.clone();
     runtime.spawn(async move {
         if let Err(error) = spawn_workers(waku_config, waku, worker_monitor, event_tx).await {
@@ -80,6 +83,7 @@ fn main() -> Result<()> {
             http.clone(),
             runtime_handle.clone(),
             monitor.clone(),
+            wallet_waku.clone(),
             event_rx,
             chain_ids.clone(),
             logs,

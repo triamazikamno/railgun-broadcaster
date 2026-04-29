@@ -25,6 +25,13 @@ pub enum WakuError {
     },
     #[error("filter request failed")]
     FilterRequestFailed,
+    #[error("store query failed: status_code={status_code:?}, desc={status_desc:?}")]
+    StoreQueryFailed {
+        status_code: Option<u32>,
+        status_desc: Option<String>,
+    },
+    #[error("store request failed")]
+    StoreRequestFailed,
 }
 
 /// Errors that can occur during transport initialization.

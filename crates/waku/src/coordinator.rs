@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio::time::Instant;
 use tracing::{debug, error, trace, warn};
 
@@ -60,6 +60,15 @@ pub struct LightPushResult {
     pub error: Option<OutboundFailure>,
 }
 
+#[derive(Debug, Clone)]
+pub struct StoreQueryOptions {
+    pub pubsub_topic: String,
+    pub content_topics: Vec<String>,
+    pub time_start: Option<i64>,
+    pub time_end: Option<i64>,
+    pub pagination_limit: Option<u64>,
+}
+
 static LIGHTPUSH_UNIMPLEMENTED: OnceLock<proto::light_push::LightPushResponseV3> = OnceLock::new();
 static PEER_EXCHANGE_EMPTY_RESPONSE: OnceLock<proto::peer_exchange::PeerExchangeRpc> =
     OnceLock::new();
@@ -71,6 +80,7 @@ struct PeerState {
     supports_lightpush_v3: bool,
     supports_peer_exchange: bool,
     supports_filter: bool,
+    supports_store: bool,
     dial_failures: u32,
     next_dial_at: Option<Instant>,
     last_peer_exchange_at: Option<Instant>,
@@ -246,14 +256,27 @@ impl Default for FilterState {
     }
 }
 
+#[derive(Debug)]
+struct StorePending {
+    waiter: oneshot::Sender<Result<proto::store::StoreQueryResponse, WakuError>>,
+    deadline: Instant,
+}
+
+#[derive(Debug, Default)]
+struct StoreState {
+    pending: HashMap<ReqId, StorePending>,
+}
+
 struct OpTracker {
     next_req_id: AtomicU64,
     lightpush: Mutex<LightPushState>,
     peer_exchange: Mutex<PeerExchangeState>,
     filter: Mutex<FilterState>,
+    store: Mutex<StoreState>,
 }
 
 const DEDUP_CACHE_SIZE: usize = 500;
+const STORE_PEER_EVENT_CAPACITY: usize = 64;
 
 impl OpTracker {
     fn new() -> Self {
@@ -262,6 +285,7 @@ impl OpTracker {
             lightpush: Mutex::new(LightPushState::default()),
             peer_exchange: Mutex::new(PeerExchangeState::default()),
             filter: Mutex::new(FilterState::default()),
+            store: Mutex::new(StoreState::default()),
         }
     }
 
@@ -283,6 +307,44 @@ fn build_filter_request(
     }
 }
 
+fn build_store_query_request(
+    options: &StoreQueryOptions,
+    pagination_cursor: Option<Vec<u8>>,
+) -> proto::store::StoreQueryRequest {
+    proto::store::StoreQueryRequest {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        include_data: true,
+        pubsub_topic: Some(options.pubsub_topic.clone()),
+        content_topics: options.content_topics.clone(),
+        time_start: options.time_start,
+        time_end: options.time_end,
+        message_hashes: Vec::new(),
+        pagination_cursor,
+        pagination_forward: true,
+        pagination_limit: options.pagination_limit,
+    }
+}
+
+fn store_status_ok(response: &proto::store::StoreQueryResponse) -> bool {
+    response
+        .status_code
+        .is_none_or(|status_code| (200..300).contains(&status_code))
+}
+
+fn validate_store_query_options(options: &StoreQueryOptions) -> Result<(), WakuError> {
+    if options.pubsub_topic.is_empty() {
+        return Err(WakuError::InvalidArgument(
+            "pubsub_topic cannot be empty".to_string(),
+        ));
+    }
+    if options.content_topics.is_empty() {
+        return Err(WakuError::InvalidArgument(
+            "content_topics cannot be empty".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 struct NodeInner {
     config: NodeConfig,
     discovery_config: DiscoveryConfig,
@@ -293,6 +355,7 @@ struct NodeInner {
     metadata_response: proto::metadata::WakuMetadataResponse,
     peer_exchange_cooldown: Duration,
     op_counter: AtomicU64,
+    store_peer_tx: broadcast::Sender<PeerId>,
 }
 
 impl NodeInner {
@@ -516,6 +579,21 @@ impl NodeInner {
             self.finish_peer_exchange_batch(batch_id, enrs).await;
         }
 
+        // Store query timeouts
+        let expired_store_queries = {
+            let mut store = self.ops.store.lock().await;
+            store
+                .pending
+                .extract_if(|_, pending| pending.deadline <= now)
+                .collect::<Vec<_>>()
+        };
+
+        for (req_id, pending) in expired_store_queries {
+            if let Err(error) = pending.waiter.send(Err(WakuError::StoreRequestFailed)) {
+                debug!(?req_id, ?error, "store query receiver dropped");
+            }
+        }
+
         self.maybe_dial();
     }
 
@@ -523,7 +601,7 @@ impl NodeInner {
         match ev {
             TransportEvent::ConnectionEstablished { peer_id } => {
                 debug!(%peer_id, "connected");
-                {
+                let supports_store = {
                     let mut book = self.peer_book.write();
                     book.connected.insert(peer_id);
                     book.dialing.remove(&peer_id);
@@ -534,6 +612,11 @@ impl NodeInner {
                     {
                         state.dial_failures = state.dial_failures.saturating_sub(1);
                     }
+                    state.supports_store
+                };
+                if supports_store {
+                    debug!(%peer_id, "connected peer supports store");
+                    let _ = self.store_peer_tx.send(peer_id);
                 }
                 self.maybe_dial();
             }
@@ -579,16 +662,28 @@ impl NodeInner {
                 let supports_filter = protocols
                     .iter()
                     .any(|p| p == protocols::filter::FILTER_SUBSCRIBE_CODEC);
+                let supports_store = protocols
+                    .iter()
+                    .any(|p| p == protocols::store::STORE_QUERY_CODEC);
 
-                {
+                let became_store_capable = {
                     let mut book = self.peer_book.write();
                     let entry = book.peers.entry(peer_id).or_default();
+                    let became_store_capable =
+                        supports_store && entry.connected && !entry.supports_store;
                     entry.supports_lightpush_v3 = supports_lightpush;
                     entry.supports_peer_exchange = supports_px;
                     entry.supports_filter = supports_filter;
+                    entry.supports_store = supports_store;
                     entry.addrs.extend(addrs);
                     entry.addrs.sort();
                     entry.addrs.dedup();
+                    became_store_capable
+                };
+
+                if became_store_capable {
+                    debug!(%peer_id, "peer supports store");
+                    let _ = self.store_peer_tx.send(peer_id);
                 }
 
                 // Resubscribe to filter on reconnect if peer supports filter
@@ -658,6 +753,9 @@ impl NodeInner {
             }
             TransportEvent::FilterPush { peer_id, push } => {
                 self.handle_filter_push(peer_id, *push).await;
+            }
+            TransportEvent::StoreQueryResponse { req_id, result } => {
+                self.handle_store_query_response(req_id, result).await;
             }
         }
     }
@@ -1057,6 +1155,25 @@ impl NodeInner {
         }
     }
 
+    async fn handle_store_query_response(
+        &self,
+        req_id: ReqId,
+        result: Result<proto::store::StoreQueryResponse, OutboundFailure>,
+    ) {
+        let mut store = self.ops.store.lock().await;
+        let Some(pending) = store.pending.remove(&req_id) else {
+            return;
+        };
+
+        let result = result.map_err(|error| {
+            debug!(?req_id, ?error, "store request failed");
+            WakuError::StoreRequestFailed
+        });
+        if let Err(error) = pending.waiter.send(result) {
+            debug!(?req_id, ?error, "store query receiver dropped");
+        }
+    }
+
     async fn send_subscribe_request(
         &self,
         peer_id: PeerId,
@@ -1127,6 +1244,8 @@ impl WakuNode {
             shards: Vec::new(),
         };
 
+        let (store_peer_tx, _) = broadcast::channel(STORE_PEER_EVENT_CAPACITY);
+
         let inner = Arc::new(NodeInner {
             config: config.node,
             discovery_config: config.discovery,
@@ -1137,6 +1256,7 @@ impl WakuNode {
             metadata_response,
             peer_exchange_cooldown: config.peer_exchange_cooldown,
             op_counter: AtomicU64::new(1),
+            store_peer_tx,
         });
 
         {
@@ -1276,6 +1396,141 @@ impl WakuNode {
         }
 
         rx.await.map_err(|_| WakuError::Cancelled)
+    }
+
+    #[must_use]
+    pub fn store_peers(&self) -> Vec<PeerId> {
+        let book = self.inner.peer_book.read();
+        book.connected
+            .iter()
+            .filter(|p| book.peers.get(p).is_some_and(|s| s.supports_store))
+            .copied()
+            .collect()
+    }
+
+    #[must_use]
+    pub fn subscribe_store_peers(&self) -> broadcast::Receiver<PeerId> {
+        self.inner.store_peer_tx.subscribe()
+    }
+
+    pub async fn store_query(
+        &self,
+        options: StoreQueryOptions,
+    ) -> Result<Vec<proto::WakuMessage>, WakuError> {
+        validate_store_query_options(&options)?;
+
+        let peers = self.store_peers();
+        if peers.is_empty() {
+            return Err(WakuError::NoPeersAvailable);
+        }
+
+        let mut last_error = None;
+        let mut saw_success = false;
+        let mut seen_messages = HashSet::new();
+        let mut messages = Vec::new();
+        for peer_id in peers {
+            match self.store_query_peer_pages(peer_id, &options).await {
+                Ok(peer_messages) => {
+                    saw_success = true;
+                    for message in peer_messages {
+                        if seen_messages.insert(message.hash_key()) {
+                            messages.push(message);
+                        }
+                    }
+                }
+                Err(error) => {
+                    debug!(%peer_id, ?error, "store query failed on peer");
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        if saw_success {
+            Ok(messages)
+        } else {
+            Err(last_error.unwrap_or(WakuError::NoPeersAvailable))
+        }
+    }
+
+    pub async fn store_query_peer(
+        &self,
+        peer_id: PeerId,
+        options: StoreQueryOptions,
+    ) -> Result<Vec<proto::WakuMessage>, WakuError> {
+        validate_store_query_options(&options)?;
+        self.store_query_peer_pages(peer_id, &options).await
+    }
+
+    async fn store_query_peer_pages(
+        &self,
+        peer_id: PeerId,
+        options: &StoreQueryOptions,
+    ) -> Result<Vec<proto::WakuMessage>, WakuError> {
+        let mut cursor = None;
+        let mut seen_cursors = HashSet::new();
+        let mut messages = Vec::new();
+
+        loop {
+            let request = build_store_query_request(options, cursor.clone());
+            let response = self.store_query_peer_page(peer_id, request).await?;
+
+            if !store_status_ok(&response) {
+                return Err(WakuError::StoreQueryFailed {
+                    status_code: response.status_code,
+                    status_desc: response.status_desc,
+                });
+            }
+
+            messages.extend(
+                response
+                    .messages
+                    .into_iter()
+                    .filter_map(|entry| entry.message),
+            );
+
+            let Some(next_cursor) = response.pagination_cursor else {
+                break;
+            };
+
+            if next_cursor.is_empty() || !seen_cursors.insert(next_cursor.clone()) {
+                break;
+            }
+            cursor = Some(next_cursor);
+        }
+
+        Ok(messages)
+    }
+
+    async fn store_query_peer_page(
+        &self,
+        peer_id: PeerId,
+        request: proto::store::StoreQueryRequest,
+    ) -> Result<proto::store::StoreQueryResponse, WakuError> {
+        let req_id = self.inner.ops.next_req_id();
+        let (waiter, rx) = oneshot::channel();
+
+        {
+            let mut store = self.inner.ops.store.lock().await;
+            store.pending.insert(
+                req_id,
+                StorePending {
+                    waiter,
+                    deadline: Instant::now() + self.inner.config.request_timeout,
+                },
+            );
+        }
+
+        let cmd = TransportCmd::SendStoreQuery {
+            req_id,
+            peer_id,
+            request,
+        };
+        if self.inner.transport_tx.try_send(cmd).is_err() {
+            self.inner.ops.store.lock().await.pending.remove(&req_id);
+            return Err(WakuError::ChannelFull);
+        }
+
+        rx.await.map_err(|_| WakuError::Cancelled)?
     }
 
     fn filter_peers(&self) -> Vec<PeerId> {

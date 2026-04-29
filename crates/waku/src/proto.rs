@@ -34,6 +34,10 @@ pub mod filter {
     };
 }
 
+pub mod store {
+    pub use super::{StoreQueryRequest, StoreQueryResponse, WakuMessageKeyValue};
+}
+
 pub trait HashKey {
     fn hash_key(&self) -> u64;
 }

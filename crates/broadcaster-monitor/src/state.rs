@@ -29,6 +29,11 @@ pub struct FeeRow {
     pub signature_valid: bool,
     pub fees_id: Arc<str>,
     pub fee_expiration: SystemTime,
+    pub available_wallets: u32,
+    pub version: Arc<str>,
+    pub relay_adapt: Address,
+    pub relay_adapt_7702: Option<Address>,
+    pub required_poi_list_keys: Vec<Arc<str>>,
     pub identifier: Option<Arc<str>>,
     pub last_seen: SystemTime,
     pub reliability: f64,
@@ -162,6 +167,18 @@ mod tests {
     use alloy::primitives::address;
 
     fn sample_row(chain_id: u64, token: Address, fee: u64, fees_id: &str) -> FeeRow {
+        sample_row_with_metadata(chain_id, token, fee, fees_id, 1, "8.2.3", Vec::new())
+    }
+
+    fn sample_row_with_metadata(
+        chain_id: u64,
+        token: Address,
+        fee: u64,
+        fees_id: &str,
+        available_wallets: u32,
+        version: &str,
+        required_poi_list_keys: Vec<Arc<str>>,
+    ) -> FeeRow {
         FeeRow {
             chain_id,
             railgun_address: Arc::from("0zk-test"),
@@ -170,6 +187,11 @@ mod tests {
             signature_valid: true,
             fees_id: Arc::from(fees_id),
             fee_expiration: SystemTime::now(),
+            available_wallets,
+            version: Arc::from(version),
+            relay_adapt: address!("0000000000000000000000000000000000000003"),
+            relay_adapt_7702: Some(address!("0000000000000000000000000000000000000004")),
+            required_poi_list_keys,
             identifier: None,
             last_seen: SystemTime::now(),
             reliability: 1.0,
@@ -192,6 +214,37 @@ mod tests {
         let row = &rows[0];
         assert_eq!(row.fee, U256::from(200));
         assert_eq!(row.fees_id.as_ref(), "b");
+    }
+
+    #[test]
+    fn upsert_replaces_metadata_for_same_key() {
+        let mut state = MonitorState::new();
+        let token = address!("0000000000000000000000000000000000000001");
+        state.upsert_fee(sample_row_with_metadata(
+            1,
+            token,
+            100,
+            "a",
+            0,
+            "7.9.0",
+            Vec::new(),
+        ));
+        state.upsert_fee(sample_row_with_metadata(
+            1,
+            token,
+            200,
+            "b",
+            2,
+            "8.2.3",
+            vec![Arc::from("poi-list")],
+        ));
+
+        let rows = state.fee_rows();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.available_wallets, 2);
+        assert_eq!(row.version.as_ref(), "8.2.3");
+        assert_eq!(row.required_poi_list_keys, vec![Arc::from("poi-list")]);
     }
 
     #[test]

@@ -13,6 +13,6 @@ pub use keys::{bip39_entropy_from_mnemonic, bip39_mnemonic_from_entropy, public_
 pub use notes::{Note, NoteCiphertext};
 pub use prover::{ProverService, WitnessInputs};
 pub use tx::{
-    PrivateInputs, PublicInputs, SendPlan, TransactPlan, TransactionBuilder, TransactionCall,
-    UnshieldPlan,
+    BroadcasterFeeOutput, PrivateInputs, PublicInputs, SendPlan, TransactPlan, TransactionBuilder,
+    TransactionCall, UnshieldPlan,
 };
