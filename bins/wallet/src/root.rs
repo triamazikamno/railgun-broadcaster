@@ -46,6 +46,8 @@ use wallet_ops::{
     ViewWalletChainSessionRequest, WalletSessionStore, eligible_public_broadcasters_for_asset,
     estimate_desktop_send_public_broadcaster_cost,
     estimate_desktop_unshield_public_broadcaster_cost, is_wrapped_native_token,
+    max_send_amount_from_outputs as planner_max_send_amount_from_outputs,
+    max_unshield_amount_from_outputs as planner_max_unshield_amount_from_outputs,
     parse_railgun_recipient, parse_send_amount, parse_unshield_amount,
     prepare_desktop_send_calldata, prepare_desktop_unshield_calldata, select_public_broadcaster,
     sort_specific_public_broadcasters, submit_desktop_send_public_broadcaster,
@@ -64,7 +66,6 @@ const LOGS_DRAWER_MAX_HEIGHT: Pixels = px(600.0);
 const FILTER_POPOVER_MAX_HEIGHT: Pixels = px(450.0);
 const BROADCASTER_PICKER_MAX_HEIGHT: Pixels = px(680.0);
 const PRIVATE_ASSET_LIST_WIDTH: Pixels = px(760.0);
-const MAX_UNSHIELD_INPUTS: usize = 13;
 const UNSHIELD_SPINNER_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const UTXO_AGE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const COST_ESTIMATE_DEBOUNCE: Duration = Duration::from_secs(1);
@@ -286,7 +287,7 @@ struct UnshieldAsset {
     label: String,
     decimals: Option<u8>,
     total: U256,
-    max_single: U256,
+    max_batched: U256,
     icon_path: Option<PathBuf>,
 }
 
@@ -1559,7 +1560,7 @@ impl WalletRoot {
         self.send_forms.retain(|existing_key, form| {
             *existing_key == key || Self::send_form_is_dirty(form, cx)
         });
-        let amount = format_send_amount_input(asset.max_single, asset.decimals);
+        let amount = format_send_amount_input(asset.max_batched, asset.decimals);
         let amount_input = cx.new(|cx| {
             let mut input = InputState::new(window, cx).placeholder("amount");
             input.set_value(&amount, window, cx);
@@ -1635,7 +1636,7 @@ impl WalletRoot {
             return true;
         }
 
-        let default_amount = format_send_amount_input(form.asset.max_single, form.asset.decimals);
+        let default_amount = format_send_amount_input(form.asset.max_batched, form.asset.decimals);
         form.amount_input.read(cx).value().trim() != default_amount
     }
 
@@ -1886,7 +1887,7 @@ impl WalletRoot {
                 return;
             }
         };
-        if amount > asset.max_single {
+        if amount > asset.max_batched {
             self.clear_pending_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
             return;
         }
@@ -2071,8 +2072,8 @@ impl WalletRoot {
             return;
         };
         let session = Arc::clone(session);
-        if asset.max_single.is_zero() {
-            self.set_send_form_error(key, "No private notes are spendable in one transaction", cx);
+        if asset.max_batched.is_zero() {
+            self.set_send_form_error(key, "No private notes are spendable in a batched send", cx);
             return;
         }
 
@@ -2094,12 +2095,12 @@ impl WalletRoot {
                 return;
             }
         };
-        if amount > asset.max_single {
+        if amount > asset.max_batched {
             self.set_send_form_error(
                 key,
                 format!(
-                    "Amount exceeds max one transaction: {}",
-                    format_send_amount_input(asset.max_single, asset.decimals)
+                    "Amount exceeds max batched transaction: {}",
+                    format_send_amount_input(asset.max_batched, asset.decimals)
                 ),
                 cx,
             );
@@ -2265,7 +2266,7 @@ impl WalletRoot {
         self.unshield_forms.retain(|existing_key, form| {
             *existing_key == key || Self::unshield_form_is_dirty(form, cx)
         });
-        let amount = format_unshield_amount_input(asset.max_single, asset.decimals);
+        let amount = format_unshield_amount_input(asset.max_batched, asset.decimals);
         let amount_input = cx.new(|cx| {
             let mut input = InputState::new(window, cx).placeholder("amount");
             input.set_value(&amount, window, cx);
@@ -2355,7 +2356,7 @@ impl WalletRoot {
         }
 
         let default_amount =
-            format_unshield_amount_input(form.asset.max_single, form.asset.decimals);
+            format_unshield_amount_input(form.asset.max_batched, form.asset.decimals);
         form.amount_input.read(cx).value().trim() != default_amount
     }
 
@@ -2534,7 +2535,7 @@ impl WalletRoot {
                 return;
             }
         };
-        if amount > asset.max_single {
+        if amount > asset.max_batched {
             self.clear_pending_public_broadcaster_cost_estimate(
                 DeliveryFormKind::Unshield,
                 key,
@@ -2668,10 +2669,10 @@ impl WalletRoot {
             return;
         };
         let session = Arc::clone(session);
-        if asset.max_single.is_zero() {
+        if asset.max_batched.is_zero() {
             self.set_unshield_form_error(
                 key,
-                "No private notes are spendable in one transaction",
+                "No private notes are spendable in a batched unshield",
                 cx,
             );
             return;
@@ -2694,12 +2695,12 @@ impl WalletRoot {
                 return;
             }
         };
-        if amount > asset.max_single {
+        if amount > asset.max_batched {
             self.set_unshield_form_error(
                 key,
                 format!(
-                    "Amount exceeds max one transaction: {}",
-                    format_unshield_amount_input(asset.max_single, asset.decimals)
+                    "Amount exceeds max batched transaction: {}",
+                    format_unshield_amount_input(asset.max_batched, asset.decimals)
                 ),
                 cx,
             );
@@ -3728,7 +3729,7 @@ impl WalletRoot {
         };
         let asset = &form.asset;
         let total_display = format_send_amount_input(asset.total, asset.decimals);
-        let max_display = format_send_amount_input(asset.max_single, asset.decimals);
+        let max_display = format_send_amount_input(asset.max_batched, asset.decimals);
         let unit_hint = if asset.decimals.is_some() {
             format!("{} amount", asset.label)
         } else {
@@ -3797,10 +3798,10 @@ impl WalletRoot {
                     .flex()
                     .gap_3()
                     .child(unshield_metric("Total private balance", total_display))
-                    .child(unshield_metric("Max one transaction", max_display)),
+                    .child(unshield_metric("Max batched transaction", max_display)),
             );
 
-        if asset.total > asset.max_single {
+        if asset.total > asset.max_batched {
             card = card.child(
                 div()
                     .p(px(10.0))
@@ -3810,7 +3811,7 @@ impl WalletRoot {
                     .border_color(rgb(theme::WARNING))
                     .text_color(rgb(theme::WARNING))
                     .text_size(APP_TEXT_SIZE)
-                    .child("Balance is split across private notes. One send can spend only a limited number of notes."),
+                    .child("Balance is split across private notes. One send can spend up to 8 proof chunks."),
             );
         }
 
@@ -3961,7 +3962,7 @@ impl WalletRoot {
         let asset = &form.asset;
         let unwrap_supported = is_wrapped_native_token(asset.chain_id, asset.token);
         let total_display = format_unshield_amount_input(asset.total, asset.decimals);
-        let max_display = format_unshield_amount_input(asset.max_single, asset.decimals);
+        let max_display = format_unshield_amount_input(asset.max_batched, asset.decimals);
         let unit_hint = if asset.decimals.is_some() {
             format!("{} amount", asset.label)
         } else {
@@ -4031,10 +4032,10 @@ impl WalletRoot {
                     .flex()
                     .gap_3()
                     .child(unshield_metric("Total private balance", total_display))
-                    .child(unshield_metric("Max one transaction", max_display)),
+                    .child(unshield_metric("Max batched transaction", max_display)),
             );
 
-        if asset.total > asset.max_single {
+        if asset.total > asset.max_batched {
             card = card.child(
                 div()
                     .p(px(10.0))
@@ -4044,7 +4045,7 @@ impl WalletRoot {
                     .border_color(rgb(theme::WARNING))
                     .text_color(rgb(theme::WARNING))
                     .text_size(APP_TEXT_SIZE)
-                    .child("Balance is split across private notes. One unshield can spend only a limited number of notes."),
+                    .child("Balance is split across private notes. One unshield can spend up to 8 proof chunks."),
             );
         }
 
@@ -5271,8 +5272,8 @@ fn build_unshield_asset(
 ) -> Option<UnshieldAsset> {
     let token = asset.token?;
     let total = asset.total?;
-    let max_single = max_unshield_amount_from_snapshot(snapshot, token);
-    if max_single.is_zero() {
+    let max_batched = max_unshield_amount_from_snapshot(snapshot, token);
+    if max_batched.is_zero() {
         return None;
     }
     Some(UnshieldAsset {
@@ -5281,7 +5282,7 @@ fn build_unshield_asset(
         label: asset.label.clone(),
         decimals: asset.decimals,
         total,
-        max_single,
+        max_batched,
         icon_path: asset.icon_path.clone(),
     })
 }
@@ -5292,8 +5293,8 @@ fn build_send_asset(
 ) -> Option<UnshieldAsset> {
     let token = asset.token?;
     let total = asset.total?;
-    let max_single = max_send_amount_from_snapshot(snapshot, token);
-    if max_single.is_zero() {
+    let max_batched = max_send_amount_from_snapshot(snapshot, token);
+    if max_batched.is_zero() {
         return None;
     }
     Some(UnshieldAsset {
@@ -5302,7 +5303,7 @@ fn build_send_asset(
         label: asset.label.clone(),
         decimals: asset.decimals,
         total,
-        max_single,
+        max_batched,
         icon_path: asset.icon_path.clone(),
     })
 }
@@ -5453,7 +5454,7 @@ fn send_form_max_entered_amount(
     fee_mode: PublicBroadcasterFeeMode,
 ) -> Option<U256> {
     match delivery_mode {
-        DeliveryMode::ManualCalldata => Some(form.asset.max_single),
+        DeliveryMode::ManualCalldata => Some(form.asset.max_batched),
         DeliveryMode::PublicBroadcaster => form
             .cost_estimate
             .as_ref()
@@ -5468,7 +5469,7 @@ fn unshield_form_max_entered_amount(
     fee_mode: PublicBroadcasterFeeMode,
 ) -> Option<U256> {
     match delivery_mode {
-        DeliveryMode::ManualCalldata => Some(form.asset.max_single),
+        DeliveryMode::ManualCalldata => Some(form.asset.max_batched),
         DeliveryMode::PublicBroadcaster => form
             .cost_estimate
             .as_ref()
@@ -5641,6 +5642,11 @@ fn render_broadcaster_picker_row(
     candidate: &PublicBroadcasterCandidate,
     selected: bool,
 ) -> gpui::Div {
+    let poi_hint = if candidate.required_poi_list_keys.is_empty() {
+        ""
+    } else {
+        " · requires POI"
+    };
     div()
         .w_full()
         .flex()
@@ -5660,11 +5666,12 @@ fn render_broadcaster_picker_row(
                         .child(broadcaster_candidate_label(candidate)),
                 )
                 .child(app_muted_text(format!(
-                    "fee {} · reliability {:.0}% · wallets {} · v{}",
+                    "fee {} · reliability {:.0}% · wallets {} · v{}{}",
                     broadcaster_candidate_fee_label(candidate),
                     candidate.reliability * 100.0,
                     candidate.available_wallets,
-                    candidate.version
+                    candidate.version,
+                    poi_hint
                 ))),
         )
         .child(
@@ -5683,37 +5690,11 @@ fn render_broadcaster_picker_row(
 }
 
 fn max_unshield_amount_from_snapshot(snapshot: &ListUtxosOutput, token: Address) -> U256 {
-    let mut by_tree: BTreeMap<u32, Vec<U256>> = BTreeMap::new();
-    for row in snapshot.utxos.iter().filter(|row| !row.is_spent) {
-        let Some(row_token) = parse_address(&row.token) else {
-            continue;
-        };
-        if row_token != token {
-            continue;
-        }
-        let Ok(value) = U256::from_str_radix(&row.value, 10) else {
-            continue;
-        };
-        if !value.is_zero() {
-            by_tree.entry(row.tree).or_default().push(value);
-        }
-    }
-
-    by_tree
-        .into_values()
-        .map(|mut values| {
-            values.sort_by(|a, b| b.cmp(a));
-            values
-                .into_iter()
-                .take(MAX_UNSHIELD_INPUTS)
-                .fold(U256::ZERO, |sum, value| sum + value)
-        })
-        .max()
-        .unwrap_or(U256::ZERO)
+    planner_max_unshield_amount_from_outputs(&snapshot.utxos, token)
 }
 
 fn max_send_amount_from_snapshot(snapshot: &ListUtxosOutput, token: Address) -> U256 {
-    max_unshield_amount_from_snapshot(snapshot, token)
+    planner_max_send_amount_from_outputs(&snapshot.utxos, token)
 }
 
 fn format_unshield_amount_input(amount: U256, decimals: Option<u8>) -> String {
@@ -6242,8 +6223,11 @@ fn render_public_broadcaster_cost_estimate(
             ),
         ))
         .child(cost_estimate_detail_text(format!(
-            "Shape: {} inputs · {} private outputs · {} public outputs",
-            estimate.input_count, estimate.private_output_count, estimate.public_output_count
+            "Shape: {} proofs · {} inputs · {} private outputs · {} public outputs",
+            estimate.transaction_count,
+            estimate.input_count,
+            estimate.private_output_count,
+            estimate.public_output_count
         )))
         .child(cost_estimate_detail_text(
             public_broadcaster_fee_mode_summary(
@@ -6781,7 +6765,7 @@ mod tests {
             label: "USDC".to_string(),
             decimals: Some(6),
             total: U256::ZERO,
-            max_single: U256::ZERO,
+            max_batched: U256::ZERO,
             icon_path: None,
         };
 
@@ -6804,7 +6788,7 @@ mod tests {
             label: "USDC".to_string(),
             decimals: Some(6),
             total: U256::ZERO,
-            max_single: U256::ZERO,
+            max_batched: U256::ZERO,
             icon_path: None,
         };
 
@@ -6942,7 +6926,7 @@ mod tests {
     }
 
     #[test]
-    fn max_unshield_amount_from_snapshot_uses_top_thirteen_by_tree() {
+    fn max_unshield_amount_from_snapshot_uses_batched_top_chunks() {
         let token = Address::from([0x11; 20]);
         let other = Address::from([0x22; 20]);
         let mut utxos = (0..20)
@@ -6962,12 +6946,12 @@ mod tests {
 
         assert_eq!(
             max_unshield_amount_from_snapshot(&snapshot, token),
-            U256::from(15_u8)
+            U256::from(35_u8)
         );
     }
 
     #[test]
-    fn max_send_amount_from_snapshot_uses_top_thirteen_by_tree() {
+    fn max_send_amount_from_snapshot_uses_batched_top_chunks() {
         let token = Address::from([0x12; 20]);
         let other = Address::from([0x22; 20]);
         let mut utxos = (0..20)
@@ -6987,12 +6971,12 @@ mod tests {
 
         assert_eq!(
             max_send_amount_from_snapshot(&snapshot, token),
-            U256::from(15_u8)
+            U256::from(35_u8)
         );
     }
 
     #[test]
-    fn build_unshield_asset_includes_max_single_transaction() {
+    fn build_unshield_asset_includes_max_batched_transaction() {
         let token = Address::from([0x33; 20]);
         let snapshot = ListUtxosOutput {
             chain_id: 1,
@@ -7017,11 +7001,11 @@ mod tests {
         let asset = build_unshield_asset(&snapshot, &row).expect("unshield asset");
 
         assert_eq!(asset.total, U256::from(12_u8));
-        assert_eq!(asset.max_single, U256::from(12_u8));
+        assert_eq!(asset.max_batched, U256::from(12_u8));
     }
 
     #[test]
-    fn build_send_asset_includes_max_single_transaction() {
+    fn build_send_asset_includes_max_batched_transaction() {
         let token = Address::from([0x34; 20]);
         let snapshot = ListUtxosOutput {
             chain_id: 1,
@@ -7046,7 +7030,7 @@ mod tests {
         let asset = build_send_asset(&snapshot, &row).expect("send asset");
 
         assert_eq!(asset.total, U256::from(12_u8));
-        assert_eq!(asset.max_single, U256::from(12_u8));
+        assert_eq!(asset.max_batched, U256::from(12_u8));
     }
 
     #[test]

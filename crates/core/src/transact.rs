@@ -336,6 +336,15 @@ pub struct FeeNoteAssuranceContext {
 }
 
 #[derive(Debug)]
+pub struct ParsedTransactTransaction {
+    pub railgun_txid: U256,
+    pub utxo_tree_in: u64,
+    pub tx_nullifiers_len: usize,
+    pub tx_commitments_out_len: usize,
+    pub has_unshield: bool,
+}
+
+#[derive(Debug)]
 pub struct ParsedTransactCalldata {
     pub fee_token: Address,
     pub fee_amount: U256,
@@ -345,6 +354,7 @@ pub struct ParsedTransactCalldata {
     pub fee_note_npk: FixedBytes<32>,
     pub tx_nullifiers_len: usize,
     pub tx_commitments_out_len: usize,
+    pub transactions: Vec<ParsedTransactTransaction>,
     pub action_data: Option<ActionData>,
     pub fee_note_assurance: Option<FeeNoteAssuranceContext>,
 }
@@ -389,6 +399,20 @@ pub fn attach_fee_note_assurance_context(
     Ok(())
 }
 
+fn parsed_transaction_metadata(
+    transaction: &Transaction,
+    txid_version: Option<&str>,
+) -> Result<ParsedTransactTransaction, TransactError> {
+    let railgun_txid = compute_railgun_txid(transaction, txid_version)?;
+    Ok(ParsedTransactTransaction {
+        railgun_txid,
+        utxo_tree_in: transaction.boundParams.treeNumber.into(),
+        tx_nullifiers_len: transaction.nullifiers.len(),
+        tx_commitments_out_len: transaction.commitments.len(),
+        has_unshield: transaction.boundParams.unshield != 0,
+    })
+}
+
 pub fn parse_transact_calldata(
     calldata: &[u8],
     viewing_privkey: &[u8; 32],
@@ -413,9 +437,16 @@ pub fn parse_transact_calldata(
     let tx0 = transactions
         .first()
         .ok_or(TransactError::MissingTransactions)?;
+    let parsed_transactions = transactions
+        .iter()
+        .map(|transaction| parsed_transaction_metadata(transaction, txid_version))
+        .collect::<Result<Vec<_>, _>>()?;
 
-    let railgun_txid = compute_railgun_txid(tx0, txid_version)?;
-    let utxo_tree_in = tx0.boundParams.treeNumber.into();
+    let Some(tx0_metadata) = parsed_transactions.first() else {
+        return Err(TransactError::MissingTransactions);
+    };
+    let railgun_txid = tx0_metadata.railgun_txid;
+    let utxo_tree_in = tx0_metadata.utxo_tree_in;
     let fee_commitment = tx0
         .commitments
         .first()
@@ -467,8 +498,9 @@ pub fn parse_transact_calldata(
         utxo_tree_in,
         fee_commitment,
         fee_note_npk,
-        tx_nullifiers_len: tx0.nullifiers.len(),
-        tx_commitments_out_len: tx0.commitments.len(),
+        tx_nullifiers_len: tx0_metadata.tx_nullifiers_len,
+        tx_commitments_out_len: tx0_metadata.tx_commitments_out_len,
+        transactions: parsed_transactions,
         action_data,
         fee_note_assurance: None,
     })
@@ -664,6 +696,38 @@ mod tests {
         assert_eq!(parsed.utxo_tree_in, 9);
         assert_eq!(parsed.fee_commitment, fee_commitment);
         assert!(parsed.fee_note_assurance.is_none());
+    }
+
+    #[test]
+    fn parse_transact_extracts_all_inner_transaction_metadata() {
+        let viewing_key_data = sample_viewing_key_data();
+        let (_, tx0, _, _, _) = sample_transaction_and_params(None);
+        let mut tx1 = tx0.clone();
+        tx1.boundParams.treeNumber = 10;
+        tx1.nullifiers = vec![FixedBytes::from([2u8; 32]), FixedBytes::from([3u8; 32])];
+        tx1.commitments.push(FixedBytes::from([4u8; 32]));
+        let calldata = transactCall {
+            _transactions: vec![tx0, tx1],
+        }
+        .abi_encode();
+
+        let parsed = parse_transact_calldata(
+            &calldata,
+            &viewing_key_data.viewing_private_key,
+            viewing_key_data.master_public_key,
+            None,
+        )
+        .expect("parse calldata");
+
+        assert_eq!(parsed.transactions.len(), 2);
+        assert_eq!(parsed.transactions[0].utxo_tree_in, 9);
+        assert_eq!(parsed.transactions[0].tx_nullifiers_len, 1);
+        assert_eq!(parsed.transactions[0].tx_commitments_out_len, 1);
+        assert!(!parsed.transactions[0].has_unshield);
+        assert_eq!(parsed.transactions[1].utxo_tree_in, 10);
+        assert_eq!(parsed.transactions[1].tx_nullifiers_len, 2);
+        assert_eq!(parsed.transactions[1].tx_commitments_out_len, 2);
+        assert_eq!(parsed.railgun_txid, parsed.transactions[0].railgun_txid);
     }
 
     #[test]

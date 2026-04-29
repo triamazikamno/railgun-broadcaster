@@ -4,7 +4,7 @@ use broadcaster_core::crypto::poseidon::poseidon;
 use broadcaster_core::crypto::snark_proof::Prover;
 use broadcaster_core::transact::{
     BroadcasterRawParamsTransact, FeeNoteAssuranceContext, ParsedTransactCalldata,
-    railgun_txid_leaf_hash, txid_version_or_default,
+    ParsedTransactTransaction, railgun_txid_leaf_hash, txid_version_or_default,
 };
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -37,24 +37,25 @@ impl Poi {
         params: &BroadcasterRawParamsTransact,
     ) -> Result<(), PoiError> {
         for list_key in &self.required_poi_list {
-            self.validate(parsed_calldata, params, list_key)
-                .await
-                .map_err(|source| PoiError::ValidateList {
-                    list_key: *list_key,
-                    source: Box::new(source),
-                })?;
+            for transaction in &parsed_calldata.transactions {
+                self.validate_transaction(transaction, params, list_key)
+                    .await
+                    .map_err(|source| PoiError::ValidateList {
+                        list_key: *list_key,
+                        source: Box::new(source),
+                    })?;
+            }
         }
         Ok(())
     }
 
-    async fn validate(
+    async fn validate_transaction(
         &self,
-        parsed_calldata: &ParsedTransactCalldata,
+        transaction: &ParsedTransactTransaction,
         params: &BroadcasterRawParamsTransact,
         required_list_key: &FixedBytes<32>,
     ) -> Result<(), PoiError> {
-        let leaf =
-            railgun_txid_leaf_hash(parsed_calldata.railgun_txid, parsed_calldata.utxo_tree_in);
+        let leaf = railgun_txid_leaf_hash(transaction.railgun_txid, transaction.utxo_tree_in);
         let leaf_hex: FixedBytes<32> = leaf.into();
 
         let per_list = params
@@ -93,8 +94,8 @@ impl Poi {
         }
 
         let snark_ok = self.snark_prover.verify(
-            parsed_calldata.tx_nullifiers_len,
-            parsed_calldata.tx_commitments_out_len,
+            transaction.tx_nullifiers_len,
+            transaction.tx_commitments_out_len,
             poi,
         )?;
 

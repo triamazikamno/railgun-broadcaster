@@ -28,6 +28,9 @@ pub const MAX_CIRCUIT_INPUTS: usize = 13;
 /// Maximum total inputs to the signature hash (inputs + outputs + 2 for root and bound params).
 pub const MAX_SIGNATURE_INPUTS: usize = 16;
 
+/// Maximum number of inner Railgun transactions to include in one outer call.
+pub const MAX_BATCH_TRANSACTIONS: usize = 8;
+
 #[derive(Debug, Error)]
 pub enum BuildError {
     #[error("no matching utxos for amount. max immediately spendable: {0}")]
@@ -67,14 +70,27 @@ pub struct InputWitness {
 }
 
 #[derive(Debug, Clone)]
+pub struct TransactionPlanChunk {
+    pub tree_number: u32,
+    pub merkle_root: U256,
+    pub inputs: Vec<InputWitness>,
+    pub outputs: Vec<Note>,
+    pub public_inputs: PublicInputs,
+    pub private_inputs: PrivateInputs,
+    pub signature: [U256; 3],
+}
+
+#[derive(Debug, Clone)]
 pub struct UnshieldPlan {
     pub call: TransactionCall,
     pub tree_number: u32,
     pub merkle_root: U256,
     pub inputs: Vec<InputWitness>,
     pub outputs: Vec<Note>,
+    pub chunks: Vec<TransactionPlanChunk>,
     pub broadcaster_fee_note: Option<Note>,
     pub unshield_note: Note,
+    pub unshield_notes: Vec<Note>,
     pub change_note: Option<Note>,
     pub public_inputs: PublicInputs,
     pub private_inputs: PrivateInputs,
@@ -88,8 +104,10 @@ pub struct SendPlan {
     pub merkle_root: U256,
     pub inputs: Vec<InputWitness>,
     pub outputs: Vec<Note>,
+    pub chunks: Vec<TransactionPlanChunk>,
     pub broadcaster_fee_note: Option<Note>,
     pub recipient_note: Note,
+    pub recipient_notes: Vec<Note>,
     pub change_note: Option<Note>,
     pub public_inputs: PublicInputs,
     pub private_inputs: PrivateInputs,
@@ -106,6 +124,64 @@ pub struct TransactPlan {
     pub public_inputs: PublicInputs,
     pub private_inputs: PrivateInputs,
     pub signature: [U256; 3],
+}
+
+impl UnshieldPlan {
+    #[must_use]
+    pub fn transaction_count(&self) -> usize {
+        self.chunks.len()
+    }
+
+    #[must_use]
+    pub fn input_count(&self) -> usize {
+        self.inputs.len()
+    }
+
+    #[must_use]
+    pub fn private_output_count(&self) -> usize {
+        self.outputs.len()
+    }
+
+    #[must_use]
+    pub fn public_output_count(&self) -> usize {
+        self.unshield_notes.len()
+    }
+
+    #[must_use]
+    pub fn unshield_amount(&self) -> U256 {
+        self.unshield_notes
+            .iter()
+            .fold(U256::ZERO, |sum, note| sum + note.value)
+    }
+}
+
+impl SendPlan {
+    #[must_use]
+    pub fn transaction_count(&self) -> usize {
+        self.chunks.len()
+    }
+
+    #[must_use]
+    pub fn input_count(&self) -> usize {
+        self.inputs.len()
+    }
+
+    #[must_use]
+    pub fn private_output_count(&self) -> usize {
+        self.outputs.len()
+    }
+
+    #[must_use]
+    pub const fn public_output_count(&self) -> usize {
+        0
+    }
+
+    #[must_use]
+    pub fn send_amount(&self) -> U256 {
+        self.recipient_notes
+            .iter()
+            .fold(U256::ZERO, |sum, note| sum + note.value)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -274,6 +350,9 @@ impl SendRequest {
 pub struct UnshieldSelectionInfo {
     pub total: U256,
     pub input_count: usize,
+    pub transaction_count: usize,
+    pub private_output_count: usize,
+    pub public_output_count: usize,
     pub max_spendable: U256,
 }
 
@@ -316,25 +395,17 @@ impl TransactionBuilder {
         request: UnshieldRequest,
         prover: &ProverService,
     ) -> Result<UnshieldPlan, BuildError> {
-        let (selected_utxos, total) = select_utxos(
+        let selection = select_batched_utxos(
             utxos,
             request.token_address,
             request.target_amount(),
             request.spend_up_to,
             request.base_output_count(),
+            1,
         )?;
 
-        let plan_builder = TransactionPlanBuilder::new(
-            self,
-            viewing,
-            signer,
-            forest,
-            prover,
-            selected_utxos,
-            request.token_address,
-        )?;
-
-        plan_builder.build_unshield(request, total).await
+        self.build_unshield_batch_with_signer(viewing, signer, forest, selection, request, prover)
+            .await
     }
 
     /// Build a private send plan using token selection from available UTXOs.
@@ -360,25 +431,283 @@ impl TransactionBuilder {
         request: SendRequest,
         prover: &ProverService,
     ) -> Result<SendPlan, BuildError> {
-        let (selected_utxos, total) = select_utxos(
+        let selection = select_batched_utxos(
             utxos,
             request.token_address,
             request.target_amount(),
             request.spend_up_to,
             request.base_output_count(),
+            1,
         )?;
 
-        let plan_builder = TransactionPlanBuilder::new(
-            self,
-            viewing,
-            signer,
-            forest,
-            prover,
-            selected_utxos,
-            request.token_address,
-        )?;
+        self.build_send_batch_with_signer(viewing, signer, forest, selection, request, prover)
+            .await
+    }
 
-        plan_builder.build_send(request, total).await
+    async fn build_unshield_batch_with_signer(
+        &self,
+        viewing: &ViewingKeyData,
+        signer: &impl RailgunSpendSigner,
+        forest: &MerkleForest,
+        selection: BatchUtxoSelection,
+        request: UnshieldRequest,
+        prover: &ProverService,
+    ) -> Result<UnshieldPlan, BuildError> {
+        let allocations = spend_allocations(
+            &selection,
+            request.amount,
+            request.fee_amount(),
+            request.broadcaster_fee,
+            request.spend_up_to,
+        )?;
+        let receiver = viewing.address_data();
+        let unshield_to = match request.mode {
+            UnshieldMode::Token => request.recipient,
+            UnshieldMode::UnwrapBase => self.relay_adapt_contract,
+        };
+
+        let mut unproven_plans = Vec::with_capacity(selection.chunks.len());
+        let mut broadcaster_fee_note = None;
+        let mut unshield_notes = Vec::with_capacity(selection.chunks.len());
+        let mut change_note = None;
+
+        for (chunk, allocation) in selection.chunks.into_iter().zip(allocations) {
+            let plan_builder = TransactionPlanBuilder::new(
+                self,
+                viewing,
+                signer,
+                forest,
+                prover,
+                chunk.utxos,
+                request.token_address,
+            )?;
+            let UnshieldOutputs {
+                outputs,
+                commitment_ciphertext,
+                broadcaster_fee_note: chunk_fee_note,
+                unshield_note,
+                change_note: chunk_change_note,
+            } = build_unshield_outputs(
+                request.token_address,
+                allocation.amount,
+                unshield_to,
+                allocation.change,
+                &receiver,
+                allocation.fee,
+                &viewing.viewing_private_key,
+            )?;
+            if broadcaster_fee_note.is_none() {
+                broadcaster_fee_note = chunk_fee_note;
+            }
+            if chunk_change_note.is_some() {
+                change_note = chunk_change_note.clone();
+            }
+            unshield_notes.push(unshield_note);
+            unproven_plans.push(plan_builder.build_unproven_unshield(
+                request,
+                outputs,
+                commitment_ciphertext,
+                unshield_notes.last().expect("pushed unshield note"),
+            )?);
+        }
+
+        let action_data = if matches!(request.mode, UnshieldMode::UnwrapBase) {
+            let random = FixedBytes::<31>::from(rand_array());
+            Some(ActionData::unwrap_base(
+                self.relay_adapt_contract,
+                request.recipient,
+                random,
+                true,
+            ))
+        } else {
+            None
+        };
+        if let Some(action_data) = action_data.as_ref() {
+            let transactions = unproven_plans
+                .iter()
+                .map(|plan| &plan.transaction)
+                .collect::<Vec<_>>();
+            let adapt_params = action_data.adapt_params(&transactions);
+            for plan in &mut unproven_plans {
+                plan.transaction.boundParams.adaptContract = self.relay_adapt_contract;
+                plan.transaction.boundParams.adaptParams = adapt_params;
+            }
+        }
+
+        let mut transactions = Vec::with_capacity(unproven_plans.len());
+        let mut chunks = Vec::with_capacity(unproven_plans.len());
+        for plan in unproven_plans {
+            let proven = prove_transaction_plan(plan, signer, prover, request.verify_proof).await?;
+            transactions.push(proven.transaction);
+            chunks.push(proven.chunk);
+        }
+
+        let first_chunk = chunks
+            .first()
+            .expect("selection has at least one chunk")
+            .clone();
+        let inputs = chunks
+            .iter()
+            .flat_map(|chunk| chunk.inputs.clone())
+            .collect::<Vec<_>>();
+        let outputs = chunks
+            .iter()
+            .flat_map(|chunk| chunk.outputs.clone())
+            .collect::<Vec<_>>();
+        let unshield_note = unshield_notes
+            .first()
+            .expect("selection has at least one chunk")
+            .clone();
+
+        let call = if matches!(request.mode, UnshieldMode::UnwrapBase) {
+            let action_data = action_data.ok_or(BuildError::MissingActionData)?;
+            let data = relayCall {
+                _transactions: transactions,
+                _actionData: action_data,
+            }
+            .abi_encode();
+            TransactionCall {
+                to: self.relay_adapt_contract,
+                data: data.into(),
+            }
+        } else {
+            let data = transactCall {
+                _transactions: transactions,
+            }
+            .abi_encode();
+            TransactionCall {
+                to: self.railgun_contract,
+                data: data.into(),
+            }
+        };
+
+        Ok(UnshieldPlan {
+            call,
+            tree_number: first_chunk.tree_number,
+            merkle_root: first_chunk.merkle_root,
+            inputs,
+            outputs,
+            chunks,
+            broadcaster_fee_note,
+            unshield_note,
+            unshield_notes,
+            change_note,
+            public_inputs: first_chunk.public_inputs,
+            private_inputs: first_chunk.private_inputs,
+            signature: first_chunk.signature,
+        })
+    }
+
+    async fn build_send_batch_with_signer(
+        &self,
+        viewing: &ViewingKeyData,
+        signer: &impl RailgunSpendSigner,
+        forest: &MerkleForest,
+        selection: BatchUtxoSelection,
+        request: SendRequest,
+        prover: &ProverService,
+    ) -> Result<SendPlan, BuildError> {
+        let allocations = spend_allocations(
+            &selection,
+            request.amount,
+            request.fee_amount(),
+            request.broadcaster_fee,
+            request.spend_up_to,
+        )?;
+        let sender = viewing.address_data();
+        let mut unproven_plans = Vec::with_capacity(selection.chunks.len());
+        let mut broadcaster_fee_note = None;
+        let mut recipient_notes = Vec::with_capacity(selection.chunks.len());
+        let mut change_note = None;
+
+        for (chunk, allocation) in selection.chunks.into_iter().zip(allocations) {
+            let plan_builder = TransactionPlanBuilder::new(
+                self,
+                viewing,
+                signer,
+                forest,
+                prover,
+                chunk.utxos,
+                request.token_address,
+            )?;
+            let SendOutputs {
+                outputs,
+                commitment_ciphertext,
+                broadcaster_fee_note: chunk_fee_note,
+                recipient_note,
+                change_note: chunk_change_note,
+            } = build_send_outputs(
+                request.token_address,
+                allocation.amount,
+                allocation.change,
+                &sender,
+                &request.recipient,
+                allocation.fee,
+                &viewing.viewing_private_key,
+            )?;
+            if broadcaster_fee_note.is_none() {
+                broadcaster_fee_note = chunk_fee_note;
+            }
+            if chunk_change_note.is_some() {
+                change_note = chunk_change_note.clone();
+            }
+            recipient_notes.push(recipient_note);
+            unproven_plans.push(plan_builder.build_unproven_send(
+                request,
+                outputs,
+                commitment_ciphertext,
+            )?);
+        }
+
+        let mut transactions = Vec::with_capacity(unproven_plans.len());
+        let mut chunks = Vec::with_capacity(unproven_plans.len());
+        for plan in unproven_plans {
+            let proven = prove_transaction_plan(plan, signer, prover, request.verify_proof).await?;
+            transactions.push(proven.transaction);
+            chunks.push(proven.chunk);
+        }
+
+        let first_chunk = chunks
+            .first()
+            .expect("selection has at least one chunk")
+            .clone();
+        let inputs = chunks
+            .iter()
+            .flat_map(|chunk| chunk.inputs.clone())
+            .collect::<Vec<_>>();
+        let outputs = chunks
+            .iter()
+            .flat_map(|chunk| chunk.outputs.clone())
+            .collect::<Vec<_>>();
+        let recipient_note = recipient_notes
+            .first()
+            .expect("selection has at least one chunk")
+            .clone();
+
+        let data = transactCall {
+            _transactions: transactions,
+        }
+        .abi_encode();
+        let call = TransactionCall {
+            to: self.railgun_contract,
+            data: data.into(),
+        };
+
+        Ok(SendPlan {
+            call,
+            tree_number: first_chunk.tree_number,
+            merkle_root: first_chunk.merkle_root,
+            inputs,
+            outputs,
+            chunks,
+            broadcaster_fee_note,
+            recipient_note,
+            recipient_notes,
+            change_note,
+            public_inputs: first_chunk.public_inputs,
+            private_inputs: first_chunk.private_inputs,
+            signature: first_chunk.signature,
+        })
     }
 
     /// Build a transact plan for UTXO consolidation.
@@ -413,6 +742,27 @@ struct TransactionPlanBuilder<'a, S: RailgunSpendSigner> {
     prover: &'a ProverService,
     inputs: Vec<Utxo>,
     token_address: Address,
+}
+
+struct UnprovenTransactionPlan {
+    transaction: Transaction,
+    tree_number: u32,
+    merkle_root: U256,
+    inputs: Vec<InputWitness>,
+    outputs: Vec<Note>,
+    private_inputs: PrivateInputs,
+}
+
+struct ProvenTransactionPlan {
+    transaction: Transaction,
+    chunk: TransactionPlanChunk,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SpendAllocation {
+    amount: U256,
+    change: U256,
+    fee: Option<BroadcasterFeeOutput>,
 }
 
 impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
@@ -528,7 +878,118 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
             .collect()
     }
 
+    fn build_unproven_unshield(
+        self,
+        request: UnshieldRequest,
+        outputs: Vec<Note>,
+        commitment_ciphertext: Vec<NoteCiphertext>,
+        unshield_note: &Note,
+    ) -> Result<UnprovenTransactionPlan, BuildError> {
+        self.validate_signature_limit(outputs.len())?;
+
+        let tree_number = self.tree_number();
+        let root = self.get_root()?;
+        let nullifiers = self.compute_nullifiers();
+        let commitments = Self::compute_commitments(&outputs);
+        let commitment_ciphertext = commitment_ciphertext
+            .into_iter()
+            .map(NoteCiphertext::into_commitment_ciphertext)
+            .collect();
+        let bound_params = BoundParams::new_unshield(
+            tree_number,
+            self.builder.chain_type,
+            self.builder.chain_id,
+            commitment_ciphertext,
+            Address::ZERO,
+            UNRELAYED_ADAPT_PARAMS,
+        )
+        .with_min_gas_price(request.min_gas_price)?;
+
+        let transaction = Transaction {
+            proof: SnarkProof::default(),
+            merkleRoot: FixedBytes::from(root.to_be_bytes::<32>()),
+            nullifiers,
+            commitments,
+            boundParams: bound_params,
+            unshieldPreimage: CommitmentPreimage::new_unshield(
+                unshield_note,
+                request.token_address,
+            ),
+        };
+        let inputs = self.build_input_witnesses()?;
+        let private_inputs = PrivateInputs::from_inputs(
+            request.token_address,
+            &inputs,
+            &outputs,
+            self.viewing,
+            self.signer,
+        );
+
+        Ok(UnprovenTransactionPlan {
+            transaction,
+            tree_number,
+            merkle_root: root,
+            inputs,
+            outputs,
+            private_inputs,
+        })
+    }
+
+    fn build_unproven_send(
+        self,
+        request: SendRequest,
+        outputs: Vec<Note>,
+        commitment_ciphertext: Vec<NoteCiphertext>,
+    ) -> Result<UnprovenTransactionPlan, BuildError> {
+        self.validate_signature_limit(outputs.len())?;
+
+        let tree_number = self.tree_number();
+        let root = self.get_root()?;
+        let nullifiers = self.compute_nullifiers();
+        let commitments = Self::compute_commitments(&outputs);
+        let commitment_ciphertext = commitment_ciphertext
+            .into_iter()
+            .map(NoteCiphertext::into_commitment_ciphertext)
+            .collect();
+        let bound_params = BoundParams::new_transact(
+            tree_number,
+            self.builder.chain_type,
+            self.builder.chain_id,
+            commitment_ciphertext,
+            Address::ZERO,
+            UNRELAYED_ADAPT_PARAMS,
+        )
+        .with_min_gas_price(request.min_gas_price)?;
+
+        let transaction = Transaction {
+            proof: SnarkProof::default(),
+            merkleRoot: FixedBytes::from(root.to_be_bytes::<32>()),
+            nullifiers,
+            commitments,
+            boundParams: bound_params,
+            unshieldPreimage: CommitmentPreimage::empty(),
+        };
+        let inputs = self.build_input_witnesses()?;
+        let private_inputs = PrivateInputs::from_inputs(
+            request.token_address,
+            &inputs,
+            &outputs,
+            self.viewing,
+            self.signer,
+        );
+
+        Ok(UnprovenTransactionPlan {
+            transaction,
+            tree_number,
+            merkle_root: root,
+            inputs,
+            outputs,
+            private_inputs,
+        })
+    }
+
     /// Build an unshield plan.
+    #[allow(dead_code)]
     async fn build_unshield(
         self,
         request: UnshieldRequest,
@@ -687,14 +1148,26 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
             }
         };
 
+        let chunk = TransactionPlanChunk {
+            tree_number,
+            merkle_root: root,
+            inputs: inputs.clone(),
+            outputs: outputs.clone(),
+            public_inputs: public_inputs.clone(),
+            private_inputs: private_inputs.clone(),
+            signature,
+        };
+
         Ok(UnshieldPlan {
             call,
             tree_number,
             merkle_root: root,
             inputs,
             outputs,
+            chunks: vec![chunk],
             broadcaster_fee_note,
-            unshield_note,
+            unshield_note: unshield_note.clone(),
+            unshield_notes: vec![unshield_note],
             change_note,
             public_inputs,
             private_inputs,
@@ -703,6 +1176,7 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
     }
 
     /// Build a private send plan.
+    #[allow(dead_code)]
     async fn build_send(self, request: SendRequest, total: U256) -> Result<SendPlan, BuildError> {
         let fee_amount = request.fee_amount();
         if total < fee_amount {
@@ -812,14 +1286,26 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
             data: data.into(),
         };
 
+        let chunk = TransactionPlanChunk {
+            tree_number,
+            merkle_root: root,
+            inputs: inputs.clone(),
+            outputs: outputs.clone(),
+            public_inputs: public_inputs.clone(),
+            private_inputs: private_inputs.clone(),
+            signature,
+        };
+
         Ok(SendPlan {
             call,
             tree_number,
             merkle_root: root,
             inputs,
             outputs,
+            chunks: vec![chunk],
             broadcaster_fee_note,
-            recipient_note,
+            recipient_note: recipient_note.clone(),
+            recipient_notes: vec![recipient_note],
             change_note,
             public_inputs,
             private_inputs,
@@ -950,6 +1436,91 @@ impl BoundParamsExt for BoundParams {
         self.minGasPrice = Uint::<72, 2>::from(min_gas_price);
         Ok(self)
     }
+}
+
+fn spend_allocations(
+    selection: &BatchUtxoSelection,
+    requested_amount: U256,
+    fee_amount: U256,
+    broadcaster_fee: Option<BroadcasterFeeOutput>,
+    spend_up_to: bool,
+) -> Result<Vec<SpendAllocation>, BuildError> {
+    if selection.total < fee_amount {
+        return Err(BuildError::InsufficientBalance(selection.total));
+    }
+    let spendable_after_fee = selection.total - fee_amount;
+    if !spend_up_to && spendable_after_fee < requested_amount {
+        return Err(BuildError::InsufficientBalance(selection.total));
+    }
+    let amount = if spend_up_to {
+        spendable_after_fee.min(requested_amount)
+    } else {
+        requested_amount
+    };
+    if amount.is_zero() {
+        return Err(BuildError::InsufficientBalance(selection.total));
+    }
+
+    let mut remaining = amount;
+    let mut allocations = Vec::with_capacity(selection.chunks.len());
+    for (index, chunk) in selection.chunks.iter().enumerate() {
+        let fee = if index == 0 { broadcaster_fee } else { None };
+        let chunk_fee = fee.map_or(U256::ZERO, |fee| fee.amount);
+        if chunk.total <= chunk_fee {
+            return Err(BuildError::InsufficientBalance(selection.total));
+        }
+        let spendable = chunk.total - chunk_fee;
+        let amount = spendable.min(remaining);
+        if amount.is_zero() {
+            return Err(BuildError::InsufficientBalance(selection.total));
+        }
+        let change = spendable - amount;
+        remaining -= amount;
+        allocations.push(SpendAllocation {
+            amount,
+            change,
+            fee,
+        });
+    }
+
+    if remaining.is_zero() {
+        Ok(allocations)
+    } else {
+        Err(BuildError::InsufficientBalance(selection.total))
+    }
+}
+
+async fn prove_transaction_plan(
+    mut plan: UnprovenTransactionPlan,
+    signer: &impl RailgunSpendSigner,
+    prover: &ProverService,
+    verify_proof: bool,
+) -> Result<ProvenTransactionPlan, BuildError> {
+    let public_inputs =
+        PublicInputs::from_transaction(plan.merkle_root, &plan.transaction, &plan.outputs);
+    let signature = public_inputs.signature(signer);
+    let proof = prover
+        .prove_unshield(
+            &public_inputs,
+            &plan.private_inputs,
+            &signature,
+            verify_proof,
+        )
+        .await?;
+    plan.transaction.proof = proof;
+    let chunk = TransactionPlanChunk {
+        tree_number: plan.tree_number,
+        merkle_root: plan.merkle_root,
+        inputs: plan.inputs,
+        outputs: plan.outputs,
+        public_inputs,
+        private_inputs: plan.private_inputs,
+        signature,
+    };
+    Ok(ProvenTransactionPlan {
+        transaction: plan.transaction,
+        chunk,
+    })
 }
 
 fn push_broadcaster_fee_output(
@@ -1088,9 +1659,22 @@ struct UtxoSelection {
     total: U256,
 }
 
+#[derive(Debug, Clone)]
+struct BatchUtxoSelection {
+    chunks: Vec<UtxoSelection>,
+    total: U256,
+}
+
+impl BatchUtxoSelection {
+    #[must_use]
+    fn input_count(&self) -> usize {
+        self.chunks.iter().map(|chunk| chunk.utxos.len()).sum()
+    }
+}
+
 #[must_use]
 pub fn max_unshield_spendable(utxos: &[Utxo], token_address: Address) -> U256 {
-    max_unshield_selection(utxos, token_address).map_or(U256::ZERO, |selection| selection.total)
+    max_batch_spendable(utxos, token_address, 1, 1)
 }
 
 pub fn unshield_selection_info(
@@ -1099,11 +1683,15 @@ pub fn unshield_selection_info(
     amount: U256,
     spend_up_to: bool,
 ) -> Result<UnshieldSelectionInfo, BuildError> {
-    let max_spendable = max_unshield_spendable(utxos, token_address);
-    let (selected, total) = select_utxos(utxos, token_address, amount, spend_up_to, 1)?;
+    let max_spendable = max_batch_spendable(utxos, token_address, 1, 1);
+    let selection = select_batched_utxos(utxos, token_address, amount, spend_up_to, 1, 1)?;
+    let shape = batch_shape(&selection, amount, U256::ZERO, false, false);
     Ok(UnshieldSelectionInfo {
-        total,
-        input_count: selected.len(),
+        total: selection.total,
+        input_count: selection.input_count(),
+        transaction_count: shape.transaction_count,
+        private_output_count: shape.private_output_count,
+        public_output_count: shape.public_output_count,
         max_spendable,
     })
 }
@@ -1116,31 +1704,31 @@ pub fn unshield_selection_info_with_broadcaster_fee(
     spend_up_to: bool,
 ) -> Result<UnshieldSelectionInfo, BuildError> {
     let target_amount = amount + fee_amount;
-    let max_spendable = max_unshield_selection_with_output_count(utxos, token_address, 2).map_or(
-        U256::ZERO,
-        |selection| {
-            if selection.total > fee_amount {
-                selection.total - fee_amount
-            } else {
-                U256::ZERO
-            }
-        },
-    );
-    let (selected, total) = select_utxos(utxos, token_address, target_amount, spend_up_to, 2)
+    let max_total = max_batch_spendable(utxos, token_address, 2, 1);
+    let max_spendable = if max_total > fee_amount {
+        max_total - fee_amount
+    } else {
+        U256::ZERO
+    };
+    let selection = select_batched_utxos(utxos, token_address, target_amount, spend_up_to, 2, 1)
         .map_err(|error| match error {
             BuildError::InsufficientBalance(_) => BuildError::InsufficientBalance(max_spendable),
             other => other,
         })?;
+    let shape = batch_shape(&selection, amount, fee_amount, true, false);
     Ok(UnshieldSelectionInfo {
-        total,
-        input_count: selected.len(),
+        total: selection.total,
+        input_count: selection.input_count(),
+        transaction_count: shape.transaction_count,
+        private_output_count: shape.private_output_count,
+        public_output_count: shape.public_output_count,
         max_spendable,
     })
 }
 
 #[must_use]
 pub fn max_send_spendable(utxos: &[Utxo], token_address: Address) -> U256 {
-    max_unshield_spendable(utxos, token_address)
+    max_batch_spendable(utxos, token_address, 1, 1)
 }
 
 pub fn send_selection_info(
@@ -1149,7 +1737,17 @@ pub fn send_selection_info(
     amount: U256,
     spend_up_to: bool,
 ) -> Result<UnshieldSelectionInfo, BuildError> {
-    unshield_selection_info(utxos, token_address, amount, spend_up_to)
+    let max_spendable = max_batch_spendable(utxos, token_address, 1, 1);
+    let selection = select_batched_utxos(utxos, token_address, amount, spend_up_to, 1, 1)?;
+    let shape = batch_shape(&selection, amount, U256::ZERO, false, true);
+    Ok(UnshieldSelectionInfo {
+        total: selection.total,
+        input_count: selection.input_count(),
+        transaction_count: shape.transaction_count,
+        private_output_count: shape.private_output_count,
+        public_output_count: shape.public_output_count,
+        max_spendable,
+    })
 }
 
 pub fn send_selection_info_with_broadcaster_fee(
@@ -1159,15 +1757,244 @@ pub fn send_selection_info_with_broadcaster_fee(
     fee_amount: U256,
     spend_up_to: bool,
 ) -> Result<UnshieldSelectionInfo, BuildError> {
-    unshield_selection_info_with_broadcaster_fee(
+    let target_amount = amount + fee_amount;
+    let max_total = max_batch_spendable(utxos, token_address, 2, 1);
+    let max_spendable = if max_total > fee_amount {
+        max_total - fee_amount
+    } else {
+        U256::ZERO
+    };
+    let selection = select_batched_utxos(utxos, token_address, target_amount, spend_up_to, 2, 1)
+        .map_err(|error| match error {
+            BuildError::InsufficientBalance(_) => BuildError::InsufficientBalance(max_spendable),
+            other => other,
+        })?;
+    let shape = batch_shape(&selection, amount, fee_amount, true, true);
+    Ok(UnshieldSelectionInfo {
+        total: selection.total,
+        input_count: selection.input_count(),
+        transaction_count: shape.transaction_count,
+        private_output_count: shape.private_output_count,
+        public_output_count: shape.public_output_count,
+        max_spendable,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BatchShape {
+    transaction_count: usize,
+    private_output_count: usize,
+    public_output_count: usize,
+}
+
+fn batch_shape(
+    selection: &BatchUtxoSelection,
+    amount: U256,
+    fee_amount: U256,
+    has_fee_output: bool,
+    send: bool,
+) -> BatchShape {
+    let mut remaining = selection.total.saturating_sub(fee_amount).min(amount);
+    let mut private_output_count = 0;
+    let mut public_output_count = 0;
+
+    for (index, chunk) in selection.chunks.iter().enumerate() {
+        let chunk_fee = if index == 0 { fee_amount } else { U256::ZERO };
+        let spendable = chunk.total.saturating_sub(chunk_fee);
+        let amount_out = spendable.min(remaining);
+        let change = spendable.saturating_sub(amount_out);
+
+        if send {
+            private_output_count += 1 + usize::from(index == 0 && has_fee_output);
+        } else {
+            private_output_count += usize::from(index == 0 && has_fee_output);
+            public_output_count += 1;
+        }
+        private_output_count += usize::from(!change.is_zero());
+        remaining = remaining.saturating_sub(amount_out);
+    }
+
+    BatchShape {
+        transaction_count: selection.chunks.len(),
+        private_output_count,
+        public_output_count,
+    }
+}
+
+#[must_use]
+fn max_batch_spendable(
+    utxos: &[Utxo],
+    token_address: Address,
+    first_base_output_count: usize,
+    continuation_base_output_count: usize,
+) -> U256 {
+    max_batch_selection(
+        utxos,
+        token_address,
+        first_base_output_count,
+        continuation_base_output_count,
+    )
+    .map_or(U256::ZERO, |selection| selection.total)
+}
+
+fn max_batch_selection(
+    utxos: &[Utxo],
+    token_address: Address,
+    first_base_output_count: usize,
+    continuation_base_output_count: usize,
+) -> Option<BatchUtxoSelection> {
+    let mut remaining = utxos.to_vec();
+    let mut chunks = Vec::new();
+    let mut total = U256::ZERO;
+
+    for index in 0..MAX_BATCH_TRANSACTIONS {
+        let base_output_count = if index == 0 {
+            first_base_output_count
+        } else {
+            continuation_base_output_count
+        };
+        let Some(selection) =
+            max_unshield_selection_with_output_count(&remaining, token_address, base_output_count)
+        else {
+            break;
+        };
+        if selection.total.is_zero() {
+            break;
+        }
+        remove_selected_utxos(&mut remaining, &selection.utxos);
+        total += selection.total;
+        chunks.push(selection);
+    }
+
+    if chunks.is_empty() {
+        None
+    } else {
+        Some(BatchUtxoSelection { chunks, total })
+    }
+}
+
+fn select_batched_utxos(
+    utxos: &[Utxo],
+    token_address: Address,
+    amount: U256,
+    spend_up_to: bool,
+    first_base_output_count: usize,
+    continuation_base_output_count: usize,
+) -> Result<BatchUtxoSelection, BuildError> {
+    let max_selection = max_batch_selection(
+        utxos,
+        token_address,
+        first_base_output_count,
+        continuation_base_output_count,
+    );
+    let max_spendable = max_selection
+        .as_ref()
+        .map_or(U256::ZERO, |selection| selection.total);
+
+    if amount.is_zero() {
+        return Err(BuildError::InsufficientBalance(max_spendable));
+    }
+
+    if let Some(selection) =
+        best_unshield_selection(utxos, token_address, amount, first_base_output_count)
+    {
+        let total = selection.total;
+        return Ok(BatchUtxoSelection {
+            chunks: vec![selection],
+            total,
+        });
+    }
+
+    if let Some(selection) = greedy_batched_selection(
         utxos,
         token_address,
         amount,
-        fee_amount,
-        spend_up_to,
-    )
+        first_base_output_count,
+        continuation_base_output_count,
+    ) {
+        return Ok(selection);
+    }
+
+    if spend_up_to
+        && max_selection
+            .as_ref()
+            .is_some_and(|selection| !selection.total.is_zero() && selection.total < amount)
+    {
+        return Ok(max_selection.expect("checked above"));
+    }
+
+    Err(BuildError::InsufficientBalance(max_spendable))
 }
 
+fn greedy_batched_selection(
+    utxos: &[Utxo],
+    token_address: Address,
+    amount: U256,
+    first_base_output_count: usize,
+    continuation_base_output_count: usize,
+) -> Option<BatchUtxoSelection> {
+    let mut remaining_utxos = utxos.to_vec();
+    let mut remaining_amount = amount;
+    let mut chunks = Vec::new();
+    let mut total = U256::ZERO;
+
+    for index in 0..MAX_BATCH_TRANSACTIONS {
+        let base_output_count = if index == 0 {
+            first_base_output_count
+        } else {
+            continuation_base_output_count
+        };
+
+        if let Some(selection) = best_unshield_selection(
+            &remaining_utxos,
+            token_address,
+            remaining_amount,
+            base_output_count,
+        ) {
+            total += selection.total;
+            chunks.push(selection);
+            return Some(BatchUtxoSelection { chunks, total });
+        }
+
+        let Some(selection) = max_unshield_selection_with_output_count(
+            &remaining_utxos,
+            token_address,
+            base_output_count,
+        ) else {
+            break;
+        };
+        if selection.total.is_zero() {
+            return None;
+        }
+        let selection = if selection.total < remaining_amount {
+            selection
+        } else {
+            best_partial_selection_below_amount(
+                &remaining_utxos,
+                token_address,
+                remaining_amount,
+                base_output_count,
+            )?
+        };
+
+        remaining_amount -= selection.total;
+        total += selection.total;
+        remove_selected_utxos(&mut remaining_utxos, &selection.utxos);
+        chunks.push(selection);
+    }
+
+    None
+}
+
+fn remove_selected_utxos(utxos: &mut Vec<Utxo>, selected: &[Utxo]) {
+    utxos.retain(|utxo| {
+        !selected
+            .iter()
+            .any(|selected| selected.tree == utxo.tree && selected.position == utxo.position)
+    });
+}
+
+#[cfg(test)]
 fn select_utxos(
     utxos: &[Utxo],
     token_address: Address,
@@ -1222,8 +2049,34 @@ fn best_unshield_selection(
     best
 }
 
-fn max_unshield_selection(utxos: &[Utxo], token_address: Address) -> Option<UtxoSelection> {
-    max_unshield_selection_with_output_count(utxos, token_address, 1)
+fn best_partial_selection_below_amount(
+    utxos: &[Utxo],
+    token_address: Address,
+    amount: U256,
+    base_output_count: usize,
+) -> Option<UtxoSelection> {
+    if amount <= U256::from(1_u8) {
+        return None;
+    }
+    let max_input_count = max_inputs_for_base_outputs(base_output_count);
+    if max_input_count == 0 {
+        return None;
+    }
+
+    let mut best: Option<UtxoSelection> = None;
+    for mut candidates in token_utxos_by_tree(utxos, token_address).into_values() {
+        sort_search_candidates(&mut candidates);
+        let mut search = PartialSelectionSearch::new(&candidates, amount, max_input_count);
+        search.run();
+        if let Some(selection) = search.best
+            && best
+                .as_ref()
+                .is_none_or(|best| max_selection_is_better(&selection, best))
+        {
+            best = Some(selection);
+        }
+    }
+    best
 }
 
 fn max_unshield_selection_with_output_count(
@@ -1351,6 +2204,77 @@ fn selection_position_key(utxos: &[Utxo]) -> Vec<(u32, u64)> {
         .iter()
         .map(|utxo| (utxo.tree, utxo.position))
         .collect()
+}
+
+struct PartialSelectionSearch<'a> {
+    candidates: &'a [Utxo],
+    amount: U256,
+    max_input_count: usize,
+    selected: Vec<usize>,
+    best: Option<UtxoSelection>,
+}
+
+impl<'a> PartialSelectionSearch<'a> {
+    fn new(candidates: &'a [Utxo], amount: U256, max_input_count: usize) -> Self {
+        Self {
+            candidates,
+            amount,
+            max_input_count,
+            selected: Vec::with_capacity(max_input_count),
+            best: None,
+        }
+    }
+
+    fn run(&mut self) {
+        self.search(0, U256::ZERO);
+    }
+
+    fn search(&mut self, start: usize, total: U256) {
+        if self.selected.len() == self.max_input_count || start >= self.candidates.len() {
+            return;
+        }
+        let remaining_slots = self.max_input_count - self.selected.len();
+        if let Some(best) = &self.best
+            && total + self.max_possible_from(start, remaining_slots) <= best.total
+        {
+            return;
+        }
+
+        for index in start..self.candidates.len() {
+            let next_total = total + self.candidates[index].note.value;
+            if next_total >= self.amount {
+                continue;
+            }
+            self.selected.push(index);
+            self.record(next_total);
+            self.search(index + 1, next_total);
+            self.selected.pop();
+        }
+    }
+
+    fn max_possible_from(&self, start: usize, remaining_slots: usize) -> U256 {
+        self.candidates[start..]
+            .iter()
+            .take(remaining_slots)
+            .fold(U256::ZERO, |sum, utxo| sum + utxo.note.value)
+    }
+
+    fn record(&mut self, total: U256) {
+        let mut utxos = self
+            .selected
+            .iter()
+            .map(|index| self.candidates[*index].clone())
+            .collect::<Vec<_>>();
+        normalize_selection(&mut utxos);
+        let selection = UtxoSelection { utxos, total };
+        if self
+            .best
+            .as_ref()
+            .is_none_or(|best| max_selection_is_better(&selection, best))
+        {
+            self.best = Some(selection);
+        }
+    }
 }
 
 struct SelectionSearch<'a> {
@@ -1622,14 +2546,14 @@ mod tests {
     }
 
     #[test]
-    fn max_unshield_spendable_uses_largest_single_tree_top_thirteen() {
+    fn max_unshield_spendable_uses_eight_batched_chunks() {
         let token = Address::from([6_u8; 20]);
         let mut utxos = (0..20)
             .map(|position| test_utxo(token, 1, 0, position))
             .collect::<Vec<_>>();
         utxos.extend((0..5).map(|position| test_utxo(token, 3, 1, position)));
 
-        assert_eq!(max_unshield_spendable(&utxos, token), U256::from(15_u8));
+        assert_eq!(max_unshield_spendable(&utxos, token), U256::from(35_u8));
     }
 
     #[test]
@@ -1812,32 +2736,66 @@ mod tests {
     }
 
     #[test]
-    fn broadcaster_fee_selection_accounts_for_fee_and_extra_output() {
+    fn broadcaster_fee_selection_batches_when_fee_output_reduces_first_chunk() {
         let token = Address::from([17_u8; 20]);
         let utxos = (0..13)
             .map(|position| test_utxo(token, 2, 0, position))
             .collect::<Vec<_>>();
 
-        let error = send_selection_info_with_broadcaster_fee(
+        let info = send_selection_info_with_broadcaster_fee(
             &utxos,
             token,
             U256::from(23_u8),
             U256::from(3_u8),
             false,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(matches!(error, BuildError::InsufficientBalance(max) if max == U256::from(21_u8)));
+        assert_eq!(info.total, U256::from(26_u8));
+        assert_eq!(info.input_count, 13);
+        assert_eq!(info.transaction_count, 2);
+        assert_eq!(info.private_output_count, 3);
+        assert_eq!(info.public_output_count, 0);
+        assert_eq!(info.max_spendable, U256::from(23_u8));
     }
 
     #[test]
-    fn max_send_spendable_uses_largest_single_tree_top_thirteen() {
+    fn batched_selection_can_use_smaller_first_chunk_for_satisfiable_remainder() {
+        let token = Address::from([19_u8; 20]);
+        let mut utxos = (0..13)
+            .map(|position| test_utxo(token, 2, 0, position))
+            .collect::<Vec<_>>();
+        utxos.push(test_utxo(token, 1, 1, 0));
+
+        let info = send_selection_info(&utxos, token, U256::from(25_u8), false).unwrap();
+
+        assert_eq!(info.total, U256::from(25_u8));
+        assert_eq!(info.input_count, 13);
+        assert_eq!(info.transaction_count, 2);
+        assert_eq!(info.private_output_count, 2);
+        assert_eq!(info.public_output_count, 0);
+    }
+
+    #[test]
+    fn max_send_spendable_uses_eight_batched_chunks() {
         let token = Address::from([13_u8; 20]);
         let mut utxos = (0..20)
             .map(|position| test_utxo(token, 1, 0, position))
             .collect::<Vec<_>>();
         utxos.extend((0..5).map(|position| test_utxo(token, 3, 1, position)));
 
-        assert_eq!(max_send_spendable(&utxos, token), U256::from(15_u8));
+        assert_eq!(max_send_spendable(&utxos, token), U256::from(35_u8));
+    }
+
+    #[test]
+    fn batched_selection_reports_eight_chunk_cap() {
+        let token = Address::from([18_u8; 20]);
+        let utxos = (0..9)
+            .flat_map(|tree| (0..13).map(move |position| test_utxo(token, 1, tree, position)))
+            .collect::<Vec<_>>();
+
+        let error = send_selection_info(&utxos, token, U256::from(105_u8), false).unwrap_err();
+
+        assert!(matches!(error, BuildError::InsufficientBalance(max) if max == U256::from(104_u8)));
     }
 }

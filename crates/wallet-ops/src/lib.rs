@@ -29,12 +29,14 @@ use local_db::{DbConfig, DbStore};
 use railgun_wallet::artifacts::ArtifactSource;
 use railgun_wallet::tx::{
     BroadcasterFeeOutput, BuildError, SendPlan, SendRequest as RailgunSendRequest, UnshieldMode,
-    UnshieldPlan, UnshieldRequest as RailgunUnshieldRequest, send_selection_info,
-    send_selection_info_with_broadcaster_fee, unshield_selection_info,
-    unshield_selection_info_with_broadcaster_fee,
+    UnshieldPlan, UnshieldRequest as RailgunUnshieldRequest, max_send_spendable,
+    max_unshield_spendable, send_selection_info, send_selection_info_with_broadcaster_fee,
+    unshield_selection_info, unshield_selection_info_with_broadcaster_fee,
 };
 use railgun_wallet::wallet_cache::wallet_cache_key;
-use railgun_wallet::{ProverService, TransactionBuilder, Utxo, UtxoSource, WalletKeys, WalletUtxo};
+use railgun_wallet::{
+    Note, ProverService, TransactionBuilder, Utxo, UtxoSource, WalletKeys, WalletUtxo,
+};
 use rand::seq::IndexedRandom;
 use reqwest::Url;
 use serde::Serialize;
@@ -63,6 +65,7 @@ const APPROX_BASE_GAS: u64 = 650_000;
 const APPROX_GAS_PER_INPUT: u64 = 155_000;
 const APPROX_GAS_PER_PRIVATE_OUTPUT: u64 = 85_000;
 const APPROX_GAS_PER_PUBLIC_OUTPUT: u64 = 65_000;
+const APPROX_GAS_PER_TRANSACTION: u64 = 120_000;
 const APPROX_SEND_EXTRA_GAS: u64 = 40_000;
 const APPROX_UNWRAP_EXTRA_GAS: u64 = 50_000;
 const APPROX_SAFETY_GAS: u64 = 150_000;
@@ -226,6 +229,7 @@ pub struct PublicBroadcasterCandidate {
     pub version: String,
     pub relay_adapt: Address,
     pub relay_adapt_7702: Option<Address>,
+    pub required_poi_list_keys: Vec<String>,
     pub viewing_public_key: [u8; 32],
     pub address_data: AddressData,
 }
@@ -317,6 +321,7 @@ pub struct PublicBroadcasterCostEstimate {
     pub gas_limit: u64,
     pub min_gas_price: u128,
     pub native_gas_cost: U256,
+    pub transaction_count: usize,
     pub input_count: usize,
     pub private_output_count: usize,
     pub public_output_count: usize,
@@ -442,6 +447,45 @@ pub struct ListUtxosOutput {
     pub totals: Vec<TokenTotal>,
 }
 
+#[must_use]
+pub fn max_unshield_amount_from_outputs(utxos: &[UtxoOutput], token: Address) -> U256 {
+    let planner_utxos = planner_utxos_from_outputs(utxos, token);
+    max_unshield_spendable(&planner_utxos, token)
+}
+
+#[must_use]
+pub fn max_send_amount_from_outputs(utxos: &[UtxoOutput], token: Address) -> U256 {
+    let planner_utxos = planner_utxos_from_outputs(utxos, token);
+    max_send_spendable(&planner_utxos, token)
+}
+
+fn planner_utxos_from_outputs(utxos: &[UtxoOutput], token: Address) -> Vec<Utxo> {
+    utxos
+        .iter()
+        .filter(|row| !row.is_spent)
+        .filter_map(|row| {
+            let row_token = row.token.parse::<Address>().ok()?;
+            if row_token != token {
+                return None;
+            }
+            let value = U256::from_str_radix(&row.value, 10).ok()?;
+            if value.is_zero() {
+                return None;
+            }
+            Some(Utxo {
+                note: Note::new_unshield(Address::ZERO, token, value),
+                tree: row.tree,
+                position: row.position,
+                source: UtxoSource {
+                    tx_hash: FixedBytes::ZERO,
+                    block_number: row.source_block_number,
+                    block_timestamp: row.source_block_timestamp,
+                },
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct UnshieldOutput {
     pub to: Address,
@@ -456,7 +500,10 @@ pub struct PreparedUnshieldCall {
     pub recipient: Address,
     pub unwrap: bool,
     pub max_spendable: U256,
+    pub transaction_count: usize,
     pub input_count: usize,
+    pub private_output_count: usize,
+    pub public_output_count: usize,
     pub to: Address,
     pub data: String,
 }
@@ -468,7 +515,10 @@ pub struct PreparedSendCall {
     pub amount: U256,
     pub recipient: String,
     pub max_spendable: U256,
+    pub transaction_count: usize,
     pub input_count: usize,
+    pub private_output_count: usize,
+    pub public_output_count: usize,
     pub to: Address,
     pub data: String,
 }
@@ -648,10 +698,21 @@ pub fn select_public_broadcaster(
     selection: &PublicBroadcasterSelection,
 ) -> Result<PublicBroadcasterCandidate> {
     match selection {
-        PublicBroadcasterSelection::Random => candidates
-            .choose(&mut rand::rng())
-            .cloned()
-            .ok_or_else(|| eyre!("no eligible public broadcaster for selected token")),
+        PublicBroadcasterSelection::Random => {
+            let supported_candidates = candidates
+                .iter()
+                .filter(|candidate| candidate.required_poi_list_keys.is_empty())
+                .collect::<Vec<_>>();
+            let selected = if supported_candidates.is_empty() {
+                candidates.choose(&mut rand::rng()).cloned()
+            } else {
+                supported_candidates
+                    .choose(&mut rand::rng())
+                    .copied()
+                    .cloned()
+            };
+            selected.ok_or_else(|| eyre!("no eligible public broadcaster for selected token"))
+        }
         PublicBroadcasterSelection::Specific { railgun_address } => candidates
             .iter()
             .find(|candidate| candidate.railgun_address == *railgun_address)
@@ -686,6 +747,7 @@ fn buffered_public_broadcaster_fee(required_fee: U256) -> U256 {
 
 #[derive(Debug, Clone, Copy)]
 struct ApproximateTransactionShape {
+    transaction_count: usize,
     input_count: usize,
     private_output_count: usize,
     public_output_count: usize,
@@ -761,8 +823,21 @@ fn public_broadcaster_build_error(
     }
 }
 
+fn ensure_batched_public_broadcaster_poi_supported(
+    broadcaster: &PublicBroadcasterCandidate,
+    transaction_count: usize,
+) -> Result<()> {
+    if transaction_count > 1 && !broadcaster.required_poi_list_keys.is_empty() {
+        return Err(eyre!(
+            "batched public broadcaster transactions need wallet-side POI generation for broadcasters that require POI"
+        ));
+    }
+    Ok(())
+}
+
 const fn approximate_public_broadcaster_gas(shape: ApproximateTransactionShape) -> u64 {
     APPROX_BASE_GAS
+        + APPROX_GAS_PER_TRANSACTION * shape.transaction_count.saturating_sub(1) as u64
         + APPROX_GAS_PER_INPUT * shape.input_count as u64
         + APPROX_GAS_PER_PRIVATE_OUTPUT * shape.private_output_count as u64
         + APPROX_GAS_PER_PUBLIC_OUTPUT * shape.public_output_count as u64
@@ -822,6 +897,7 @@ fn approximate_public_broadcaster_cost(
                 gas_limit,
                 min_gas_price,
                 native_gas_cost: U256::from(gas_limit) * U256::from(min_gas_price),
+                transaction_count: shape.transaction_count,
                 input_count: shape.input_count,
                 private_output_count: shape.private_output_count,
                 public_output_count: shape.public_output_count,
@@ -855,23 +931,21 @@ fn approximate_public_broadcaster_cost(
         gas_limit: latest_gas_limit,
         min_gas_price,
         native_gas_cost: U256::from(latest_gas_limit) * U256::from(min_gas_price),
+        transaction_count: shape.transaction_count,
         input_count: shape.input_count,
         private_output_count: shape.private_output_count,
         public_output_count: shape.public_output_count,
     })
 }
 
-fn send_approximate_shape(
-    total: U256,
-    amount: U256,
-    fee_amount: U256,
-    input_count: usize,
+const fn send_approximate_shape(
+    selection: &railgun_wallet::tx::UnshieldSelectionInfo,
     max_receiver_amount: U256,
 ) -> ApproximateTransactionShape {
-    let change = total > amount + fee_amount;
     ApproximateTransactionShape {
-        input_count,
-        private_output_count: 2 + usize::from(change),
+        transaction_count: selection.transaction_count,
+        input_count: selection.input_count,
+        private_output_count: selection.private_output_count,
         public_output_count: 0,
         max_receiver_amount,
         unwrap: false,
@@ -879,19 +953,16 @@ fn send_approximate_shape(
     }
 }
 
-fn unshield_approximate_shape(
-    total: U256,
-    amount: U256,
-    fee_amount: U256,
-    input_count: usize,
+const fn unshield_approximate_shape(
+    selection: &railgun_wallet::tx::UnshieldSelectionInfo,
     max_receiver_amount: U256,
     unwrap: bool,
 ) -> ApproximateTransactionShape {
-    let change = total > amount + fee_amount;
     ApproximateTransactionShape {
-        input_count,
-        private_output_count: 1 + usize::from(change),
-        public_output_count: 1,
+        transaction_count: selection.transaction_count,
+        input_count: selection.input_count,
+        private_output_count: selection.private_output_count,
+        public_output_count: selection.public_output_count,
         max_receiver_amount,
         unwrap,
         send: false,
@@ -949,6 +1020,11 @@ fn candidate_from_fee_row(row: &FeeRow) -> Option<PublicBroadcasterCandidate> {
         version: row.version.to_string(),
         relay_adapt: row.relay_adapt,
         relay_adapt_7702: row.relay_adapt_7702,
+        required_poi_list_keys: row
+            .required_poi_list_keys
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
         viewing_public_key: address_data.viewing_public_key,
         address_data,
     })
@@ -1507,7 +1583,10 @@ pub async fn prepare_desktop_unshield_calldata(
         recipient: request.recipient,
         unwrap: request.unwrap,
         max_spendable: selection_info.max_spendable,
-        input_count: plan.inputs.len(),
+        transaction_count: plan.transaction_count(),
+        input_count: plan.input_count(),
+        private_output_count: plan.private_output_count(),
+        public_output_count: plan.public_output_count(),
         to: plan.call.to,
         data: format!("0x{}", hex::encode(&plan.call.data)),
     })
@@ -1587,7 +1666,10 @@ pub async fn prepare_desktop_send_calldata(
         amount: request.amount,
         recipient,
         max_spendable: selection_info.max_spendable,
-        input_count: plan.inputs.len(),
+        transaction_count: plan.transaction_count(),
+        input_count: plan.input_count(),
+        private_output_count: plan.private_output_count(),
+        public_output_count: plan.public_output_count(),
         to: plan.call.to,
         data: format!("0x{}", hex::encode(&plan.call.data)),
     })
@@ -1627,6 +1709,7 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
         .erased();
     let min_gas_price = buffered_gas_price(&provider).await?;
     let utxos = request.session.unspent_utxos().await;
+    let broadcaster_requires_poi = !broadcaster.required_poi_list_keys.is_empty();
 
     approximate_public_broadcaster_cost(
         broadcaster,
@@ -1645,11 +1728,13 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
             .map_err(|error| {
                 public_broadcaster_build_error(error, split.fee_amount, split.fee_mode)
             })?;
+            if selection.transaction_count > 1 && broadcaster_requires_poi {
+                return Err(eyre!(
+                    "batched public broadcaster transactions need wallet-side POI generation for broadcasters that require POI"
+                ));
+            }
             Ok(unshield_approximate_shape(
-                selection.total,
-                split.receiver_amount,
-                split.fee_amount,
-                selection.input_count,
+                &selection,
                 selection.max_spendable,
                 request.unwrap,
             ))
@@ -1685,6 +1770,7 @@ pub async fn estimate_desktop_send_public_broadcaster_cost(
         .erased();
     let min_gas_price = buffered_gas_price(&provider).await?;
     let utxos = request.session.unspent_utxos().await;
+    let broadcaster_requires_poi = !broadcaster.required_poi_list_keys.is_empty();
 
     approximate_public_broadcaster_cost(
         broadcaster,
@@ -1703,13 +1789,12 @@ pub async fn estimate_desktop_send_public_broadcaster_cost(
             .map_err(|error| {
                 public_broadcaster_build_error(error, split.fee_amount, split.fee_mode)
             })?;
-            Ok(send_approximate_shape(
-                selection.total,
-                split.receiver_amount,
-                split.fee_amount,
-                selection.input_count,
-                selection.max_spendable,
-            ))
+            if selection.transaction_count > 1 && broadcaster_requires_poi {
+                return Err(eyre!(
+                    "batched public broadcaster transactions need wallet-side POI generation for broadcasters that require POI"
+                ));
+            }
+            Ok(send_approximate_shape(&selection, selection.max_spendable))
         },
     )
 }
@@ -1863,6 +1948,7 @@ async fn prepare_desktop_unshield_public_broadcaster(
             .await
             .map_err(|error| public_broadcaster_build_error(error, fee_amount, split.fee_mode))
             .wrap_err("build public broadcaster unshield proof")?;
+        ensure_batched_public_broadcaster_poi_supported(&broadcaster, plan.transaction_count())?;
         let (gas_limit, computed_fee) = estimate_public_broadcaster_fee(
             &provider,
             request.chain_id,
@@ -2013,6 +2099,7 @@ async fn prepare_desktop_send_public_broadcaster(
             .await
             .map_err(|error| public_broadcaster_build_error(error, fee_amount, split.fee_mode))
             .wrap_err("build public broadcaster send proof")?;
+        ensure_batched_public_broadcaster_poi_supported(&broadcaster, plan.transaction_count())?;
         let (gas_limit, computed_fee) = estimate_public_broadcaster_fee(
             &provider,
             request.chain_id,
@@ -2670,6 +2757,7 @@ mod tests {
     };
     use broadcaster_core::transact_response::build_transact_response_txhash;
     use broadcaster_monitor::FeeRow;
+    use railgun_wallet::tx::UnshieldSelectionInfo;
     use railgun_wallet::{Utxo, UtxoSource, WalletKeys, WalletUtxo};
     use serde_json::json;
 
@@ -2680,11 +2768,11 @@ mod tests {
         approximate_public_broadcaster_cost, approximate_public_broadcaster_gas,
         broadcaster_fee_amount, broadcaster_fee_covers, buffered_public_broadcaster_fee,
         decode_public_broadcaster_response, eligible_public_broadcasters, is_wrapped_native_token,
-        parse_railgun_recipient, parse_send_amount, parse_unshield_amount,
-        public_broadcaster_amount_split, public_broadcaster_max_entered_amount,
-        select_public_broadcaster, send_approximate_shape, sort_specific_public_broadcasters,
-        transact_topic, unshield_approximate_shape, utxo_outputs_from_utxos,
-        wrapped_native_token_for_chain,
+        max_send_amount_from_outputs, max_unshield_amount_from_outputs, parse_railgun_recipient,
+        parse_send_amount, parse_unshield_amount, public_broadcaster_amount_split,
+        public_broadcaster_max_entered_amount, select_public_broadcaster, send_approximate_shape,
+        sort_specific_public_broadcasters, transact_topic, unshield_approximate_shape,
+        utxo_outputs_from_utxos, wrapped_native_token_for_chain,
     };
 
     fn address(byte: u8) -> Address {
@@ -2696,6 +2784,24 @@ mod tests {
             tx_hash: FixedBytes::from([byte; 32]),
             block_number: u64::from(byte),
             block_timestamp: 1_700_000_000 + u64::from(byte),
+        }
+    }
+
+    fn selection_info(
+        total: U256,
+        input_count: usize,
+        transaction_count: usize,
+        private_output_count: usize,
+        public_output_count: usize,
+        max_spendable: U256,
+    ) -> UnshieldSelectionInfo {
+        UnshieldSelectionInfo {
+            total,
+            input_count,
+            transaction_count,
+            private_output_count,
+            public_output_count,
+            max_spendable,
         }
     }
 
@@ -2795,6 +2901,28 @@ mod tests {
                     total: "7".to_string(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn max_amount_from_outputs_uses_planner_batched_selection() {
+        let token = address(0x11);
+        let other = address(0x22);
+        let mut wallet_utxos = (0..20)
+            .map(|position| utxo(token, 1, 0, position))
+            .collect::<Vec<_>>();
+        wallet_utxos.extend((0..5).map(|position| utxo(token, 3, 1, position)));
+        wallet_utxos.push(utxo(other, 100, 1, 99));
+        wallet_utxos.push(spent_utxo(token, 100, 2, 0));
+        let (outputs, _) = utxo_outputs_from_utxos(wallet_utxos);
+
+        assert_eq!(
+            max_unshield_amount_from_outputs(&outputs, token),
+            U256::from(35_u8)
+        );
+        assert_eq!(
+            max_send_amount_from_outputs(&outputs, token),
+            U256::from(35_u8)
         );
     }
 
@@ -3039,6 +3167,29 @@ mod tests {
     }
 
     #[test]
+    fn random_public_broadcaster_selection_prefers_non_poi_required_candidate() {
+        let token = address(0x27);
+        let mut poi_required = fee_row_with_broadcaster_seed(1, token, 10, 0.9, "poi", 31);
+        poi_required.required_poi_list_keys = vec![Arc::from("poi-list")];
+        let candidates = eligible_public_broadcasters(
+            &[
+                poi_required,
+                fee_row_with_broadcaster_seed(1, token, 10, 0.9, "supported", 32),
+            ],
+            1,
+            token,
+            None,
+            SystemTime::now(),
+        );
+
+        let selected = select_public_broadcaster(&candidates, &PublicBroadcasterSelection::Random)
+            .expect("random supported candidate");
+
+        assert_eq!(selected.fees_id, "supported");
+        assert!(selected.required_poi_list_keys.is_empty());
+    }
+
+    #[test]
     fn public_broadcaster_specific_selection_survives_fees_id_refresh() {
         let token = address(0x24);
         let railgun_address = sample_railgun_address(21);
@@ -3199,14 +3350,9 @@ mod tests {
             PublicBroadcasterFeeMode::DeductFromAmount,
             0,
             100,
-            |split| {
-                Ok(send_approximate_shape(
-                    selected_total,
-                    split.receiver_amount,
-                    split.fee_amount,
-                    1,
-                    selected_total,
-                ))
+            |_split| {
+                let selection = selection_info(selected_total, 1, 1, 2, 0, selected_total);
+                Ok(send_approximate_shape(&selection, selected_total))
             },
         )
         .expect("deduct estimate");
@@ -3226,14 +3372,9 @@ mod tests {
             PublicBroadcasterFeeMode::AddToAmount,
             0,
             100,
-            |split| {
-                Ok(send_approximate_shape(
-                    selected_total,
-                    split.receiver_amount,
-                    split.fee_amount,
-                    1,
-                    selected_total,
-                ))
+            |_split| {
+                let selection = selection_info(selected_total, 1, 1, 2, 0, selected_total);
+                Ok(send_approximate_shape(&selection, selected_total))
             },
         )
         .expect("add estimate");
@@ -3273,12 +3414,10 @@ mod tests {
             PublicBroadcasterFeeMode::AddToAmount,
             RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
             100,
-            |split| {
+            |_split| {
+                let selection = selection_info(selected_total, 1, 1, 1, 1, selected_total);
                 Ok(unshield_approximate_shape(
-                    selected_total,
-                    split.receiver_amount,
-                    split.fee_amount,
-                    1,
+                    &selection,
                     selected_total,
                     false,
                 ))
@@ -3298,6 +3437,7 @@ mod tests {
     #[test]
     fn approximate_public_broadcaster_gas_tracks_transaction_shape() {
         let base = approximate_public_broadcaster_gas(ApproximateTransactionShape {
+            transaction_count: 1,
             input_count: 1,
             private_output_count: 2,
             public_output_count: 0,
@@ -3306,6 +3446,7 @@ mod tests {
             send: true,
         });
         let larger = approximate_public_broadcaster_gas(ApproximateTransactionShape {
+            transaction_count: 2,
             input_count: 2,
             private_output_count: 3,
             public_output_count: 1,
@@ -3319,26 +3460,17 @@ mod tests {
 
     #[test]
     fn approximate_shapes_include_broadcaster_fee_output_and_change() {
-        let send = send_approximate_shape(
-            U256::from(15_u8),
-            U256::from(10_u8),
-            U256::from(2_u8),
-            2,
-            U256::from(13_u8),
-        );
+        let send_selection = selection_info(U256::from(15_u8), 2, 1, 3, 0, U256::from(13_u8));
+        let send = send_approximate_shape(&send_selection, U256::from(13_u8));
         assert_eq!(send.input_count, 2);
+        assert_eq!(send.transaction_count, 1);
         assert_eq!(send.private_output_count, 3);
         assert_eq!(send.public_output_count, 0);
 
-        let unshield = unshield_approximate_shape(
-            U256::from(12_u8),
-            U256::from(10_u8),
-            U256::from(2_u8),
-            1,
-            U256::from(10_u8),
-            true,
-        );
+        let unshield_selection = selection_info(U256::from(12_u8), 1, 1, 1, 1, U256::from(10_u8));
+        let unshield = unshield_approximate_shape(&unshield_selection, U256::from(10_u8), true);
         assert_eq!(unshield.input_count, 1);
+        assert_eq!(unshield.transaction_count, 1);
         assert_eq!(unshield.private_output_count, 1);
         assert_eq!(unshield.public_output_count, 1);
         assert!(unshield.unwrap);

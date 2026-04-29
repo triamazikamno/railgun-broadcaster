@@ -227,11 +227,12 @@ impl AutoRefillService {
                 }
             };
 
-            if plan.unshield_note.value < refill_amount {
+            let unshield_amount = plan.unshield_amount();
+            if unshield_amount < refill_amount {
                 info!(
                     wallet = %wallet_address,
                     requested = %pretty_number(&refill_amount, 18),
-                    actual = %pretty_number(&plan.unshield_note.value, 18),
+                    actual = %pretty_number(&unshield_amount, 18),
                     inputs = plan.inputs.len(),
                     "auto-refill used spend-up-to",
                 );
