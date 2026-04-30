@@ -13,7 +13,7 @@ use gpui::{
     prelude::FluentBuilder as _, px, rgb, size,
 };
 use gpui_component::{
-    Disableable, IconName, Root, Selectable, Sizable, StyledExt,
+    Disableable, IconName, IndexPath, Root, Selectable, Sizable, StyledExt,
     alert::Alert,
     button::{ButtonGroup, ButtonVariants},
     group_box::{GroupBox, GroupBoxVariants},
@@ -22,6 +22,7 @@ use gpui_component::{
     progress::Progress as UiProgress,
     resizable::{ResizableState, resizable_panel, v_resizable},
     scroll::ScrollableElement,
+    select::{Select, SelectEvent, SelectItem, SelectState},
     spinner::Spinner,
     tab::{Tab, TabBar},
     table::{Column, Table, TableDelegate, TableEvent, TableState},
@@ -69,7 +70,6 @@ const ACTIVITY_RAIL_WIDTH: Pixels = px(48.0);
 const LOGS_DRAWER_HEIGHT: Pixels = px(260.0);
 const LOGS_DRAWER_MIN_HEIGHT: Pixels = px(160.0);
 const LOGS_DRAWER_MAX_HEIGHT: Pixels = px(600.0);
-const FILTER_POPOVER_MAX_HEIGHT: Pixels = px(450.0);
 const BROADCASTER_PICKER_MAX_HEIGHT: Pixels = px(680.0);
 const PRIVATE_ASSET_LIST_WIDTH: Pixels = px(760.0);
 const UNSHIELD_SPINNER_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
@@ -286,6 +286,33 @@ struct WalletOption {
     label: Arc<str>,
 }
 
+#[derive(Clone, Copy)]
+struct ChainSelectItem {
+    chain_id: u64,
+}
+
+impl SelectItem for ChainSelectItem {
+    type Value = u64;
+
+    fn title(&self) -> SharedString {
+        SharedString::from(
+            chain_name(self.chain_id).map_or_else(|| self.chain_id.to_string(), str::to_owned),
+        )
+    }
+
+    fn display_title(&self) -> Option<gpui::AnyElement> {
+        Some(chain_label_row(self.chain_id).into_any_element())
+    }
+
+    fn render(&self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        chain_label_row(self.chain_id)
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.chain_id
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PrivateActionMetric {
     label: &'static str,
@@ -373,10 +400,12 @@ enum ChainUtxoState {
         snapshot: Arc<ListUtxosOutput>,
         progress: Option<SyncProgressUpdate>,
         session: Arc<wallet_ops::WalletSession>,
+        poi_refreshing: bool,
     },
     Ready {
         snapshot: Arc<ListUtxosOutput>,
         session: Arc<wallet_ops::WalletSession>,
+        poi_refreshing: bool,
     },
     Error(Arc<str>),
 }
@@ -409,6 +438,22 @@ impl ChainUtxoState {
 
     const fn is_syncing(&self) -> bool {
         matches!(self, Self::Loading { .. } | Self::Syncing { .. })
+    }
+
+    const fn poi_refreshing(&self) -> bool {
+        match self {
+            Self::Syncing { poi_refreshing, .. } | Self::Ready { poi_refreshing, .. } => {
+                *poi_refreshing
+            }
+            Self::Idle | Self::Loading { .. } | Self::Error(_) => false,
+        }
+    }
+
+    fn poi_refresh_session(&self) -> Option<Arc<wallet_ops::WalletSession>> {
+        match self {
+            Self::Syncing { session, .. } | Self::Ready { session, .. } => Some(session.clone()),
+            Self::Idle | Self::Loading { .. } | Self::Error(_) => None,
+        }
     }
 }
 
@@ -497,7 +542,7 @@ pub(crate) struct WalletRoot {
     wallet_options: Vec<WalletOption>,
     selected_wallet_id: Option<Arc<str>>,
     selected_chain: u64,
-    chain_ids: Vec<u64>,
+    chain_select: Entity<SelectState<Vec<ChainSelectItem>>>,
     chain_states: BTreeMap<u64, ChainUtxoState>,
     session_store: Arc<OnceCell<Arc<WalletSessionStore>>>,
     unlock_password_input: Entity<InputState>,
@@ -536,6 +581,15 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) -> Self {
         let chain_ids = DEFAULT_CHAINS.to_vec();
+        let chain_select_items: Vec<_> = chain_ids
+            .iter()
+            .copied()
+            .map(|chain_id| ChainSelectItem { chain_id })
+            .collect();
+        let selected_chain_index = chain_ids
+            .iter()
+            .position(|chain_id| *chain_id == options.initial_chain_id)
+            .map(|row| IndexPath::default().row(row));
         let mut chain_states = BTreeMap::new();
         for chain_id in &chain_ids {
             chain_states.insert(*chain_id, ChainUtxoState::Idle);
@@ -591,6 +645,8 @@ impl WalletRoot {
             cx.new(|cx| InputState::new(window, cx).placeholder("0 = deployment block"));
         let tx_search_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("search tx hash"));
+        let chain_select =
+            cx.new(|cx| SelectState::new(chain_select_items, selected_chain_index, window, cx));
         let utxo_table =
             cx.new(|cx| TableState::new(UtxoDelegate::new(tx_search_input.clone()), window, cx));
 
@@ -617,7 +673,7 @@ impl WalletRoot {
             active_wallet_tab: WalletTab::default(),
             wallet_options: Vec::new(),
             selected_wallet_id: None,
-            chain_ids,
+            chain_select: chain_select.clone(),
             chain_states,
             session_store: Arc::new(OnceCell::new()),
             unlock_password_input,
@@ -650,6 +706,20 @@ impl WalletRoot {
                 cx.notify();
             }
         })
+        .detach();
+        cx.subscribe_in(
+            &chain_select,
+            window,
+            |this, _select, event: &SelectEvent<Vec<ChainSelectItem>>, window, cx| {
+                let SelectEvent::Confirm(Some(chain_id)) = event else {
+                    return;
+                };
+                this.select_chain(*chain_id, cx);
+                cx.defer_in(window, |_this, window, _cx| {
+                    window.blur();
+                });
+            },
+        )
         .detach();
         cx.subscribe_in(
             &root.unlock_password_input,
@@ -932,8 +1002,10 @@ impl WalletRoot {
 
             let mut snapshots_rx = session.snapshots_rx.clone();
             let mut ready_rx = session.ready_rx.clone();
+            let mut poi_refreshing_rx = session.poi_refreshing_rx.clone();
             let initial_snapshot = snapshots_rx.borrow().clone();
             let mut ready = *ready_rx.borrow();
+            let initial_poi_refreshing = *poi_refreshing_rx.borrow();
 
             let _ = this.update(cx, |root, cx| {
                 let progress = root
@@ -944,12 +1016,14 @@ impl WalletRoot {
                     ChainUtxoState::Ready {
                         snapshot: initial_snapshot.clone(),
                         session: session.clone(),
+                        poi_refreshing: initial_poi_refreshing,
                     }
                 } else {
                     ChainUtxoState::Syncing {
                         snapshot: initial_snapshot.clone(),
                         progress,
                         session: session.clone(),
+                        poi_refreshing: initial_poi_refreshing,
                     }
                 };
                 root.chain_states.insert(chain_id, state);
@@ -1011,10 +1085,10 @@ impl WalletRoot {
                                 return false;
                             };
                             match state {
-                                ChainUtxoState::Syncing { snapshot, session, .. } => {
+                                ChainUtxoState::Syncing { snapshot, session, poi_refreshing, .. } => {
                                     root.chain_states.insert(
                                         chain_id,
-                                        ChainUtxoState::Ready { snapshot, session },
+                                        ChainUtxoState::Ready { snapshot, session, poi_refreshing },
                                     );
                                     if root.selected_chain == chain_id {
                                         root.sync_utxo_table(cx);
@@ -1038,6 +1112,34 @@ impl WalletRoot {
                             break;
                         }
                     }
+                    changed = poi_refreshing_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        let poi_refreshing = *poi_refreshing_rx.borrow();
+                        let should_continue = this.update(cx, |root, cx| {
+                            let Some(state) = root.chain_states.get_mut(&chain_id) else {
+                                return false;
+                            };
+                            match state {
+                                ChainUtxoState::Syncing { poi_refreshing: state, .. }
+                                | ChainUtxoState::Ready { poi_refreshing: state, .. } => {
+                                    *state = poi_refreshing;
+                                }
+                                ChainUtxoState::Idle
+                                | ChainUtxoState::Loading { .. }
+                                | ChainUtxoState::Error(_) => return false,
+                            }
+                            if root.selected_chain == chain_id {
+                                root.sync_utxo_table(cx);
+                            }
+                            cx.notify();
+                            true
+                        });
+                        if !matches!(should_continue, Ok(true)) {
+                            break;
+                        }
+                    }
                 }
             }
         })
@@ -1045,18 +1147,25 @@ impl WalletRoot {
     }
 
     fn sync_utxo_table(&self, cx: &mut Context<'_, Self>) {
-        let rows = match self.chain_states.get(&self.selected_chain) {
-            Some(state) => state.snapshot().map_or_else(Vec::new, |snapshot| {
-                display_rows_from_output(
-                    snapshot,
-                    self.tx_search_query.as_ref(),
-                    self.show_spent_utxos,
-                )
-            }),
-            _ => Vec::new(),
-        };
+        let (rows, poi_refresh_session, poi_refreshing) =
+            match self.chain_states.get(&self.selected_chain) {
+                Some(state) => {
+                    let rows = state.snapshot().map_or_else(Vec::new, |snapshot| {
+                        display_rows_from_output(
+                            snapshot,
+                            self.tx_search_query.as_ref(),
+                            self.show_spent_utxos,
+                        )
+                    });
+                    (rows, state.poi_refresh_session(), state.poi_refreshing())
+                }
+                _ => (Vec::new(), None, false),
+            };
         self.utxo_table.update(cx, |state, cx| {
             state.delegate_mut().set_rows(rows);
+            state
+                .delegate_mut()
+                .set_poi_refresh_state(poi_refresh_session, poi_refreshing);
             cx.notify();
         });
     }
@@ -3475,7 +3584,7 @@ impl WalletRoot {
             .border_b_1()
             .border_color(rgb(theme::BORDER))
             .child(self.render_wallet_selector(root.clone()))
-            .child(self.render_chain_selector(root.clone()))
+            .child(self.render_chain_selector())
             .child(div().flex_1())
             .children(receive_address.clone().map(|address| {
                 div()
@@ -4393,45 +4502,15 @@ impl WalletRoot {
             )
     }
 
-    fn render_chain_selector(&self, root: Entity<Self>) -> impl IntoElement {
-        let selected_chain = self.selected_chain;
-        let chain_ids = self.chain_ids.clone();
-
-        Popover::new("wallet-chain-selector")
-            .trigger(
-                app_button_base("wallet-chain-selector-trigger")
-                    .ghost()
-                    .small()
-                    .justify_start()
-                    .child(chain_label_row(selected_chain)),
-            )
-            .content(move |_state, window, cx| {
-                let popover = cx.entity();
-                let max_height =
-                    (window.viewport_size().height * 0.7).min(FILTER_POPOVER_MAX_HEIGHT);
-                let root = root.clone();
-                v_flex()
-                    .gap_1()
-                    .min_w(px(180.0))
-                    .max_h(max_height)
-                    .overflow_y_scrollbar()
-                    .children(chain_ids.clone().into_iter().map(move |chain_id| {
-                        let root = root.clone();
-                        let popover = popover.clone();
-                        app_button_base(SharedString::from(format!("wallet-chain-{chain_id}")))
-                            .ghost()
-                            .small()
-                            .w_full()
-                            .justify_start()
-                            .child(chain_label_row(chain_id))
-                            .on_click(move |_event, window, cx| {
-                                root.update(cx, |root, cx| {
-                                    root.select_chain(chain_id, cx);
-                                });
-                                popover.update(cx, |state, cx| state.dismiss(window, cx));
-                            })
-                    }))
-            })
+    fn render_chain_selector(&self) -> impl IntoElement {
+        div().h(px(24.0)).w(px(180.0)).flex().items_center().child(
+            Select::new(&self.chain_select)
+                .appearance(false)
+                .small()
+                .w(px(180.0))
+                .h(px(24.0))
+                .menu_width(px(220.0)),
+        )
     }
 
     fn render_utxo_body(&self, root: &Entity<Self>, window: &Window) -> impl IntoElement {
@@ -5006,6 +5085,8 @@ struct UtxoDelegate {
     rows: Arc<[UtxoDisplayRow]>,
     columns: [Column; 7],
     tx_search_input: Entity<InputState>,
+    poi_refresh_session: Option<Arc<wallet_ops::WalletSession>>,
+    poi_refreshing: bool,
 }
 
 impl UtxoDelegate {
@@ -5034,6 +5115,8 @@ impl UtxoDelegate {
                     .movable(false),
             ],
             tx_search_input,
+            poi_refresh_session: None,
+            poi_refreshing: false,
         }
     }
 
@@ -5045,6 +5128,15 @@ impl UtxoDelegate {
         for (column, width) in self.columns.iter_mut().zip(widths.iter().copied()) {
             column.width = width;
         }
+    }
+
+    fn set_poi_refresh_state(
+        &mut self,
+        session: Option<Arc<wallet_ops::WalletSession>>,
+        refreshing: bool,
+    ) {
+        self.poi_refresh_session = session;
+        self.poi_refreshing = refreshing;
     }
 }
 
@@ -5059,6 +5151,74 @@ impl TableDelegate for UtxoDelegate {
 
     fn column(&self, col_ix: usize, _: &App) -> &Column {
         &self.columns[col_ix]
+    }
+
+    fn render_th(
+        &mut self,
+        col_ix: usize,
+        _window: &mut Window,
+        _cx: &mut Context<'_, TableState<Self>>,
+    ) -> impl IntoElement {
+        if col_ix != 4 {
+            return div()
+                .size_full()
+                .child(self.columns[col_ix].name.clone())
+                .into_any_element();
+        }
+
+        let session = self.poi_refresh_session.clone();
+        let refreshing = self.poi_refreshing;
+        let can_refresh = session.is_some();
+        let action = div()
+            .id("wallet-poi-refresh")
+            .size(px(18.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_sm()
+            .when(refreshing, |this| {
+                this.child(
+                    Spinner::new()
+                        .icon(IconName::LoaderCircle)
+                        .color(rgb(theme::TEXT_MUTED).into())
+                        .with_size(px(13.0)),
+                )
+            })
+            .when(!refreshing, |this| {
+                this.when(can_refresh, |this| {
+                    this.cursor_pointer()
+                        .hover(|this| this.bg(rgb(theme::SURFACE_HOVER)))
+                        .tooltip(|window, cx| {
+                            Tooltip::new("Refresh POI statuses").build(window, cx)
+                        })
+                        .on_click(move |_event, _window, cx| {
+                            cx.stop_propagation();
+                            let Some(session) = session.clone() else {
+                                return;
+                            };
+                            cx.spawn(async move |_cx| {
+                                session.refresh_poi_statuses().await;
+                            })
+                            .detach();
+                        })
+                })
+                .child(
+                    img(icons::refresh_ccw_icon_path())
+                        .size(px(13.0))
+                        .flex_none(),
+                )
+            })
+            .into_any_element();
+
+        div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_1()
+            .child("POI")
+            .child(action)
+            .into_any_element()
     }
 
     fn render_tr(

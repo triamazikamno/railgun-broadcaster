@@ -654,6 +654,7 @@ pub struct WalletSession {
     pub cache_key: String,
     pub ready_rx: watch::Receiver<bool>,
     pub snapshots_rx: watch::Receiver<Arc<ListUtxosOutput>>,
+    pub poi_refreshing_rx: watch::Receiver<bool>,
     db: Arc<DbStore>,
     sync_manager: Arc<SyncManager>,
     chain_key: ChainKey,
@@ -671,6 +672,10 @@ impl WalletSession {
     pub async fn unspent_utxos(&self) -> Vec<Utxo> {
         let utxos = self.handle.utxos.read().await;
         poi_verified_unspent_utxos_from_records(&utxos)
+    }
+
+    pub async fn refresh_poi_statuses(&self) -> bool {
+        self.handle.refresh_poi_statuses().await
     }
 }
 
@@ -1667,6 +1672,7 @@ async fn wallet_session_from_parts(
     let (snapshots_tx, snapshots_rx) = watch::channel(initial_snapshot);
     let cache_key = handle.cache_key.clone();
     let ready_rx = handle.ready_rx.clone();
+    let poi_refreshing_rx = handle.poi_refreshing_rx.clone();
     let snapshot_handle = handle.clone();
     tokio::spawn(async move {
         loop {
@@ -1685,6 +1691,7 @@ async fn wallet_session_from_parts(
         cache_key,
         ready_rx,
         snapshots_rx,
+        poi_refreshing_rx,
         db,
         sync_manager,
         chain_key,

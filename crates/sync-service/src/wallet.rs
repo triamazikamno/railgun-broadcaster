@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{FixedBytes, U256};
 use async_trait::async_trait;
@@ -25,7 +25,17 @@ use url::Url;
 use crate::types::{BackfillEvent, SharedLogBatch, WalletCacheStore, WalletConfig};
 
 pub const WALLET_POI_STATUS_BATCH_SIZE: usize = 1000;
+pub const WALLET_POI_RECOVERABLE_REFRESH_AFTER: Duration = Duration::from_secs(60);
+const WALLET_POI_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 const EVM_CHAIN_TYPE: u8 = 0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalletPoiRefreshSelection {
+    Required,
+    AllUnspent,
+    RecoverableStale { now: u64 },
+    Recoverable,
+}
 
 #[derive(Debug, Clone)]
 pub struct WalletHandle {
@@ -33,7 +43,15 @@ pub struct WalletHandle {
     pub utxos: Arc<RwLock<Vec<WalletUtxo>>>,
     pub ready_rx: watch::Receiver<bool>,
     pub rev_rx: watch::Receiver<u64>,
+    pub poi_refreshing_rx: watch::Receiver<bool>,
+    poi_refresh_tx: mpsc::Sender<()>,
     rev_tx: watch::Sender<u64>,
+}
+
+impl WalletHandle {
+    pub async fn refresh_poi_statuses(&self) -> bool {
+        self.poi_refresh_tx.send(()).await.is_ok()
+    }
 }
 
 #[async_trait]
@@ -387,6 +405,23 @@ pub(crate) async fn refresh_wallet_poi_statuses(
     active_list_keys: &[FixedBytes<32>],
     wallet_utxos: &mut [WalletUtxo],
 ) -> bool {
+    refresh_wallet_poi_statuses_selected(
+        client,
+        chain_id,
+        active_list_keys,
+        wallet_utxos,
+        WalletPoiRefreshSelection::AllUnspent,
+    )
+    .await
+}
+
+async fn refresh_wallet_poi_statuses_selected(
+    client: &dyn PoiStatusReader,
+    chain_id: u64,
+    active_list_keys: &[FixedBytes<32>],
+    wallet_utxos: &mut [WalletUtxo],
+    selection: WalletPoiRefreshSelection,
+) -> bool {
     if active_list_keys.is_empty() {
         return false;
     }
@@ -394,7 +429,14 @@ pub(crate) async fn refresh_wallet_poi_statuses(
     let unspent: Vec<_> = wallet_utxos
         .iter()
         .enumerate()
-        .filter(|(_, wallet_utxo)| !wallet_utxo.is_spent())
+        .filter(|(_, wallet_utxo)| {
+            !wallet_utxo.is_spent()
+                && wallet_utxo_matches_poi_refresh_selection(
+                    wallet_utxo,
+                    active_list_keys,
+                    selection,
+                )
+        })
         .map(|(index, wallet_utxo)| {
             (
                 index,
@@ -460,14 +502,75 @@ pub(crate) fn wallet_poi_status_refresh_needed(
     wallet_utxos: &[WalletUtxo],
     active_list_keys: &[FixedBytes<32>],
 ) -> bool {
+    wallet_poi_status_refresh_needed_for_selection(
+        wallet_utxos,
+        active_list_keys,
+        WalletPoiRefreshSelection::Required,
+    )
+}
+
+fn wallet_poi_status_refresh_needed_for_selection(
+    wallet_utxos: &[WalletUtxo],
+    active_list_keys: &[FixedBytes<32>],
+    selection: WalletPoiRefreshSelection,
+) -> bool {
     !active_list_keys.is_empty()
         && wallet_utxos.iter().any(|wallet_utxo| {
             !wallet_utxo.is_spent()
-                && (wallet_utxo.utxo.poi.refreshed_at.is_none()
-                    || active_list_keys
-                        .iter()
-                        .any(|list_key| !wallet_utxo.utxo.poi.statuses.contains_key(list_key)))
+                && wallet_utxo_matches_poi_refresh_selection(
+                    wallet_utxo,
+                    active_list_keys,
+                    selection,
+                )
         })
+}
+
+fn wallet_utxo_matches_poi_refresh_selection(
+    wallet_utxo: &WalletUtxo,
+    active_list_keys: &[FixedBytes<32>],
+    selection: WalletPoiRefreshSelection,
+) -> bool {
+    match selection {
+        WalletPoiRefreshSelection::Required => {
+            wallet_utxo.utxo.poi.refreshed_at.is_none()
+                || active_list_keys
+                    .iter()
+                    .any(|list_key| !wallet_utxo.utxo.poi.statuses.contains_key(list_key))
+        }
+        WalletPoiRefreshSelection::AllUnspent => true,
+        WalletPoiRefreshSelection::Recoverable => active_list_keys.iter().any(|list_key| {
+            wallet_utxo
+                .utxo
+                .poi
+                .statuses
+                .get(list_key)
+                .is_none_or(|status| status_is_recoverable(*status))
+        }),
+        WalletPoiRefreshSelection::RecoverableStale { now } => {
+            active_list_keys.iter().any(|list_key| {
+                wallet_utxo
+                    .utxo
+                    .poi
+                    .statuses
+                    .get(list_key)
+                    .is_none_or(|status| status_is_recoverable(*status))
+            }) && wallet_utxo
+                .utxo
+                .poi
+                .refreshed_at
+                .is_none_or(|refreshed_at| {
+                    now.saturating_sub(refreshed_at)
+                        >= WALLET_POI_RECOVERABLE_REFRESH_AFTER.as_secs()
+                })
+        }
+    }
+}
+
+const fn status_is_recoverable(status: PoiStatus) -> bool {
+    matches!(
+        status,
+        PoiStatus::Missing | PoiStatus::ProofSubmitted | PoiStatus::Unknown
+    )
 }
 
 fn apply_poi_statuses(
@@ -603,6 +706,51 @@ fn persist_wallet_progress(
     Ok(false)
 }
 
+async fn refresh_wallet_poi_statuses_and_persist(
+    client: &dyn PoiStatusReader,
+    cache_store: &dyn WalletCacheStore,
+    cfg: &WalletConfig,
+    active_list_keys: &[FixedBytes<32>],
+    utxos: &Arc<RwLock<Vec<WalletUtxo>>>,
+    last_scanned: u64,
+    persist_state: &mut WalletPersistState,
+    selection: WalletPoiRefreshSelection,
+) -> bool {
+    let mut locked = utxos.write().await;
+    let changed = refresh_wallet_poi_statuses_selected(
+        client,
+        cfg.chain.chain_id,
+        active_list_keys,
+        &mut locked,
+        selection,
+    )
+    .await;
+    if !changed {
+        return false;
+    }
+
+    if let Err(err) = persist_wallet_progress(
+        cache_store,
+        WalletProgressPersist {
+            cache_key: &cfg.cache_key,
+            snapshot: &locked,
+            last_scanned,
+            last_scanned_block_hash: None,
+            changed: true,
+        },
+        persist_state,
+    ) {
+        warn!(?err, cache_key = %cfg.cache_key, "failed to persist wallet POI status refresh");
+    }
+    true
+}
+
+fn set_poi_refreshing(sender: &watch::Sender<bool>, value: bool, cache_key: &str) {
+    if let Err(err) = sender.send(value) {
+        debug!(?err, cache_key, "failed to send wallet POI refresh state");
+    }
+}
+
 pub(crate) fn spawn_wallet_worker(
     db: Arc<DbStore>,
     cfg: WalletConfig,
@@ -616,11 +764,15 @@ pub(crate) fn spawn_wallet_worker(
     let cache_store = wallet_cache_store(&db, &cfg);
     let (ready_tx, ready_rx) = watch::channel(false);
     let (rev_tx, rev_rx) = watch::channel(0_u64);
+    let (poi_refresh_tx, mut poi_refresh_rx) = mpsc::channel(1);
+    let (poi_refreshing_tx, poi_refreshing_rx) = watch::channel(false);
     let handle = WalletHandle {
         cache_key: cfg.cache_key.clone(),
         utxos: utxos.clone(),
         ready_rx,
         rev_rx,
+        poi_refreshing_rx,
+        poi_refresh_tx,
         rev_tx,
     };
 
@@ -689,6 +841,59 @@ pub(crate) fn spawn_wallet_worker(
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
+                Some(()) = poi_refresh_rx.recv() => {
+                    let Some(client) = poi_status_client.as_ref() else {
+                        continue;
+                    };
+                    set_poi_refreshing(&poi_refreshing_tx, true, &cfg.cache_key);
+                    let changed = refresh_wallet_poi_statuses_and_persist(
+                        client,
+                        cache_store.as_ref(),
+                        &cfg,
+                        &active_poi_list_keys,
+                        &utxos,
+                        last_scanned,
+                        &mut persist_state,
+                        WalletPoiRefreshSelection::Recoverable,
+                    ).await;
+                    set_poi_refreshing(&poi_refreshing_tx, false, &cfg.cache_key);
+                    if changed {
+                        worker_handle.notify_changed();
+                    }
+                }
+                _ = tokio::time::sleep(WALLET_POI_REFRESH_INTERVAL), if poi_status_client.is_some() => {
+                    let now = now_epoch_secs();
+                    let selection = WalletPoiRefreshSelection::RecoverableStale { now };
+                    let refresh_needed = {
+                        let locked = utxos.read().await;
+                        wallet_poi_status_refresh_needed_for_selection(
+                            &locked,
+                            &active_poi_list_keys,
+                            selection,
+                        )
+                    };
+                    if !refresh_needed {
+                        continue;
+                    }
+                    let Some(client) = poi_status_client.as_ref() else {
+                        continue;
+                    };
+                    set_poi_refreshing(&poi_refreshing_tx, true, &cfg.cache_key);
+                    let changed = refresh_wallet_poi_statuses_and_persist(
+                        client,
+                        cache_store.as_ref(),
+                        &cfg,
+                        &active_poi_list_keys,
+                        &utxos,
+                        last_scanned,
+                        &mut persist_state,
+                        selection,
+                    ).await;
+                    set_poi_refreshing(&poi_refreshing_tx, false, &cfg.cache_key);
+                    if changed {
+                        worker_handle.notify_changed();
+                    }
+                }
                 Some(event) = backfill_rx.recv() => {
                     match event {
                         BackfillEvent::Logs(batch) => {
@@ -923,10 +1128,12 @@ fn wallet_utxo_counts(utxos: &[WalletUtxo]) -> (usize, usize) {
 mod tests {
     use super::{
         DEFAULT_TXID_VERSION, PendingOutputPoiSubmitter, PoiStatusReader,
-        WALLET_POI_STATUS_BATCH_SIZE, WalletHandle, WalletPersistState, WalletProgressPersist,
+        WALLET_POI_RECOVERABLE_REFRESH_AFTER, WALLET_POI_STATUS_BATCH_SIZE, WalletHandle,
+        WalletPersistState, WalletPoiRefreshSelection, WalletProgressPersist,
         apply_wallet_delta_to_vec, notify_wallet_rev, persist_wallet_progress,
         process_pending_output_poi_observations, refresh_wallet_poi_statuses,
-        spent_source_for_utxo, wallet_poi_status_refresh_needed,
+        refresh_wallet_poi_statuses_selected, spent_source_for_utxo,
+        wallet_poi_status_refresh_needed, wallet_poi_status_refresh_needed_for_selection,
     };
     use crate::types::{ChainKey, WalletCacheStore, WalletConfig};
     use alloy::primitives::{Address, Bytes, FixedBytes, U256};
@@ -947,7 +1154,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
-    use tokio::sync::{RwLock, watch};
+    use tokio::sync::{RwLock, mpsc, watch};
 
     static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1286,6 +1493,79 @@ mod tests {
         assert!(wallet_utxos[0].utxo.poi.refreshed_at.is_some());
     }
 
+    #[test]
+    fn stale_missing_poi_status_is_refresh_needed_after_ttl() {
+        let list_key = FixedBytes::from([0x11; 32]);
+        let list_keys = vec![list_key];
+        let mut wallet_utxo = test_wallet_utxo(1);
+        wallet_utxo
+            .utxo
+            .poi
+            .statuses
+            .insert(list_key, PoiStatus::Missing);
+        wallet_utxo.utxo.poi.refreshed_at = Some(100);
+        let wallet_utxos = vec![wallet_utxo];
+
+        assert!(!wallet_poi_status_refresh_needed_for_selection(
+            &wallet_utxos,
+            &list_keys,
+            WalletPoiRefreshSelection::RecoverableStale {
+                now: 100 + WALLET_POI_RECOVERABLE_REFRESH_AFTER.as_secs() - 1,
+            },
+        ));
+        assert!(wallet_poi_status_refresh_needed_for_selection(
+            &wallet_utxos,
+            &list_keys,
+            WalletPoiRefreshSelection::RecoverableStale {
+                now: 100 + WALLET_POI_RECOVERABLE_REFRESH_AFTER.as_secs(),
+            },
+        ));
+    }
+
+    #[tokio::test]
+    async fn forced_recoverable_poi_refresh_batches_missing_utxos() {
+        let client = RecordingPoiStatusClient::default();
+        let list_key = FixedBytes::from([0x11; 32]);
+        let list_keys = vec![list_key];
+        let mut valid = test_wallet_utxo(0);
+        valid.utxo.poi.statuses.insert(list_key, PoiStatus::Valid);
+        valid.utxo.poi.refreshed_at = Some(100);
+        let mut missing_one = test_wallet_utxo(1);
+        missing_one
+            .utxo
+            .poi
+            .statuses
+            .insert(list_key, PoiStatus::Missing);
+        missing_one.utxo.poi.refreshed_at = Some(100);
+        let mut missing_two = test_wallet_utxo(2);
+        missing_two
+            .utxo
+            .poi
+            .statuses
+            .insert(list_key, PoiStatus::Missing);
+        missing_two.utxo.poi.refreshed_at = Some(100);
+        let mut wallet_utxos = vec![valid, missing_one, missing_two];
+
+        let changed = refresh_wallet_poi_statuses_selected(
+            &client,
+            1,
+            &list_keys,
+            &mut wallet_utxos,
+            WalletPoiRefreshSelection::Recoverable,
+        )
+        .await;
+
+        assert!(changed);
+        let calls = client.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1.len(), 2);
+        assert!(
+            wallet_utxos
+                .iter()
+                .all(|wallet_utxo| wallet_utxo.utxo.poi.is_valid_for_lists(&list_keys))
+        );
+    }
+
     #[tokio::test]
     async fn poi_status_refresh_keeps_failed_chunks_unknown() {
         let client = RecordingPoiStatusClient::default();
@@ -1584,11 +1864,15 @@ mod tests {
         let (ready_tx, ready_rx) = watch::channel(false);
         drop(ready_tx);
         let (rev_tx, rev_rx) = watch::channel(0_u64);
+        let (poi_refresh_tx, _poi_refresh_rx) = mpsc::channel(1);
+        let (_poi_refreshing_tx, poi_refreshing_rx) = watch::channel(false);
         let handle = WalletHandle {
             cache_key: "cache-key".to_string(),
             utxos: Arc::new(RwLock::new(Vec::new())),
             ready_rx,
             rev_rx,
+            poi_refreshing_rx,
+            poi_refresh_tx,
             rev_tx,
         };
 

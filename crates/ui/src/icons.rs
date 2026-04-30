@@ -79,3 +79,11 @@ pub fn robot_icon_path() -> PathBuf {
         .join("icons")
         .join("robot.svg")
 }
+
+#[must_use]
+pub fn refresh_ccw_icon_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("icons")
+        .join("refresh-ccw.svg")
+}
