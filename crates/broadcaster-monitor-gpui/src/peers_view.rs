@@ -9,10 +9,11 @@ use gpui_component::{
     button::{Button, ButtonVariants},
     popover::Popover,
     table::{Column, Table, TableDelegate, TableState},
+    tooltip::Tooltip,
 };
 
 use broadcaster_monitor::{PeerRow, PeerSummary};
-use ui::clipboard::copy_with_toast;
+use ui::clipboard::clipboard_with_toast;
 use ui::table::ColumnWidthSync;
 use ui::theme;
 
@@ -30,7 +31,7 @@ impl PeersDelegate {
             rows: Arc::from(Vec::<PeerRow>::new()),
             columns: [
                 Column::new("peer_id", "peer id")
-                    .width(px(100.0))
+                    .width(px(120.0))
                     .movable(false),
                 Column::new("state", "state").width(px(80.0)).movable(false),
                 Column::new("caps", "caps").width(px(140.0)).movable(false),
@@ -96,14 +97,29 @@ impl TableDelegate for PeersDelegate {
         match col_ix {
             0 => {
                 let peer_id = row.peer_id.to_string();
+                let group = SharedString::from(format!("peer-id-cell-group-{row_ix}"));
                 div()
+                    .group(group.clone())
                     .id(SharedString::from(format!("peer-id-cell-{row_ix}")))
+                    .flex()
+                    .items_center()
+                    .gap_1()
                     .text_color(rgb(theme::PURPLE))
-                    .cursor_pointer()
                     .child(SharedString::from(short(row.peer_id.as_ref(), 4)))
-                    .on_click(move |_event, window, cx| {
-                        copy_with_toast(peer_id.clone(), window, cx);
-                    })
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("peer-id-copy-action-{row_ix}")))
+                            .group(group.clone())
+                            .flex_none()
+                            .opacity(0.0)
+                            .group_hover(group, |this| this.opacity(1.0))
+                            .hover(|this| this.opacity(1.0))
+                            .tooltip(|window, cx| Tooltip::new("Copy peer ID").build(window, cx))
+                            .child(clipboard_with_toast(
+                                SharedString::from(format!("peer-id-clipboard-{row_ix}")),
+                                peer_id,
+                            )),
+                    )
                     .into_any_element()
             }
             1 => {
@@ -154,30 +170,50 @@ impl TableDelegate for PeersDelegate {
                                     .child(addr),
                             ),
                     )
-                    .content(move |_state, _window, cx| {
-                        let popover = cx.entity();
+                    .content(move |_state, _window, _cx| {
                         div().flex().flex_col().gap_1().min_w(px(320.0)).children(
                             addrs
                                 .clone()
                                 .into_iter()
                                 .enumerate()
                                 .map(move |(ix, addr)| {
-                                    let popover = popover.clone();
                                     let label = SharedString::from(addr.as_ref().to_owned());
+                                    let group = SharedString::from(format!(
+                                        "peer-address-option-group-{row_ix}-{ix}"
+                                    ));
                                     div()
+                                        .group(group.clone())
                                         .id(SharedString::from(format!(
                                             "peer-address-option-{row_ix}-{ix}"
                                         )))
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
                                         .px_2()
                                         .py_1()
                                         .text_color(rgb(theme::TEXT_MUTED))
-                                        .cursor_pointer()
-                                        .child(label.clone())
-                                        .on_click(move |_event, window, cx| {
-                                            copy_with_toast(label.clone(), window, cx);
-                                            popover
-                                                .update(cx, |state, cx| state.dismiss(window, cx));
-                                        })
+                                        .child(div().min_w_0().child(label.clone()))
+                                        .child(
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "peer-address-copy-action-{row_ix}-{ix}"
+                                                )))
+                                                .group(group.clone())
+                                                .flex_none()
+                                                .opacity(0.0)
+                                                .group_hover(group, |this| this.opacity(1.0))
+                                                .hover(|this| this.opacity(1.0))
+                                                .tooltip(|window, cx| {
+                                                    Tooltip::new("Copy peer address")
+                                                        .build(window, cx)
+                                                })
+                                                .child(clipboard_with_toast(
+                                                    SharedString::from(format!(
+                                                        "peer-address-clipboard-{row_ix}-{ix}"
+                                                    )),
+                                                    label,
+                                                )),
+                                        )
                                 }),
                         )
                     })

@@ -77,7 +77,7 @@ fn main() -> Result<()> {
         }
     });
 
-    let application = Application::new();
+    let application = Application::new().with_assets(gpui_component_assets::Assets);
     application.run(move |app: &mut App| {
         // Initialize gpui-component globals (theme, table key bindings,
         // menu/select/popover/etc. state). Must run before any of its

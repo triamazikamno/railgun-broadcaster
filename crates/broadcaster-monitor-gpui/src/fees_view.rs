@@ -21,7 +21,7 @@ use railgun_ui::{
     chain_icon_path, chain_name, format_broadcaster_address_label, format_token_amount,
     lookup_token, short_address, token_icon_path,
 };
-use ui::clipboard::copy_with_toast;
+use ui::clipboard::clipboard_with_toast;
 use ui::theme;
 
 /// A single-select filter: either "All" (no filter) or a specific value.
@@ -373,16 +373,35 @@ impl TableDelegate for FeesDelegate {
                 let addr = row.railgun_address.as_ref();
                 let label = format_broadcaster_address_label(addr, row.identifier.as_deref());
                 let addr = addr.to_string();
+                let group = SharedString::from(format!("broadcaster-addr-cell-group-{row_ix}"));
                 div()
+                    .group(group.clone())
                     .id(SharedString::from(format!(
                         "broadcaster-addr-cell-{row_ix}"
                     )))
-                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .gap_1()
                     .text_color(rgb(theme::PURPLE))
                     .child(SharedString::from(label))
-                    .on_click(move |_event, window, cx| {
-                        copy_with_toast(addr.clone(), window, cx);
-                    })
+                    .child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "broadcaster-addr-copy-action-{row_ix}"
+                            )))
+                            .group(group.clone())
+                            .flex_none()
+                            .opacity(0.0)
+                            .group_hover(group, |this| this.opacity(1.0))
+                            .hover(|this| this.opacity(1.0))
+                            .tooltip(|window, cx| {
+                                Tooltip::new("Copy broadcaster address").build(window, cx)
+                            })
+                            .child(clipboard_with_toast(
+                                SharedString::from(format!("broadcaster-addr-clipboard-{row_ix}")),
+                                addr,
+                            )),
+                    )
                     .into_any_element()
             }
             2 => {
@@ -390,12 +409,14 @@ impl TableDelegate for FeesDelegate {
                     || short_address(&row.token_address),
                     |info| info.symbol.to_owned(),
                 );
-                // EIP-55 checksummed form for clipboard — the form downstream
-                // tooling expects. Captured by the click closure per row.
                 let addr_for_clipboard = row.token_address.to_string();
+                let group = SharedString::from(format!("token-cell-group-{row_ix}"));
                 div()
+                    .group(group.clone())
                     .id(SharedString::from(format!("token-cell-{row_ix}")))
-                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .gap_1()
                     .text_color(rgb(theme::TEXT))
                     .child(token_label_row(
                         row.chain_id,
@@ -403,9 +424,24 @@ impl TableDelegate for FeesDelegate {
                         SharedString::from(label),
                         px(14.0),
                     ))
-                    .on_click(move |_event, window, cx| {
-                        copy_with_toast(addr_for_clipboard.clone(), window, cx);
-                    })
+                    .child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "token-address-copy-action-{row_ix}"
+                            )))
+                            .group(group.clone())
+                            .flex_none()
+                            .opacity(0.0)
+                            .group_hover(group, |this| this.opacity(1.0))
+                            .hover(|this| this.opacity(1.0))
+                            .tooltip(|window, cx| {
+                                Tooltip::new("Copy token address").build(window, cx)
+                            })
+                            .child(clipboard_with_toast(
+                                SharedString::from(format!("token-address-clipboard-{row_ix}")),
+                                addr_for_clipboard,
+                            )),
+                    )
                     .into_any_element()
             }
             3 => {
@@ -414,18 +450,33 @@ impl TableDelegate for FeesDelegate {
                     || raw_fee.clone(),
                     |info| format_token_amount(row.fee, info.decimals),
                 );
+                let group = SharedString::from(format!("fee-cell-group-{row_ix}"));
                 div()
+                    .group(group.clone())
                     .id(SharedString::from(format!("fee-cell-{row_ix}")))
-                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .gap_1()
                     .text_color(rgb(theme::WARNING))
                     .tooltip({
                         let raw_fee = raw_fee.clone();
                         move |window, cx| Tooltip::new(raw_fee.clone()).build(window, cx)
                     })
                     .child(SharedString::from(label))
-                    .on_click(move |_event, window, cx| {
-                        copy_with_toast(raw_fee.clone(), window, cx);
-                    })
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("fee-copy-action-{row_ix}")))
+                            .group(group.clone())
+                            .flex_none()
+                            .opacity(0.0)
+                            .group_hover(group, |this| this.opacity(1.0))
+                            .hover(|this| this.opacity(1.0))
+                            .tooltip(|window, cx| Tooltip::new("Copy raw fee").build(window, cx))
+                            .child(clipboard_with_toast(
+                                SharedString::from(format!("fee-clipboard-{row_ix}")),
+                                raw_fee,
+                            )),
+                    )
                     .into_any_element()
             }
             4 => {

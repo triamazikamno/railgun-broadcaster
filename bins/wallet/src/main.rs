@@ -71,7 +71,7 @@ fn main() -> Result<()> {
     });
 
     let wallet_options = WalletAppOptions::from(opts);
-    let application = Application::new();
+    let application = Application::new().with_assets(gpui_component_assets::Assets);
     application.run(move |app: &mut App| {
         gpui_component::init(app);
         ui::theme::apply_zenburn_component_theme(app);

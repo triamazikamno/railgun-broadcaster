@@ -10,16 +10,22 @@ use gpui::{
     App, AppContext, Bounds, Context, Entity, FocusHandle, Focusable, InteractiveElement,
     IntoElement, KeyBinding, MouseButton, ParentElement, Pixels, Point, Render, SharedString,
     StatefulInteractiveElement, Styled, Window, WindowBounds, WindowOptions, div, img,
-    prelude::FluentBuilder as _, px, relative, rgb, size,
+    prelude::FluentBuilder as _, px, rgb, size,
 };
 use gpui_component::{
-    Disableable, Root, Selectable, Sizable, StyledExt,
-    button::{Button, ButtonGroup, ButtonVariants},
+    Disableable, IconName, Root, Selectable, Sizable, StyledExt,
+    alert::Alert,
+    button::{ButtonGroup, ButtonVariants},
+    group_box::{GroupBox, GroupBoxVariants},
     input::{Input, InputEvent, InputState},
     popover::Popover,
+    progress::Progress as UiProgress,
     resizable::{ResizableState, resizable_panel, v_resizable},
     scroll::ScrollableElement,
-    table::{Column, Table, TableDelegate, TableState},
+    spinner::Spinner,
+    tab::{Tab, TabBar},
+    table::{Column, Table, TableDelegate, TableEvent, TableState},
+    tag::Tag,
     tooltip::Tooltip,
     v_flex,
 };
@@ -30,7 +36,7 @@ use railgun_ui::{
 use reqwest::Url;
 use tokio::runtime::Handle;
 use tokio::sync::{OnceCell, watch};
-use ui::clipboard::copy_with_toast;
+use ui::clipboard::clipboard_with_toast;
 use ui::controls::{app_button, app_button_base, app_input, app_muted_text, app_strong_text};
 use ui::icons;
 use ui::logs::{LogStore, LogsPane};
@@ -709,6 +715,15 @@ impl WalletRoot {
             },
         )
         .detach();
+        cx.subscribe(&root.utxo_table, |_, table, event: &TableEvent, cx| {
+            if let TableEvent::ColumnWidthsChanged(widths) = event {
+                table.update(cx, |table, cx| {
+                    table.delegate_mut().set_column_widths(widths);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
@@ -720,7 +735,7 @@ impl WalletRoot {
                             root.chain_states.get(&root.selected_chain),
                             Some(state) if state.snapshot().is_some()
                         ) {
-                            root.utxo_table.update(cx, TableState::refresh);
+                            root.utxo_table.update(cx, |_table, cx| cx.notify());
                             cx.notify();
                         }
                     })
@@ -1042,7 +1057,7 @@ impl WalletRoot {
         };
         self.utxo_table.update(cx, |state, cx| {
             state.delegate_mut().set_rows(rows);
-            state.refresh(cx);
+            cx.notify();
         });
     }
 
@@ -3151,7 +3166,7 @@ impl WalletRoot {
             })
     }
 
-    fn render_create_vault(&self, root: Entity<Self>) -> gpui::Div {
+    fn render_create_vault(&self, root: Entity<Self>) -> gpui::AnyElement {
         let submit_root = root;
         let mut card = vault_card(
             "Create wallet vault",
@@ -3179,9 +3194,10 @@ impl WalletRoot {
                     .text_color(rgb(theme::TEXT_MUTED))
                     .child("No OS keychain or mnemonic startup argument is used in v1."),
             )
+            .into_any_element()
     }
 
-    fn render_unlock_vault(&self, root: Entity<Self>) -> gpui::Div {
+    fn render_unlock_vault(&self, root: Entity<Self>) -> gpui::AnyElement {
         let submit_root = root;
         let mut card = vault_card(
             "Unlock wallet vault",
@@ -3210,9 +3226,10 @@ impl WalletRoot {
                     .text_color(rgb(theme::TEXT_MUTED))
                     .child("Unlocking view mode does not decrypt spend material."),
             )
+            .into_any_element()
     }
 
-    fn render_wallet_setup(&self, root: Entity<Self>) -> gpui::Div {
+    fn render_wallet_setup(&self, root: Entity<Self>) -> gpui::AnyElement {
         match self.wallet_setup_mode {
             WalletSetupMode::Choose => self.render_wallet_setup_choice(root),
             WalletSetupMode::GeneratedReview => self.render_generated_wallet_review(root),
@@ -3220,7 +3237,7 @@ impl WalletRoot {
         }
     }
 
-    fn render_wallet_setup_choice(&self, root: Entity<Self>) -> gpui::Div {
+    fn render_wallet_setup_choice(&self, root: Entity<Self>) -> gpui::AnyElement {
         let generate_root = root.clone();
         let import_root = root;
         let mut card = vault_card(
@@ -3251,9 +3268,10 @@ impl WalletRoot {
                     });
                 }),
         )
+        .into_any_element()
     }
 
-    fn render_generated_wallet_review(&self, root: Entity<Self>) -> gpui::Div {
+    fn render_generated_wallet_review(&self, root: Entity<Self>) -> gpui::AnyElement {
         let confirm_root = root.clone();
         let back_root = root;
         let phrase = self
@@ -3301,9 +3319,10 @@ impl WalletRoot {
                     });
                 }),
         )
+        .into_any_element()
     }
 
-    fn render_import_wallet(&self, root: Entity<Self>) -> gpui::Div {
+    fn render_import_wallet(&self, root: Entity<Self>) -> gpui::AnyElement {
         let import_root = root.clone();
         let back_root = root;
         let mut card = vault_card(
@@ -3335,9 +3354,10 @@ impl WalletRoot {
                         });
                     }),
             )
+            .into_any_element()
     }
 
-    fn render_vault_fatal(&self, message: &str) -> gpui::Div {
+    fn render_vault_fatal(&self, message: &str) -> gpui::AnyElement {
         let mut card = vault_card(
             "Wallet vault unavailable",
             SharedString::from(message.to_owned()),
@@ -3345,7 +3365,7 @@ impl WalletRoot {
         if let Some(error) = self.render_vault_error() {
             card = card.child(error);
         }
-        card
+        card.into_any_element()
     }
 
     fn render_vault_error(&self) -> Option<gpui::AnyElement> {
@@ -3457,20 +3477,16 @@ impl WalletRoot {
             .child(self.render_wallet_selector(root.clone()))
             .child(self.render_chain_selector(root.clone()))
             .child(div().flex_1())
-            .children(receive_address.map(|address| {
-                let copy_address = address.clone();
-                app_button(
-                    "wallet-receive-address",
-                    SharedString::from(short_hash(&address)),
-                )
-                .ghost()
-                .xsmall()
-                .text_color(rgb(theme::TEAL))
-                .tooltip("Copy receive address")
-                .on_click(move |_event, window, cx| {
-                    copy_with_toast(copy_address.clone(), window, cx);
-                })
+            .children(receive_address.clone().map(|address| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .text_color(rgb(theme::TEAL))
+                    .child(SharedString::from(short_hash(&address)))
+                    .child(clipboard_with_toast("wallet-receive-address-copy", address))
             }))
+            .children(receive_address.map(|_| header_divider()))
             .child(self.render_repair_cache_popover(root.clone()))
             .child(
                 app_button_base("wallet-lock-vault")
@@ -3616,70 +3632,32 @@ impl WalletRoot {
     }
 
     fn render_wallet_tabs(&self, root: &Entity<Self>) -> impl IntoElement {
-        div()
-            .h(px(40.0))
-            .flex_none()
-            .flex()
-            .items_end()
-            .gap_2()
-            .px(px(14.0))
-            .pt(px(7.0))
-            .bg(rgb(theme::SURFACE))
-            .children(WalletTab::ALL.into_iter().map(|tab| {
-                Self::render_wallet_tab_button(root.clone(), tab, self.active_wallet_tab == tab)
-            }))
-    }
+        let selected_index = WalletTab::ALL
+            .iter()
+            .position(|tab| *tab == self.active_wallet_tab)
+            .unwrap_or(0);
+        let tab_root = root.clone();
 
-    fn render_wallet_tab_button(
-        root: Entity<Self>,
-        tab: WalletTab,
-        active: bool,
-    ) -> impl IntoElement {
-        let label = tab.label();
-        div()
-            .id(SharedString::from(format!(
-                "wallet-tab-{}",
-                label.to_ascii_lowercase()
-            )))
-            .h(px(34.0))
-            .min_w(px(92.0))
-            .px(px(16.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .gap_2()
-            .cursor_pointer()
-            .text_size(APP_TEXT_SIZE)
-            .rounded_t_md()
-            .when(active, |button| {
-                button
-                    .bg(rgb(theme::SURFACE_ELEVATED))
-                    .border_t_1()
-                    .border_l_1()
-                    .border_r_1()
-                    .border_color(rgb(theme::BORDER))
-                    .text_color(rgb(theme::TEXT))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-            })
-            .when(!active, |button| {
-                button.text_color(rgb(theme::TEXT_MUTED)).hover(|button| {
-                    button
-                        .bg(rgb(theme::SURFACE_HOVER_SUBTLE))
-                        .text_color(rgb(theme::TEXT))
-                })
-            })
-            .child(
-                img(tab.icon_path())
-                    .size(px(18.0))
-                    .flex_none()
-                    .opacity(if active { 1.0 } else { 0.75 }),
-            )
-            .child(label)
-            .on_click(move |_event, _window, cx| {
-                root.update(cx, |root, cx| {
+        TabBar::new("wallet-tabs")
+            .underline()
+            .w_full()
+            .flex_none()
+            .px(px(14.0))
+            .selected_index(selected_index)
+            .on_click(move |index, _window, cx| {
+                let Some(tab) = WalletTab::ALL.get(*index).copied() else {
+                    return;
+                };
+                tab_root.update(cx, |root, cx| {
                     root.select_wallet_tab(tab, cx);
                 });
             })
+            .children(WalletTab::ALL.into_iter().map(|tab| {
+                Tab::new()
+                    .min_w(px(92.0))
+                    .label(tab.label())
+                    .prefix(img(tab.icon_path()).size(px(16.0)).flex_none())
+            }))
     }
 
     fn render_wallet_content(&self, root: &Entity<Self>, window: &Window) -> gpui::AnyElement {
@@ -3997,17 +3975,10 @@ impl WalletRoot {
             ));
 
         if asset.total > asset.max_batched {
-            card = card.child(
-                div()
-                    .p(px(10.0))
-                    .rounded_md()
-                    .bg(rgb(theme::WARNING_BG))
-                    .border_1()
-                    .border_color(rgb(theme::WARNING))
-                    .text_color(rgb(theme::WARNING))
-                    .text_size(APP_TEXT_SIZE)
-                    .child("Spend capacity is limited by private note fragmentation and POI verification status. One send can spend up to 8 proof chunks."),
-            );
+            card = card.child(Alert::warning(
+                send_element_id(key, "spend-capacity-warning"),
+                "Spend capacity is limited by private note fragmentation and POI verification status. One send can spend up to 8 proof chunks.",
+            ).small());
         }
 
         card = card.child(render_delivery_selector(
@@ -4135,17 +4106,11 @@ impl WalletRoot {
 
         if let Some(error) = form.error.as_ref() {
             card = card.child(
-                div()
-                    .p(px(10.0))
-                    .rounded_md()
-                    .bg(rgb(theme::DANGER_BG))
-                    .border_1()
-                    .border_color(rgb(theme::DANGER))
-                    .text_color(rgb(theme::DANGER))
-                    .text_size(APP_TEXT_SIZE)
-                    .child(SharedString::from(format_form_error_for_asset(
-                        error, asset,
-                    ))),
+                Alert::error(
+                    send_element_id(key, "form-error"),
+                    format_form_error_for_asset(error, asset),
+                )
+                .small(),
             );
         }
 
@@ -4240,17 +4205,10 @@ impl WalletRoot {
             ));
 
         if asset.total > asset.max_batched {
-            card = card.child(
-                div()
-                    .p(px(10.0))
-                    .rounded_md()
-                    .bg(rgb(theme::WARNING_BG))
-                    .border_1()
-                    .border_color(rgb(theme::WARNING))
-                    .text_color(rgb(theme::WARNING))
-                    .text_size(APP_TEXT_SIZE)
-                    .child("Spend capacity is limited by private note fragmentation and POI verification status. One unshield can spend up to 8 proof chunks."),
-            );
+            card = card.child(Alert::warning(
+                unshield_element_id(key, "spend-capacity-warning"),
+                "Spend capacity is limited by private note fragmentation and POI verification status. One unshield can spend up to 8 proof chunks.",
+            ).small());
         }
 
         card = card.child(render_delivery_selector(
@@ -4387,17 +4345,11 @@ impl WalletRoot {
 
         if let Some(error) = form.error.as_ref() {
             card = card.child(
-                div()
-                    .p(px(10.0))
-                    .rounded_md()
-                    .bg(rgb(theme::DANGER_BG))
-                    .border_1()
-                    .border_color(rgb(theme::DANGER))
-                    .text_color(rgb(theme::DANGER))
-                    .text_size(APP_TEXT_SIZE)
-                    .child(SharedString::from(format_form_error_for_asset(
-                        error, asset,
-                    ))),
+                Alert::error(
+                    unshield_element_id(key, "form-error"),
+                    format_form_error_for_asset(error, asset),
+                )
+                .small(),
             );
         }
 
@@ -5075,10 +5027,10 @@ impl UtxoDelegate {
                     .movable(false),
                 Column::new("poi", "POI").width(px(130.0)).movable(false),
                 Column::new("source_tx", "source tx")
-                    .width(px(170.0))
+                    .width(px(200.0))
                     .movable(false),
                 Column::new("spent_tx", "spent tx")
-                    .width(px(170.0))
+                    .width(px(200.0))
                     .movable(false),
             ],
             tx_search_input,
@@ -5087,6 +5039,12 @@ impl UtxoDelegate {
 
     fn set_rows(&mut self, rows: Vec<UtxoDisplayRow>) {
         self.rows = Arc::from(rows);
+    }
+
+    fn set_column_widths(&mut self, widths: &[Pixels]) {
+        for (column, width) in self.columns.iter_mut().zip(widths.iter().copied()) {
+            column.width = width;
+        }
     }
 }
 
@@ -5142,9 +5100,13 @@ impl TableDelegate for UtxoDelegate {
             }
             2 => {
                 let address = row.token_address.clone();
+                let group = SharedString::from(format!("wallet-token-cell-group-{row_ix}"));
                 div()
+                    .group(group.clone())
                     .id(SharedString::from(format!("wallet-token-cell-{row_ix}")))
-                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .gap_1()
                     .font_bold()
                     .text_color(utxo_cell_text_color(row, rgb(theme::TEXT)))
                     .child(token_label_row(
@@ -5152,9 +5114,26 @@ impl TableDelegate for UtxoDelegate {
                         row.token_icon_path.clone(),
                         px(14.0),
                     ))
-                    .on_click(move |_event, window, cx| {
-                        copy_with_toast(address.clone(), window, cx);
-                    })
+                    .child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "wallet-token-address-copy-action-{row_ix}"
+                            )))
+                            .group(group.clone())
+                            .flex_none()
+                            .opacity(0.0)
+                            .group_hover(group, |this| this.opacity(1.0))
+                            .hover(|this| this.opacity(1.0))
+                            .tooltip(|window, cx| {
+                                Tooltip::new("Copy token address").build(window, cx)
+                            })
+                            .child(clipboard_with_toast(
+                                SharedString::from(format!(
+                                    "wallet-token-address-clipboard-{row_ix}"
+                                )),
+                                address,
+                            )),
+                    )
                     .into_any_element()
             }
             3 => div()
@@ -5162,15 +5141,17 @@ impl TableDelegate for UtxoDelegate {
                 .child(SharedString::from(row.amount.clone()))
                 .into_any_element(),
             4 => div()
-                .text_color(utxo_cell_text_color(
-                    row,
+                .opacity(if row.is_spent { 0.6 } else { 1.0 })
+                .child(
                     if row.poi_spendable {
-                        rgb(theme::TEAL)
+                        Tag::success()
                     } else {
-                        rgb(theme::WARNING)
-                    },
-                ))
-                .child(SharedString::from(row.poi_status.clone()))
+                        Tag::warning()
+                    }
+                    .small()
+                    .outline()
+                    .child(SharedString::from(row.poi_status.clone())),
+                )
                 .into_any_element(),
             5 => tx_hash_cell(
                 row,
@@ -5208,7 +5189,6 @@ fn tx_hash_cell(
 ) -> gpui::AnyElement {
     let display_hash = short_hash(tx_hash);
     let search_hash = tx_hash.to_string();
-    let copy_hash = tx_hash.to_string();
     let group = SharedString::from(format!("wallet-{kind}-tx-group-{row_ix}"));
 
     div()
@@ -5222,34 +5202,58 @@ fn tx_hash_cell(
                 .id(SharedString::from(format!(
                     "wallet-{kind}-tx-copy-{row_ix}"
                 )))
-                .cursor_pointer()
+                .flex_none()
                 .text_color(utxo_cell_text_color(row, color))
-                .child(SharedString::from(display_hash))
-                .on_click(move |_event, window, cx| {
-                    copy_with_toast(copy_hash.clone(), window, cx);
-                }),
+                .child(SharedString::from(display_hash)),
         )
         .child(
             div()
                 .id(SharedString::from(format!(
-                    "wallet-{kind}-tx-search-{row_ix}"
+                    "wallet-{kind}-tx-actions-{row_ix}"
                 )))
-                .size(px(16.0))
+                .group(group.clone())
                 .flex()
+                .flex_none()
                 .items_center()
-                .justify_center()
-                .rounded_sm()
-                .cursor_pointer()
+                .gap_1()
                 .opacity(0.0)
                 .group_hover(group, |this| this.opacity(1.0))
-                .hover(|this| this.bg(rgb(theme::SURFACE_HOVER)))
-                .tooltip(|window, cx| Tooltip::new("Filter by this transaction").build(window, cx))
-                .on_click(move |_event, window, cx| {
-                    tx_search_input.update(cx, |input, cx| {
-                        input.set_value(search_hash.clone(), window, cx);
-                    });
-                })
-                .child(img(icons::search_icon_path()).size(px(10.0)).flex_none()),
+                .hover(|this| this.opacity(1.0))
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "wallet-{kind}-tx-copy-action-{row_ix}"
+                        )))
+                        .tooltip(|window, cx| {
+                            Tooltip::new("Copy transaction hash").build(window, cx)
+                        })
+                        .child(clipboard_with_toast(
+                            SharedString::from(format!("wallet-{kind}-tx-clipboard-{row_ix}")),
+                            tx_hash.to_string(),
+                        )),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "wallet-{kind}-tx-search-{row_ix}"
+                        )))
+                        .size(px(20.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .hover(|this| this.bg(rgb(theme::SURFACE_HOVER)))
+                        .tooltip(|window, cx| {
+                            Tooltip::new("Filter by this transaction").build(window, cx)
+                        })
+                        .on_click(move |_event, window, cx| {
+                            tx_search_input.update(cx, |input, cx| {
+                                input.set_value(search_hash.clone(), window, cx);
+                            });
+                        })
+                        .child(img(icons::search_icon_path()).size(px(14.0)).flex_none()),
+                ),
         )
         .into_any_element()
 }
@@ -5287,19 +5291,12 @@ fn private_action_input(state: &Entity<InputState>) -> Input {
     Input::new(state).px(px(12.0)).py(px(8.0))
 }
 
-fn vault_card(title: &'static str, subtitle: impl Into<SharedString>) -> gpui::Div {
+fn vault_card(title: &'static str, subtitle: impl Into<SharedString>) -> GroupBox {
     let subtitle = subtitle.into();
-    div()
+    GroupBox::new()
+        .outline()
         .w(px(500.0))
         .max_w_full()
-        .flex()
-        .flex_col()
-        .gap_3()
-        .p(px(22.0))
-        .rounded_lg()
-        .bg(rgb(theme::SURFACE))
-        .border_1()
-        .border_color(rgb(theme::BORDER))
         .child(app_strong_text(title))
         .child(app_muted_text(subtitle).line_height(px(18.0)))
 }
@@ -5318,8 +5315,6 @@ fn sync_status_bar(progress: Option<SyncProgressUpdate>) -> gpui::Div {
         || "Waiting for indexed sync progress...".to_string(),
         progress_detail,
     );
-    let fill_width = relative(f32::from(percent) / 100.0);
-
     div()
         .h(px(36.0))
         .flex_none()
@@ -5338,19 +5333,10 @@ fn sync_status_bar(progress: Option<SyncProgressUpdate>) -> gpui::Div {
                 .child(title),
         )
         .child(
-            div()
+            UiProgress::new()
                 .w(px(190.0))
                 .h(px(6.0))
-                .rounded_md()
-                .overflow_hidden()
-                .bg(rgb(theme::SURFACE_HOVER))
-                .child(
-                    div()
-                        .h_full()
-                        .w(fill_width)
-                        .rounded_md()
-                        .bg(rgb(theme::INFO)),
-                ),
+                .value(f32::from(percent)),
         )
         .child(
             div()
@@ -5410,6 +5396,14 @@ fn wallet_label_row(label: SharedString) -> impl IntoElement {
         .text_size(APP_TEXT_SIZE)
         .child(img(icons::wallet_icon_path()).size(px(16.0)).flex_none())
         .child(label)
+}
+
+fn header_divider() -> gpui::Div {
+    div()
+        .h(px(18.0))
+        .w(px(1.0))
+        .mx(px(2.0))
+        .bg(rgb(theme::BORDER))
 }
 
 fn token_label_row(
@@ -6133,7 +6127,7 @@ fn private_action_metric_id_suffix(label: &'static str) -> &'static str {
     }
 }
 
-fn render_unshield_generating_status(tick: usize, stage: TransactionGenerationStage) -> gpui::Div {
+fn render_unshield_generating_status(_tick: usize, stage: TransactionGenerationStage) -> gpui::Div {
     div()
         .flex()
         .items_center()
@@ -6144,16 +6138,10 @@ fn render_unshield_generating_status(tick: usize, stage: TransactionGenerationSt
         .border_1()
         .border_color(rgb(theme::INFO))
         .child(
-            div()
-                .size(px(22.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded_full()
-                .bg(rgb(theme::BACKGROUND))
-                .text_color(rgb(theme::INFO))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .child(unshield_spinner_frame(tick)),
+            Spinner::new()
+                .icon(IconName::LoaderCircle)
+                .color(rgb(theme::INFO).into())
+                .with_size(px(18.0)),
         )
         .child(
             div()
@@ -6170,16 +6158,6 @@ fn render_unshield_generating_status(tick: usize, stage: TransactionGenerationSt
         )
 }
 
-const fn unshield_spinner_frame(tick: usize) -> &'static str {
-    const FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
-    FRAMES[tick % FRAMES.len()]
-}
-
-#[cfg(test)]
-const fn send_spinner_frame(tick: usize) -> &'static str {
-    unshield_spinner_frame(tick)
-}
-
 fn render_delivery_selector(
     root: Entity<WalletRoot>,
     key: UnshieldAssetKey,
@@ -6187,8 +6165,7 @@ fn render_delivery_selector(
     mode: DeliveryMode,
     generating: bool,
 ) -> gpui::Div {
-    let manual_root = root.clone();
-    let public_root = root;
+    let selector_root = root;
     div()
         .flex()
         .flex_col()
@@ -6200,65 +6177,43 @@ fn render_delivery_selector(
                 .flex_wrap()
                 .gap_2()
                 .child(
-                    app_button(delivery_element_id(key, kind, "manual"), "Manual calldata")
-                        .xsmall()
+                    ButtonGroup::new(delivery_element_id(key, kind, "mode-toggle"))
                         .outline()
-                        .p(px(12.0))
-                        .when(mode == DeliveryMode::ManualCalldata, |button| {
-                            button.primary()
-                        })
                         .disabled(generating)
-                        .on_click(move |_event, window, cx| {
-                            manual_root.update(cx, |root, cx| match kind {
-                                DeliveryFormKind::Send => root.set_send_delivery_mode(
-                                    key,
-                                    DeliveryMode::ManualCalldata,
-                                    window,
-                                    cx,
-                                ),
-                                DeliveryFormKind::Unshield => root.set_unshield_delivery_mode(
-                                    key,
-                                    DeliveryMode::ManualCalldata,
-                                    window,
-                                    cx,
-                                ),
+                        .child(
+                            app_button(delivery_element_id(key, kind, "manual"), "Manual calldata")
+                                .selected(mode == DeliveryMode::ManualCalldata),
+                        )
+                        .child(
+                            app_button(
+                                delivery_element_id(key, kind, "public"),
+                                "Public broadcaster",
+                            )
+                            .selected(mode == DeliveryMode::PublicBroadcaster),
+                        )
+                        .on_click(move |selected, window, cx| {
+                            let Some(index) = selected.first() else {
+                                return;
+                            };
+                            let mode = if *index == 0 {
+                                DeliveryMode::ManualCalldata
+                            } else {
+                                DeliveryMode::PublicBroadcaster
+                            };
+                            selector_root.update(cx, |root, cx| match kind {
+                                DeliveryFormKind::Send => {
+                                    root.set_send_delivery_mode(key, mode, window, cx);
+                                }
+                                DeliveryFormKind::Unshield => {
+                                    root.set_unshield_delivery_mode(key, mode, window, cx);
+                                }
                             });
                         }),
                 )
                 .child(
-                    app_button(
-                        delivery_element_id(key, kind, "public"),
-                        "Public broadcaster",
-                    )
-                    .xsmall()
-                    .outline()
-                    .p(px(12.0))
-                    .when(mode == DeliveryMode::PublicBroadcaster, |button| {
-                        button.primary()
-                    })
-                    .disabled(generating)
-                    .on_click(move |_event, window, cx| {
-                        public_root.update(cx, |root, cx| match kind {
-                            DeliveryFormKind::Send => root.set_send_delivery_mode(
-                                key,
-                                DeliveryMode::PublicBroadcaster,
-                                window,
-                                cx,
-                            ),
-                            DeliveryFormKind::Unshield => root.set_unshield_delivery_mode(
-                                key,
-                                DeliveryMode::PublicBroadcaster,
-                                window,
-                                cx,
-                            ),
-                        });
-                    }),
-                )
-                .child(
                     app_button(delivery_element_id(key, kind, "self"), "Self-broadcast")
-                        .xsmall()
                         .outline()
-                        .p(px(12.0))
+                        .disabled(generating)
                         .disabled(true),
                 ),
         )
@@ -6400,6 +6355,7 @@ fn render_broadcaster_fee_mode_toggle(
     mode: PublicBroadcasterFeeMode,
     generating: bool,
 ) -> gpui::Div {
+    let selector_root = root;
     let helper = match mode {
         PublicBroadcasterFeeMode::DeductFromAmount => {
             "Recipient receives the entered amount minus the broadcaster fee."
@@ -6418,66 +6374,45 @@ fn render_broadcaster_fee_mode_toggle(
         .border_1()
         .border_color(rgb(theme::BORDER))
         .child(
-            div()
-                .flex()
-                .gap_2()
-                .child(render_broadcaster_fee_mode_button(
-                    root.clone(),
-                    key,
-                    kind,
-                    mode,
-                    PublicBroadcasterFeeMode::DeductFromAmount,
-                    "Deduct fee from amount",
-                    generating,
-                ))
-                .child(render_broadcaster_fee_mode_button(
-                    root,
-                    key,
-                    kind,
-                    mode,
-                    PublicBroadcasterFeeMode::AddToAmount,
-                    "Add fee on top",
-                    generating,
-                )),
+            div().flex().gap_2().child(
+                ButtonGroup::new(delivery_element_id(key, kind, "fee-mode-toggle"))
+                    .outline()
+                    .disabled(generating)
+                    .child(
+                        app_button(
+                            delivery_element_id(key, kind, "fee-mode-deduct"),
+                            "Deduct fee from amount",
+                        )
+                        .selected(mode == PublicBroadcasterFeeMode::DeductFromAmount),
+                    )
+                    .child(
+                        app_button(
+                            delivery_element_id(key, kind, "fee-mode-add"),
+                            "Add fee on top",
+                        )
+                        .selected(mode == PublicBroadcasterFeeMode::AddToAmount),
+                    )
+                    .on_click(move |selected, window, cx| {
+                        let Some(index) = selected.first() else {
+                            return;
+                        };
+                        let mode = if *index == 0 {
+                            PublicBroadcasterFeeMode::DeductFromAmount
+                        } else {
+                            PublicBroadcasterFeeMode::AddToAmount
+                        };
+                        selector_root.update(cx, |root, cx| match kind {
+                            DeliveryFormKind::Send => {
+                                root.set_send_broadcaster_fee_mode(key, mode, window, cx);
+                            }
+                            DeliveryFormKind::Unshield => {
+                                root.set_unshield_broadcaster_fee_mode(key, mode, window, cx);
+                            }
+                        });
+                    }),
+            ),
         )
         .child(app_muted_text(helper))
-}
-
-fn render_broadcaster_fee_mode_button(
-    root: Entity<WalletRoot>,
-    key: UnshieldAssetKey,
-    kind: DeliveryFormKind,
-    current_mode: PublicBroadcasterFeeMode,
-    target_mode: PublicBroadcasterFeeMode,
-    label: &'static str,
-    generating: bool,
-) -> Button {
-    app_button(
-        delivery_element_id(
-            key,
-            kind,
-            match target_mode {
-                PublicBroadcasterFeeMode::DeductFromAmount => "fee-mode-deduct",
-                PublicBroadcasterFeeMode::AddToAmount => "fee-mode-add",
-            },
-        ),
-        label,
-    )
-    .xsmall()
-    .outline()
-    .p(px(12.0))
-    .when(current_mode == target_mode, ButtonVariants::primary)
-    .disabled(generating)
-    .on_click(move |_event, window, cx| {
-        root.update(cx, |root, cx| match kind {
-            DeliveryFormKind::Send => {
-                root.set_send_broadcaster_fee_mode(key, target_mode, window, cx);
-            }
-            DeliveryFormKind::Unshield => {
-                root.set_unshield_broadcaster_fee_mode(key, target_mode, window, cx);
-            }
-        });
-    })
 }
 
 fn render_send_result(key: UnshieldAssetKey, result: &PreparedSendCall) -> gpui::Div {
@@ -6703,7 +6638,7 @@ const fn public_broadcaster_cost_status_text(
     }
 }
 
-fn render_public_broadcaster_cost_status(tick: usize, status: CostEstimateStatus) -> gpui::Div {
+fn render_public_broadcaster_cost_status(_tick: usize, status: CostEstimateStatus) -> gpui::Div {
     let (title, detail) = public_broadcaster_cost_status_text(status);
     div()
         .flex()
@@ -6715,16 +6650,10 @@ fn render_public_broadcaster_cost_status(tick: usize, status: CostEstimateStatus
         .border_1()
         .border_color(rgb(theme::BORDER))
         .child(
-            div()
-                .size(px(22.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded_full()
-                .bg(rgb(theme::BACKGROUND))
-                .text_color(rgb(theme::INFO))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .child(unshield_spinner_frame(tick)),
+            Spinner::new()
+                .icon(IconName::LoaderCircle)
+                .color(rgb(theme::INFO).into())
+                .with_size(px(18.0)),
         )
         .child(
             div()
@@ -6799,7 +6728,6 @@ fn render_unshield_copy_field(
     value: String,
     button_id: SharedString,
 ) -> gpui::Div {
-    let copy_value = value.clone();
     div()
         .flex()
         .items_start()
@@ -6822,13 +6750,9 @@ fn render_unshield_copy_field(
                 .border_color(rgb(theme::BORDER))
                 .font_family(APP_FONT_FAMILY)
                 .text_size(APP_TEXT_SIZE)
-                .child(SharedString::from(value)),
+                .child(SharedString::from(value.clone())),
         )
-        .child(app_button(button_id, "Copy").xsmall().outline().on_click(
-            move |_event, window, cx| {
-                copy_with_toast(copy_value.clone(), window, cx);
-            },
-        ))
+        .child(clipboard_with_toast(button_id, value))
 }
 
 fn display_rows_from_output(
@@ -7086,10 +7010,9 @@ mod tests {
         max_unshield_amount_from_snapshot, native_wrapped_output_labels, parse_repair_cache_block,
         private_action_metrics, progress_detail, public_broadcaster_cost_status,
         public_broadcaster_cost_status_text, refresh_form_asset_from_snapshot,
-        send_asset_key_from_formatted, send_element_id, send_key_matches_asset, send_spinner_frame,
+        send_asset_key_from_formatted, send_element_id, send_key_matches_asset,
         should_focus_utxo_table, should_show_distinct_amount, should_show_pending_poi_amount,
         unshield_asset_key_from_formatted, unshield_element_id, unshield_key_matches_asset,
-        unshield_spinner_frame,
     };
 
     fn wallet_options_with_overrides() -> WalletAppOptions {
@@ -7455,24 +7378,6 @@ mod tests {
             "1"
         );
         assert_eq!(format_send_amount_input(U256::from(42_u8), None), "42");
-    }
-
-    #[test]
-    fn unshield_spinner_frames_cycle() {
-        assert_eq!(unshield_spinner_frame(0), "|");
-        assert_eq!(unshield_spinner_frame(1), "/");
-        assert_eq!(unshield_spinner_frame(2), "-");
-        assert_eq!(unshield_spinner_frame(3), "\\");
-        assert_eq!(unshield_spinner_frame(4), "|");
-    }
-
-    #[test]
-    fn send_spinner_frames_cycle() {
-        assert_eq!(send_spinner_frame(0), "|");
-        assert_eq!(send_spinner_frame(1), "/");
-        assert_eq!(send_spinner_frame(2), "-");
-        assert_eq!(send_spinner_frame(3), "\\");
-        assert_eq!(send_spinner_frame(4), "|");
     }
 
     #[test]

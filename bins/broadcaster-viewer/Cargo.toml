@@ -12,6 +12,7 @@ path = "src/main.rs"
 # Pinned GUI stack (pre-1.0; keep exact pins and narrow API use).
 gpui = { workspace = true }
 gpui-component = { workspace = true }
+gpui-component-assets = { workspace = true }
 
 # Async runtime / CLI / diagnostics.
 eyre = { workspace = true }

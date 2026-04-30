@@ -2373,6 +2373,7 @@ dependencies = [
  "eyre",
  "gpui",
  "gpui-component",
+ "gpui-component-assets",
  "humantime",
  "pprof",
  "railgun-ui",
@@ -5266,6 +5267,17 @@ dependencies = [
  "unicode-segmentation",
  "uuid",
  "zed-sum-tree",
+]
+
+[[package]]
+name = "gpui-component-assets"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "afc6e4c6551a1a12d4e8b69c3e8eba3cef43331c8c87898a0d4d040c78c6865e"
+dependencies = [
+ "anyhow",
+ "gpui",
+ "rust-embed",
 ]
 
 [[package]]
@@ -9893,6 +9905,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rust-embed-utils",
+ "shellexpand",
  "syn 2.0.117",
  "walkdir",
 ]
@@ -10685,6 +10698,15 @@ checksum = "f6c99835bad52957e7aa241d3975ed17c1e5f8c92026377d117a606f36b84b16"
 dependencies = [
  "bytes",
  "memmap2 0.6.2",
+]
+
+[[package]]
+name = "shellexpand"
+version = "3.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32824fab5e16e6c4d86dc1ba84489390419a39f97699852b66480bb87d297ed8"
+dependencies = [
+ "dirs 5.0.1",
 ]
 
 [[package]]
@@ -12489,6 +12511,7 @@ dependencies = [
  "eyre",
  "gpui",
  "gpui-component",
+ "gpui-component-assets",
  "railgun-ui",
  "reqwest",
  "structopt",
