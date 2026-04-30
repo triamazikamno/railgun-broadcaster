@@ -14,7 +14,7 @@ use railgun_wallet::public_spending_key;
 use railgun_wallet::tx::{
     PrivateInputs, PublicInputs, TransactionBuilder, UnshieldMode, UnshieldPlan, UnshieldRequest,
 };
-use railgun_wallet::{Utxo, WalletKeys};
+use railgun_wallet::{Utxo, UtxoCommitmentKind, WalletKeys};
 use serde::Deserialize;
 
 use broadcaster_core::contracts::railgun::{BoundParams, CommitmentCiphertext};
@@ -145,16 +145,17 @@ fn build_valid_unshield_plan() -> UnshieldPlan {
                 random: note_random,
                 npk: note_public_key(wallet.viewing.master_public_key, note_random),
             };
-            let utxo = Utxo {
-                note: note.clone(),
-                tree: 0,
-                position: 0,
-                source: railgun_wallet::UtxoSource {
+            let utxo = Utxo::new(
+                note.clone(),
+                0,
+                0,
+                railgun_wallet::UtxoSource {
                     tx_hash: FixedBytes::from([1u8; 32]),
                     block_number: 1,
                     block_timestamp: 1_700_000_001,
                 },
-            };
+                UtxoCommitmentKind::Transact,
+            );
             let mut forest = MerkleForest::new();
             forest
                 .insert_leaf(MerkleTreeUpdate {

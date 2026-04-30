@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 use alloy::primitives::{Address, Bytes, FixedBytes, U256, Uint};
 use alloy::sol_types::SolCall;
@@ -13,12 +14,17 @@ use broadcaster_core::contracts::railgun::{
 };
 use broadcaster_core::crypto::poseidon::poseidon;
 use broadcaster_core::crypto::railgun::{AddressData, ViewingKeyData};
+use broadcaster_core::transact::{
+    DEFAULT_TXID_VERSION, PreTxPoi, SnarkJsProof, pad_with_merkle_zero, railgun_txid_leaf_hash,
+};
 use broadcaster_core::utxo::Utxo;
 use merkletree::tree::{MerkleForest, MerkleProof};
+use poi::error::PoiRpcError;
+use poi::poi::{PoiMerkleProof, PoiRpcClient};
 
 use crate::keys::{RailgunSpendSigner, WalletKeys};
 use crate::notes::{Note, NoteCiphertext};
-use crate::prover::ProverService;
+use crate::prover::{ProverError, ProverService};
 
 pub const UNRELAYED_ADAPT_PARAMS: FixedBytes<32> = FixedBytes::ZERO;
 
@@ -57,6 +63,38 @@ pub enum BuildError {
     Prover(#[from] crate::prover::ProverError),
 }
 
+#[derive(Debug, Error)]
+pub enum PreTransactionPoiError {
+    #[error("POI proof input count mismatch: expected {expected}, got {got}")]
+    InputCountMismatch { expected: usize, got: usize },
+    #[error("POI output count mismatch: expected at least {expected}, got {got}")]
+    OutputCountMismatch { expected: usize, got: usize },
+    #[error("missing private output before unshield marker")]
+    MissingPrivateOutputBeforeUnshield,
+    #[error("POI merkle proof count mismatch: expected {expected}, got {got}")]
+    MerkleProofCountMismatch { expected: usize, got: usize },
+    #[error("POI merkle proof leaf mismatch at index {index}: expected {expected}, got {actual}")]
+    MerkleProofLeafMismatch {
+        index: usize,
+        expected: FixedBytes<32>,
+        actual: FixedBytes<32>,
+    },
+    #[error(
+        "POI merkle proof path length mismatch at index {index}: expected {expected}, got {got}"
+    )]
+    MerkleProofPathLengthMismatch {
+        index: usize,
+        expected: usize,
+        got: usize,
+    },
+    #[error("invalid hex field {field}: {value}")]
+    InvalidHex { field: &'static str, value: String },
+    #[error("POI RPC failed: {0}")]
+    PoiRpc(#[from] PoiRpcError),
+    #[error("POI prove failed: {0}")]
+    Prover(#[from] ProverError),
+}
+
 #[derive(Debug, Clone)]
 pub struct TransactionCall {
     pub to: Address,
@@ -75,9 +113,17 @@ pub struct TransactionPlanChunk {
     pub merkle_root: U256,
     pub inputs: Vec<InputWitness>,
     pub outputs: Vec<Note>,
+    pub has_unshield: bool,
     pub public_inputs: PublicInputs,
     pub private_inputs: PrivateInputs,
     pub signature: [U256; 3],
+}
+
+impl TransactionPlanChunk {
+    #[must_use]
+    pub fn railgun_txid(&self) -> U256 {
+        compute_railgun_txid_from_public_inputs(&self.public_inputs)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -281,6 +327,421 @@ impl PrivateInputs {
             nullifying_key: viewing.nullifying_key,
         }
     }
+}
+
+pub type PreTransactionPoiMap = BTreeMap<FixedBytes<32>, BTreeMap<FixedBytes<32>, PreTxPoi>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoiCircuitVariant {
+    pub max_inputs: usize,
+    pub max_outputs: usize,
+}
+
+#[must_use]
+pub const fn poi_circuit_variant(nullifiers: usize, commitments_out: usize) -> PoiCircuitVariant {
+    if nullifiers <= 3 && commitments_out <= 3 {
+        PoiCircuitVariant {
+            max_inputs: 3,
+            max_outputs: 3,
+        }
+    } else {
+        PoiCircuitVariant {
+            max_inputs: 13,
+            max_outputs: 13,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PoiProofInputs {
+    pub any_railgun_txid_merkleroot_after_transaction: U256,
+    pub bound_params_hash: U256,
+    pub nullifiers: Vec<U256>,
+    pub commitments_out: Vec<U256>,
+    pub spending_public_key: [U256; 2],
+    pub nullifying_key: U256,
+    pub token: U256,
+    pub randoms_in: Vec<U256>,
+    pub values_in: Vec<U256>,
+    pub utxo_positions_in: Vec<U256>,
+    pub utxo_tree_in: U256,
+    pub npks_out: Vec<U256>,
+    pub values_out: Vec<U256>,
+    pub utxo_batch_global_start_position_out: U256,
+    pub railgun_txid_if_has_unshield: U256,
+    pub railgun_txid_merkle_proof_indices: U256,
+    pub railgun_txid_merkle_proof_path_elements: Vec<U256>,
+    pub poi_merkleroots: Vec<U256>,
+    pub poi_in_merkle_proof_indices: Vec<U256>,
+    pub poi_in_merkle_proof_path_elements: Vec<Vec<U256>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreTransactionPoiChunkInputs {
+    pub txid_leaf_hash: FixedBytes<32>,
+    pub txid_merkleroot: FixedBytes<32>,
+    pub blinded_commitments_in: Vec<FixedBytes<32>>,
+    pub blinded_commitments_out: Vec<FixedBytes<32>>,
+    pub railgun_txid_if_has_unshield: Bytes,
+    proof_base_inputs: PoiProofBaseInputs,
+}
+
+#[derive(Debug, Clone)]
+struct PoiProofBaseInputs {
+    any_railgun_txid_merkleroot_after_transaction: U256,
+    bound_params_hash: U256,
+    nullifiers: Vec<U256>,
+    commitments_out: Vec<U256>,
+    spending_public_key: [U256; 2],
+    nullifying_key: U256,
+    token: U256,
+    randoms_in: Vec<U256>,
+    values_in: Vec<U256>,
+    utxo_positions_in: Vec<U256>,
+    utxo_tree_in: U256,
+    npks_out: Vec<U256>,
+    values_out: Vec<U256>,
+    utxo_batch_global_start_position_out: U256,
+    railgun_txid_if_has_unshield: U256,
+    railgun_txid_merkle_proof_indices: U256,
+    railgun_txid_merkle_proof_path_elements: Vec<U256>,
+}
+
+impl PreTransactionPoiChunkInputs {
+    pub fn proof_inputs(
+        &self,
+        merkle_proofs: &[PoiMerkleProof],
+    ) -> Result<PoiProofInputs, PreTransactionPoiError> {
+        if merkle_proofs.len() != self.blinded_commitments_in.len() {
+            return Err(PreTransactionPoiError::MerkleProofCountMismatch {
+                expected: self.blinded_commitments_in.len(),
+                got: merkle_proofs.len(),
+            });
+        }
+
+        let mut poi_merkleroots = Vec::with_capacity(merkle_proofs.len());
+        let mut poi_in_merkle_proof_indices = Vec::with_capacity(merkle_proofs.len());
+        let mut poi_in_merkle_proof_path_elements = Vec::with_capacity(merkle_proofs.len());
+
+        for (index, proof) in merkle_proofs.iter().enumerate() {
+            let leaf = parse_fixed_hex(&proof.leaf, "leaf")?;
+            let expected = self.blinded_commitments_in[index];
+            if leaf != expected {
+                return Err(PreTransactionPoiError::MerkleProofLeafMismatch {
+                    index,
+                    expected,
+                    actual: leaf,
+                });
+            }
+            if proof.elements.len() != merkletree::tree::TREE_DEPTH {
+                return Err(PreTransactionPoiError::MerkleProofPathLengthMismatch {
+                    index,
+                    expected: merkletree::tree::TREE_DEPTH,
+                    got: proof.elements.len(),
+                });
+            }
+            poi_merkleroots.push(parse_u256_hex(&proof.root, "root")?);
+            poi_in_merkle_proof_indices.push(parse_u256_hex(&proof.indices, "indices")?);
+            poi_in_merkle_proof_path_elements.push(
+                proof
+                    .elements
+                    .iter()
+                    .map(|element| parse_u256_hex(element, "elements"))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+
+        Ok(PoiProofInputs {
+            any_railgun_txid_merkleroot_after_transaction: self
+                .proof_base_inputs
+                .any_railgun_txid_merkleroot_after_transaction,
+            bound_params_hash: self.proof_base_inputs.bound_params_hash,
+            nullifiers: self.proof_base_inputs.nullifiers.clone(),
+            commitments_out: self.proof_base_inputs.commitments_out.clone(),
+            spending_public_key: self.proof_base_inputs.spending_public_key,
+            nullifying_key: self.proof_base_inputs.nullifying_key,
+            token: self.proof_base_inputs.token,
+            randoms_in: self.proof_base_inputs.randoms_in.clone(),
+            values_in: self.proof_base_inputs.values_in.clone(),
+            utxo_positions_in: self.proof_base_inputs.utxo_positions_in.clone(),
+            utxo_tree_in: self.proof_base_inputs.utxo_tree_in,
+            npks_out: self.proof_base_inputs.npks_out.clone(),
+            values_out: self.proof_base_inputs.values_out.clone(),
+            utxo_batch_global_start_position_out: self
+                .proof_base_inputs
+                .utxo_batch_global_start_position_out,
+            railgun_txid_if_has_unshield: self.proof_base_inputs.railgun_txid_if_has_unshield,
+            railgun_txid_merkle_proof_indices: self
+                .proof_base_inputs
+                .railgun_txid_merkle_proof_indices,
+            railgun_txid_merkle_proof_path_elements: self
+                .proof_base_inputs
+                .railgun_txid_merkle_proof_path_elements
+                .clone(),
+            poi_merkleroots,
+            poi_in_merkle_proof_indices,
+            poi_in_merkle_proof_path_elements,
+        })
+    }
+
+    #[must_use]
+    pub fn pre_tx_poi(&self, snark_proof: SnarkJsProof, proof_inputs: &PoiProofInputs) -> PreTxPoi {
+        PreTxPoi {
+            snark_proof,
+            txid_merkleroot: self.txid_merkleroot,
+            poi_merkleroots: proof_inputs
+                .poi_merkleroots
+                .iter()
+                .copied()
+                .map(u256_to_fixed)
+                .collect(),
+            blinded_commitments_out: self.blinded_commitments_out.clone(),
+            railgun_txid_if_has_unshield: self.railgun_txid_if_has_unshield.clone(),
+        }
+    }
+}
+
+pub fn pre_transaction_poi_inputs_from_chunk(
+    chunk: &TransactionPlanChunk,
+) -> Result<PreTransactionPoiChunkInputs, PreTransactionPoiError> {
+    if chunk.inputs.len() != chunk.public_inputs.nullifiers.len() {
+        return Err(PreTransactionPoiError::InputCountMismatch {
+            expected: chunk.public_inputs.nullifiers.len(),
+            got: chunk.inputs.len(),
+        });
+    }
+
+    let private_output_count = if chunk.has_unshield {
+        chunk
+            .public_inputs
+            .commitments_out
+            .len()
+            .checked_sub(1)
+            .ok_or(PreTransactionPoiError::MissingPrivateOutputBeforeUnshield)?
+    } else {
+        chunk.public_inputs.commitments_out.len()
+    };
+    if chunk.private_inputs.npk_out.len() < private_output_count
+        || chunk.private_inputs.value_out.len() < private_output_count
+    {
+        return Err(PreTransactionPoiError::OutputCountMismatch {
+            expected: private_output_count,
+            got: chunk
+                .private_inputs
+                .npk_out
+                .len()
+                .min(chunk.private_inputs.value_out.len()),
+        });
+    }
+
+    let railgun_txid = compute_railgun_txid_from_public_inputs(&chunk.public_inputs);
+    let txid_leaf = railgun_txid_leaf_hash(railgun_txid, u64::from(chunk.tree_number));
+    let txid_merkleroot = dummy_txid_root(txid_leaf);
+    let railgun_txid_if_has_unshield = if chunk.has_unshield {
+        Bytes::copy_from_slice(&railgun_txid.to_be_bytes::<32>())
+    } else {
+        Bytes::copy_from_slice(&[0_u8])
+    };
+    let railgun_txid_if_has_unshield_value = if chunk.has_unshield {
+        railgun_txid
+    } else {
+        U256::ZERO
+    };
+
+    let blinded_commitments_in = chunk
+        .inputs
+        .iter()
+        .map(|input| input.utxo.poi.blinded_commitment)
+        .collect::<Vec<_>>();
+    let blinded_commitments_out = chunk
+        .public_inputs
+        .commitments_out
+        .iter()
+        .take(private_output_count)
+        .zip(
+            chunk
+                .private_inputs
+                .npk_out
+                .iter()
+                .take(private_output_count),
+        )
+        .enumerate()
+        .map(|(index, (commitment, npk))| {
+            let global_position = pre_transaction_output_global_position() + U256::from(index);
+            poseidon(vec![*commitment, *npk, global_position]).into()
+        })
+        .collect::<Vec<_>>();
+
+    Ok(PreTransactionPoiChunkInputs {
+        txid_leaf_hash: u256_to_fixed(txid_leaf),
+        txid_merkleroot: u256_to_fixed(txid_merkleroot),
+        blinded_commitments_in,
+        blinded_commitments_out,
+        railgun_txid_if_has_unshield,
+        proof_base_inputs: PoiProofBaseInputs {
+            any_railgun_txid_merkleroot_after_transaction: txid_merkleroot,
+            bound_params_hash: chunk.public_inputs.bound_params_hash,
+            nullifiers: chunk.public_inputs.nullifiers.clone(),
+            commitments_out: chunk.public_inputs.commitments_out.clone(),
+            spending_public_key: chunk.private_inputs.public_key,
+            nullifying_key: chunk.private_inputs.nullifying_key,
+            token: chunk.private_inputs.token_address,
+            randoms_in: chunk.private_inputs.random_in.clone(),
+            values_in: chunk.private_inputs.value_in.clone(),
+            utxo_positions_in: chunk.private_inputs.leaves_indices.clone(),
+            utxo_tree_in: U256::from(chunk.tree_number),
+            npks_out: chunk
+                .private_inputs
+                .npk_out
+                .iter()
+                .take(private_output_count)
+                .copied()
+                .collect(),
+            values_out: chunk
+                .private_inputs
+                .value_out
+                .iter()
+                .take(private_output_count)
+                .copied()
+                .collect(),
+            utxo_batch_global_start_position_out: pre_transaction_output_global_position(),
+            railgun_txid_if_has_unshield: railgun_txid_if_has_unshield_value,
+            railgun_txid_merkle_proof_indices: U256::ZERO,
+            railgun_txid_merkle_proof_path_elements: vec![U256::ZERO; merkletree::tree::TREE_DEPTH],
+        },
+    })
+}
+
+pub struct PreTransactionPoiGenerationRequest<'a> {
+    pub chunks: &'a [TransactionPlanChunk],
+    pub chain_type: u8,
+    pub chain_id: u64,
+    pub txid_version: Option<&'a str>,
+    pub required_poi_list_keys: &'a [FixedBytes<32>],
+    pub poi_client: &'a PoiRpcClient,
+    pub prover: &'a ProverService,
+    pub verify_proof: bool,
+}
+
+pub async fn generate_pre_transaction_pois(
+    request: PreTransactionPoiGenerationRequest<'_>,
+) -> Result<PreTransactionPoiMap, PreTransactionPoiError> {
+    let mut map = BTreeMap::new();
+    if request.required_poi_list_keys.is_empty() {
+        return Ok(map);
+    }
+    let txid_version = request.txid_version.unwrap_or(DEFAULT_TXID_VERSION);
+    for chunk in request.chunks {
+        let chunk_inputs = pre_transaction_poi_inputs_from_chunk(chunk)?;
+        for list_key in request.required_poi_list_keys {
+            let merkle_started = Instant::now();
+            let merkle_proofs = request
+                .poi_client
+                .poi_merkle_proofs(
+                    txid_version,
+                    request.chain_type,
+                    request.chain_id,
+                    list_key,
+                    &chunk_inputs.blinded_commitments_in,
+                )
+                .await?;
+            let merkle_elapsed_ms = merkle_started.elapsed().as_millis();
+            let proof_inputs = chunk_inputs.proof_inputs(&merkle_proofs)?;
+            let prove_started = Instant::now();
+            let snark_proof = request
+                .prover
+                .prove_poi(&proof_inputs, request.verify_proof)
+                .await?;
+            let prove_elapsed_ms = prove_started.elapsed().as_millis();
+            tracing::info!(
+                chain_type = request.chain_type,
+                chain_id = request.chain_id,
+                tree_number = chunk.tree_number,
+                input_count = chunk.inputs.len(),
+                output_count = chunk.outputs.len(),
+                has_unshield = chunk.has_unshield,
+                list_key = %hex::encode(list_key),
+                merkle_elapsed_ms,
+                prove_elapsed_ms,
+                "generated pre-transaction POI proof"
+            );
+            let pre_tx_poi = chunk_inputs.pre_tx_poi(snark_proof, &proof_inputs);
+            insert_pre_transaction_poi(
+                &mut map,
+                *list_key,
+                chunk_inputs.txid_leaf_hash,
+                pre_tx_poi,
+            );
+        }
+    }
+    Ok(map)
+}
+
+pub fn insert_pre_transaction_poi(
+    map: &mut PreTransactionPoiMap,
+    list_key: FixedBytes<32>,
+    txid_leaf_hash: FixedBytes<32>,
+    pre_tx_poi: PreTxPoi,
+) {
+    map.entry(list_key)
+        .or_default()
+        .insert(txid_leaf_hash, pre_tx_poi);
+}
+
+fn compute_railgun_txid_from_public_inputs(public_inputs: &PublicInputs) -> U256 {
+    let nullifiers_hash = poseidon(pad_with_merkle_zero(public_inputs.nullifiers.clone(), 13));
+    let commitments_hash = poseidon(pad_with_merkle_zero(
+        public_inputs.commitments_out.clone(),
+        13,
+    ));
+    poseidon(vec![
+        nullifiers_hash,
+        commitments_hash,
+        public_inputs.bound_params_hash,
+    ])
+}
+
+fn dummy_txid_root(leaf: U256) -> U256 {
+    let mut acc = leaf;
+    for _ in 0..merkletree::tree::TREE_DEPTH {
+        acc = poseidon(vec![acc, U256::ZERO]);
+    }
+    acc
+}
+
+fn pre_transaction_output_global_position() -> U256 {
+    const PRE_TRANSACTION_POI_TREE: u64 = 199_999;
+    const PRE_TRANSACTION_POI_POSITION: u64 = 199_999;
+
+    U256::from(PRE_TRANSACTION_POI_TREE) * U256::from(merkletree::tree::TREE_LEAF_COUNT)
+        + U256::from(PRE_TRANSACTION_POI_POSITION)
+}
+
+fn parse_fixed_hex(
+    value: &str,
+    field: &'static str,
+) -> Result<FixedBytes<32>, PreTransactionPoiError> {
+    parse_u256_hex(value, field).map(u256_to_fixed)
+}
+
+fn parse_u256_hex(value: &str, field: &'static str) -> Result<U256, PreTransactionPoiError> {
+    let value_without_prefix = value.strip_prefix("0x").unwrap_or(value);
+    if value_without_prefix.len() > 64 {
+        return Err(PreTransactionPoiError::InvalidHex {
+            field,
+            value: value.to_string(),
+        });
+    }
+    let padded = format!("{value_without_prefix:0>64}");
+    let bytes = hex::decode(padded).map_err(|_| PreTransactionPoiError::InvalidHex {
+        field,
+        value: value.to_string(),
+    })?;
+    Ok(U256::from_be_slice(&bytes))
+}
+
+fn u256_to_fixed(value: U256) -> FixedBytes<32> {
+    FixedBytes::from(value.to_be_bytes::<32>())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -750,6 +1211,7 @@ struct UnprovenTransactionPlan {
     merkle_root: U256,
     inputs: Vec<InputWitness>,
     outputs: Vec<Note>,
+    has_unshield: bool,
     private_inputs: PrivateInputs,
 }
 
@@ -931,6 +1393,7 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
             merkle_root: root,
             inputs,
             outputs,
+            has_unshield: true,
             private_inputs,
         })
     }
@@ -984,6 +1447,7 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
             merkle_root: root,
             inputs,
             outputs,
+            has_unshield: false,
             private_inputs,
         })
     }
@@ -1153,6 +1617,7 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
             merkle_root: root,
             inputs: inputs.clone(),
             outputs: outputs.clone(),
+            has_unshield: true,
             public_inputs: public_inputs.clone(),
             private_inputs: private_inputs.clone(),
             signature,
@@ -1291,6 +1756,7 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
             merkle_root: root,
             inputs: inputs.clone(),
             outputs: outputs.clone(),
+            has_unshield: false,
             public_inputs: public_inputs.clone(),
             private_inputs: private_inputs.clone(),
             signature,
@@ -1513,6 +1979,7 @@ async fn prove_transaction_plan(
         merkle_root: plan.merkle_root,
         inputs: plan.inputs,
         outputs: plan.outputs,
+        has_unshield: plan.has_unshield,
         public_inputs,
         private_inputs: plan.private_inputs,
         signature,
@@ -2393,7 +2860,7 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
-    use broadcaster_core::utxo::UtxoSource;
+    use broadcaster_core::utxo::{UtxoCommitmentKind, UtxoSource};
 
     struct MockSpendSigner {
         signed_msg: Cell<Option<U256>>,
@@ -2411,20 +2878,137 @@ mod tests {
     }
 
     fn test_utxo(token: Address, value: u64, tree: u32, position: u64) -> Utxo {
-        Utxo {
-            note: Note::new_unshield(Address::ZERO, token, U256::from(value)),
+        Utxo::new(
+            Note::new_unshield(Address::ZERO, token, U256::from(value)),
             tree,
             position,
-            source: UtxoSource {
+            UtxoSource {
                 tx_hash: FixedBytes::ZERO,
                 block_number: 1,
                 block_timestamp: 1,
             },
-        }
+            UtxoCommitmentKind::Transact,
+        )
     }
 
     fn selected_positions(selection: &[Utxo]) -> Vec<u64> {
         selection.iter().map(|utxo| utxo.position).collect()
+    }
+
+    fn dummy_merkle_proof(leaf: U256, leaf_index: u64) -> MerkleProof {
+        MerkleProof {
+            root: U256::ZERO,
+            leaf,
+            leaf_index,
+            path_elements: [U256::ZERO; merkletree::tree::TREE_DEPTH],
+            path_indices: [0u8; merkletree::tree::TREE_DEPTH],
+        }
+    }
+
+    fn sample_chunk(
+        seed: u8,
+        input_count: usize,
+        private_output_count: usize,
+        has_unshield: bool,
+    ) -> TransactionPlanChunk {
+        let token = Address::from([seed; 20]);
+        let inputs = (0..input_count)
+            .map(|index| {
+                let utxo = test_utxo(
+                    token,
+                    u64::try_from(index + 1).unwrap(),
+                    seed.into(),
+                    index as u64,
+                );
+                InputWitness {
+                    merkle_proof: dummy_merkle_proof(utxo.note.commitment(), index as u64),
+                    utxo,
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut outputs = (0..private_output_count)
+            .map(|index| {
+                Note::new_change(
+                    U256::from(1_000_u64 + u64::from(seed) + index as u64),
+                    token,
+                    U256::from(10_u64 + index as u64),
+                    [seed.saturating_add(index as u8); 16],
+                )
+            })
+            .collect::<Vec<_>>();
+        if has_unshield {
+            outputs.push(Note::new_unshield(
+                Address::from([seed.saturating_add(1); 20]),
+                token,
+                U256::from(5_u8),
+            ));
+        }
+
+        let public_inputs = PublicInputs {
+            merkle_root: U256::from(7_u8),
+            bound_params_hash: U256::from(2_000_u64 + u64::from(seed)),
+            nullifiers: (0..input_count)
+                .map(|index| U256::from(3_000_u64 + u64::from(seed) + index as u64))
+                .collect(),
+            commitments_out: outputs.iter().map(Note::commitment).collect(),
+        };
+        let private_inputs = PrivateInputs {
+            token_address: U256::from_be_slice(token.as_slice()),
+            random_in: inputs
+                .iter()
+                .map(|input| U256::from_be_slice(&input.utxo.note.random))
+                .collect(),
+            value_in: inputs.iter().map(|input| input.utxo.note.value).collect(),
+            path_elements: vec![U256::ZERO; input_count * merkletree::tree::TREE_DEPTH],
+            leaves_indices: inputs
+                .iter()
+                .map(|input| U256::from(input.utxo.position))
+                .collect(),
+            value_out: outputs.iter().map(|note| note.value).collect(),
+            public_key: [U256::from(11_u8), U256::from(12_u8)],
+            npk_out: outputs.iter().map(|note| note.npk).collect(),
+            nullifying_key: U256::from(13_u8),
+        };
+
+        TransactionPlanChunk {
+            tree_number: seed.into(),
+            merkle_root: U256::from(7_u8),
+            inputs,
+            outputs,
+            has_unshield,
+            public_inputs,
+            private_inputs,
+            signature: [U256::from(1_u8), U256::from(2_u8), U256::from(3_u8)],
+        }
+    }
+
+    fn sample_poi_merkle_proofs(blinded_commitments: &[FixedBytes<32>]) -> Vec<PoiMerkleProof> {
+        blinded_commitments
+            .iter()
+            .enumerate()
+            .map(|(index, blinded_commitment)| PoiMerkleProof {
+                leaf: format!("0x{}", hex::encode(blinded_commitment)),
+                elements: (0..merkletree::tree::TREE_DEPTH)
+                    .map(|level| format!("0x{:064x}", index + level + 1))
+                    .collect(),
+                indices: format!("0x{index:064x}"),
+                root: format!("0x{:064x}", 100 + index),
+            })
+            .collect()
+    }
+
+    fn sample_pre_tx_poi() -> PreTxPoi {
+        PreTxPoi {
+            snark_proof: SnarkJsProof {
+                pi_a: [U256::ZERO, U256::ZERO],
+                pi_b: [[U256::ZERO, U256::ZERO], [U256::ZERO, U256::ZERO]],
+                pi_c: [U256::ZERO, U256::ZERO],
+            },
+            txid_merkleroot: FixedBytes::ZERO,
+            poi_merkleroots: vec![FixedBytes::ZERO],
+            blinded_commitments_out: vec![FixedBytes::ZERO],
+            railgun_txid_if_has_unshield: Bytes::copy_from_slice(&[0_u8]),
+        }
     }
 
     fn sample_address_data(seed: u8) -> ViewingKeyData {
@@ -2432,6 +3016,114 @@ mod tests {
             [seed; 32],
             [U256::from(seed), U256::from(seed + 1)],
         )
+    }
+
+    #[test]
+    fn poi_circuit_variant_selects_smallest_supported_variant() {
+        assert_eq!(
+            poi_circuit_variant(3, 3),
+            PoiCircuitVariant {
+                max_inputs: 3,
+                max_outputs: 3,
+            }
+        );
+        assert_eq!(
+            poi_circuit_variant(4, 3),
+            PoiCircuitVariant {
+                max_inputs: 13,
+                max_outputs: 13,
+            }
+        );
+        assert_eq!(
+            poi_circuit_variant(3, 4),
+            PoiCircuitVariant {
+                max_inputs: 13,
+                max_outputs: 13,
+            }
+        );
+    }
+
+    #[test]
+    fn pre_transaction_poi_inputs_exclude_unshield_output_from_blinded_outputs() {
+        let chunk = sample_chunk(31, 2, 2, true);
+
+        let chunk_inputs = pre_transaction_poi_inputs_from_chunk(&chunk).expect("chunk inputs");
+        let proof_inputs = chunk_inputs
+            .proof_inputs(&sample_poi_merkle_proofs(
+                &chunk_inputs.blinded_commitments_in,
+            ))
+            .expect("proof inputs");
+
+        assert_eq!(chunk_inputs.blinded_commitments_in.len(), 2);
+        assert_eq!(chunk_inputs.blinded_commitments_out.len(), 2);
+        assert_eq!(chunk_inputs.railgun_txid_if_has_unshield.len(), 32);
+        assert_eq!(proof_inputs.commitments_out.len(), 3);
+        assert_eq!(proof_inputs.npks_out.len(), 2);
+        assert_eq!(proof_inputs.values_out.len(), 2);
+        assert_ne!(proof_inputs.railgun_txid_if_has_unshield, U256::ZERO);
+        assert_eq!(proof_inputs.poi_merkleroots.len(), 2);
+        assert_eq!(proof_inputs.poi_in_merkle_proof_path_elements[0].len(), 16);
+    }
+
+    #[test]
+    fn pre_transaction_poi_map_shape_single_chunk_send() {
+        let chunk = sample_chunk(41, 1, 1, false);
+        let chunk_inputs = pre_transaction_poi_inputs_from_chunk(&chunk).expect("chunk inputs");
+        let list_key = FixedBytes::from([0x11; 32]);
+        let mut map = BTreeMap::new();
+
+        insert_pre_transaction_poi(
+            &mut map,
+            list_key,
+            chunk_inputs.txid_leaf_hash,
+            sample_pre_tx_poi(),
+        );
+
+        assert_eq!(map.len(), 1);
+        assert!(
+            map.get(&list_key)
+                .is_some_and(|per_leaf| per_leaf.contains_key(&chunk_inputs.txid_leaf_hash))
+        );
+        assert_eq!(
+            chunk_inputs.railgun_txid_if_has_unshield,
+            Bytes::copy_from_slice(&[0_u8])
+        );
+    }
+
+    #[test]
+    fn pre_transaction_poi_map_shape_multi_chunk_unshield() {
+        let chunks = [sample_chunk(51, 2, 1, true), sample_chunk(52, 3, 1, true)];
+        let list_keys = [FixedBytes::from([0x21; 32]), FixedBytes::from([0x22; 32])];
+        let mut map = BTreeMap::new();
+        let chunk_inputs = chunks
+            .iter()
+            .map(pre_transaction_poi_inputs_from_chunk)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("chunk inputs");
+
+        for list_key in list_keys {
+            for inputs in &chunk_inputs {
+                insert_pre_transaction_poi(
+                    &mut map,
+                    list_key,
+                    inputs.txid_leaf_hash,
+                    sample_pre_tx_poi(),
+                );
+            }
+        }
+
+        assert_eq!(map.len(), 2);
+        for list_key in list_keys {
+            let per_leaf = map.get(&list_key).expect("list key");
+            assert_eq!(per_leaf.len(), 2);
+            for inputs in &chunk_inputs {
+                assert!(per_leaf.contains_key(&inputs.txid_leaf_hash));
+            }
+        }
+        assert_ne!(
+            chunk_inputs[0].txid_leaf_hash,
+            chunk_inputs[1].txid_leaf_hash
+        );
     }
 
     #[test]

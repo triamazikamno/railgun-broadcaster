@@ -1,16 +1,31 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use alloy::primitives::{FixedBytes, U256};
+use async_trait::async_trait;
+use broadcaster_core::transact::DEFAULT_TXID_VERSION;
 use tokio::sync::{RwLock, broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info, warn};
 
-use local_db::DbStore;
-use merkletree::wallet::{WalletLogDelta, WalletScanError, parse_wallet_delta_from_logs};
+use local_db::{DbStore, PendingOutputPoiContextRecord, PendingOutputPoiObservation};
+use merkletree::wallet::{
+    CommitmentObservation, WalletLogDelta, WalletScanError, parse_wallet_delta_from_logs,
+};
+use poi::error::PoiError;
+use poi::poi::{
+    BlindedCommitmentData, BlindedCommitmentType, DEFAULT_WALLET_POI_RPC_URL, PoiRpcClient,
+    SingleCommitmentProofContext, default_active_poi_list_keys,
+};
 use railgun_wallet::wallet_cache::WalletCacheError;
-use railgun_wallet::{Utxo, UtxoSource, WalletUtxo};
+use railgun_wallet::{PoiStatus, Utxo, UtxoCommitmentKind, UtxoSource, WalletUtxo};
+use url::Url;
 
 use crate::types::{BackfillEvent, SharedLogBatch, WalletCacheStore, WalletConfig};
+
+pub const WALLET_POI_STATUS_BATCH_SIZE: usize = 1000;
+const EVM_CHAIN_TYPE: u8 = 0;
 
 #[derive(Debug, Clone)]
 pub struct WalletHandle {
@@ -21,7 +36,81 @@ pub struct WalletHandle {
     rev_tx: watch::Sender<u64>,
 }
 
+#[async_trait]
+pub(crate) trait PoiStatusReader: Send + Sync {
+    async fn pois_per_list(
+        &self,
+        txid_version: &str,
+        chain_type: u8,
+        chain_id: u64,
+        list_keys: &[FixedBytes<32>],
+        blinded_commitment_datas: &[BlindedCommitmentData],
+    ) -> Result<BTreeMap<FixedBytes<32>, BTreeMap<FixedBytes<32>, PoiStatus>>, PoiError>;
+}
+
+#[async_trait]
+impl PoiStatusReader for PoiRpcClient {
+    async fn pois_per_list(
+        &self,
+        txid_version: &str,
+        chain_type: u8,
+        chain_id: u64,
+        list_keys: &[FixedBytes<32>],
+        blinded_commitment_datas: &[BlindedCommitmentData],
+    ) -> Result<BTreeMap<FixedBytes<32>, BTreeMap<FixedBytes<32>, PoiStatus>>, PoiError> {
+        PoiRpcClient::pois_per_list(
+            self,
+            txid_version,
+            chain_type,
+            chain_id,
+            list_keys,
+            blinded_commitment_datas,
+        )
+        .await
+    }
+}
+
+#[async_trait]
+pub(crate) trait PendingOutputPoiSubmitter: Send + Sync {
+    async fn submit_single_commitment_proofs(
+        &self,
+        txid_version: &str,
+        chain_type: u8,
+        chain_id: u64,
+        context: &SingleCommitmentProofContext,
+        utxo_tree_out: u64,
+        utxo_position_out: u64,
+    ) -> Result<(), PoiError>;
+}
+
+#[async_trait]
+impl PendingOutputPoiSubmitter for PoiRpcClient {
+    async fn submit_single_commitment_proofs(
+        &self,
+        txid_version: &str,
+        chain_type: u8,
+        chain_id: u64,
+        context: &SingleCommitmentProofContext,
+        utxo_tree_out: u64,
+        utxo_position_out: u64,
+    ) -> Result<(), PoiError> {
+        PoiRpcClient::submit_single_commitment_proofs(
+            self,
+            txid_version,
+            chain_type,
+            chain_id,
+            context,
+            utxo_tree_out,
+            utxo_position_out,
+        )
+        .await?;
+        Ok(())
+    }
+}
+
 async fn apply_wallet_logs(
+    db: &DbStore,
+    poi_submitter: Option<&dyn PendingOutputPoiSubmitter>,
     cfg: &WalletConfig,
     wallet_utxos: &Arc<RwLock<Vec<WalletUtxo>>>,
     batch: &SharedLogBatch,
@@ -37,14 +126,24 @@ async fn apply_wallet_logs(
     let WalletLogDelta {
         utxos: new_utxos,
         nullifiers,
+        commitment_observations,
     } = if filtered_logs.is_empty() {
         WalletLogDelta {
             utxos: Vec::new(),
             nullifiers: Vec::new(),
+            commitment_observations: Vec::new(),
         }
     } else {
         parse_wallet_delta_from_logs(&filtered_logs, &batch.block_timestamps, &cfg.scan_keys)?
     };
+
+    process_pending_output_poi_observations(
+        db,
+        cfg.chain.chain_id,
+        &commitment_observations,
+        poi_submitter,
+    )
+    .await;
 
     let changed = apply_wallet_delta(
         cfg,
@@ -52,6 +151,7 @@ async fn apply_wallet_logs(
         WalletLogDelta {
             utxos: new_utxos,
             nullifiers,
+            commitment_observations,
         },
     )
     .await;
@@ -76,6 +176,7 @@ pub(crate) fn apply_wallet_delta_to_vec(
     let WalletLogDelta {
         utxos: new_utxos,
         nullifiers,
+        ..
     } = delta;
     let nullifier_sources: HashMap<_, _> = nullifiers
         .into_iter()
@@ -121,6 +222,312 @@ fn spent_source_for_utxo(
     nullifier_sources
         .get(&(utxo.tree, utxo.nullifier(nullifying_key)))
         .cloned()
+}
+
+pub(crate) async fn process_pending_output_poi_observations(
+    db: &DbStore,
+    chain_id: u64,
+    observations: &[CommitmentObservation],
+    submitter: Option<&dyn PendingOutputPoiSubmitter>,
+) {
+    for observation in observations {
+        if let Err(err) = record_pending_output_poi_observation(db, chain_id, observation) {
+            warn!(
+                ?err,
+                chain_id,
+                commitment = %hex_fixed(&u256_to_fixed(observation.commitment)),
+                "failed to record pending output POI observation"
+            );
+        }
+    }
+
+    let Some(submitter) = submitter else {
+        return;
+    };
+    if let Err(err) = submit_observed_pending_output_pois(db, chain_id, submitter).await {
+        warn!(
+            ?err,
+            chain_id, "failed to submit observed pending output POI contexts"
+        );
+    }
+}
+
+fn record_pending_output_poi_observation(
+    db: &DbStore,
+    chain_id: u64,
+    observation: &CommitmentObservation,
+) -> Result<(), local_db::DbError> {
+    let output_commitment = u256_to_fixed(observation.commitment);
+    let Some(mut record) = db.get_pending_output_poi_context(chain_id, &output_commitment)? else {
+        return Ok(());
+    };
+    let observed = PendingOutputPoiObservation {
+        output_tree: u64::from(observation.tree),
+        output_position: observation.position,
+        tx_hash: observation.source.tx_hash,
+        block_number: observation.source.block_number,
+        block_timestamp: observation.source.block_timestamp,
+    };
+    if record.observation.as_ref() != Some(&observed) {
+        record.observation = Some(observed);
+        db.put_pending_output_poi_context(&record)?;
+    }
+    Ok(())
+}
+
+async fn submit_observed_pending_output_pois(
+    db: &DbStore,
+    chain_id: u64,
+    submitter: &dyn PendingOutputPoiSubmitter,
+) -> Result<(), local_db::DbError> {
+    let records = db.list_pending_output_poi_contexts(chain_id)?;
+    for mut record in records {
+        let Some(observation) = record.observation.clone() else {
+            continue;
+        };
+        if record.terminal_error.is_some() {
+            continue;
+        }
+        let missing_list_keys = missing_pending_output_poi_list_keys(&record);
+        if missing_list_keys.is_empty() {
+            continue;
+        }
+        let pre_transaction_pois = retain_pending_output_poi_lists(&record, &missing_list_keys);
+        if pre_transaction_pois.len() != missing_list_keys.len() {
+            record.terminal_error =
+                Some("missing pre-transaction POI for pending output".to_string());
+            db.put_pending_output_poi_context(&record)?;
+            continue;
+        }
+        let context = SingleCommitmentProofContext {
+            txid_version: record.txid_version.clone(),
+            railgun_txid: record.railgun_txid,
+            utxo_tree_in: record.utxo_tree_in,
+            commitment: record.output_commitment,
+            npk: record.output_npk,
+            pre_transaction_pois_per_txid_leaf_per_list: pre_transaction_pois,
+        };
+        match submitter
+            .submit_single_commitment_proofs(
+                &record.txid_version,
+                EVM_CHAIN_TYPE,
+                chain_id,
+                &context,
+                observation.output_tree,
+                observation.output_position,
+            )
+            .await
+        {
+            Ok(()) => {
+                for list_key in missing_list_keys {
+                    if !record.submitted_poi_list_keys.contains(&list_key) {
+                        record.submitted_poi_list_keys.push(list_key);
+                    }
+                }
+                db.put_pending_output_poi_context(&record)?;
+            }
+            Err(err) => {
+                warn!(
+                    ?err,
+                    chain_id,
+                    commitment = %hex_fixed(&record.output_commitment),
+                    "pending output POI submission failed; keeping context retryable"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn missing_pending_output_poi_list_keys(
+    record: &PendingOutputPoiContextRecord,
+) -> Vec<FixedBytes<32>> {
+    let list_keys: Vec<_> = if record.required_poi_list_keys.is_empty() {
+        record
+            .pre_transaction_pois_per_txid_leaf_per_list
+            .keys()
+            .copied()
+            .collect()
+    } else {
+        record.required_poi_list_keys.clone()
+    };
+    list_keys
+        .into_iter()
+        .filter(|list_key| !record.submitted_poi_list_keys.contains(list_key))
+        .collect()
+}
+
+fn retain_pending_output_poi_lists(
+    record: &PendingOutputPoiContextRecord,
+    list_keys: &[FixedBytes<32>],
+) -> BTreeMap<FixedBytes<32>, BTreeMap<FixedBytes<32>, broadcaster_core::transact::PreTxPoi>> {
+    list_keys
+        .iter()
+        .filter_map(|list_key| {
+            record
+                .pre_transaction_pois_per_txid_leaf_per_list
+                .get(list_key)
+                .cloned()
+                .map(|per_leaf| (*list_key, per_leaf))
+        })
+        .collect()
+}
+
+fn u256_to_fixed(value: U256) -> FixedBytes<32> {
+    FixedBytes::from(value.to_be_bytes::<32>())
+}
+
+fn hex_fixed(value: &FixedBytes<32>) -> String {
+    alloy::hex::encode(value)
+}
+
+pub(crate) async fn refresh_wallet_poi_statuses(
+    client: &dyn PoiStatusReader,
+    chain_id: u64,
+    active_list_keys: &[FixedBytes<32>],
+    wallet_utxos: &mut [WalletUtxo],
+) -> bool {
+    if active_list_keys.is_empty() {
+        return false;
+    }
+
+    let unspent: Vec<_> = wallet_utxos
+        .iter()
+        .enumerate()
+        .filter(|(_, wallet_utxo)| !wallet_utxo.is_spent())
+        .map(|(index, wallet_utxo)| {
+            (
+                index,
+                BlindedCommitmentData::new(
+                    wallet_utxo.utxo.poi.blinded_commitment,
+                    blinded_commitment_type(wallet_utxo.utxo.poi.commitment_kind),
+                ),
+            )
+        })
+        .collect();
+
+    let mut changed = false;
+    for chunk in unspent.chunks(WALLET_POI_STATUS_BATCH_SIZE) {
+        let request_data: Vec<_> = chunk.iter().map(|(_, data)| *data).collect();
+        match client
+            .pois_per_list(
+                DEFAULT_TXID_VERSION,
+                EVM_CHAIN_TYPE,
+                chain_id,
+                active_list_keys,
+                &request_data,
+            )
+            .await
+        {
+            Ok(statuses_by_blinded_commitment) => {
+                let refreshed_at = now_epoch_secs();
+                for (index, data) in chunk {
+                    let Some(wallet_utxo) = wallet_utxos.get_mut(*index) else {
+                        continue;
+                    };
+                    if apply_poi_statuses(
+                        wallet_utxo,
+                        active_list_keys,
+                        statuses_by_blinded_commitment.get(&data.blinded_commitment),
+                        refreshed_at,
+                    ) {
+                        changed = true;
+                    }
+                }
+            }
+            Err(error) => {
+                warn!(
+                    ?error,
+                    chain_id,
+                    commitments = chunk.len(),
+                    "wallet POI status chunk failed; leaving statuses unknown"
+                );
+                for (index, _) in chunk {
+                    let Some(wallet_utxo) = wallet_utxos.get_mut(*index) else {
+                        continue;
+                    };
+                    if apply_unknown_poi_statuses(wallet_utxo, active_list_keys) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    changed
+}
+
+pub(crate) fn wallet_poi_status_refresh_needed(
+    wallet_utxos: &[WalletUtxo],
+    active_list_keys: &[FixedBytes<32>],
+) -> bool {
+    !active_list_keys.is_empty()
+        && wallet_utxos.iter().any(|wallet_utxo| {
+            !wallet_utxo.is_spent()
+                && (wallet_utxo.utxo.poi.refreshed_at.is_none()
+                    || active_list_keys
+                        .iter()
+                        .any(|list_key| !wallet_utxo.utxo.poi.statuses.contains_key(list_key)))
+        })
+}
+
+fn apply_poi_statuses(
+    wallet_utxo: &mut WalletUtxo,
+    active_list_keys: &[FixedBytes<32>],
+    statuses: Option<&BTreeMap<FixedBytes<32>, PoiStatus>>,
+    refreshed_at: u64,
+) -> bool {
+    let mut changed = false;
+    for list_key in active_list_keys {
+        let status = statuses
+            .and_then(|per_list| per_list.get(list_key))
+            .copied()
+            .unwrap_or(PoiStatus::Missing);
+        if wallet_utxo.utxo.poi.statuses.insert(*list_key, status) != Some(status) {
+            changed = true;
+        }
+    }
+    if wallet_utxo.utxo.poi.refreshed_at != Some(refreshed_at) {
+        wallet_utxo.utxo.poi.refreshed_at = Some(refreshed_at);
+        changed = true;
+    }
+    changed
+}
+
+fn apply_unknown_poi_statuses(
+    wallet_utxo: &mut WalletUtxo,
+    active_list_keys: &[FixedBytes<32>],
+) -> bool {
+    let mut changed = false;
+    for list_key in active_list_keys {
+        if wallet_utxo
+            .utxo
+            .poi
+            .statuses
+            .insert(*list_key, PoiStatus::Unknown)
+            != Some(PoiStatus::Unknown)
+        {
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn blinded_commitment_type(kind: UtxoCommitmentKind) -> BlindedCommitmentType {
+    match kind {
+        UtxoCommitmentKind::Shield => BlindedCommitmentType::Shield,
+        UtxoCommitmentKind::Transact => BlindedCommitmentType::Transact,
+    }
+}
+
+pub(crate) fn wallet_poi_status_client() -> Option<PoiRpcClient> {
+    let url = Url::parse(DEFAULT_WALLET_POI_RPC_URL).ok()?;
+    Some(PoiRpcClient::new(url))
+}
+
+fn now_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 impl WalletHandle {
@@ -235,6 +642,49 @@ pub(crate) fn spawn_wallet_worker(
 
         let mut backfill_complete_block: Option<u64> = None;
         let mut persist_state = WalletPersistState::default();
+        let poi_status_client = wallet_poi_status_client();
+        let active_poi_list_keys = default_active_poi_list_keys();
+
+        if let Some(client) = poi_status_client.as_ref() {
+            let mut locked = utxos.write().await;
+            if wallet_poi_status_refresh_needed(&locked, &active_poi_list_keys)
+                && refresh_wallet_poi_statuses(
+                    client,
+                    cfg.chain.chain_id,
+                    &active_poi_list_keys,
+                    &mut locked,
+                )
+                .await
+            {
+                let (unspent, spent) = wallet_utxo_counts(&locked);
+                let persisted_full_snapshot = match persist_wallet_progress(
+                    cache_store.as_ref(),
+                    WalletProgressPersist {
+                        cache_key: &cfg.cache_key,
+                        snapshot: &locked,
+                        last_scanned,
+                        last_scanned_block_hash: None,
+                        changed: true,
+                    },
+                    &mut persist_state,
+                ) {
+                    Ok(persisted_full_snapshot) => persisted_full_snapshot,
+                    Err(err) => {
+                        warn!(?err, cache_key = %cfg.cache_key, "failed to persist wallet POI status refresh");
+                        false
+                    }
+                };
+                info!(
+                    cache_key = %cfg.cache_key,
+                    total = locked.len(),
+                    unspent,
+                    spent,
+                    persisted_full_snapshot,
+                    "wallet POI status refresh complete"
+                );
+                worker_handle.notify_changed();
+            }
+        }
 
         loop {
             tokio::select! {
@@ -253,9 +703,23 @@ pub(crate) fn spawn_wallet_worker(
                                 logs = batch.logs.len(),
                                 "applying wallet backfill logs"
                             );
-                            match apply_wallet_logs(&cfg, &utxos, &batch, last_scanned).await {
-                                Ok((updated_last_scanned, changed)) => {
+                            let poi_submitter = poi_status_client
+                                .as_ref()
+                                .map(|client| client as &dyn PendingOutputPoiSubmitter);
+                            match apply_wallet_logs(db.as_ref(), poi_submitter, &cfg, &utxos, &batch, last_scanned).await {
+                                Ok((updated_last_scanned, mut changed)) => {
                                     last_scanned = updated_last_scanned;
+                                    if changed
+                                        && let Some(client) = poi_status_client.as_ref()
+                                    {
+                                        let mut locked = utxos.write().await;
+                                        changed |= refresh_wallet_poi_statuses(
+                                            client,
+                                            cfg.chain.chain_id,
+                                            &active_poi_list_keys,
+                                            &mut locked,
+                                        ).await;
+                                    }
                                     let snapshot = utxos.read().await;
                                     let (unspent, spent) = wallet_utxo_counts(&snapshot);
                                     let persisted_full_snapshot = match persist_wallet_progress(
@@ -367,9 +831,23 @@ pub(crate) fn spawn_wallet_worker(
                             {
                                 continue;
                             }
-                            match apply_wallet_logs(&cfg, &utxos, &batch, last_scanned).await {
-                                Ok((updated_last_scanned, changed)) => {
+                            let poi_submitter = poi_status_client
+                                .as_ref()
+                                .map(|client| client as &dyn PendingOutputPoiSubmitter);
+                            match apply_wallet_logs(db.as_ref(), poi_submitter, &cfg, &utxos, &batch, last_scanned).await {
+                                Ok((updated_last_scanned, mut changed)) => {
                                     last_scanned = updated_last_scanned;
+                                    if changed
+                                        && let Some(client) = poi_status_client.as_ref()
+                                    {
+                                        let mut locked = utxos.write().await;
+                                        changed |= refresh_wallet_poi_statuses(
+                                            client,
+                                            cfg.chain.chain_id,
+                                            &active_poi_list_keys,
+                                            &mut locked,
+                                        ).await;
+                                    }
                                     let snapshot = utxos.read().await;
                                     let (unspent, spent) = wallet_utxo_counts(&snapshot);
                                     let persisted_full_snapshot = match persist_wallet_progress(
@@ -444,20 +922,45 @@ fn wallet_utxo_counts(utxos: &[WalletUtxo]) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::{
-        WalletHandle, WalletPersistState, WalletProgressPersist, apply_wallet_delta_to_vec,
-        notify_wallet_rev, persist_wallet_progress, spent_source_for_utxo,
+        DEFAULT_TXID_VERSION, PendingOutputPoiSubmitter, PoiStatusReader,
+        WALLET_POI_STATUS_BATCH_SIZE, WalletHandle, WalletPersistState, WalletProgressPersist,
+        apply_wallet_delta_to_vec, notify_wallet_rev, persist_wallet_progress,
+        process_pending_output_poi_observations, refresh_wallet_poi_statuses,
+        spent_source_for_utxo, wallet_poi_status_refresh_needed,
     };
     use crate::types::{ChainKey, WalletCacheStore, WalletConfig};
-    use alloy::primitives::{Address, FixedBytes, U256};
+    use alloy::primitives::{Address, Bytes, FixedBytes, U256};
+    use async_trait::async_trait;
     use broadcaster_core::crypto::railgun::ViewingKeyData;
     use broadcaster_core::notes::Note;
-    use local_db::WalletMeta;
-    use merkletree::wallet::{SpentNullifier, WalletLogDelta};
+    use broadcaster_core::transact::{PreTxPoi, SnarkJsProof};
+    use local_db::{
+        DbConfig, DbStore, PendingOutputPoiContextRecord, PendingOutputPoiRole, WalletMeta,
+    };
+    use merkletree::wallet::{CommitmentObservation, SpentNullifier, WalletLogDelta};
+    use poi::error::PoiError;
+    use poi::poi::{BlindedCommitmentData, SingleCommitmentProofContext};
     use railgun_wallet::wallet_cache::WalletCacheError;
-    use railgun_wallet::{Utxo, UtxoSource, WalletUtxo};
-    use std::collections::HashMap;
+    use railgun_wallet::{PoiStatus, Utxo, UtxoCommitmentKind, UtxoSource, WalletUtxo};
+    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::sync::{RwLock, watch};
+
+    static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_db_root() -> PathBuf {
+        let dir = std::env::temp_dir().join("railgun-broadcaster-sync-service-tests");
+        fs::create_dir_all(&dir).expect("create temp db dir");
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let counter = TEMP_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
+        dir.join(format!("db-{pid}-{nanos}-{counter}"))
+    }
 
     fn source(byte: u8) -> UtxoSource {
         UtxoSource {
@@ -485,6 +988,167 @@ mod tests {
             progress_tx: None,
             cache_store: None,
             use_indexed_wallet_catch_up: true,
+        }
+    }
+
+    fn test_wallet_utxo(position: u64) -> WalletUtxo {
+        WalletUtxo::new(Utxo::new(
+            Note {
+                token_hash: U256::from(1_u8),
+                value: U256::from(10_u8),
+                random: [0u8; 16],
+                npk: U256::from(2_u8),
+            },
+            2,
+            position,
+            source((position % 200) as u8 + 1),
+            UtxoCommitmentKind::Transact,
+        ))
+    }
+
+    #[derive(Default)]
+    struct RecordingPoiStatusClient {
+        calls: Mutex<Vec<(Vec<FixedBytes<32>>, Vec<BlindedCommitmentData>)>>,
+        fail_calls: Mutex<HashSet<usize>>,
+    }
+
+    impl RecordingPoiStatusClient {
+        fn fail_call(&self, call_index: usize) {
+            self.fail_calls
+                .lock()
+                .expect("fail calls")
+                .insert(call_index);
+        }
+
+        fn calls(&self) -> Vec<(Vec<FixedBytes<32>>, Vec<BlindedCommitmentData>)> {
+            self.calls.lock().expect("poi calls").clone()
+        }
+    }
+
+    #[async_trait]
+    impl PoiStatusReader for RecordingPoiStatusClient {
+        async fn pois_per_list(
+            &self,
+            _txid_version: &str,
+            _chain_type: u8,
+            _chain_id: u64,
+            list_keys: &[FixedBytes<32>],
+            blinded_commitment_datas: &[BlindedCommitmentData],
+        ) -> Result<BTreeMap<FixedBytes<32>, BTreeMap<FixedBytes<32>, PoiStatus>>, PoiError>
+        {
+            let call_index = {
+                let mut calls = self.calls.lock().expect("poi calls");
+                let call_index = calls.len();
+                calls.push((list_keys.to_vec(), blinded_commitment_datas.to_vec()));
+                call_index
+            };
+            if self
+                .fail_calls
+                .lock()
+                .expect("fail calls")
+                .contains(&call_index)
+            {
+                return Err(PoiError::MerkleRootsRejected);
+            }
+            Ok(blinded_commitment_datas
+                .iter()
+                .map(|data| {
+                    (
+                        data.blinded_commitment,
+                        list_keys
+                            .iter()
+                            .copied()
+                            .map(|list_key| (list_key, PoiStatus::Valid))
+                            .collect(),
+                    )
+                })
+                .collect())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingPendingOutputPoiSubmitter {
+        calls: Mutex<Vec<(FixedBytes<32>, u64, u64)>>,
+        fail_next: Mutex<bool>,
+    }
+
+    impl RecordingPendingOutputPoiSubmitter {
+        fn fail_next(&self) {
+            *self.fail_next.lock().expect("fail next") = true;
+        }
+
+        fn calls(&self) -> Vec<(FixedBytes<32>, u64, u64)> {
+            self.calls.lock().expect("submission calls").clone()
+        }
+    }
+
+    #[async_trait]
+    impl PendingOutputPoiSubmitter for RecordingPendingOutputPoiSubmitter {
+        async fn submit_single_commitment_proofs(
+            &self,
+            _txid_version: &str,
+            _chain_type: u8,
+            _chain_id: u64,
+            context: &SingleCommitmentProofContext,
+            utxo_tree_out: u64,
+            utxo_position_out: u64,
+        ) -> Result<(), PoiError> {
+            self.calls.lock().expect("submission calls").push((
+                context.commitment,
+                utxo_tree_out,
+                utxo_position_out,
+            ));
+            let mut fail_next = self.fail_next.lock().expect("fail next");
+            if *fail_next {
+                *fail_next = false;
+                return Err(PoiError::MerkleRootsRejected);
+            }
+            Ok(())
+        }
+    }
+
+    fn sample_pre_tx_poi(byte: u8) -> PreTxPoi {
+        PreTxPoi {
+            snark_proof: SnarkJsProof {
+                pi_a: [U256::from(byte), U256::from(byte + 1)],
+                pi_b: [
+                    [U256::from(byte + 2), U256::from(byte + 3)],
+                    [U256::from(byte + 4), U256::from(byte + 5)],
+                ],
+                pi_c: [U256::from(byte + 6), U256::from(byte + 7)],
+            },
+            txid_merkleroot: FixedBytes::from([byte; 32]),
+            poi_merkleroots: vec![FixedBytes::from([byte + 1; 32])],
+            blinded_commitments_out: vec![FixedBytes::from([byte + 2; 32])],
+            railgun_txid_if_has_unshield: Bytes::copy_from_slice(&[0_u8]),
+        }
+    }
+
+    fn pending_output_record(
+        chain_id: u64,
+        output_commitment: FixedBytes<32>,
+        list_key: FixedBytes<32>,
+    ) -> PendingOutputPoiContextRecord {
+        let txid_leaf = FixedBytes::from([0x55; 32]);
+        PendingOutputPoiContextRecord {
+            chain_id,
+            wallet_id: "wallet-1".to_string(),
+            txid_version: DEFAULT_TXID_VERSION.to_string(),
+            output_commitment,
+            output_npk: FixedBytes::from([0x66; 32]),
+            utxo_tree_in: 9,
+            railgun_txid: U256::from(7_u8),
+            pre_transaction_pois_per_txid_leaf_per_list: BTreeMap::from([(
+                list_key,
+                BTreeMap::from([(txid_leaf, sample_pre_tx_poi(0x10))]),
+            )]),
+            required_poi_list_keys: vec![list_key],
+            output_role: PendingOutputPoiRole::Recipient,
+            created_at: 123,
+            source_operation_id: None,
+            observation: None,
+            submitted_poi_list_keys: Vec::new(),
+            terminal_error: None,
         }
     }
 
@@ -567,6 +1231,244 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn poi_status_refresh_chunks_unspent_utxos() {
+        let client = RecordingPoiStatusClient::default();
+        let list_keys = vec![FixedBytes::from([0x11; 32]), FixedBytes::from([0x22; 32])];
+        let mut wallet_utxos = (0..=WALLET_POI_STATUS_BATCH_SIZE)
+            .map(|position| test_wallet_utxo(position as u64))
+            .collect::<Vec<_>>();
+
+        let changed = refresh_wallet_poi_statuses(&client, 1, &list_keys, &mut wallet_utxos).await;
+
+        assert!(changed);
+        let calls = client.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, list_keys);
+        assert_eq!(calls[0].1.len(), WALLET_POI_STATUS_BATCH_SIZE);
+        assert_eq!(calls[1].0, list_keys);
+        assert_eq!(calls[1].1.len(), 1);
+        assert!(wallet_utxos.iter().all(|wallet_utxo| {
+            wallet_utxo.utxo.poi.is_valid_for_lists(&list_keys)
+                && wallet_utxo.utxo.poi.refreshed_at.is_some()
+        }));
+    }
+
+    #[tokio::test]
+    async fn poi_status_refresh_needed_after_indexed_delta_discovers_utxo() {
+        let client = RecordingPoiStatusClient::default();
+        let list_key = FixedBytes::from([0x11; 32]);
+        let list_keys = vec![list_key];
+        let cfg = wallet_config(U256::ZERO);
+        let mut wallet_utxos = Vec::new();
+        let delta = WalletLogDelta {
+            utxos: vec![test_wallet_utxo(1).utxo],
+            nullifiers: Vec::new(),
+            commitment_observations: Vec::new(),
+        };
+
+        assert!(apply_wallet_delta_to_vec(&cfg, &mut wallet_utxos, delta));
+        assert!(wallet_poi_status_refresh_needed(&wallet_utxos, &list_keys));
+
+        let changed =
+            refresh_wallet_poi_statuses(&client, cfg.chain.chain_id, &list_keys, &mut wallet_utxos)
+                .await;
+
+        assert!(changed);
+        assert!(!wallet_poi_status_refresh_needed(&wallet_utxos, &list_keys));
+        assert_eq!(client.calls().len(), 1);
+        assert_eq!(
+            wallet_utxos[0].utxo.poi.statuses.get(&list_key),
+            Some(&PoiStatus::Valid)
+        );
+        assert!(wallet_utxos[0].utxo.poi.refreshed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn poi_status_refresh_keeps_failed_chunks_unknown() {
+        let client = RecordingPoiStatusClient::default();
+        client.fail_call(0);
+        let list_key = FixedBytes::from([0x11; 32]);
+        let list_keys = vec![list_key];
+        let mut wallet_utxos = (0..=WALLET_POI_STATUS_BATCH_SIZE)
+            .map(|position| test_wallet_utxo(position as u64))
+            .collect::<Vec<_>>();
+
+        let changed = refresh_wallet_poi_statuses(&client, 1, &list_keys, &mut wallet_utxos).await;
+
+        assert!(changed);
+        assert_eq!(client.calls().len(), 2);
+        assert_eq!(
+            wallet_utxos[0].utxo.poi.statuses.get(&list_key),
+            Some(&PoiStatus::Unknown)
+        );
+        assert_eq!(wallet_utxos[0].utxo.poi.refreshed_at, None);
+        assert_eq!(
+            wallet_utxos[WALLET_POI_STATUS_BATCH_SIZE]
+                .utxo
+                .poi
+                .statuses
+                .get(&list_key),
+            Some(&PoiStatus::Valid)
+        );
+        assert!(
+            wallet_utxos[WALLET_POI_STATUS_BATCH_SIZE]
+                .utxo
+                .poi
+                .refreshed_at
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_output_poi_matches_undecryptable_observation_and_marks_submitted() {
+        let root_dir = temp_db_root();
+        let store = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db");
+        let chain_id = 1;
+        let output_commitment = FixedBytes::from([0x77; 32]);
+        let list_key = FixedBytes::from([0x44; 32]);
+        store
+            .put_pending_output_poi_context(&pending_output_record(
+                chain_id,
+                output_commitment,
+                list_key,
+            ))
+            .expect("store pending context");
+        let submitter = RecordingPendingOutputPoiSubmitter::default();
+        let observation = CommitmentObservation {
+            tree: 12,
+            position: 34,
+            commitment: U256::from_be_bytes(output_commitment.0),
+            source: source(8),
+        };
+
+        process_pending_output_poi_observations(&store, chain_id, &[observation], Some(&submitter))
+            .await;
+
+        let loaded = store
+            .get_pending_output_poi_context(chain_id, &output_commitment)
+            .expect("load pending context")
+            .expect("pending context present");
+        let observed = loaded.observation.expect("observation recorded");
+        assert_eq!(observed.output_tree, 12);
+        assert_eq!(observed.output_position, 34);
+        assert_eq!(observed.tx_hash, source(8).tx_hash);
+        assert_eq!(loaded.submitted_poi_list_keys, vec![list_key]);
+        assert_eq!(submitter.calls(), vec![(output_commitment, 12, 34)]);
+
+        drop(store);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test]
+    async fn pending_output_poi_matches_wallet_owned_observation_and_keeps_utxo() {
+        let root_dir = temp_db_root();
+        let store = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db");
+        let chain_id = 1;
+        let utxo = test_wallet_utxo(36).utxo;
+        let output_commitment = FixedBytes::from(utxo.note.commitment().to_be_bytes::<32>());
+        let list_key = FixedBytes::from([0x46; 32]);
+        store
+            .put_pending_output_poi_context(&pending_output_record(
+                chain_id,
+                output_commitment,
+                list_key,
+            ))
+            .expect("store pending context");
+        let submitter = RecordingPendingOutputPoiSubmitter::default();
+        let observation = CommitmentObservation {
+            tree: utxo.tree,
+            position: utxo.position,
+            commitment: utxo.note.commitment(),
+            source: source(10),
+        };
+        let delta = WalletLogDelta {
+            utxos: vec![utxo],
+            nullifiers: Vec::new(),
+            commitment_observations: vec![observation],
+        };
+
+        process_pending_output_poi_observations(
+            &store,
+            chain_id,
+            &delta.commitment_observations,
+            Some(&submitter),
+        )
+        .await;
+        let mut wallet_utxos = Vec::new();
+        let changed =
+            apply_wallet_delta_to_vec(&wallet_config(U256::ZERO), &mut wallet_utxos, delta);
+
+        assert!(changed);
+        assert_eq!(wallet_utxos.len(), 1);
+        assert_eq!(wallet_utxos[0].utxo.position, 36);
+        let loaded = store
+            .get_pending_output_poi_context(chain_id, &output_commitment)
+            .expect("load pending context")
+            .expect("pending context present");
+        assert!(loaded.observation.is_some());
+        assert_eq!(loaded.submitted_poi_list_keys, vec![list_key]);
+        assert_eq!(submitter.calls(), vec![(output_commitment, 2, 36)]);
+
+        drop(store);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test]
+    async fn pending_output_poi_submission_failure_remains_retryable() {
+        let root_dir = temp_db_root();
+        let store = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db");
+        let chain_id = 1;
+        let output_commitment = FixedBytes::from([0x78; 32]);
+        let list_key = FixedBytes::from([0x45; 32]);
+        store
+            .put_pending_output_poi_context(&pending_output_record(
+                chain_id,
+                output_commitment,
+                list_key,
+            ))
+            .expect("store pending context");
+        let submitter = RecordingPendingOutputPoiSubmitter::default();
+        submitter.fail_next();
+        let observation = CommitmentObservation {
+            tree: 13,
+            position: 35,
+            commitment: U256::from_be_bytes(output_commitment.0),
+            source: source(9),
+        };
+
+        process_pending_output_poi_observations(&store, chain_id, &[observation], Some(&submitter))
+            .await;
+        let failed = store
+            .get_pending_output_poi_context(chain_id, &output_commitment)
+            .expect("load pending context")
+            .expect("pending context present");
+        assert!(failed.observation.is_some());
+        assert!(failed.submitted_poi_list_keys.is_empty());
+        assert!(failed.terminal_error.is_none());
+
+        process_pending_output_poi_observations(&store, chain_id, &[], Some(&submitter)).await;
+
+        let retried = store
+            .get_pending_output_poi_context(chain_id, &output_commitment)
+            .expect("load retried pending context")
+            .expect("pending context present");
+        assert_eq!(retried.submitted_poi_list_keys, vec![list_key]);
+        assert_eq!(submitter.calls().len(), 2);
+
+        drop(store);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
     }
 
     #[test]
@@ -700,23 +1602,25 @@ mod tests {
     #[test]
     fn spent_nullifiers_are_scoped_by_tree() {
         let nullifying_key = U256::from(42_u8);
-        let utxo_tree_one = Utxo {
-            note: Note {
+        let utxo_tree_one = Utxo::new(
+            Note {
                 token_hash: U256::from(1_u8),
                 value: U256::from(10_u8),
                 random: [0u8; 16],
                 npk: U256::from(2_u8),
             },
-            tree: 1,
-            position: 7,
-            source: source(1),
-        };
-        let utxo_tree_two = Utxo {
-            note: utxo_tree_one.note.clone(),
-            tree: 2,
-            position: 7,
-            source: source(2),
-        };
+            1,
+            7,
+            source(1),
+            UtxoCommitmentKind::Transact,
+        );
+        let utxo_tree_two = Utxo::new(
+            utxo_tree_one.note.clone(),
+            2,
+            7,
+            source(2),
+            UtxoCommitmentKind::Transact,
+        );
         let shared_nullifier = utxo_tree_one.nullifier(nullifying_key);
         let spent_source = source(9);
         let nullifier_sources = HashMap::from([((2, shared_nullifier), spent_source.clone())]);
@@ -735,17 +1639,18 @@ mod tests {
     fn indexed_delta_marks_matching_utxo_spent() {
         let nullifying_key = U256::from(42_u8);
         let cfg = wallet_config(nullifying_key);
-        let utxo = Utxo {
-            note: Note {
+        let utxo = Utxo::new(
+            Note {
                 token_hash: U256::from(1_u8),
                 value: U256::from(10_u8),
                 random: [0u8; 16],
                 npk: U256::from(2_u8),
             },
-            tree: 2,
-            position: 7,
-            source: source(1),
-        };
+            2,
+            7,
+            source(1),
+            UtxoCommitmentKind::Transact,
+        );
         let spent_source = source(9);
         let nullifier = utxo.nullifier(nullifying_key);
         let mut wallet_utxos = vec![WalletUtxo::new(utxo)];
@@ -756,6 +1661,7 @@ mod tests {
                 nullifier,
                 source: spent_source.clone(),
             }],
+            commitment_observations: Vec::new(),
         };
 
         let changed = apply_wallet_delta_to_vec(&cfg, &mut wallet_utxos, delta);
@@ -768,17 +1674,18 @@ mod tests {
     fn indexed_delta_preserves_unmatched_utxo() {
         let nullifying_key = U256::from(42_u8);
         let cfg = wallet_config(nullifying_key);
-        let utxo = Utxo {
-            note: Note {
+        let utxo = Utxo::new(
+            Note {
                 token_hash: U256::from(1_u8),
                 value: U256::from(10_u8),
                 random: [0u8; 16],
                 npk: U256::from(2_u8),
             },
-            tree: 2,
-            position: 7,
-            source: source(1),
-        };
+            2,
+            7,
+            source(1),
+            UtxoCommitmentKind::Transact,
+        );
         let nullifier = utxo.nullifier(nullifying_key);
         let mut wallet_utxos = vec![WalletUtxo::new(utxo)];
         let delta = WalletLogDelta {
@@ -788,6 +1695,7 @@ mod tests {
                 nullifier,
                 source: source(9),
             }],
+            commitment_observations: Vec::new(),
         };
 
         let changed = apply_wallet_delta_to_vec(&cfg, &mut wallet_utxos, delta);

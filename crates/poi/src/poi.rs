@@ -4,13 +4,33 @@ use broadcaster_core::crypto::poseidon::poseidon;
 use broadcaster_core::crypto::snark_proof::Prover;
 use broadcaster_core::transact::{
     BroadcasterRawParamsTransact, FeeNoteAssuranceContext, ParsedTransactCalldata,
-    ParsedTransactTransaction, railgun_txid_leaf_hash, txid_version_or_default,
+    ParsedTransactTransaction, PreTxPoi, railgun_txid_leaf_hash, txid_version_or_default,
 };
+pub use broadcaster_core::utxo::PoiStatus;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tracing::debug;
+
+pub const DEFAULT_WALLET_POI_RPC_URL: &str = "https://ppoi.fdi.network";
+pub const DEFAULT_ACTIVE_POI_LIST_KEY_HEX: &str =
+    "efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88";
+
+const DEFAULT_ACTIVE_POI_LIST_KEY_BYTES: [u8; 32] = [
+    0xef, 0xc6, 0xdd, 0xb5, 0x9c, 0x09, 0x8a, 0x13, 0xfb, 0x2b, 0x61, 0x8f, 0xda, 0xe9, 0x4c, 0x1c,
+    0x3a, 0x80, 0x7a, 0xbc, 0x8f, 0xb1, 0x83, 0x7c, 0x93, 0x62, 0x0c, 0x91, 0x43, 0xee, 0x9e, 0x88,
+];
+
+#[must_use]
+pub fn default_active_poi_list_key() -> FixedBytes<32> {
+    FixedBytes::from(DEFAULT_ACTIVE_POI_LIST_KEY_BYTES)
+}
+
+#[must_use]
+pub fn default_active_poi_list_keys() -> Vec<FixedBytes<32>> {
+    vec![default_active_poi_list_key()]
+}
 
 pub struct Poi {
     rpc_client: PoiRpcClient,
@@ -137,6 +157,47 @@ impl Poi {
                 .collect::<Vec<_>>(),
             "submit fee-note single-commitment poi"
         );
+        let single_commitment_context =
+            SingleCommitmentProofContext::from_fee_note_assurance(context);
+        self.rpc_client
+            .submit_single_commitment_proofs(
+                &context.txid_version,
+                chain_type,
+                chain_id,
+                &single_commitment_context,
+                utxo_tree_out,
+                utxo_position_out,
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn submit_single_commitment(
+        &self,
+        chain_type: u8,
+        chain_id: u64,
+        context: &SingleCommitmentProofContext,
+        utxo_tree_out: u64,
+        utxo_position_out: u64,
+    ) -> Result<(), PoiError> {
+        debug!(
+            method = POI_SUBMIT_SINGLE_COMMITMENT_PROOFS_METHOD,
+            chain_type,
+            chain_id,
+            txid_version = %context.txid_version,
+            commitment = %encode_fixed_bytes(&context.commitment),
+            npk = %encode_fixed_bytes(&context.npk),
+            railgun_txid = %encode_u256(context.railgun_txid),
+            utxo_tree_in = context.utxo_tree_in,
+            utxo_tree_out,
+            utxo_position_out,
+            poi_list_keys = ?context
+                .pre_transaction_pois_per_txid_leaf_per_list
+                .keys()
+                .map(hex::encode)
+                .collect::<Vec<_>>(),
+            "submit single-commitment poi"
+        );
         self.rpc_client
             .submit_single_commitment_proofs(
                 &context.txid_version,
@@ -167,21 +228,34 @@ impl Poi {
             required_poi_list_keys = ?required_poi_list_keys.iter().map(hex::encode).collect::<Vec<_>>(),
             "query fee-note poi statuses for candidate commitment"
         );
-        self.rpc_client
+        let statuses = self
+            .rpc_client
             .pois_per_list(
                 txid_version,
                 chain_type,
                 chain_id,
                 required_poi_list_keys,
-                blinded_commitment,
+                &[BlindedCommitmentData::transact(*blinded_commitment)],
             )
-            .await
+            .await?;
+
+        Ok(statuses
+            .get(blinded_commitment)
+            .cloned()
+            .unwrap_or_else(|| {
+                required_poi_list_keys
+                    .iter()
+                    .copied()
+                    .map(|list_key| (list_key, PoiStatus::Missing))
+                    .collect()
+            }))
     }
 }
 
 const POI_VALIDATE_MERKLEROOTS_METHOD: &str = "ppoi_validate_poi_merkleroots";
 const POI_SUBMIT_SINGLE_COMMITMENT_PROOFS_METHOD: &str = "ppoi_submit_single_commitment_proofs";
 const POI_POIS_PER_LIST_METHOD: &str = "ppoi_pois_per_list";
+const POI_MERKLE_PROOFS_METHOD: &str = "ppoi_merkle_proofs";
 
 #[derive(Debug, Serialize)]
 struct JsonRpcReq<T> {
@@ -230,6 +304,33 @@ struct SubmitSingleCommitmentProofsParams {
     single_commitment_proofs_data: SingleCommitmentProofsData,
 }
 
+#[derive(Debug, Clone)]
+pub struct SingleCommitmentProofContext {
+    pub txid_version: String,
+    pub railgun_txid: U256,
+    pub utxo_tree_in: u64,
+    pub commitment: FixedBytes<32>,
+    pub npk: FixedBytes<32>,
+    pub pre_transaction_pois_per_txid_leaf_per_list:
+        BTreeMap<FixedBytes<32>, BTreeMap<FixedBytes<32>, PreTxPoi>>,
+}
+
+impl SingleCommitmentProofContext {
+    #[must_use]
+    pub fn from_fee_note_assurance(context: &FeeNoteAssuranceContext) -> Self {
+        Self {
+            txid_version: context.txid_version.clone(),
+            railgun_txid: context.railgun_txid,
+            utxo_tree_in: context.utxo_tree_in,
+            commitment: context.fee_commitment,
+            npk: context.fee_note_npk,
+            pre_transaction_pois_per_txid_leaf_per_list: context
+                .pre_transaction_pois_per_txid_leaf_per_list
+                .clone(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SingleCommitmentProofsData {
@@ -265,26 +366,87 @@ struct GetPoisPerListParams {
     #[serde(flatten)]
     chain: ChainParams,
     list_keys: Vec<String>,
-    blinded_commitment_datas: Vec<BlindedCommitmentData>,
+    blinded_commitment_datas: Vec<BlindedCommitmentDataParam>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct BlindedCommitmentData {
+struct BlindedCommitmentDataParam {
     blinded_commitment: String,
     #[serde(rename = "type")]
     commitment_type: &'static str,
 }
 
-pub type PoisPerListMap = BTreeMap<String, BTreeMap<String, PoiStatus>>;
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GetMerkleProofsParams {
+    #[serde(flatten)]
+    chain: ChainParams,
+    list_key: String,
+    blinded_commitments: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoiMerkleProof {
+    pub leaf: String,
+    pub elements: Vec<String>,
+    pub indices: String,
+    pub root: String,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PoiStatus {
-    Valid,
-    ShieldBlocked,
-    ProofSubmitted,
-    Missing,
+pub enum BlindedCommitmentType {
+    Shield,
+    Transact,
+    Unshield,
 }
+
+impl BlindedCommitmentType {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Shield => "Shield",
+            Self::Transact => "Transact",
+            Self::Unshield => "Unshield",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlindedCommitmentData {
+    pub blinded_commitment: FixedBytes<32>,
+    pub commitment_type: BlindedCommitmentType,
+}
+
+impl BlindedCommitmentData {
+    #[must_use]
+    pub const fn new(
+        blinded_commitment: FixedBytes<32>,
+        commitment_type: BlindedCommitmentType,
+    ) -> Self {
+        Self {
+            blinded_commitment,
+            commitment_type,
+        }
+    }
+
+    #[must_use]
+    pub const fn shield(blinded_commitment: FixedBytes<32>) -> Self {
+        Self::new(blinded_commitment, BlindedCommitmentType::Shield)
+    }
+
+    #[must_use]
+    pub const fn transact(blinded_commitment: FixedBytes<32>) -> Self {
+        Self::new(blinded_commitment, BlindedCommitmentType::Transact)
+    }
+
+    #[must_use]
+    pub const fn unshield(blinded_commitment: FixedBytes<32>) -> Self {
+        Self::new(blinded_commitment, BlindedCommitmentType::Unshield)
+    }
+}
+
+pub type PoisPerListMap = BTreeMap<String, BTreeMap<String, PoiStatus>>;
+pub type PoisPerListStatusMap = BTreeMap<FixedBytes<32>, BTreeMap<FixedBytes<32>, PoiStatus>>;
 
 pub struct PoiRpcClient {
     base_url: Url,
@@ -388,7 +550,7 @@ impl PoiRpcClient {
     }
 
     fn submit_single_commitment_pois(
-        context: &FeeNoteAssuranceContext,
+        context: &SingleCommitmentProofContext,
     ) -> BTreeMap<String, BTreeMap<String, SubmitPreTxPoi>> {
         context
             .pre_transaction_pois_per_txid_leaf_per_list
@@ -451,15 +613,15 @@ impl PoiRpcClient {
         txid_version: &str,
         chain_type: u8,
         chain_id: u64,
-        context: &FeeNoteAssuranceContext,
+        context: &SingleCommitmentProofContext,
         utxo_tree_out: u64,
         utxo_position_out: u64,
     ) -> SubmitSingleCommitmentProofsParams {
         SubmitSingleCommitmentProofsParams {
             chain: Self::chain_params(txid_version, chain_type, chain_id),
             single_commitment_proofs_data: SingleCommitmentProofsData {
-                commitment: encode_fixed_bytes(&context.fee_commitment),
-                npk: encode_fixed_bytes(&context.fee_note_npk),
+                commitment: encode_fixed_bytes(&context.commitment),
+                npk: encode_fixed_bytes(&context.npk),
                 utxo_tree_in: context.utxo_tree_in,
                 utxo_tree_out,
                 utxo_position_out,
@@ -474,15 +636,32 @@ impl PoiRpcClient {
         chain_type: u8,
         chain_id: u64,
         list_keys: &[FixedBytes<32>],
-        blinded_commitment: &FixedBytes<32>,
+        blinded_commitment_datas: &[BlindedCommitmentData],
     ) -> GetPoisPerListParams {
         GetPoisPerListParams {
             chain: Self::chain_params(txid_version, chain_type, chain_id),
             list_keys: list_keys.iter().map(hex::encode).collect(),
-            blinded_commitment_datas: vec![BlindedCommitmentData {
-                blinded_commitment: encode_fixed_bytes(blinded_commitment),
-                commitment_type: "Transact",
-            }],
+            blinded_commitment_datas: blinded_commitment_datas
+                .iter()
+                .map(|data| BlindedCommitmentDataParam {
+                    blinded_commitment: encode_fixed_bytes(&data.blinded_commitment),
+                    commitment_type: data.commitment_type.as_str(),
+                })
+                .collect(),
+        }
+    }
+
+    fn poi_merkle_proofs_params(
+        txid_version: &str,
+        chain_type: u8,
+        chain_id: u64,
+        list_key: &FixedBytes<32>,
+        blinded_commitments: &[FixedBytes<32>],
+    ) -> GetMerkleProofsParams {
+        GetMerkleProofsParams {
+            chain: Self::chain_params(txid_version, chain_type, chain_id),
+            list_key: hex::encode(list_key),
+            blinded_commitments: blinded_commitments.iter().map(encode_fixed_bytes).collect(),
         }
     }
 
@@ -507,12 +686,12 @@ impl PoiRpcClient {
         .await
     }
 
-    async fn submit_single_commitment_proofs(
+    pub async fn submit_single_commitment_proofs(
         &self,
         txid_version: &str,
         chain_type: u8,
         chain_id: u64,
-        context: &FeeNoteAssuranceContext,
+        context: &SingleCommitmentProofContext,
         utxo_tree_out: u64,
         utxo_position_out: u64,
     ) -> Result<(), PoiRpcError> {
@@ -530,15 +709,14 @@ impl PoiRpcClient {
         .await
     }
 
-    async fn pois_per_list(
+    pub async fn pois_per_list(
         &self,
         txid_version: &str,
         chain_type: u8,
         chain_id: u64,
         list_keys: &[FixedBytes<32>],
-        blinded_commitment: &FixedBytes<32>,
-    ) -> Result<BTreeMap<FixedBytes<32>, PoiStatus>, PoiError> {
-        let blinded_commitment_hex = encode_fixed_bytes(blinded_commitment);
+        blinded_commitment_datas: &[BlindedCommitmentData],
+    ) -> Result<PoisPerListStatusMap, PoiError> {
         let response: PoisPerListMap = self
             .send_request(
                 POI_POIS_PER_LIST_METHOD,
@@ -547,27 +725,54 @@ impl PoiRpcClient {
                     chain_type,
                     chain_id,
                     list_keys,
-                    blinded_commitment,
+                    blinded_commitment_datas,
                 ),
             )
             .await?;
 
-        let per_list = response
-            .get(&blinded_commitment_hex)
-            .cloned()
-            .unwrap_or_default();
-
-        Ok(list_keys
+        Ok(blinded_commitment_datas
             .iter()
-            .copied()
-            .map(|list_key| {
-                let status = per_list
-                    .get(&hex::encode(list_key))
+            .map(|data| {
+                let blinded_commitment_hex = encode_fixed_bytes(&data.blinded_commitment);
+                let per_list = response
+                    .get(&blinded_commitment_hex)
+                    .cloned()
+                    .unwrap_or_default();
+                let statuses = list_keys
+                    .iter()
                     .copied()
-                    .unwrap_or(PoiStatus::Missing);
-                (list_key, status)
+                    .map(|list_key| {
+                        let status = per_list
+                            .get(&hex::encode(list_key))
+                            .copied()
+                            .unwrap_or(PoiStatus::Missing);
+                        (list_key, status)
+                    })
+                    .collect();
+                (data.blinded_commitment, statuses)
             })
             .collect())
+    }
+
+    pub async fn poi_merkle_proofs(
+        &self,
+        txid_version: &str,
+        chain_type: u8,
+        chain_id: u64,
+        list_key: &FixedBytes<32>,
+        blinded_commitments: &[FixedBytes<32>],
+    ) -> Result<Vec<PoiMerkleProof>, PoiRpcError> {
+        self.send_request(
+            POI_MERKLE_PROOFS_METHOD,
+            Self::poi_merkle_proofs_params(
+                txid_version,
+                chain_type,
+                chain_id,
+                list_key,
+                blinded_commitments,
+            ),
+        )
+        .await
     }
 }
 
@@ -632,7 +837,9 @@ fn encode_bytes(value: &alloy::primitives::Bytes) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        PoiRpcClient, PoiStatus, decode_json_rpc_ack_response, decode_json_rpc_response,
+        BlindedCommitmentData, DEFAULT_ACTIVE_POI_LIST_KEY_HEX, DEFAULT_WALLET_POI_RPC_URL,
+        PoiMerkleProof, PoiRpcClient, PoiStatus, SingleCommitmentProofContext,
+        decode_json_rpc_ack_response, decode_json_rpc_response, default_active_poi_list_key,
         encode_fixed_bytes, encode_u256_bare, railgun_txid_leaf_hash,
     };
     use crate::error::PoiRpcError;
@@ -673,6 +880,23 @@ mod tests {
     }
 
     #[test]
+    fn wallet_poi_defaults_are_available() {
+        assert_eq!(DEFAULT_WALLET_POI_RPC_URL, "https://ppoi.fdi.network");
+        assert_eq!(
+            hex::encode(default_active_poi_list_key()),
+            DEFAULT_ACTIVE_POI_LIST_KEY_HEX
+        );
+    }
+
+    #[test]
+    fn poi_status_supports_local_unknown() {
+        let json = serde_json::to_string(&PoiStatus::Unknown).expect("serialize unknown status");
+        assert_eq!(json, r#""Unknown""#);
+        let status: PoiStatus = serde_json::from_str(&json).expect("deserialize unknown status");
+        assert_eq!(status, PoiStatus::Unknown);
+    }
+
+    #[test]
     fn validate_request_uses_non_default_txid_version() {
         let params = PoiRpcClient::validate_poi_merkleroots_params(
             "V3_PoseidonMerkle",
@@ -691,11 +915,13 @@ mod tests {
     #[test]
     fn single_commitment_submit_request_serializes_context() {
         let context = sample_context();
+        let single_commitment_context =
+            SingleCommitmentProofContext::from_fee_note_assurance(&context);
         let params = PoiRpcClient::submit_single_commitment_proofs_params(
             &context.txid_version,
             0,
             1,
-            &context,
+            &single_commitment_context,
             10,
             12,
         );
@@ -734,11 +960,13 @@ mod tests {
     #[test]
     fn single_commitment_submit_request_uses_bare_hex_poi_keys() {
         let context = sample_context();
+        let single_commitment_context =
+            SingleCommitmentProofContext::from_fee_note_assurance(&context);
         let params = PoiRpcClient::submit_single_commitment_proofs_params(
             &context.txid_version,
             0,
             1,
-            &context,
+            &single_commitment_context,
             10,
             12,
         );
@@ -792,12 +1020,16 @@ mod tests {
     fn pois_per_list_query_serializes_blinded_commitment_request() {
         let context = sample_context();
         let blinded_commitment = FixedBytes::from([0x88; 32]);
+        let shield_blinded_commitment = FixedBytes::from([0x99; 32]);
         let params = PoiRpcClient::pois_per_list_params(
             &context.txid_version,
             0,
             1,
             &context.required_poi_list_keys,
-            &blinded_commitment,
+            &[
+                BlindedCommitmentData::transact(blinded_commitment),
+                BlindedCommitmentData::shield(shield_blinded_commitment),
+            ],
         );
         let json = to_value(params).expect("serialize pois per list params");
 
@@ -811,6 +1043,51 @@ mod tests {
             json["blindedCommitmentDatas"][0]["blindedCommitment"],
             encode_fixed_bytes(&blinded_commitment)
         );
+        assert_eq!(json["blindedCommitmentDatas"][1]["type"], "Shield");
+        assert_eq!(
+            json["blindedCommitmentDatas"][1]["blindedCommitment"],
+            encode_fixed_bytes(&shield_blinded_commitment)
+        );
+    }
+
+    #[test]
+    fn poi_merkle_proofs_query_serializes_blinded_commitments() {
+        let context = sample_context();
+        let list_key = context.required_poi_list_keys[0];
+        let blinded_commitments = [FixedBytes::from([0x88; 32]), FixedBytes::from([0x99; 32])];
+        let params = PoiRpcClient::poi_merkle_proofs_params(
+            &context.txid_version,
+            0,
+            1,
+            &list_key,
+            &blinded_commitments,
+        );
+        let json = to_value(params).expect("serialize merkle proof params");
+
+        assert_eq!(json["txidVersion"], "V3_PoseidonMerkle");
+        assert_eq!(json["listKey"], hex::encode(list_key));
+        assert_eq!(
+            json["blindedCommitments"][0],
+            encode_fixed_bytes(&blinded_commitments[0])
+        );
+        assert_eq!(
+            json["blindedCommitments"][1],
+            encode_fixed_bytes(&blinded_commitments[1])
+        );
+    }
+
+    #[test]
+    fn poi_merkle_proofs_response_decodes() {
+        let proofs: Vec<PoiMerkleProof> = decode_json_rpc_response(
+            r#"{"result":[{"leaf":"0x11","elements":["0x22"],"indices":"0x00","root":"0x33"}]}"#,
+        )
+        .expect("decode merkle proofs");
+
+        assert_eq!(proofs.len(), 1);
+        assert_eq!(proofs[0].leaf, "0x11");
+        assert_eq!(proofs[0].elements, vec!["0x22".to_string()]);
+        assert_eq!(proofs[0].indices, "0x00");
+        assert_eq!(proofs[0].root, "0x33");
     }
 
     #[test]

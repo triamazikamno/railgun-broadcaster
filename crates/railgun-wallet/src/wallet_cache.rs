@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use alloy::primitives::Address as ContractAddress;
 use alloy::primitives::{FixedBytes, U256};
 use broadcaster_core::notes::Note;
-use broadcaster_core::utxo::{Utxo, UtxoSource, WalletUtxo};
+use broadcaster_core::utxo::{Utxo, UtxoPoiMetadata, UtxoSource, WalletUtxo};
 use local_db::{DbError, DbStore, WalletMeta};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -63,6 +63,7 @@ struct CachedWalletUtxo {
     tree: u32,
     position: u64,
     source: CachedUtxoSource,
+    poi: UtxoPoiMetadata,
     spent: Option<CachedUtxoSource>,
 }
 
@@ -79,6 +80,7 @@ impl From<&WalletUtxo> for CachedWalletUtxo {
             tree: utxo.tree,
             position: utxo.position,
             source: CachedUtxoSource::from(&utxo.source),
+            poi: utxo.poi.clone(),
             spent: wallet_utxo.spent.as_ref().map(CachedUtxoSource::from),
         }
     }
@@ -96,6 +98,7 @@ impl CachedWalletUtxo {
             tree: self.tree,
             position: self.position,
             source: self.source.into_source(),
+            poi: self.poi,
         };
         WalletUtxo {
             utxo,
@@ -202,9 +205,10 @@ fn now_epoch_secs() -> Result<u64, std::io::Error> {
 mod tests {
     use alloy::primitives::{FixedBytes, U256};
     use broadcaster_core::notes::Note;
+    use std::collections::BTreeMap;
 
     use super::{deserialize_wallet_utxo, serialize_wallet_utxo};
-    use crate::{Utxo, UtxoSource, WalletUtxo};
+    use crate::{PoiStatus, Utxo, UtxoCommitmentKind, UtxoSource, WalletUtxo};
 
     fn source(byte: u8) -> UtxoSource {
         UtxoSource {
@@ -216,24 +220,43 @@ mod tests {
 
     #[test]
     fn wallet_cache_roundtrips_source_timestamps() {
-        let wallet_utxo = WalletUtxo {
-            utxo: Utxo {
-                note: Note {
+        let list_key = FixedBytes::from([0xaa; 32]);
+        let mut wallet_utxo = WalletUtxo {
+            utxo: Utxo::new(
+                Note {
                     token_hash: U256::from(1_u8),
                     value: U256::from(2_u8),
                     random: [3_u8; 16],
                     npk: U256::from(4_u8),
                 },
-                tree: 5,
-                position: 6,
-                source: source(7),
-            },
+                5,
+                6,
+                source(7),
+                UtxoCommitmentKind::Transact,
+            ),
             spent: Some(source(8)),
         };
+        wallet_utxo.utxo.poi.statuses = BTreeMap::from([(list_key, PoiStatus::Valid)]);
+        wallet_utxo.utxo.poi.refreshed_at = Some(42);
 
         let encoded = serialize_wallet_utxo(&wallet_utxo).expect("serialize wallet UTXO");
         let decoded = deserialize_wallet_utxo(&encoded).expect("deserialize wallet UTXO");
 
+        assert_eq!(
+            decoded.utxo.poi.commitment_kind,
+            UtxoCommitmentKind::Transact
+        );
+        assert_eq!(decoded.utxo.poi.commitment, wallet_utxo.utxo.poi.commitment);
+        assert_eq!(decoded.utxo.poi.npk, wallet_utxo.utxo.poi.npk);
+        assert_eq!(
+            decoded.utxo.poi.blinded_commitment,
+            wallet_utxo.utxo.poi.blinded_commitment
+        );
+        assert_eq!(
+            decoded.utxo.poi.statuses.get(&list_key),
+            Some(&PoiStatus::Valid)
+        );
+        assert_eq!(decoded.utxo.poi.refreshed_at, Some(42));
         assert_eq!(decoded.utxo.source.block_timestamp, 1_700_000_007);
         assert_eq!(
             decoded.spent.expect("spent source").block_timestamp,

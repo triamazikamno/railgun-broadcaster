@@ -10,7 +10,7 @@ use broadcaster_core::crypto::shared_key::{shared_symmetric_key, shared_symmetri
 use broadcaster_core::notes::{
     Note, decrypt_legacy_random, decrypt_shield_random, note_public_key,
 };
-use broadcaster_core::utxo::{Utxo, UtxoSource};
+use broadcaster_core::utxo::{Utxo, UtxoCommitmentKind, UtxoSource};
 
 use crate::errors::SyncError;
 use crate::slow::types::{
@@ -36,6 +36,15 @@ pub type WalletScanKeys = ViewingKeyData;
 pub struct WalletLogDelta {
     pub utxos: Vec<Utxo>,
     pub nullifiers: Vec<SpentNullifier>,
+    pub commitment_observations: Vec<CommitmentObservation>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CommitmentObservation {
+    pub tree: u32,
+    pub position: u64,
+    pub commitment: U256,
+    pub source: UtxoSource,
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +108,7 @@ pub fn parse_wallet_delta_from_logs(
 ) -> Result<WalletLogDelta, WalletScanError> {
     let mut utxos = Vec::new();
     let mut nullifiers = HashMap::new();
+    let mut commitment_observations = Vec::new();
 
     for raw_log in logs {
         let topic0 = raw_log.inner.topics().first().copied().unwrap_or_default();
@@ -114,7 +124,14 @@ pub fn parse_wallet_delta_from_logs(
                 if let Some(expected_hash) = commitment_hashes
                     .get(index)
                     .map(|hash| U256::from_be_bytes(hash.0))
-                    && let Some(utxo) = scan_transact_commitment(
+                {
+                    commitment_observations.push(commitment_observation(
+                        tree_number,
+                        position,
+                        expected_hash,
+                        source.clone(),
+                    ));
+                    if let Some(utxo) = scan_transact_commitment(
                         tree_number,
                         position,
                         expected_hash,
@@ -123,9 +140,9 @@ pub fn parse_wallet_delta_from_logs(
                         ciphertext.memo.as_ref(),
                         source.clone(),
                         keys,
-                    )
-                {
-                    utxos.push(utxo);
+                    ) {
+                        utxos.push(utxo);
+                    }
                 }
             }
         } else if topic0 == Shield::SIGNATURE_HASH {
@@ -136,6 +153,12 @@ pub fn parse_wallet_delta_from_logs(
             let source = source_from_log(raw_log, block_timestamps)?;
             for (index, preimage) in event.commitments.iter().enumerate() {
                 let position = start_pos + index as u64;
+                commitment_observations.push(commitment_observation(
+                    tree_number,
+                    position,
+                    preimage.hash(),
+                    source.clone(),
+                ));
                 if let Some(ciphertext) = event.shieldCiphertext.get(index)
                     && let Some(utxo) = scan_shield_commitment(
                         tree_number,
@@ -157,6 +180,12 @@ pub fn parse_wallet_delta_from_logs(
             let source = source_from_log(raw_log, block_timestamps)?;
             for (index, preimage) in event.commitments.iter().enumerate() {
                 let position = start_pos + index as u64;
+                commitment_observations.push(commitment_observation(
+                    tree_number,
+                    position,
+                    preimage.hash(),
+                    source.clone(),
+                ));
                 if let Some(ciphertext) = event.shieldCiphertext.get(index)
                     && let Some(utxo) = scan_shield_commitment(
                         tree_number,
@@ -213,6 +242,12 @@ pub fn parse_wallet_delta_from_logs(
                         .collect(),
                     source: source.clone(),
                 };
+                commitment_observations.push(commitment_observation(
+                    tree_number,
+                    position,
+                    expected_hash,
+                    source.clone(),
+                ));
                 if let Some(utxo) = scan_legacy_encrypted_commitment(&input, keys) {
                     utxos.push(utxo);
                 }
@@ -235,6 +270,12 @@ pub fn parse_wallet_delta_from_logs(
                     encrypted_random: encrypted_random_from_u256(*encrypted_random),
                     source: source.clone(),
                 };
+                commitment_observations.push(commitment_observation(
+                    tree_number,
+                    position,
+                    preimage.hash(),
+                    source.clone(),
+                ));
                 if let Some(utxo) = scan_legacy_generated_commitment(&input, keys) {
                     utxos.push(utxo);
                 }
@@ -252,6 +293,7 @@ pub fn parse_wallet_delta_from_logs(
                 source,
             })
             .collect(),
+        commitment_observations,
     })
 }
 
@@ -265,8 +307,15 @@ pub fn parse_indexed_wallet_delta(
 ) -> WalletLogDelta {
     let mut utxos = Vec::new();
     let mut nullifiers = HashMap::new();
+    let mut commitment_observations = Vec::new();
 
     for commitment in transact_commitments {
+        commitment_observations.push(commitment_observation(
+            commitment.tree_number,
+            commitment.tree_position,
+            commitment.hash,
+            commitment.source.clone(),
+        ));
         if let Some(utxo) = scan_transact_commitment(
             commitment.tree_number,
             commitment.tree_position,
@@ -282,6 +331,12 @@ pub fn parse_indexed_wallet_delta(
     }
 
     for commitment in shield_commitments {
+        commitment_observations.push(commitment_observation(
+            commitment.tree_number,
+            commitment.tree_position,
+            commitment.preimage.hash(),
+            commitment.source.clone(),
+        ));
         if let Some(utxo) = scan_shield_commitment(
             commitment.tree_number,
             commitment.tree_position,
@@ -295,12 +350,24 @@ pub fn parse_indexed_wallet_delta(
     }
 
     for commitment in legacy_encrypted_commitments {
+        commitment_observations.push(commitment_observation(
+            commitment.tree_number,
+            commitment.tree_position,
+            commitment.hash,
+            commitment.source.clone(),
+        ));
         if let Some(utxo) = scan_legacy_encrypted_commitment(commitment, keys) {
             utxos.push(utxo);
         }
     }
 
     for commitment in legacy_generated_commitments {
+        commitment_observations.push(commitment_observation(
+            commitment.tree_number,
+            commitment.tree_position,
+            commitment.preimage.hash(),
+            commitment.source.clone(),
+        ));
         if let Some(utxo) = scan_legacy_generated_commitment(commitment, keys) {
             utxos.push(utxo);
         }
@@ -322,6 +389,22 @@ pub fn parse_indexed_wallet_delta(
                 source,
             })
             .collect(),
+        commitment_observations,
+    }
+}
+
+const fn commitment_observation(
+    tree_number: u32,
+    tree_position: u64,
+    commitment: U256,
+    source: UtxoSource,
+) -> CommitmentObservation {
+    let (tree, position) = normalize_tree_position(tree_number, tree_position);
+    CommitmentObservation {
+        tree,
+        position,
+        commitment,
+        source,
     }
 }
 
@@ -350,12 +433,13 @@ fn scan_legacy_encrypted_commitment(
     if note.commitment() != commitment.hash {
         return None;
     }
-    Some(Utxo {
+    Some(Utxo::new(
         note,
         tree,
         position,
-        source: commitment.source.clone(),
-    })
+        commitment.source.clone(),
+        UtxoCommitmentKind::Transact,
+    ))
 }
 
 fn scan_legacy_generated_commitment(
@@ -374,17 +458,19 @@ fn scan_legacy_generated_commitment(
     }
     let (tree, position) =
         normalize_tree_position(commitment.tree_number, commitment.tree_position);
-    Some(Utxo {
-        note: Note {
-            token_hash: commitment.preimage.token.id(),
-            value: U256::from(commitment.preimage.value.to::<u128>()),
-            random,
-            npk: commitment.preimage.npk,
-        },
+    let note = Note {
+        token_hash: commitment.preimage.token.id(),
+        value: U256::from(commitment.preimage.value.to::<u128>()),
+        random,
+        npk: commitment.preimage.npk,
+    };
+    Some(Utxo::new(
+        note,
         tree,
         position,
-        source: commitment.source.clone(),
-    })
+        commitment.source.clone(),
+        UtxoCommitmentKind::Shield,
+    ))
 }
 
 fn scan_transact_commitment(
@@ -404,12 +490,13 @@ fn scan_transact_commitment(
     if note.commitment() != expected_hash {
         return None;
     }
-    Some(Utxo {
+    Some(Utxo::new(
         note,
         tree,
         position,
         source,
-    })
+        UtxoCommitmentKind::Transact,
+    ))
 }
 
 fn u256_to_fixed_bytes(value: U256) -> FixedBytes<32> {
@@ -435,12 +522,13 @@ fn scan_shield_commitment(
     let shared_key =
         shared_symmetric_key(&keys.viewing_private_key, &ciphertext.shieldKey.0).ok()?;
     let random = decrypt_shield_random(&ciphertext.encryptedBundle, &shared_key).ok()?;
-    Some(Utxo {
-        note: preimage.note_with_random(random),
+    Some(Utxo::new(
+        preimage.note_with_random(random),
         tree,
         position,
         source,
-    })
+        UtxoCommitmentKind::Shield,
+    ))
 }
 
 fn source_from_log(

@@ -26,6 +26,7 @@ zeroize = { workspace = true }
 broadcaster-core = { path = "../core" }
 broadcaster-monitor = { path = "../broadcaster-monitor" }
 local-db = { path = "../local-db" }
+poi = { path = "../poi" }
 railgun-wallet = { path = "../railgun-wallet" }
 sync-service = { path = "../sync-service" }
 waku = { path = "../waku" }

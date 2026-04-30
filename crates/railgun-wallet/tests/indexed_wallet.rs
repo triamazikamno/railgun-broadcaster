@@ -76,6 +76,13 @@ fn indexed_transact_commitment_decrypts_wallet_utxo() {
     assert_eq!(delta.utxos[0].position, 11);
     assert_eq!(delta.utxos[0].note.commitment(), note.commitment());
     assert_eq!(delta.utxos[0].source, source(1));
+    assert_eq!(delta.commitment_observations.len(), 1);
+    assert_eq!(delta.commitment_observations[0].tree, 2);
+    assert_eq!(delta.commitment_observations[0].position, 11);
+    assert_eq!(
+        delta.commitment_observations[0].commitment,
+        note.commitment()
+    );
 }
 
 #[test]
@@ -105,6 +112,13 @@ fn indexed_transact_commitment_ignores_undecryptable_utxo() {
     let delta = parse_delta(&[input], &[], &[], &[], &[], &other_keys);
 
     assert!(delta.utxos.is_empty());
+    assert_eq!(delta.commitment_observations.len(), 1);
+    assert_eq!(delta.commitment_observations[0].tree, 2);
+    assert_eq!(delta.commitment_observations[0].position, 11);
+    assert_eq!(
+        delta.commitment_observations[0].commitment,
+        note.commitment()
+    );
 }
 
 #[test]

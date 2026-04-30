@@ -1,9 +1,10 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::hex;
-use alloy::primitives::FixedBytes;
-use broadcaster_core::transact::FeeNoteAssuranceContext;
+use alloy::primitives::{FixedBytes, U256};
+use broadcaster_core::transact::{FeeNoteAssuranceContext, PreTxPoi};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,8 @@ const PENDING_FEE_NOTE_ASSURANCE_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("fee_note_assurance_pending");
 const TERMINAL_FEE_NOTE_ASSURANCE_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("fee_note_assurance_terminal");
+const PENDING_OUTPUT_POI_CONTEXT_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("pending_output_poi_context");
 const DESKTOP_WALLET_VAULT_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("desktop_wallet_vault_v1");
 
@@ -27,7 +30,7 @@ const META_KEY: &str = "meta";
 const RAILGUN_DIR: &str = "railgun";
 const BLOBS_DIR: &str = "blobs";
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 5;
+pub const CURRENT_SCHEMA_VERSION: u32 = 6;
 
 #[derive(Debug, Clone)]
 pub struct DbConfig {
@@ -145,6 +148,42 @@ pub struct TerminalFeeNoteAssuranceRecord {
     pub public_tx_hash: FixedBytes<32>,
     pub context: FeeNoteAssuranceContext,
     pub outcome: FeeNoteAssuranceTerminalOutcome,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PendingOutputPoiRole {
+    BroadcasterFee,
+    Recipient,
+    Change,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingOutputPoiObservation {
+    pub output_tree: u64,
+    pub output_position: u64,
+    pub tx_hash: FixedBytes<32>,
+    pub block_number: u64,
+    pub block_timestamp: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingOutputPoiContextRecord {
+    pub chain_id: u64,
+    pub wallet_id: String,
+    pub txid_version: String,
+    pub output_commitment: FixedBytes<32>,
+    pub output_npk: FixedBytes<32>,
+    pub utxo_tree_in: u64,
+    pub railgun_txid: U256,
+    pub pre_transaction_pois_per_txid_leaf_per_list:
+        BTreeMap<FixedBytes<32>, BTreeMap<FixedBytes<32>, PreTxPoi>>,
+    pub required_poi_list_keys: Vec<FixedBytes<32>>,
+    pub output_role: PendingOutputPoiRole,
+    pub created_at: u64,
+    pub source_operation_id: Option<String>,
+    pub observation: Option<PendingOutputPoiObservation>,
+    pub submitted_poi_list_keys: Vec<FixedBytes<32>>,
+    pub terminal_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -562,6 +601,51 @@ impl DbStore {
         Ok(())
     }
 
+    pub fn get_pending_output_poi_context(
+        &self,
+        chain_id: u64,
+        output_commitment: &FixedBytes<32>,
+    ) -> Result<Option<PendingOutputPoiContextRecord>, DbError> {
+        let key = pending_output_poi_context_key(chain_id, output_commitment);
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(PENDING_OUTPUT_POI_CONTEXT_TABLE)?;
+        match table.get(key.as_str())? {
+            Some(value) => Ok(Some(decode(value.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn put_pending_output_poi_context(
+        &self,
+        record: &PendingOutputPoiContextRecord,
+    ) -> Result<(), DbError> {
+        let key = pending_output_poi_context_key(record.chain_id, &record.output_commitment);
+        let data = encode(record)?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(PENDING_OUTPUT_POI_CONTEXT_TABLE)?;
+            table.insert(key.as_str(), data.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn list_pending_output_poi_contexts(
+        &self,
+        chain_id: u64,
+    ) -> Result<Vec<PendingOutputPoiContextRecord>, DbError> {
+        let prefix = pending_output_poi_context_prefix(chain_id);
+        let range_end = format!("{prefix}~");
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(PENDING_OUTPUT_POI_CONTEXT_TABLE)?;
+        let mut out = Vec::new();
+        for entry in table.range(prefix.as_str()..range_end.as_str())? {
+            let (_, value) = entry?;
+            out.push(decode(value.value())?);
+        }
+        Ok(out)
+    }
+
     pub fn get_desktop_wallet_vault_record(&self, key: &str) -> Result<Option<Vec<u8>>, DbError> {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(DESKTOP_WALLET_VAULT_TABLE)?;
@@ -681,6 +765,7 @@ impl DbStore {
         txn.open_table(WALLET_META_TABLE)?;
         txn.open_table(PENDING_FEE_NOTE_ASSURANCE_TABLE)?;
         txn.open_table(TERMINAL_FEE_NOTE_ASSURANCE_TABLE)?;
+        txn.open_table(PENDING_OUTPUT_POI_CONTEXT_TABLE)?;
         txn.open_table(DESKTOP_WALLET_VAULT_TABLE)?;
         txn.commit()?;
         Ok(())
@@ -794,14 +879,22 @@ fn fee_note_assurance_prefix(chain_id: u64) -> String {
     format!("{chain_id}|")
 }
 
+fn pending_output_poi_context_key(chain_id: u64, output_commitment: &FixedBytes<32>) -> String {
+    format!("{chain_id}|{}", hex::encode(output_commitment))
+}
+
+fn pending_output_poi_context_prefix(chain_id: u64) -> String {
+    format!("{chain_id}|")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CURRENT_SCHEMA_VERSION, DbConfig, DbStore, Meta, PendingFeeNoteAssuranceRecord, WalletMeta,
-        fee_note_assurance_key,
+        CURRENT_SCHEMA_VERSION, DbConfig, DbStore, Meta, PendingFeeNoteAssuranceRecord,
+        PendingOutputPoiContextRecord, PendingOutputPoiRole, WalletMeta, fee_note_assurance_key,
     };
-    use alloy::primitives::{FixedBytes, U256};
-    use broadcaster_core::transact::FeeNoteAssuranceContext;
+    use alloy::primitives::{Bytes, FixedBytes, U256};
+    use broadcaster_core::transact::{FeeNoteAssuranceContext, PreTxPoi, SnarkJsProof};
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
@@ -838,6 +931,50 @@ mod tests {
                 pre_transaction_pois_per_txid_leaf_per_list: BTreeMap::new(),
                 required_poi_list_keys: vec![FixedBytes::from([4u8; 32])],
             },
+        }
+    }
+
+    fn sample_pre_tx_poi(byte: u8) -> PreTxPoi {
+        PreTxPoi {
+            snark_proof: SnarkJsProof {
+                pi_a: [U256::from(byte), U256::from(byte + 1)],
+                pi_b: [
+                    [U256::from(byte + 2), U256::from(byte + 3)],
+                    [U256::from(byte + 4), U256::from(byte + 5)],
+                ],
+                pi_c: [U256::from(byte + 6), U256::from(byte + 7)],
+            },
+            txid_merkleroot: FixedBytes::from([byte; 32]),
+            poi_merkleroots: vec![FixedBytes::from([byte + 1; 32])],
+            blinded_commitments_out: vec![FixedBytes::from([byte + 2; 32])],
+            railgun_txid_if_has_unshield: Bytes::copy_from_slice(&[0_u8]),
+        }
+    }
+
+    fn sample_pending_output_record(
+        chain_id: u64,
+        output_commitment: FixedBytes<32>,
+    ) -> PendingOutputPoiContextRecord {
+        let list_key = FixedBytes::from([0x44; 32]);
+        let txid_leaf = FixedBytes::from([0x55; 32]);
+        PendingOutputPoiContextRecord {
+            chain_id,
+            wallet_id: "wallet-1".to_string(),
+            txid_version: "V2_PoseidonMerkle".to_string(),
+            output_commitment,
+            output_npk: FixedBytes::from([0x66; 32]),
+            utxo_tree_in: 9,
+            railgun_txid: U256::from(7_u8),
+            pre_transaction_pois_per_txid_leaf_per_list: BTreeMap::from([(list_key, {
+                BTreeMap::from([(txid_leaf, sample_pre_tx_poi(0x10))])
+            })]),
+            required_poi_list_keys: vec![list_key],
+            output_role: PendingOutputPoiRole::Recipient,
+            created_at: 123,
+            source_operation_id: None,
+            observation: None,
+            submitted_poi_list_keys: Vec::new(),
+            terminal_error: None,
         }
     }
 
@@ -959,6 +1096,48 @@ mod tests {
             .expect("list terminal assurance records");
         assert_eq!(terminal_records.len(), 1);
         assert_eq!(terminal_records[0].public_tx_hash, record.public_tx_hash);
+
+        drop(store);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn pending_output_poi_context_roundtrip_and_listing() {
+        let root_dir = temp_db_root();
+        let store = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db");
+
+        let record = sample_pending_output_record(1, FixedBytes::from([0x77; 32]));
+        store
+            .put_pending_output_poi_context(&record)
+            .expect("store pending output POI context");
+
+        let loaded = store
+            .get_pending_output_poi_context(record.chain_id, &record.output_commitment)
+            .expect("load pending output POI context")
+            .expect("record present");
+        assert_eq!(loaded.wallet_id, record.wallet_id);
+        assert_eq!(loaded.txid_version, record.txid_version);
+        assert_eq!(loaded.output_npk, record.output_npk);
+        assert_eq!(loaded.output_role, PendingOutputPoiRole::Recipient);
+        assert_eq!(loaded.required_poi_list_keys, record.required_poi_list_keys);
+        assert!(loaded.observation.is_none());
+        assert!(loaded.submitted_poi_list_keys.is_empty());
+        assert!(loaded.terminal_error.is_none());
+
+        let records = store
+            .list_pending_output_poi_contexts(record.chain_id)
+            .expect("list pending output POI contexts");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].output_commitment, record.output_commitment);
+        assert!(
+            store
+                .list_pending_output_poi_contexts(2)
+                .expect("list other chain pending output POI contexts")
+                .is_empty()
+        );
 
         drop(store);
         fs::remove_dir_all(root_dir).expect("remove temp db dir");

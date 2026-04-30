@@ -13,9 +13,9 @@ use gpui::{
     prelude::FluentBuilder as _, px, relative, rgb, size,
 };
 use gpui_component::{
-    Disableable, Root, Sizable, StyledExt,
-    button::{Button, ButtonVariants},
-    input::{InputEvent, InputState},
+    Disableable, Root, Selectable, Sizable, StyledExt,
+    button::{Button, ButtonGroup, ButtonVariants},
+    input::{Input, InputEvent, InputState},
     popover::Popover,
     resizable::{ResizableState, resizable_panel, v_resizable},
     scroll::ScrollableElement,
@@ -29,7 +29,7 @@ use railgun_ui::{
 };
 use reqwest::Url;
 use tokio::runtime::Handle;
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, watch};
 use ui::clipboard::copy_with_toast;
 use ui::controls::{app_button, app_button_base, app_input, app_muted_text, app_strong_text};
 use ui::icons;
@@ -42,9 +42,9 @@ use wallet_ops::{
     HttpContext, ListUtxosOutput, PreparedSendCall, PreparedUnshieldCall,
     PublicBroadcasterCandidate, PublicBroadcasterCostEstimate, PublicBroadcasterFeeMode,
     PublicBroadcasterResultKind, PublicBroadcasterSelection, PublicBroadcasterSubmissionResult,
-    PublicBroadcasterWakuClient, SyncProgressUpdate, TokenTotal, UtxoOutput,
-    ViewWalletChainSessionRequest, WalletSessionStore, eligible_public_broadcasters_for_asset,
-    estimate_desktop_send_public_broadcaster_cost,
+    PublicBroadcasterWakuClient, SyncProgressUpdate, TokenTotal, TransactionGenerationStage,
+    UtxoOutput, ViewWalletChainSessionRequest, WalletSessionStore,
+    eligible_public_broadcasters_for_asset, estimate_desktop_send_public_broadcaster_cost,
     estimate_desktop_unshield_public_broadcaster_cost, is_wrapped_native_token,
     max_send_amount_from_outputs as planner_max_send_amount_from_outputs,
     max_unshield_amount_from_outputs as planner_max_unshield_amount_from_outputs,
@@ -280,13 +280,25 @@ struct WalletOption {
     label: Arc<str>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PrivateActionMetric {
+    label: &'static str,
+    amount: U256,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CostEstimateStatus {
+    Estimating,
+}
+
+#[derive(Clone, Eq, PartialEq)]
 struct UnshieldAsset {
     chain_id: u64,
     token: Address,
     label: String,
     decimals: Option<u8>,
     total: U256,
+    poi_verified_total: U256,
     max_batched: U256,
     icon_path: Option<PathBuf>,
 }
@@ -320,7 +332,9 @@ struct UnshieldFormState {
     estimating_cost: bool,
     cost_estimate: Option<PublicBroadcasterCostEstimate>,
     estimate_id: u64,
+    generation_id: u64,
     generating: bool,
+    generation_stage: TransactionGenerationStage,
     error: Option<Arc<str>>,
     result: Option<UnshieldResult>,
 }
@@ -339,6 +353,7 @@ struct SendFormState {
     estimate_id: u64,
     generation_id: u64,
     generating: bool,
+    generation_stage: TransactionGenerationStage,
     error: Option<Arc<str>>,
     result: Option<SendResult>,
 }
@@ -486,6 +501,7 @@ pub(crate) struct WalletRoot {
     spend_password_input: Entity<InputState>,
     send_forms: BTreeMap<UnshieldAssetKey, SendFormState>,
     send_generation_seq: u64,
+    unshield_generation_seq: u64,
     cost_estimate_seq: u64,
     unshield_forms: BTreeMap<UnshieldAssetKey, UnshieldFormState>,
     broadcaster_picker: Option<BroadcasterPickerState>,
@@ -605,6 +621,7 @@ impl WalletRoot {
             spend_password_input,
             send_forms: BTreeMap::new(),
             send_generation_seq: 0,
+            unshield_generation_seq: 0,
             cost_estimate_seq: 0,
             unshield_forms: BTreeMap::new(),
             broadcaster_picker: None,
@@ -940,18 +957,21 @@ impl WalletRoot {
                         }
                         let snapshot = snapshots_rx.borrow().clone();
                         let should_continue = this.update(cx, |root, cx| {
-                            let Some(state) = root.chain_states.get_mut(&chain_id) else {
-                                return false;
-                            };
-                            match state {
-                                ChainUtxoState::Syncing { snapshot: current, .. }
-                                | ChainUtxoState::Ready { snapshot: current, .. } => {
-                                    *current = snapshot;
+                            {
+                                let Some(state) = root.chain_states.get_mut(&chain_id) else {
+                                    return false;
+                                };
+                                match state {
+                                    ChainUtxoState::Syncing { snapshot: current, .. }
+                                    | ChainUtxoState::Ready { snapshot: current, .. } => {
+                                        *current = snapshot.clone();
+                                    }
+                                    ChainUtxoState::Idle
+                                    | ChainUtxoState::Loading { .. }
+                                    | ChainUtxoState::Error(_) => return false,
                                 }
-                                ChainUtxoState::Idle
-                                | ChainUtxoState::Loading { .. }
-                                | ChainUtxoState::Error(_) => return false,
                             }
+                            root.refresh_open_form_assets_for_snapshot(&snapshot, cx);
                             if root.selected_chain == chain_id {
                                 root.sync_utxo_table(cx);
                             }
@@ -1223,6 +1243,51 @@ impl WalletRoot {
         }
 
         for (kind, key) in reschedule {
+            self.schedule_public_broadcaster_cost_estimate(kind, key, cx);
+        }
+    }
+
+    fn refresh_open_form_assets_for_snapshot(
+        &mut self,
+        snapshot: &ListUtxosOutput,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let mut reschedule_estimates = Vec::new();
+        for (key, form) in &mut self.send_forms {
+            if key.chain_id != snapshot.chain_id {
+                continue;
+            }
+            let updated = refresh_form_asset_from_snapshot(snapshot, &form.asset, true);
+            if form.asset == updated {
+                continue;
+            }
+            form.asset = updated;
+            if form.delivery_mode == DeliveryMode::PublicBroadcaster && !form.generating {
+                form.cost_estimate = None;
+                form.estimate_id = 0;
+                form.cost_estimate_pending = false;
+                form.estimating_cost = false;
+                reschedule_estimates.push((DeliveryFormKind::Send, *key));
+            }
+        }
+        for (key, form) in &mut self.unshield_forms {
+            if key.chain_id != snapshot.chain_id {
+                continue;
+            }
+            let updated = refresh_form_asset_from_snapshot(snapshot, &form.asset, false);
+            if form.asset == updated {
+                continue;
+            }
+            form.asset = updated;
+            if form.delivery_mode == DeliveryMode::PublicBroadcaster && !form.generating {
+                form.cost_estimate = None;
+                form.estimate_id = 0;
+                form.cost_estimate_pending = false;
+                form.estimating_cost = false;
+                reschedule_estimates.push((DeliveryFormKind::Unshield, *key));
+            }
+        }
+        for (kind, key) in reschedule_estimates {
             self.schedule_public_broadcaster_cost_estimate(kind, key, cx);
         }
     }
@@ -1618,6 +1683,7 @@ impl WalletRoot {
                 estimate_id: 0,
                 generation_id: 0,
                 generating: false,
+                generation_stage: TransactionGenerationStage::default(),
                 error: None,
                 result: None,
             },
@@ -2073,7 +2139,11 @@ impl WalletRoot {
         };
         let session = Arc::clone(session);
         if asset.max_batched.is_zero() {
-            self.set_send_form_error(key, "No private notes are spendable in a batched send", cx);
+            self.set_send_form_error(
+                key,
+                "No POI-verified private notes are spendable in a batched send",
+                cx,
+            );
             return;
         }
 
@@ -2099,7 +2169,7 @@ impl WalletRoot {
             self.set_send_form_error(
                 key,
                 format!(
-                    "Amount exceeds max batched transaction: {}",
+                    "Amount exceeds max POI-verified batched transaction: {}",
                     format_send_amount_input(asset.max_batched, asset.decimals)
                 ),
                 cx,
@@ -2142,9 +2212,11 @@ impl WalletRoot {
 
         self.send_generation_seq = self.send_generation_seq.wrapping_add(1);
         let generation_id = self.send_generation_seq;
+        let (progress_tx, progress_rx) = watch::channel(TransactionGenerationStage::default());
         if let Some(form) = self.send_forms.get_mut(&key) {
             form.generation_id = generation_id;
             form.generating = true;
+            form.generation_stage = TransactionGenerationStage::default();
             form.cost_estimate_pending = false;
             form.estimating_cost = false;
             form.estimate_id = 0;
@@ -2169,6 +2241,7 @@ impl WalletRoot {
                     amount,
                     recipient,
                     verify_proof: true,
+                    progress_tx: Some(progress_tx),
                 };
                 self.runtime.spawn(async move {
                     prepare_desktop_send_calldata(request, &http)
@@ -2192,6 +2265,7 @@ impl WalletRoot {
                     fee_mode: broadcaster_fee_mode,
                     waku,
                     response_timeout: PUBLIC_BROADCASTER_RESPONSE_TIMEOUT,
+                    progress_tx: Some(progress_tx),
                 };
                 self.runtime.spawn(async move {
                     submit_desktop_send_public_broadcaster(request, &http)
@@ -2204,6 +2278,7 @@ impl WalletRoot {
                 return;
             }
         };
+        Self::watch_send_generation_stage(key, generation_id, progress_rx, cx);
         cx.spawn(async move |this, cx| {
             let result = match join.await {
                 Ok(result) => result,
@@ -2232,6 +2307,35 @@ impl WalletRoot {
                 }
                 cx.notify();
             });
+        })
+        .detach();
+    }
+
+    fn watch_send_generation_stage(
+        key: UnshieldAssetKey,
+        generation_id: u64,
+        mut progress_rx: watch::Receiver<TransactionGenerationStage>,
+        cx: &Context<'_, Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            while progress_rx.changed().await.is_ok() {
+                let stage = *progress_rx.borrow_and_update();
+                if this
+                    .update(cx, |root, cx| {
+                        let Some(form) = root.send_forms.get_mut(&key) else {
+                            return;
+                        };
+                        if form.generation_id != generation_id || !form.generating {
+                            return;
+                        }
+                        form.generation_stage = stage;
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
         })
         .detach();
     }
@@ -2331,7 +2435,9 @@ impl WalletRoot {
                 estimating_cost: false,
                 cost_estimate: None,
                 estimate_id: 0,
+                generation_id: 0,
                 generating: false,
+                generation_stage: TransactionGenerationStage::default(),
                 error: None,
                 result: None,
             },
@@ -2360,14 +2466,22 @@ impl WalletRoot {
         form.amount_input.read(cx).value().trim() != default_amount
     }
 
-    fn toggle_unshield_unwrap(&mut self, key: UnshieldAssetKey, cx: &mut Context<'_, Self>) {
+    fn set_unshield_unwrap(
+        &mut self,
+        key: UnshieldAssetKey,
+        unwrap: bool,
+        cx: &mut Context<'_, Self>,
+    ) {
         let Some(form) = self.unshield_forms.get_mut(&key) else {
             return;
         };
-        if !is_wrapped_native_token(form.asset.chain_id, form.asset.token) || form.generating {
+        if !is_wrapped_native_token(form.asset.chain_id, form.asset.token)
+            || form.generating
+            || form.unwrap == unwrap
+        {
             return;
         }
-        form.unwrap = !form.unwrap;
+        form.unwrap = unwrap;
         form.error = None;
         form.result = None;
         form.cost_estimate = None;
@@ -2672,7 +2786,7 @@ impl WalletRoot {
         if asset.max_batched.is_zero() {
             self.set_unshield_form_error(
                 key,
-                "No private notes are spendable in a batched unshield",
+                "No POI-verified private notes are spendable in a batched unshield",
                 cx,
             );
             return;
@@ -2699,7 +2813,7 @@ impl WalletRoot {
             self.set_unshield_form_error(
                 key,
                 format!(
-                    "Amount exceeds max batched transaction: {}",
+                    "Amount exceeds max POI-verified batched transaction: {}",
                     format_unshield_amount_input(asset.max_batched, asset.decimals)
                 ),
                 cx,
@@ -2744,8 +2858,13 @@ impl WalletRoot {
         }
         let vault_password = Self::read_and_clear_input(&password_input, window, cx);
 
+        self.unshield_generation_seq = self.unshield_generation_seq.wrapping_add(1);
+        let generation_id = self.unshield_generation_seq;
+        let (progress_tx, progress_rx) = watch::channel(TransactionGenerationStage::default());
         if let Some(form) = self.unshield_forms.get_mut(&key) {
+            form.generation_id = generation_id;
             form.generating = true;
+            form.generation_stage = TransactionGenerationStage::default();
             form.cost_estimate_pending = false;
             form.estimating_cost = false;
             form.estimate_id = 0;
@@ -2771,6 +2890,7 @@ impl WalletRoot {
                     recipient,
                     unwrap,
                     verify_proof: true,
+                    progress_tx: Some(progress_tx),
                 };
                 self.runtime.spawn(async move {
                     prepare_desktop_unshield_calldata(request, &http)
@@ -2795,6 +2915,7 @@ impl WalletRoot {
                     fee_mode: broadcaster_fee_mode,
                     waku,
                     response_timeout: PUBLIC_BROADCASTER_RESPONSE_TIMEOUT,
+                    progress_tx: Some(progress_tx),
                 };
                 self.runtime.spawn(async move {
                     submit_desktop_unshield_public_broadcaster(request, &http)
@@ -2807,6 +2928,7 @@ impl WalletRoot {
                 return;
             }
         };
+        Self::watch_unshield_generation_stage(key, generation_id, progress_rx, cx);
         cx.spawn(async move |this, cx| {
             let result = match join.await {
                 Ok(result) => result,
@@ -2817,6 +2939,9 @@ impl WalletRoot {
                     return;
                 };
                 if form.asset.chain_id != chain_id || form.asset.token != token {
+                    return;
+                }
+                if form.generation_id != generation_id || !form.generating {
                     return;
                 }
                 form.generating = false;
@@ -2832,6 +2957,35 @@ impl WalletRoot {
                 }
                 cx.notify();
             });
+        })
+        .detach();
+    }
+
+    fn watch_unshield_generation_stage(
+        key: UnshieldAssetKey,
+        generation_id: u64,
+        mut progress_rx: watch::Receiver<TransactionGenerationStage>,
+        cx: &Context<'_, Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            while progress_rx.changed().await.is_ok() {
+                let stage = *progress_rx.borrow_and_update();
+                if this
+                    .update(cx, |root, cx| {
+                        let Some(form) = root.unshield_forms.get_mut(&key) else {
+                            return;
+                        };
+                        if form.generation_id != generation_id || !form.generating {
+                            return;
+                        }
+                        form.generation_stage = stage;
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
         })
         .detach();
     }
@@ -3539,14 +3693,14 @@ impl WalletRoot {
     fn render_private_assets_body(&self, root: &Entity<Self>) -> gpui::AnyElement {
         match self.chain_states.get(&self.selected_chain) {
             Some(ChainUtxoState::Error(error)) => error_message(error.as_ref()).into_any_element(),
-            Some(ChainUtxoState::Loading { .. }) => {
-                centered_message("Loading private balances...").into_any_element()
+            Some(ChainUtxoState::Loading { progress }) => {
+                centered_message(loading_summary(*progress)).into_any_element()
             }
-            Some(ChainUtxoState::Syncing { snapshot, .. }) => {
-                self.render_private_asset_snapshot(root, snapshot, false, true)
-            }
+            Some(ChainUtxoState::Syncing {
+                snapshot, progress, ..
+            }) => self.render_private_asset_snapshot(root, snapshot, false, true, *progress),
             Some(ChainUtxoState::Ready { snapshot, .. }) => {
-                self.render_private_asset_snapshot(root, snapshot, true, false)
+                self.render_private_asset_snapshot(root, snapshot, true, false, None)
             }
             Some(ChainUtxoState::Idle) | None => {
                 centered_message("Select a chain to load private balances").into_any_element()
@@ -3560,13 +3714,34 @@ impl WalletRoot {
         snapshot: &ListUtxosOutput,
         chain_ready: bool,
         syncing: bool,
+        progress: Option<SyncProgressUpdate>,
     ) -> gpui::AnyElement {
         let assets = format_private_asset_rows(snapshot.chain_id, &snapshot.totals);
-        if assets.is_empty() {
+        let asset_keys = assets
+            .iter()
+            .filter_map(unshield_asset_key_from_formatted)
+            .collect::<Vec<_>>();
+        let extra_form_keys = self
+            .send_forms
+            .keys()
+            .filter(|key| key.chain_id == snapshot.chain_id && !asset_keys.contains(key))
+            .map(|key| (DeliveryFormKind::Send, *key))
+            .chain(
+                self.unshield_forms
+                    .keys()
+                    .filter(|key| {
+                        key.chain_id == snapshot.chain_id
+                            && !asset_keys.contains(key)
+                            && !self.send_forms.contains_key(key)
+                    })
+                    .map(|key| (DeliveryFormKind::Unshield, *key)),
+            )
+            .collect::<Vec<_>>();
+        if assets.is_empty() && extra_form_keys.is_empty() {
             return centered_message(if syncing {
-                "Syncing private balances..."
+                loading_summary(progress)
             } else {
-                "No private assets found"
+                "No private assets found".to_string()
             })
             .into_any_element();
         }
@@ -3607,6 +3782,16 @@ impl WalletRoot {
                             )
                             .into_any_element()
                         }
+                    }))
+                    .children(extra_form_keys.into_iter().map(|(kind, key)| {
+                        match kind {
+                            DeliveryFormKind::Send => {
+                                self.render_send_form(root.clone(), key).into_any_element()
+                            }
+                            DeliveryFormKind::Unshield => self
+                                .render_unshield_form(root.clone(), key)
+                                .into_any_element(),
+                        }
                     })),
             )
             .into_any_element()
@@ -3639,6 +3824,8 @@ impl WalletRoot {
         };
         let send_opacity = if can_send { 1.0 } else { 0.5 };
         let unshield_opacity = if can_unshield { 1.0 } else { 0.5 };
+        let show_pending_poi = should_show_pending_poi_amount(asset.pending_poi_total);
+        let pending_poi_amount = asset.pending_poi_amount.clone();
         let send_root = root.clone();
         let unshield_root = root;
 
@@ -3667,13 +3854,23 @@ impl WalletRoot {
                     )),
             )
             .child(
-                div().min_w(px(120.0)).flex().flex_col().items_end().child(
-                    div()
-                        .text_color(rgb(theme::WARNING))
-                        .text_size(theme::BALANCE_TEXT_SIZE)
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .child(SharedString::from(asset.amount)),
-                ),
+                div()
+                    .min_w(px(150.0))
+                    .flex()
+                    .flex_col()
+                    .items_end()
+                    .child(
+                        div()
+                            .text_color(rgb(theme::WARNING))
+                            .text_size(theme::BALANCE_TEXT_SIZE)
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(SharedString::from(asset.amount)),
+                    )
+                    .when(show_pending_poi, |column| {
+                        column.child(app_muted_text(format!(
+                            "*Pending POI: {pending_poi_amount}"
+                        )))
+                    }),
             )
             .child(
                 div()
@@ -3728,8 +3925,6 @@ impl WalletRoot {
             return div();
         };
         let asset = &form.asset;
-        let total_display = format_send_amount_input(asset.total, asset.decimals);
-        let max_display = format_send_amount_input(asset.max_batched, asset.decimals);
         let unit_hint = if asset.decimals.is_some() {
             format!("{} amount", asset.label)
         } else {
@@ -3793,13 +3988,13 @@ impl WalletRoot {
                             }),
                     ),
             )
-            .child(
-                div()
-                    .flex()
-                    .gap_3()
-                    .child(unshield_metric("Total private balance", total_display))
-                    .child(unshield_metric("Max batched transaction", max_display)),
-            );
+            .child(render_private_action_metrics(
+                key,
+                DeliveryFormKind::Send,
+                form.amount_input.clone(),
+                asset,
+                form.generating,
+            ));
 
         if asset.total > asset.max_batched {
             card = card.child(
@@ -3811,7 +4006,7 @@ impl WalletRoot {
                     .border_color(rgb(theme::WARNING))
                     .text_color(rgb(theme::WARNING))
                     .text_size(APP_TEXT_SIZE)
-                    .child("Balance is split across private notes. One send can spend up to 8 proof chunks."),
+                    .child("Spend capacity is limited by private note fragmentation and POI verification status. One send can spend up to 8 proof chunks."),
             );
         }
 
@@ -3851,6 +4046,7 @@ impl WalletRoot {
             .child(
                 div()
                     .flex()
+                    .items_end()
                     .gap_3()
                     .child(
                         div()
@@ -3860,7 +4056,10 @@ impl WalletRoot {
                             .flex_col()
                             .gap_1()
                             .child(app_muted_text("Recipient 0zk address"))
-                            .child(app_input(&form.recipient_input).disabled(form.generating)),
+                            .child(
+                                private_action_input(&form.recipient_input)
+                                    .disabled(form.generating),
+                            ),
                     )
                     .child(
                         div()
@@ -3869,7 +4068,9 @@ impl WalletRoot {
                             .flex_col()
                             .gap_1()
                             .child(app_muted_text(unit_hint))
-                            .child(app_input(&form.amount_input).disabled(form.generating)),
+                            .child(
+                                private_action_input(&form.amount_input).disabled(form.generating),
+                            ),
                     ),
             )
             .child(
@@ -3885,7 +4086,10 @@ impl WalletRoot {
                             .flex_col()
                             .gap_1()
                             .child(app_muted_text("Vault password"))
-                            .child(app_input(&form.password_input).disabled(form.generating)),
+                            .child(
+                                private_action_input(&form.password_input)
+                                    .disabled(form.generating),
+                            ),
                     )
                     .child(
                         app_button(
@@ -3899,8 +4103,6 @@ impl WalletRoot {
                             },
                         )
                         .primary()
-                        .xsmall()
-                        .p(px(12.0))
                         .loading(form.generating)
                         .disabled(form.generating)
                         .on_click(move |_event, window, cx| {
@@ -3912,9 +4114,12 @@ impl WalletRoot {
             );
 
         if form.delivery_mode == DeliveryMode::PublicBroadcaster {
-            if form.cost_estimate_pending || form.estimating_cost {
-                card = card.child(render_public_broadcaster_cost_estimating(
+            if let Some(status) =
+                public_broadcaster_cost_status(form.cost_estimate_pending, form.estimating_cost)
+            {
+                card = card.child(render_public_broadcaster_cost_status(
                     self.unshield_spinner_tick,
+                    status,
                 ));
             } else if let Some(estimate) = form.cost_estimate.as_ref() {
                 card = card.child(render_public_broadcaster_cost_estimate(asset, estimate));
@@ -3924,6 +4129,7 @@ impl WalletRoot {
         if form.generating {
             card = card.child(render_unshield_generating_status(
                 self.unshield_spinner_tick,
+                form.generation_stage,
             ));
         }
 
@@ -3961,8 +4167,6 @@ impl WalletRoot {
         };
         let asset = &form.asset;
         let unwrap_supported = is_wrapped_native_token(asset.chain_id, asset.token);
-        let total_display = format_unshield_amount_input(asset.total, asset.decimals);
-        let max_display = format_unshield_amount_input(asset.max_batched, asset.decimals);
         let unit_hint = if asset.decimals.is_some() {
             format!("{} amount", asset.label)
         } else {
@@ -3977,9 +4181,9 @@ impl WalletRoot {
         let delivery_root = root.clone();
         let chooser_root = root.clone();
         let fee_mode_root = root.clone();
+        let output_root = root.clone();
         let submit_root = root.clone();
-        let cancel_root = root.clone();
-        let toggle_root = root;
+        let cancel_root = root;
 
         let mut card = div()
             .w_full()
@@ -4027,13 +4231,13 @@ impl WalletRoot {
                             }),
                     ),
             )
-            .child(
-                div()
-                    .flex()
-                    .gap_3()
-                    .child(unshield_metric("Total private balance", total_display))
-                    .child(unshield_metric("Max batched transaction", max_display)),
-            );
+            .child(render_private_action_metrics(
+                key,
+                DeliveryFormKind::Unshield,
+                form.amount_input.clone(),
+                asset,
+                form.generating,
+            ));
 
         if asset.total > asset.max_batched {
             card = card.child(
@@ -4045,7 +4249,7 @@ impl WalletRoot {
                     .border_color(rgb(theme::WARNING))
                     .text_color(rgb(theme::WARNING))
                     .text_size(APP_TEXT_SIZE)
-                    .child("Balance is split across private notes. One unshield can spend up to 8 proof chunks."),
+                    .child("Spend capacity is limited by private note fragmentation and POI verification status. One unshield can spend up to 8 proof chunks."),
             );
         }
 
@@ -4085,6 +4289,7 @@ impl WalletRoot {
             .child(
                 div()
                     .flex()
+                    .items_end()
                     .gap_3()
                     .child(
                         div()
@@ -4094,8 +4299,20 @@ impl WalletRoot {
                             .flex_col()
                             .gap_1()
                             .child(app_muted_text("Recipient"))
-                            .child(app_input(&form.recipient_input).disabled(form.generating)),
+                            .child(
+                                private_action_input(&form.recipient_input)
+                                    .disabled(form.generating),
+                            ),
                     )
+                    .children(unwrap_supported.then(|| {
+                        render_unshield_output_toggle(
+                            output_root.clone(),
+                            key,
+                            asset.chain_id,
+                            form.unwrap,
+                            form.generating,
+                        )
+                    }))
                     .child(
                         div()
                             .w(px(220.0))
@@ -4103,7 +4320,9 @@ impl WalletRoot {
                             .flex_col()
                             .gap_1()
                             .child(app_muted_text(unit_hint))
-                            .child(app_input(&form.amount_input).disabled(form.generating)),
+                            .child(
+                                private_action_input(&form.amount_input).disabled(form.generating),
+                            ),
                     ),
             )
             .child(
@@ -4119,21 +4338,11 @@ impl WalletRoot {
                             .flex_col()
                             .gap_1()
                             .child(app_muted_text("Vault password"))
-                            .child(app_input(&form.password_input).disabled(form.generating)),
+                            .child(
+                                private_action_input(&form.password_input)
+                                    .disabled(form.generating),
+                            ),
                     )
-                    .children(unwrap_supported.then(|| {
-                        app_button(unshield_element_id(key, "unwrap"), "Unwrap to native")
-                            .xsmall()
-                            .outline()
-                            .p(px(12.0))
-                            .disabled(form.generating)
-                            .when(form.unwrap, ButtonVariants::primary)
-                            .on_click(move |_event, _window, cx| {
-                                toggle_root.update(cx, |root, cx| {
-                                    root.toggle_unshield_unwrap(key, cx);
-                                });
-                            })
-                    }))
                     .child(
                         app_button(
                             unshield_element_id(key, "generate"),
@@ -4146,8 +4355,6 @@ impl WalletRoot {
                             },
                         )
                         .primary()
-                        .xsmall()
-                        .p(px(12.0))
                         .loading(form.generating)
                         .disabled(form.generating)
                         .on_click(move |_event, window, cx| {
@@ -4159,9 +4366,12 @@ impl WalletRoot {
             );
 
         if form.delivery_mode == DeliveryMode::PublicBroadcaster {
-            if form.cost_estimate_pending || form.estimating_cost {
-                card = card.child(render_public_broadcaster_cost_estimating(
+            if let Some(status) =
+                public_broadcaster_cost_status(form.cost_estimate_pending, form.estimating_cost)
+            {
+                card = card.child(render_public_broadcaster_cost_status(
                     self.unshield_spinner_tick,
+                    status,
                 ));
             } else if let Some(estimate) = form.cost_estimate.as_ref() {
                 card = card.child(render_public_broadcaster_cost_estimate(asset, estimate));
@@ -4171,6 +4381,7 @@ impl WalletRoot {
         if form.generating {
             card = card.child(render_unshield_generating_status(
                 self.unshield_spinner_tick,
+                form.generation_stage,
             ));
         }
 
@@ -4830,6 +5041,8 @@ struct UtxoDisplayRow {
     token: String,
     token_icon_path: Option<PathBuf>,
     amount: String,
+    poi_status: String,
+    poi_spendable: bool,
     source_tx_hash: String,
     source_block_timestamp: u64,
     spent_tx_hash: Option<String>,
@@ -4839,7 +5052,7 @@ struct UtxoDisplayRow {
 
 struct UtxoDelegate {
     rows: Arc<[UtxoDisplayRow]>,
-    columns: [Column; 6],
+    columns: [Column; 7],
     tx_search_input: Entity<InputState>,
 }
 
@@ -4860,6 +5073,7 @@ impl UtxoDelegate {
                 Column::new("amount", "amount")
                     .width(px(160.0))
                     .movable(false),
+                Column::new("poi", "POI").width(px(130.0)).movable(false),
                 Column::new("source_tx", "source tx")
                     .width(px(170.0))
                     .movable(false),
@@ -4947,7 +5161,18 @@ impl TableDelegate for UtxoDelegate {
                 .text_color(utxo_cell_text_color(row, rgb(theme::WARNING)))
                 .child(SharedString::from(row.amount.clone()))
                 .into_any_element(),
-            4 => tx_hash_cell(
+            4 => div()
+                .text_color(utxo_cell_text_color(
+                    row,
+                    if row.poi_spendable {
+                        rgb(theme::TEAL)
+                    } else {
+                        rgb(theme::WARNING)
+                    },
+                ))
+                .child(SharedString::from(row.poi_status.clone()))
+                .into_any_element(),
+            5 => tx_hash_cell(
                 row,
                 row_ix,
                 "source",
@@ -5047,7 +5272,8 @@ fn should_focus_utxo_table(
         && state.is_some_and(ChainUtxoState::renders_table)
 }
 
-fn centered_message(message: &'static str) -> gpui::Div {
+fn centered_message(message: impl Into<SharedString>) -> gpui::Div {
+    let message = message.into();
     div()
         .size_full()
         .flex()
@@ -5055,6 +5281,10 @@ fn centered_message(message: &'static str) -> gpui::Div {
         .justify_center()
         .text_color(rgb(theme::TEXT_SUBTLE))
         .child(message)
+}
+
+fn private_action_input(state: &Entity<InputState>) -> Input {
+    Input::new(state).px(px(12.0)).py(px(8.0))
 }
 
 fn vault_card(title: &'static str, subtitle: impl Into<SharedString>) -> gpui::Div {
@@ -5074,7 +5304,6 @@ fn vault_card(title: &'static str, subtitle: impl Into<SharedString>) -> gpui::D
         .child(app_muted_text(subtitle).line_height(px(18.0)))
 }
 
-#[cfg(test)]
 fn loading_summary(progress: Option<SyncProgressUpdate>) -> String {
     progress.map_or_else(
         || "Preparing wallet sync...".to_string(),
@@ -5209,7 +5438,10 @@ struct FormattedTokenTotal {
     token: Option<Address>,
     label: String,
     amount: String,
+    pending_poi_amount: String,
     total: Option<U256>,
+    poi_verified_total: Option<U256>,
+    pending_poi_total: Option<U256>,
     decimals: Option<u8>,
     icon_path: Option<PathBuf>,
 }
@@ -5228,13 +5460,19 @@ fn format_total(chain_id: u64, total: &TokenTotal) -> String {
 }
 
 fn format_total_parts(chain_id: u64, total: &TokenTotal) -> FormattedTokenTotal {
+    let total_raw = U256::from_str_radix(&total.total, 10).ok();
+    let poi_verified_total_raw = U256::from_str_radix(&total.poi_verified_total, 10).ok();
+    let pending_poi_total = pending_poi_total(total_raw, poi_verified_total_raw);
     let Some(address) = parse_address(&total.token) else {
         return FormattedTokenTotal {
             chain_id,
             token: None,
             label: total.token.clone(),
             amount: total.total.clone(),
-            total: U256::from_str_radix(&total.total, 10).ok(),
+            pending_poi_amount: format_pending_poi_amount(pending_poi_total, None),
+            total: total_raw,
+            poi_verified_total: poi_verified_total_raw,
+            pending_poi_total,
             decimals: None,
             icon_path: None,
         };
@@ -5245,12 +5483,14 @@ fn format_total_parts(chain_id: u64, total: &TokenTotal) -> FormattedTokenTotal 
             token: Some(address),
             label: short_address(&address),
             amount: total.total.clone(),
-            total: U256::from_str_radix(&total.total, 10).ok(),
+            pending_poi_amount: format_pending_poi_amount(pending_poi_total, None),
+            total: total_raw,
+            poi_verified_total: poi_verified_total_raw,
+            pending_poi_total,
             decimals: None,
             icon_path: None,
         };
     };
-    let total_raw = U256::from_str_radix(&total.total, 10).ok();
     let amount = total_raw.map_or_else(
         || total.total.clone(),
         |value| format_token_amount(value, token.decimals),
@@ -5260,10 +5500,36 @@ fn format_total_parts(chain_id: u64, total: &TokenTotal) -> FormattedTokenTotal 
         token: Some(address),
         label: token.symbol.to_owned(),
         amount,
+        pending_poi_amount: format_pending_poi_amount(pending_poi_total, Some(token.decimals)),
         total: total_raw,
+        poi_verified_total: poi_verified_total_raw,
+        pending_poi_total,
         decimals: Some(token.decimals),
         icon_path: token_icon_path(chain_id, &address),
     }
+}
+
+fn pending_poi_total(total: Option<U256>, poi_verified_total: Option<U256>) -> Option<U256> {
+    total
+        .zip(poi_verified_total)
+        .map(|(total, poi_verified_total)| total.saturating_sub(poi_verified_total))
+}
+
+fn format_pending_poi_amount(pending_poi_total: Option<U256>, decimals: Option<u8>) -> String {
+    pending_poi_total.as_ref().map_or_else(
+        || "0".to_string(),
+        |value| {
+            if let Some(decimals) = decimals {
+                format_token_amount(*value, decimals)
+            } else {
+                value.to_string()
+            }
+        },
+    )
+}
+
+fn should_show_pending_poi_amount(pending_poi_total: Option<U256>) -> bool {
+    pending_poi_total.is_some_and(|amount| !amount.is_zero())
 }
 
 fn build_unshield_asset(
@@ -5272,6 +5538,7 @@ fn build_unshield_asset(
 ) -> Option<UnshieldAsset> {
     let token = asset.token?;
     let total = asset.total?;
+    let poi_verified_total = asset.poi_verified_total?;
     let max_batched = max_unshield_amount_from_snapshot(snapshot, token);
     if max_batched.is_zero() {
         return None;
@@ -5282,6 +5549,7 @@ fn build_unshield_asset(
         label: asset.label.clone(),
         decimals: asset.decimals,
         total,
+        poi_verified_total,
         max_batched,
         icon_path: asset.icon_path.clone(),
     })
@@ -5293,6 +5561,7 @@ fn build_send_asset(
 ) -> Option<UnshieldAsset> {
     let token = asset.token?;
     let total = asset.total?;
+    let poi_verified_total = asset.poi_verified_total?;
     let max_batched = max_send_amount_from_snapshot(snapshot, token);
     if max_batched.is_zero() {
         return None;
@@ -5303,9 +5572,52 @@ fn build_send_asset(
         label: asset.label.clone(),
         decimals: asset.decimals,
         total,
+        poi_verified_total,
         max_batched,
         icon_path: asset.icon_path.clone(),
     })
+}
+
+fn refresh_form_asset_from_snapshot(
+    snapshot: &ListUtxosOutput,
+    current: &UnshieldAsset,
+    send: bool,
+) -> UnshieldAsset {
+    let formatted = format_private_asset_rows(snapshot.chain_id, &snapshot.totals)
+        .into_iter()
+        .find(|asset| asset.token == Some(current.token));
+    let total = formatted
+        .as_ref()
+        .and_then(|asset| asset.total)
+        .unwrap_or_default();
+    let poi_verified_total = formatted
+        .as_ref()
+        .and_then(|asset| asset.poi_verified_total)
+        .unwrap_or_default();
+    let max_batched = if send {
+        max_send_amount_from_snapshot(snapshot, current.token)
+    } else {
+        max_unshield_amount_from_snapshot(snapshot, current.token)
+    };
+
+    UnshieldAsset {
+        chain_id: current.chain_id,
+        token: current.token,
+        label: formatted
+            .as_ref()
+            .map_or_else(|| current.label.clone(), |asset| asset.label.clone()),
+        decimals: formatted
+            .as_ref()
+            .and_then(|asset| asset.decimals)
+            .or(current.decimals),
+        total,
+        poi_verified_total,
+        max_batched,
+        icon_path: formatted
+            .as_ref()
+            .and_then(|asset| asset.icon_path.clone())
+            .or_else(|| current.icon_path.clone()),
+    }
 }
 
 fn send_asset_key_from_formatted(asset: &FormattedTokenTotal) -> Option<UnshieldAssetKey> {
@@ -5522,14 +5834,14 @@ fn apply_amount_adjustment_for_max_change(
 fn format_form_error_for_asset(error: &str, asset: &UnshieldAsset) -> String {
     if let Some(max_spendable) = form_error_public_broadcaster_max_entered_amount(error) {
         return format!(
-            "Max entered amount for public broadcaster: {}. Try a smaller amount or switch fee mode.",
+            "Max POI-verified entered amount for public broadcaster: {}. Try a smaller amount or switch fee mode.",
             format_exact_asset_amount_for_display(max_spendable, asset)
         );
     }
 
     if let Some(max_spendable) = form_error_max_immediately_spendable(error) {
         return format!(
-            "Amount exceeds max for public broadcaster: {}. Try a smaller amount or switch fee mode.",
+            "Amount exceeds max POI-verified amount for public broadcaster: {}. Try a smaller amount or switch fee mode.",
             format_exact_asset_amount_for_display(max_spendable, asset)
         );
     }
@@ -5721,19 +6033,89 @@ fn format_send_amount_input(amount: U256, decimals: Option<u8>) -> String {
     format_unshield_amount_input(amount, decimals)
 }
 
-fn unshield_metric(label: &'static str, value: String) -> gpui::Div {
+fn private_action_metrics(asset: &UnshieldAsset) -> Vec<PrivateActionMetric> {
+    let mut metrics = vec![PrivateActionMetric {
+        label: "Total private balance",
+        amount: asset.total,
+    }];
+    if asset.poi_verified_total != asset.total {
+        metrics.push(PrivateActionMetric {
+            label: "POI-verified balance",
+            amount: asset.poi_verified_total,
+        });
+    }
+    if asset.max_batched != asset.total {
+        metrics.push(PrivateActionMetric {
+            label: "Max batched transaction",
+            amount: asset.max_batched,
+        });
+    }
+    metrics
+}
+
+fn render_private_action_metrics(
+    key: UnshieldAssetKey,
+    kind: DeliveryFormKind,
+    amount_input: Entity<InputState>,
+    asset: &UnshieldAsset,
+    disabled: bool,
+) -> gpui::Div {
+    let decimals = asset.decimals;
     div()
-        .flex_1()
-        .min_w(px(0.0))
-        .p(px(10.0))
+        .flex()
+        .flex_wrap()
+        .gap_2()
+        .children(
+            private_action_metrics(asset)
+                .into_iter()
+                .map(move |metric| {
+                    render_private_action_metric(
+                        amount_input.clone(),
+                        delivery_element_id(
+                            key,
+                            kind,
+                            private_action_metric_id_suffix(metric.label),
+                        ),
+                        metric,
+                        decimals,
+                        disabled,
+                    )
+                }),
+        )
+}
+
+fn render_private_action_metric(
+    amount_input: Entity<InputState>,
+    id: SharedString,
+    metric: PrivateActionMetric,
+    decimals: Option<u8>,
+    disabled: bool,
+) -> impl IntoElement {
+    let value = format_unshield_amount_input(metric.amount, decimals);
+    let click_value = value.clone();
+    div()
+        .id(id)
+        .flex_none()
+        .px(px(12.0))
+        .py(px(10.0))
         .rounded_md()
         .bg(rgb(theme::SURFACE_ELEVATED))
         .border_1()
         .border_color(rgb(theme::BORDER))
         .flex()
-        .flex_col()
-        .gap_1()
-        .child(app_muted_text(label))
+        .items_center()
+        .gap_2()
+        .when(!disabled, |this| {
+            this.cursor_pointer()
+                .hover(|this| this.bg(rgb(theme::SURFACE_HOVER)))
+                .on_click(move |_event, window, cx| {
+                    let value = click_value.clone();
+                    amount_input.update(cx, |input, cx| {
+                        input.set_value(value, window, cx);
+                    });
+                })
+        })
+        .child(app_muted_text(metric.label))
         .child(
             div()
                 .text_color(rgb(theme::WARNING))
@@ -5742,7 +6124,16 @@ fn unshield_metric(label: &'static str, value: String) -> gpui::Div {
         )
 }
 
-fn render_unshield_generating_status(tick: usize) -> gpui::Div {
+fn private_action_metric_id_suffix(label: &'static str) -> &'static str {
+    match label {
+        "Total private balance" => "metric-total",
+        "POI-verified balance" => "metric-poi-verified",
+        "Max batched transaction" => "metric-max-batched",
+        _ => "metric",
+    }
+}
+
+fn render_unshield_generating_status(tick: usize, stage: TransactionGenerationStage) -> gpui::Div {
     div()
         .flex()
         .items_center()
@@ -5773,11 +6164,9 @@ fn render_unshield_generating_status(tick: usize) -> gpui::Div {
                     div()
                         .text_color(rgb(theme::TEXT))
                         .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .child("Generating calldata..."),
+                        .child(stage.label()),
                 )
-                .child(app_muted_text(
-                    "Selecting private notes, proving, and encoding the transaction. This can take a minute.",
-                )),
+                .child(app_muted_text(stage.detail())),
         )
 }
 
@@ -5952,6 +6341,56 @@ fn render_broadcaster_chooser(
     list.child(app_muted_text(
         "Open the broadcaster picker to search, inspect, and choose a specific broadcaster.",
     ))
+}
+
+fn render_unshield_output_toggle(
+    root: Entity<WalletRoot>,
+    key: UnshieldAssetKey,
+    chain_id: u64,
+    unwrap: bool,
+    generating: bool,
+) -> gpui::Div {
+    let Some((native_label, wrapped_label)) = native_wrapped_output_labels(chain_id) else {
+        return div();
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(app_muted_text("Output"))
+        .child(
+            ButtonGroup::new(unshield_element_id(key, "output-toggle"))
+                .outline()
+                .disabled(generating)
+                .child(
+                    app_button(unshield_element_id(key, "output-native"), native_label)
+                        .selected(unwrap)
+                        .disabled(generating),
+                )
+                .child(
+                    app_button(unshield_element_id(key, "output-wrapped"), wrapped_label)
+                        .selected(!unwrap)
+                        .disabled(generating),
+                )
+                .on_click(move |selected, _window, cx| {
+                    let Some(index) = selected.first() else {
+                        return;
+                    };
+                    let unwrap = *index == 0;
+                    root.update(cx, |root, cx| {
+                        root.set_unshield_unwrap(key, unwrap, cx);
+                    });
+                }),
+        )
+}
+
+const fn native_wrapped_output_labels(chain_id: u64) -> Option<(&'static str, &'static str)> {
+    match chain_id {
+        1 | 42161 => Some(("ETH", "WETH")),
+        56 => Some(("BNB", "WBNB")),
+        137 => Some(("MATIC", "WMATIC")),
+        _ => None,
+    }
 }
 
 fn render_broadcaster_fee_mode_toggle(
@@ -6240,7 +6679,32 @@ fn render_public_broadcaster_cost_estimate(
         ))
 }
 
-fn render_public_broadcaster_cost_estimating(tick: usize) -> gpui::Div {
+const fn public_broadcaster_cost_status(
+    pending: bool,
+    estimating: bool,
+) -> Option<CostEstimateStatus> {
+    if pending {
+        None
+    } else if estimating {
+        Some(CostEstimateStatus::Estimating)
+    } else {
+        None
+    }
+}
+
+const fn public_broadcaster_cost_status_text(
+    status: CostEstimateStatus,
+) -> (&'static str, &'static str) {
+    match status {
+        CostEstimateStatus::Estimating => (
+            "Estimating public broadcaster cost...",
+            "Using current gas price, broadcaster fee rate, and selected private note shape.",
+        ),
+    }
+}
+
+fn render_public_broadcaster_cost_status(tick: usize, status: CostEstimateStatus) -> gpui::Div {
+    let (title, detail) = public_broadcaster_cost_status_text(status);
     div()
         .flex()
         .items_center()
@@ -6267,10 +6731,8 @@ fn render_public_broadcaster_cost_estimating(tick: usize) -> gpui::Div {
                 .flex()
                 .flex_col()
                 .gap_1()
-                .child(app_strong_text("Estimating public broadcaster cost..."))
-                .child(app_muted_text(
-                    "Using current gas price, broadcaster fee rate, and selected private note shape.",
-                )),
+                .child(app_strong_text(title))
+                .child(app_muted_text(detail)),
         )
 }
 
@@ -6404,6 +6866,8 @@ fn display_row_from_utxo(chain_id: u64, row: &UtxoOutput) -> UtxoDisplayRow {
             token: row.token.clone(),
             token_icon_path: None,
             amount: row.value.clone(),
+            poi_status: format_poi_status(row),
+            poi_spendable: row.poi_spendable,
             source_tx_hash: row.source_tx_hash.clone(),
             source_block_timestamp: row.source_block_timestamp,
             spent_tx_hash: row.spent_tx_hash.clone(),
@@ -6431,11 +6895,27 @@ fn display_row_from_utxo(chain_id: u64, row: &UtxoOutput) -> UtxoDisplayRow {
         token,
         token_icon_path,
         amount,
+        poi_status: format_poi_status(row),
+        poi_spendable: row.poi_spendable,
         source_tx_hash: row.source_tx_hash.clone(),
         source_block_timestamp: row.source_block_timestamp,
         spent_tx_hash: row.spent_tx_hash.clone(),
         token_address: address.to_checksum(None),
         is_spent: row.is_spent,
+    }
+}
+
+fn format_poi_status(row: &UtxoOutput) -> String {
+    if row.poi_statuses.is_empty() {
+        return "Unknown".to_string();
+    }
+    let mut statuses: Vec<_> = row.poi_statuses.values().cloned().collect();
+    statuses.sort();
+    statuses.dedup();
+    if statuses.len() == 1 {
+        statuses.remove(0)
+    } else {
+        statuses.join(", ")
     }
 }
 
@@ -6585,23 +7065,31 @@ const fn vault_error_kind(error: &VaultError) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     use alloy::primitives::{Address, U256};
-    use wallet_ops::{ListUtxosOutput, SyncProgressStage, SyncProgressUpdate, UtxoOutput};
+    use wallet_ops::{
+        ListUtxosOutput, SyncProgressStage, SyncProgressUpdate, TransactionGenerationStage,
+        UtxoOutput,
+    };
 
     use super::{
-        Activity, ChainLoadSource, ChainUtxoState, SECONDS_PER_DAY, SECONDS_PER_HOUR,
-        SECONDS_PER_MINUTE, SECONDS_PER_MONTH, SECONDS_PER_YEAR, UnshieldAsset, UnshieldAssetKey,
-        WalletAppOptions, WalletTab, adjusted_amount_for_max_change, build_send_asset,
-        build_unshield_asset, chain_load_overrides, display_rows_from_output, format_compact_age,
+        Activity, ChainLoadSource, ChainUtxoState, CostEstimateStatus, PrivateActionMetric,
+        SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_MINUTE, SECONDS_PER_MONTH, SECONDS_PER_YEAR,
+        UnshieldAsset, UnshieldAssetKey, WalletAppOptions, WalletTab,
+        adjusted_amount_for_max_change, build_send_asset, build_unshield_asset,
+        chain_load_overrides, display_rows_from_output, format_compact_age,
         format_exact_asset_amount_for_display, format_form_error_for_asset,
         format_private_asset_rows, format_send_amount_input, format_total,
         format_unshield_amount_input, loading_summary, max_send_amount_from_snapshot,
-        max_unshield_amount_from_snapshot, parse_repair_cache_block, progress_detail,
+        max_unshield_amount_from_snapshot, native_wrapped_output_labels, parse_repair_cache_block,
+        private_action_metrics, progress_detail, public_broadcaster_cost_status,
+        public_broadcaster_cost_status_text, refresh_form_asset_from_snapshot,
         send_asset_key_from_formatted, send_element_id, send_key_matches_asset, send_spinner_frame,
-        should_focus_utxo_table, should_show_distinct_amount, unshield_asset_key_from_formatted,
-        unshield_element_id, unshield_key_matches_asset, unshield_spinner_frame,
+        should_focus_utxo_table, should_show_distinct_amount, should_show_pending_poi_amount,
+        unshield_asset_key_from_formatted, unshield_element_id, unshield_key_matches_asset,
+        unshield_spinner_frame,
     };
 
     fn wallet_options_with_overrides() -> WalletAppOptions {
@@ -6643,6 +7131,17 @@ mod tests {
             position: 7,
             token: token.to_string(),
             value: value.to_string(),
+            commitment_kind: "Transact".to_string(),
+            commitment: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+            npk: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            blinded_commitment:
+                "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string(),
+            poi_statuses: BTreeMap::from([(
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string(),
+                if is_spent { "Unknown" } else { "Valid" }.to_string(),
+            )]),
+            poi_spendable: !is_spent,
             source_tx_hash: source_tx_hash.to_string(),
             source_block_number: 11,
             source_block_timestamp: 1_700_000_011,
@@ -6658,6 +7157,17 @@ mod tests {
             position,
             token: token.to_checksum(None),
             value: value.to_string(),
+            commitment_kind: "Transact".to_string(),
+            commitment: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+            npk: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            blinded_commitment:
+                "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string(),
+            poi_statuses: BTreeMap::from([(
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string(),
+                "Valid".to_string(),
+            )]),
+            poi_spendable: true,
             source_tx_hash: "0x1111111111111111111111111111111111111111111111111111111111111111"
                 .to_string(),
             source_block_number: 11,
@@ -6688,6 +7198,8 @@ mod tests {
         assert_eq!(rows[0].token, "USDC");
         assert_eq!(rows[0].amount, "1.23");
         assert_eq!(rows[0].tree_position, "0/7");
+        assert_eq!(rows[0].poi_status, "Valid");
+        assert!(rows[0].poi_spendable);
         assert_eq!(rows[0].source_block_timestamp, 1_700_000_011);
         assert!(rows[0].token_icon_path.is_some());
         assert!(!rows[0].is_spent);
@@ -6752,6 +7264,7 @@ mod tests {
         let total = wallet_ops::TokenTotal {
             token: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string(),
             total: "1234567".to_string(),
+            poi_verified_total: "1234567".to_string(),
         };
 
         assert_eq!(format_total(1, &total), "USDC 1.23");
@@ -6765,6 +7278,7 @@ mod tests {
             label: "USDC".to_string(),
             decimals: Some(6),
             total: U256::ZERO,
+            poi_verified_total: U256::ZERO,
             max_batched: U256::ZERO,
             icon_path: None,
         };
@@ -6776,7 +7290,7 @@ mod tests {
 
         assert_eq!(
             formatted,
-            "Max entered amount for public broadcaster: 388.58577 USDC. Try a smaller amount or switch fee mode."
+            "Max POI-verified entered amount for public broadcaster: 388.58577 USDC. Try a smaller amount or switch fee mode."
         );
     }
 
@@ -6788,6 +7302,7 @@ mod tests {
             label: "USDC".to_string(),
             decimals: Some(6),
             total: U256::ZERO,
+            poi_verified_total: U256::ZERO,
             max_batched: U256::ZERO,
             icon_path: None,
         };
@@ -6811,6 +7326,21 @@ mod tests {
             entered,
             entered + U256::from(1_u8)
         ));
+    }
+
+    #[test]
+    fn public_broadcaster_cost_status_separates_pending_from_estimating() {
+        assert_eq!(public_broadcaster_cost_status(true, false), None);
+        assert_eq!(
+            public_broadcaster_cost_status(false, true),
+            Some(CostEstimateStatus::Estimating)
+        );
+        assert_eq!(public_broadcaster_cost_status(true, true), None);
+        assert_eq!(public_broadcaster_cost_status(false, false), None);
+        assert_eq!(
+            public_broadcaster_cost_status_text(CostEstimateStatus::Estimating).0,
+            "Estimating public broadcaster cost..."
+        );
     }
 
     #[test]
@@ -6872,13 +7402,33 @@ mod tests {
         let totals = [wallet_ops::TokenTotal {
             token: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string(),
             total: "1234567".to_string(),
+            poi_verified_total: "1000000".to_string(),
         }];
 
         let rows = format_private_asset_rows(1, &totals);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].label, "USDC");
         assert_eq!(rows[0].amount, "1.23");
+        assert_eq!(rows[0].pending_poi_amount, "0.23457");
+        assert_eq!(rows[0].pending_poi_total, Some(U256::from(234_567_u64)));
+        assert!(should_show_pending_poi_amount(rows[0].pending_poi_total));
         assert!(rows[0].icon_path.is_some());
+    }
+
+    #[test]
+    fn private_asset_rows_hide_zero_pending_poi() {
+        let totals = [wallet_ops::TokenTotal {
+            token: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string(),
+            total: "1234567".to_string(),
+            poi_verified_total: "1234567".to_string(),
+        }];
+
+        let rows = format_private_asset_rows(1, &totals);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].pending_poi_amount, "0");
+        assert_eq!(rows[0].pending_poi_total, Some(U256::ZERO));
+        assert!(!should_show_pending_poi_amount(rows[0].pending_poi_total));
     }
 
     #[test]
@@ -6926,6 +7476,89 @@ mod tests {
     }
 
     #[test]
+    fn transaction_generation_stage_text_is_specific() {
+        assert_eq!(
+            TransactionGenerationStage::SelectingPrivateNotes.label(),
+            "Selecting private notes"
+        );
+        assert_eq!(
+            TransactionGenerationStage::ProvingTransaction.detail(),
+            "Generating the zero-knowledge proof. This is usually the slowest step."
+        );
+        assert_eq!(
+            TransactionGenerationStage::PublishingToBroadcaster.label(),
+            "Publishing to broadcaster"
+        );
+        assert_eq!(
+            TransactionGenerationStage::WaitingForBroadcasterResponse.detail(),
+            "Waiting for the selected broadcaster to respond."
+        );
+    }
+
+    #[test]
+    fn private_action_metrics_hide_values_matching_total() {
+        let token = Address::from([0x11; 20]);
+        let mut asset = UnshieldAsset {
+            chain_id: 1,
+            token,
+            label: "WETH".to_string(),
+            decimals: Some(18),
+            total: U256::from(10_u8),
+            poi_verified_total: U256::from(10_u8),
+            max_batched: U256::from(10_u8),
+            icon_path: None,
+        };
+
+        assert_eq!(
+            private_action_metrics(&asset),
+            vec![PrivateActionMetric {
+                label: "Total private balance",
+                amount: U256::from(10_u8),
+            }]
+        );
+
+        asset.poi_verified_total = U256::from(7_u8);
+        assert_eq!(
+            private_action_metrics(&asset),
+            vec![
+                PrivateActionMetric {
+                    label: "Total private balance",
+                    amount: U256::from(10_u8),
+                },
+                PrivateActionMetric {
+                    label: "POI-verified balance",
+                    amount: U256::from(7_u8),
+                },
+            ]
+        );
+
+        asset.poi_verified_total = asset.total;
+        asset.max_batched = U256::from(8_u8);
+        assert_eq!(
+            private_action_metrics(&asset),
+            vec![
+                PrivateActionMetric {
+                    label: "Total private balance",
+                    amount: U256::from(10_u8),
+                },
+                PrivateActionMetric {
+                    label: "Max batched transaction",
+                    amount: U256::from(8_u8),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn native_wrapped_output_labels_are_chain_specific() {
+        assert_eq!(native_wrapped_output_labels(1), Some(("ETH", "WETH")));
+        assert_eq!(native_wrapped_output_labels(56), Some(("BNB", "WBNB")));
+        assert_eq!(native_wrapped_output_labels(137), Some(("MATIC", "WMATIC")));
+        assert_eq!(native_wrapped_output_labels(42161), Some(("ETH", "WETH")));
+        assert_eq!(native_wrapped_output_labels(999_999), None);
+    }
+
+    #[test]
     fn max_unshield_amount_from_snapshot_uses_batched_top_chunks() {
         let token = Address::from([0x11; 20]);
         let other = Address::from([0x22; 20]);
@@ -6934,6 +7567,10 @@ mod tests {
             .collect::<Vec<_>>();
         utxos.extend((0..5).map(|position| unshield_utxo_output(token, 3, 1, position)));
         utxos.push(unshield_utxo_output(other, 100, 1, 99));
+        let mut unknown = unshield_utxo_output(token, 100, 2, 1);
+        unknown.poi_statuses.clear();
+        unknown.poi_spendable = false;
+        utxos.push(unknown);
         let snapshot = ListUtxosOutput {
             chain_id: 1,
             cache_key: "cache".to_string(),
@@ -6951,6 +7588,89 @@ mod tests {
     }
 
     #[test]
+    fn refreshed_form_asset_tracks_new_utxos() {
+        let token = Address::from([0x11; 20]);
+        let original_snapshot = ListUtxosOutput {
+            chain_id: 1,
+            cache_key: "cache".to_string(),
+            utxo_count: 1,
+            unspent_count: 1,
+            spent_count: 0,
+            utxos: vec![unshield_utxo_output(token, 5, 0, 1)],
+            totals: vec![wallet_ops::TokenTotal {
+                token: token.to_checksum(None),
+                total: "5".to_string(),
+                poi_verified_total: "5".to_string(),
+            }],
+        };
+        let original_row = format_private_asset_rows(1, &original_snapshot.totals)
+            .pop()
+            .expect("formatted row");
+        let original_asset =
+            build_unshield_asset(&original_snapshot, &original_row).expect("original asset");
+        let updated_snapshot = ListUtxosOutput {
+            chain_id: 1,
+            cache_key: "cache".to_string(),
+            utxo_count: 2,
+            unspent_count: 2,
+            spent_count: 0,
+            utxos: vec![
+                unshield_utxo_output(token, 5, 0, 1),
+                unshield_utxo_output(token, 3, 0, 2),
+            ],
+            totals: vec![wallet_ops::TokenTotal {
+                token: token.to_checksum(None),
+                total: "8".to_string(),
+                poi_verified_total: "8".to_string(),
+            }],
+        };
+
+        let updated = refresh_form_asset_from_snapshot(&updated_snapshot, &original_asset, false);
+
+        assert_eq!(updated.total, U256::from(8_u8));
+        assert_eq!(updated.poi_verified_total, U256::from(8_u8));
+        assert_eq!(updated.max_batched, U256::from(8_u8));
+    }
+
+    #[test]
+    fn refreshed_form_asset_tracks_spent_out_token() {
+        let token = Address::from([0x11; 20]);
+        let original_asset = UnshieldAsset {
+            chain_id: 1,
+            token,
+            label: "WETH".to_string(),
+            decimals: Some(18),
+            total: U256::from(5_u8),
+            poi_verified_total: U256::from(5_u8),
+            max_batched: U256::from(5_u8),
+            icon_path: None,
+        };
+        let mut spent = unshield_utxo_output(token, 5, 0, 1);
+        spent.is_spent = true;
+        spent.poi_spendable = false;
+        spent.spent_tx_hash =
+            Some("0x2222222222222222222222222222222222222222222222222222222222222222".to_string());
+        spent.spent_block_number = Some(21);
+        let updated_snapshot = ListUtxosOutput {
+            chain_id: 1,
+            cache_key: "cache".to_string(),
+            utxo_count: 1,
+            unspent_count: 0,
+            spent_count: 1,
+            utxos: vec![spent],
+            totals: Vec::new(),
+        };
+
+        let updated = refresh_form_asset_from_snapshot(&updated_snapshot, &original_asset, false);
+
+        assert_eq!(updated.label, "WETH");
+        assert_eq!(updated.decimals, Some(18));
+        assert_eq!(updated.total, U256::ZERO);
+        assert_eq!(updated.poi_verified_total, U256::ZERO);
+        assert_eq!(updated.max_batched, U256::ZERO);
+    }
+
+    #[test]
     fn max_send_amount_from_snapshot_uses_batched_top_chunks() {
         let token = Address::from([0x12; 20]);
         let other = Address::from([0x22; 20]);
@@ -6959,6 +7679,10 @@ mod tests {
             .collect::<Vec<_>>();
         utxos.extend((0..5).map(|position| unshield_utxo_output(token, 3, 1, position)));
         utxos.push(unshield_utxo_output(other, 100, 1, 99));
+        let mut unknown = unshield_utxo_output(token, 100, 2, 1);
+        unknown.poi_statuses.clear();
+        unknown.poi_spendable = false;
+        utxos.push(unknown);
         let snapshot = ListUtxosOutput {
             chain_id: 1,
             cache_key: "cache".to_string(),
@@ -6991,6 +7715,7 @@ mod tests {
             totals: vec![wallet_ops::TokenTotal {
                 token: token.to_checksum(None),
                 total: "12".to_string(),
+                poi_verified_total: "12".to_string(),
             }],
         };
         let row = format_private_asset_rows(1, &snapshot.totals)
@@ -7020,6 +7745,7 @@ mod tests {
             totals: vec![wallet_ops::TokenTotal {
                 token: token.to_checksum(None),
                 total: "12".to_string(),
+                poi_verified_total: "12".to_string(),
             }],
         };
         let row = format_private_asset_rows(1, &snapshot.totals)
@@ -7043,10 +7769,12 @@ mod tests {
                 wallet_ops::TokenTotal {
                     token: token.to_checksum(None),
                     total: "5".to_string(),
+                    poi_verified_total: "5".to_string(),
                 },
                 wallet_ops::TokenTotal {
                     token: other.to_checksum(None),
                     total: "7".to_string(),
+                    poi_verified_total: "7".to_string(),
                 },
             ],
         );
@@ -7067,10 +7795,12 @@ mod tests {
                 wallet_ops::TokenTotal {
                     token: token.to_checksum(None),
                     total: "5".to_string(),
+                    poi_verified_total: "5".to_string(),
                 },
                 wallet_ops::TokenTotal {
                     token: other.to_checksum(None),
                     total: "7".to_string(),
+                    poi_verified_total: "7".to_string(),
                 },
             ],
         );
@@ -7315,13 +8045,16 @@ mod tests {
 
     #[test]
     fn loading_summary_uses_sync_stage_and_percent() {
-        let progress =
+        let commitments =
             SyncProgressUpdate::new(SyncProgressStage::SynchronizingCommitments, 100, 150, 300);
+        let indexing = SyncProgressUpdate::new(SyncProgressStage::IndexingUtxos, 100, 150, 300);
 
         assert_eq!(
-            loading_summary(Some(progress)),
+            loading_summary(Some(commitments)),
             "Synchronizing commitments · 25%"
         );
+        assert_eq!(loading_summary(Some(indexing)), "Indexing UTXOs · 25%");
+        assert_eq!(loading_summary(None), "Preparing wallet sync...");
     }
 
     #[test]

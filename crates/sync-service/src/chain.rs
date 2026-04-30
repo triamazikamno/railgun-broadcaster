@@ -3,7 +3,9 @@ use crate::types::{
     SyncProgressStage, SyncProgressUpdate, WalletConfig,
 };
 use crate::wallet::{
-    WalletHandle, apply_wallet_delta_to_vec, spawn_wallet_worker, wallet_cache_store,
+    PendingOutputPoiSubmitter, WalletHandle, apply_wallet_delta_to_vec,
+    process_pending_output_poi_observations, refresh_wallet_poi_statuses, spawn_wallet_worker,
+    wallet_cache_store, wallet_poi_status_client, wallet_poi_status_refresh_needed,
 };
 use alloy::eips::BlockNumberOrTag;
 use alloy::primitives::Address;
@@ -34,6 +36,7 @@ use merkletree::wallet::{
     IndexedNullifierInput, IndexedShieldCommitmentInput, IndexedTransactCommitmentInput,
     WalletScanError, apply_commitment_updates_from_logs, parse_indexed_wallet_delta,
 };
+use poi::poi::default_active_poi_list_keys;
 use railgun_wallet::UtxoSource;
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
@@ -497,6 +500,8 @@ impl ChainService {
         );
 
         let cache_store = wallet_cache_store(&self.db, cfg);
+        let poi_client = wallet_poi_status_client();
+        let active_poi_list_keys = default_active_poi_list_keys();
         let mut checkpoint = last_scanned;
         while from_block <= target {
             if cancel.is_cancelled() {
@@ -533,9 +538,34 @@ impl ChainService {
                 &page.nullifiers,
                 &cfg.scan_keys,
             );
-            let (indexed_total, indexed_unspent, indexed_spent, changed) = {
+            let poi_submitter = poi_client
+                .as_ref()
+                .map(|client| client as &dyn PendingOutputPoiSubmitter);
+            process_pending_output_poi_observations(
+                self.db.as_ref(),
+                self.chain.chain_id,
+                &delta.commitment_observations,
+                poi_submitter,
+            )
+            .await;
+            let (indexed_total, indexed_unspent, indexed_spent, changed, poi_status_changed) = {
                 let mut wallet_utxos = handle.utxos.write().await;
-                let changed = apply_wallet_delta_to_vec(cfg, &mut wallet_utxos, delta);
+                let mut changed = apply_wallet_delta_to_vec(cfg, &mut wallet_utxos, delta);
+                let poi_status_changed = if changed
+                    && wallet_poi_status_refresh_needed(&wallet_utxos, &active_poi_list_keys)
+                    && let Some(client) = poi_client.as_ref()
+                {
+                    refresh_wallet_poi_statuses(
+                        client,
+                        self.chain.chain_id,
+                        &active_poi_list_keys,
+                        &mut wallet_utxos,
+                    )
+                    .await
+                } else {
+                    false
+                };
+                changed |= poi_status_changed;
                 let indexed_spent = wallet_utxos.iter().filter(|utxo| utxo.is_spent()).count();
                 let indexed_unspent = wallet_utxos.len().saturating_sub(indexed_spent);
                 if let Err(err) = cache_store.store_wallet_utxos(
@@ -552,7 +582,13 @@ impl ChainService {
                     );
                     return checkpoint;
                 }
-                (wallet_utxos.len(), indexed_unspent, indexed_spent, changed)
+                (
+                    wallet_utxos.len(),
+                    indexed_unspent,
+                    indexed_spent,
+                    changed,
+                    poi_status_changed,
+                )
             };
             if changed {
                 handle.notify_changed();
@@ -572,6 +608,7 @@ impl ChainService {
                 total = indexed_total,
                 unspent = indexed_unspent,
                 spent = indexed_spent,
+                poi_status_changed,
                 "indexed wallet catch-up page complete"
             );
             from_block = checkpoint.saturating_add(1);

@@ -10,6 +10,7 @@ use gpui_component::{
     popover::Popover,
     scroll::ScrollableElement,
     table::{Column, ColumnSort, TableDelegate, TableState},
+    tooltip::Tooltip,
     v_flex,
 };
 use std::sync::Arc;
@@ -408,13 +409,23 @@ impl TableDelegate for FeesDelegate {
                     .into_any_element()
             }
             3 => {
+                let raw_fee = row.fee.to_string();
                 let label = lookup_token(row.chain_id, &row.token_address).map_or_else(
-                    || row.fee.to_string(),
+                    || raw_fee.clone(),
                     |info| format_token_amount(row.fee, info.decimals),
                 );
                 div()
+                    .id(SharedString::from(format!("fee-cell-{row_ix}")))
+                    .cursor_pointer()
                     .text_color(rgb(theme::WARNING))
+                    .tooltip({
+                        let raw_fee = raw_fee.clone();
+                        move |window, cx| Tooltip::new(raw_fee.clone()).build(window, cx)
+                    })
                     .child(SharedString::from(label))
+                    .on_click(move |_event, window, cx| {
+                        copy_with_toast(raw_fee.clone(), window, cx);
+                    })
                     .into_any_element()
             }
             4 => {

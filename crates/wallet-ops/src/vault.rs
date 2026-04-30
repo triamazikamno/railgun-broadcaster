@@ -2310,7 +2310,7 @@ mod tests {
     #[test]
     fn encrypted_cache_store_hides_wallet_history_details() {
         use alloy::primitives::{FixedBytes, U256};
-        use railgun_wallet::{Note, Utxo, UtxoSource};
+        use railgun_wallet::{Note, Utxo, UtxoCommitmentKind, UtxoSource};
         use sync_service::WalletCacheStore;
 
         let root_dir = temp_db_root();
@@ -2352,21 +2352,22 @@ mod tests {
         )
         .expect("encrypted cache store");
         let wallet_utxo = WalletUtxo {
-            utxo: Utxo {
-                note: Note {
+            utxo: Utxo::new(
+                Note {
                     token_hash: U256::from_be_bytes([0x44; KEY_LEN]),
                     value: U256::from_be_bytes([0x55; KEY_LEN]),
                     random: [0x66; 16],
                     npk: U256::from_be_bytes([0x77; KEY_LEN]),
                 },
-                tree: 7,
-                position: 42,
-                source: UtxoSource {
+                7,
+                42,
+                UtxoSource {
                     tx_hash: FixedBytes::from([0x88; KEY_LEN]),
                     block_number: 123,
                     block_timestamp: 1_700_000_123,
                 },
-            },
+                UtxoCommitmentKind::Transact,
+            ),
             spent: Some(UtxoSource {
                 tx_hash: FixedBytes::from([0x99; KEY_LEN]),
                 block_number: 124,
@@ -2429,7 +2430,7 @@ mod tests {
     #[test]
     fn encrypted_cache_upsert_does_not_delete_existing_rows() {
         use alloy::primitives::{FixedBytes, U256};
-        use railgun_wallet::{Note, Utxo, UtxoSource};
+        use railgun_wallet::{Note, Utxo, UtxoCommitmentKind, UtxoSource};
         use sync_service::WalletCacheStore;
 
         let root_dir = temp_db_root();
@@ -2471,21 +2472,22 @@ mod tests {
         )
         .expect("encrypted cache store");
         let first = WalletUtxo {
-            utxo: Utxo {
-                note: Note {
+            utxo: Utxo::new(
+                Note {
                     token_hash: U256::from_be_bytes([0x11; KEY_LEN]),
                     value: U256::from(1_u8),
                     random: [0x22; 16],
                     npk: U256::from_be_bytes([0x33; KEY_LEN]),
                 },
-                tree: 3,
-                position: 1,
-                source: UtxoSource {
+                3,
+                1,
+                UtxoSource {
                     tx_hash: FixedBytes::from([0x44; KEY_LEN]),
                     block_number: 101,
                     block_timestamp: 1_700_000_101,
                 },
-            },
+                UtxoCommitmentKind::Transact,
+            ),
             spent: None,
         };
         let mut second = first.clone();

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use alloy::eips::Encodable2718;
 use alloy::hex;
@@ -18,24 +18,27 @@ use broadcaster_core::crypto::railgun::{Address as RailgunAddress, AddressData};
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use broadcaster_core::transact::{
     BroadcasterRawParamsTransact, DEFAULT_TXID_VERSION, build_transact_request_payload,
-    encrypt_transact_request,
+    encrypt_transact_request, railgun_txid_leaf_hash,
 };
 use broadcaster_core::transact_response::{
     DecryptedTransactResponse, try_decrypt_transact_response_message,
 };
 use broadcaster_monitor::FeeRow;
 use eyre::{Report, Result, WrapErr, eyre};
-use local_db::{DbConfig, DbStore};
+use local_db::{DbConfig, DbStore, PendingOutputPoiContextRecord, PendingOutputPoiRole};
+use poi::poi::{DEFAULT_WALLET_POI_RPC_URL, PoiRpcClient, default_active_poi_list_keys};
 use railgun_wallet::artifacts::ArtifactSource;
 use railgun_wallet::tx::{
-    BroadcasterFeeOutput, BuildError, SendPlan, SendRequest as RailgunSendRequest, UnshieldMode,
-    UnshieldPlan, UnshieldRequest as RailgunUnshieldRequest, max_send_spendable,
+    BroadcasterFeeOutput, BuildError, PreTransactionPoiGenerationRequest, PreTransactionPoiMap,
+    SendPlan, SendRequest as RailgunSendRequest, TransactionPlanChunk, UnshieldMode, UnshieldPlan,
+    UnshieldRequest as RailgunUnshieldRequest, generate_pre_transaction_pois, max_send_spendable,
     max_unshield_spendable, send_selection_info, send_selection_info_with_broadcaster_fee,
     unshield_selection_info, unshield_selection_info_with_broadcaster_fee,
 };
 use railgun_wallet::wallet_cache::wallet_cache_key;
 use railgun_wallet::{
-    Note, ProverService, TransactionBuilder, Utxo, UtxoSource, WalletKeys, WalletUtxo,
+    Note, PoiStatus, ProverService, TransactionBuilder, Utxo, UtxoCommitmentKind, UtxoSource,
+    WalletKeys, WalletUtxo,
 };
 use rand::seq::IndexedRandom;
 use reqwest::Url;
@@ -201,6 +204,7 @@ pub struct DesktopUnshieldCalldataRequest {
     pub recipient: Address,
     pub unwrap: bool,
     pub verify_proof: bool,
+    pub progress_tx: Option<TransactionGenerationProgressSender>,
 }
 
 pub struct DesktopSendCalldataRequest {
@@ -213,6 +217,7 @@ pub struct DesktopSendCalldataRequest {
     pub amount: U256,
     pub recipient: String,
     pub verify_proof: bool,
+    pub progress_tx: Option<TransactionGenerationProgressSender>,
 }
 
 #[derive(Debug, Clone)]
@@ -247,6 +252,60 @@ pub enum PublicBroadcasterFeeMode {
     AddToAmount,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TransactionGenerationStage {
+    #[default]
+    SelectingPrivateNotes,
+    ProvingTransaction,
+    EstimatingBroadcasterFee,
+    GeneratingPoiProofs,
+    PublishingToBroadcaster,
+    WaitingForBroadcasterResponse,
+}
+
+impl TransactionGenerationStage {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::SelectingPrivateNotes => "Selecting private notes",
+            Self::ProvingTransaction => "Proving transaction",
+            Self::EstimatingBroadcasterFee => "Estimating broadcaster fee",
+            Self::GeneratingPoiProofs => "Generating POI proofs",
+            Self::PublishingToBroadcaster => "Publishing to broadcaster",
+            Self::WaitingForBroadcasterResponse => "Waiting for broadcaster response",
+        }
+    }
+
+    #[must_use]
+    pub const fn detail(self) -> &'static str {
+        match self {
+            Self::SelectingPrivateNotes => {
+                "Finding POI-verified notes that cover the amount and fee."
+            }
+            Self::ProvingTransaction => {
+                "Generating the zero-knowledge proof. This is usually the slowest step."
+            }
+            Self::EstimatingBroadcasterFee => "Checking gas cost and broadcaster fee requirements.",
+            Self::GeneratingPoiProofs => "Generating POI proofs for transaction outputs.",
+            Self::PublishingToBroadcaster => "Encrypting and publishing the request over Waku.",
+            Self::WaitingForBroadcasterResponse => {
+                "Waiting for the selected broadcaster to respond."
+            }
+        }
+    }
+}
+
+pub type TransactionGenerationProgressSender = watch::Sender<TransactionGenerationStage>;
+
+fn update_transaction_generation_stage(
+    progress_tx: Option<&TransactionGenerationProgressSender>,
+    stage: TransactionGenerationStage,
+) {
+    if let Some(progress_tx) = progress_tx {
+        let _ = progress_tx.send(stage);
+    }
+}
+
 pub struct DesktopUnshieldPublicBroadcasterRequest {
     pub chain_id: u64,
     pub view_session: Arc<vault::DesktopViewSession>,
@@ -263,6 +322,7 @@ pub struct DesktopUnshieldPublicBroadcasterRequest {
     pub fee_mode: PublicBroadcasterFeeMode,
     pub waku: Arc<WakuClient>,
     pub response_timeout: Duration,
+    pub progress_tx: Option<TransactionGenerationProgressSender>,
 }
 
 pub struct DesktopSendPublicBroadcasterRequest {
@@ -280,6 +340,7 @@ pub struct DesktopSendPublicBroadcasterRequest {
     pub fee_mode: PublicBroadcasterFeeMode,
     pub waku: Arc<WakuClient>,
     pub response_timeout: Duration,
+    pub progress_tx: Option<TransactionGenerationProgressSender>,
 }
 
 pub struct DesktopUnshieldPublicBroadcasterEstimateRequest {
@@ -353,6 +414,7 @@ pub struct PublicBroadcasterSubmissionResult {
 #[derive(Debug, Clone)]
 struct PreparedPublicBroadcasterPlan<P> {
     plan: P,
+    pre_transaction_pois_per_txid_leaf_per_list: PreTransactionPoiMap,
     broadcaster: PublicBroadcasterCandidate,
     entered_amount: U256,
     receiver_amount: U256,
@@ -422,6 +484,12 @@ pub struct UtxoOutput {
     pub position: u64,
     pub token: String,
     pub value: String,
+    pub commitment_kind: String,
+    pub commitment: String,
+    pub npk: String,
+    pub blinded_commitment: String,
+    pub poi_statuses: BTreeMap<String, String>,
+    pub poi_spendable: bool,
     pub source_tx_hash: String,
     pub source_block_number: u64,
     pub source_block_timestamp: u64,
@@ -434,6 +502,7 @@ pub struct UtxoOutput {
 pub struct TokenTotal {
     pub token: String,
     pub total: String,
+    pub poi_verified_total: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -463,6 +532,7 @@ fn planner_utxos_from_outputs(utxos: &[UtxoOutput], token: Address) -> Vec<Utxo>
     utxos
         .iter()
         .filter(|row| !row.is_spent)
+        .filter(|row| row.poi_spendable)
         .filter_map(|row| {
             let row_token = row.token.parse::<Address>().ok()?;
             if row_token != token {
@@ -472,16 +542,17 @@ fn planner_utxos_from_outputs(utxos: &[UtxoOutput], token: Address) -> Vec<Utxo>
             if value.is_zero() {
                 return None;
             }
-            Some(Utxo {
-                note: Note::new_unshield(Address::ZERO, token, value),
-                tree: row.tree,
-                position: row.position,
-                source: UtxoSource {
+            Some(Utxo::new(
+                Note::new_unshield(Address::ZERO, token, value),
+                row.tree,
+                row.position,
+                UtxoSource {
                     tx_hash: FixedBytes::ZERO,
                     block_number: row.source_block_number,
                     block_timestamp: row.source_block_timestamp,
                 },
-            })
+                UtxoCommitmentKind::Transact,
+            ))
         })
         .collect()
 }
@@ -598,15 +669,19 @@ impl WalletSession {
     }
 
     pub async fn unspent_utxos(&self) -> Vec<Utxo> {
-        self.handle
-            .utxos
-            .read()
-            .await
-            .iter()
-            .filter(|entry| !entry.is_spent())
-            .map(|entry| entry.utxo.clone())
-            .collect()
+        let utxos = self.handle.utxos.read().await;
+        poi_verified_unspent_utxos_from_records(&utxos)
     }
+}
+
+fn poi_verified_unspent_utxos_from_records(utxos: &[WalletUtxo]) -> Vec<Utxo> {
+    let active_poi_list_keys = default_active_poi_list_keys();
+    utxos
+        .iter()
+        .filter(|entry| !entry.is_spent())
+        .filter(|entry| entry.utxo.poi.is_valid_for_lists(&active_poi_list_keys))
+        .map(|entry| entry.utxo.clone())
+        .collect()
 }
 
 pub fn parse_unshield_amount(input: &str, decimals: Option<u8>) -> Result<U256> {
@@ -823,16 +898,370 @@ fn public_broadcaster_build_error(
     }
 }
 
-fn ensure_batched_public_broadcaster_poi_supported(
+fn parse_required_poi_list_keys(
     broadcaster: &PublicBroadcasterCandidate,
-    transaction_count: usize,
-) -> Result<()> {
-    if transaction_count > 1 && !broadcaster.required_poi_list_keys.is_empty() {
-        return Err(eyre!(
-            "batched public broadcaster transactions need wallet-side POI generation for broadcasters that require POI"
-        ));
+) -> Result<Vec<FixedBytes<32>>> {
+    broadcaster
+        .required_poi_list_keys
+        .iter()
+        .map(|list_key| {
+            let bare = list_key.strip_prefix("0x").unwrap_or(list_key);
+            if bare.len() != 64 {
+                return Err(eyre!(
+                    "invalid required POI list key {list_key}: expected 32-byte hex"
+                ));
+            }
+            let bytes = hex::decode(bare)
+                .wrap_err_with(|| format!("invalid required POI list key {list_key}"))?;
+            let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
+                eyre!("invalid required POI list key {list_key}: expected 32 bytes")
+            })?;
+            Ok(FixedBytes::from(bytes))
+        })
+        .collect()
+}
+
+struct PublicBroadcasterPreTransactionPois {
+    request_pois: PreTransactionPoiMap,
+    pending_poi_list_keys: Vec<FixedBytes<32>>,
+    pending_pois: PreTransactionPoiMap,
+}
+
+async fn public_broadcaster_pre_transaction_pois(
+    chunks: &[TransactionPlanChunk],
+    broadcaster: &PublicBroadcasterCandidate,
+    chain_id: u64,
+    prover: &ProverService,
+    verify_proof: bool,
+    http: &HttpContext,
+) -> Result<PublicBroadcasterPreTransactionPois> {
+    let required_poi_list_keys = parse_required_poi_list_keys(broadcaster)?;
+    let pending_poi_list_keys: Vec<FixedBytes<32>> = default_active_poi_list_keys();
+    let all_poi_list_keys = combined_poi_list_keys(&required_poi_list_keys, &pending_poi_list_keys);
+    let poi_started = Instant::now();
+    let all_pois = generate_pre_transaction_pois_for_lists(
+        chunks,
+        chain_id,
+        prover,
+        verify_proof,
+        http,
+        &all_poi_list_keys,
+        "generate public broadcaster pre-transaction POI",
+    )
+    .await?;
+    tracing::info!(
+        chain_id,
+        chunks = chunks.len(),
+        required_list_keys = required_poi_list_keys.len(),
+        pending_list_keys = pending_poi_list_keys.len(),
+        total_list_keys = all_poi_list_keys.len(),
+        elapsed_ms = poi_started.elapsed().as_millis(),
+        "generated public broadcaster pre-transaction POIs"
+    );
+    let pending_pois = retain_pre_transaction_poi_lists(&all_pois, &pending_poi_list_keys);
+    Ok(PublicBroadcasterPreTransactionPois {
+        request_pois: retain_pre_transaction_poi_lists(&all_pois, &required_poi_list_keys),
+        pending_poi_list_keys,
+        pending_pois,
+    })
+}
+
+async fn active_list_pre_transaction_pois(
+    chunks: &[TransactionPlanChunk],
+    chain_id: u64,
+    prover: &ProverService,
+    verify_proof: bool,
+    http: &HttpContext,
+    context: &'static str,
+) -> Result<(Vec<FixedBytes<32>>, PreTransactionPoiMap)> {
+    let poi_list_keys = default_active_poi_list_keys();
+    let pois = generate_pre_transaction_pois_for_lists(
+        chunks,
+        chain_id,
+        prover,
+        verify_proof,
+        http,
+        &poi_list_keys,
+        context,
+    )
+    .await?;
+    Ok((poi_list_keys, pois))
+}
+
+async fn generate_pre_transaction_pois_for_lists(
+    chunks: &[TransactionPlanChunk],
+    chain_id: u64,
+    prover: &ProverService,
+    verify_proof: bool,
+    http: &HttpContext,
+    poi_list_keys: &[FixedBytes<32>],
+    context: &'static str,
+) -> Result<PreTransactionPoiMap> {
+    if poi_list_keys.is_empty() {
+        return Ok(BTreeMap::new());
     }
-    Ok(())
+    let poi_rpc_url =
+        Url::parse(DEFAULT_WALLET_POI_RPC_URL).wrap_err("parse default POI RPC URL")?;
+    let poi_client = PoiRpcClient::with_http_client(poi_rpc_url, http.client.clone());
+    generate_pre_transaction_pois(PreTransactionPoiGenerationRequest {
+        chunks,
+        chain_type: 0,
+        chain_id,
+        txid_version: Some(DEFAULT_TXID_VERSION),
+        required_poi_list_keys: poi_list_keys,
+        poi_client: &poi_client,
+        prover,
+        verify_proof,
+    })
+    .await
+    .wrap_err(context)
+}
+
+fn combined_poi_list_keys(
+    first: &[FixedBytes<32>],
+    second: &[FixedBytes<32>],
+) -> Vec<FixedBytes<32>> {
+    let mut out = Vec::with_capacity(first.len() + second.len());
+    for key in first.iter().chain(second.iter()) {
+        if !out.contains(key) {
+            out.push(*key);
+        }
+    }
+    out
+}
+
+fn retain_pre_transaction_poi_lists(
+    pois: &PreTransactionPoiMap,
+    list_keys: &[FixedBytes<32>],
+) -> PreTransactionPoiMap {
+    list_keys
+        .iter()
+        .filter_map(|list_key| {
+            pois.get(list_key)
+                .cloned()
+                .map(|per_leaf| (*list_key, per_leaf))
+        })
+        .collect()
+}
+
+fn persist_pending_send_output_poi_contexts(
+    db: &DbStore,
+    chain_id: u64,
+    wallet_id: &str,
+    chunks: &[TransactionPlanChunk],
+    pre_transaction_pois: &PreTransactionPoiMap,
+    poi_list_keys: &[FixedBytes<32>],
+    include_broadcaster_fee: bool,
+) -> Result<usize> {
+    let created_at = now_epoch_secs()?;
+    let mut count = 0;
+    for (chunk_index, chunk) in chunks.iter().enumerate() {
+        let chunk_context = pending_chunk_context(chunk, pre_transaction_pois, poi_list_keys)?;
+        let private_output_count = pending_private_output_count(chunk)?;
+        let mut output_index = 0;
+
+        if include_broadcaster_fee && chunk_index == 0 {
+            let note = chunk.outputs.get(output_index).ok_or_else(|| {
+                eyre!("missing public broadcaster send fee output for pending POI")
+            })?;
+            put_pending_output_poi_context(
+                db,
+                chain_id,
+                wallet_id,
+                created_at,
+                &chunk_context,
+                note,
+                PendingOutputPoiRole::BroadcasterFee,
+            )?;
+            count += 1;
+            output_index += 1;
+        }
+
+        let note = chunk
+            .outputs
+            .get(output_index)
+            .ok_or_else(|| eyre!("missing send recipient output for pending POI"))?;
+        put_pending_output_poi_context(
+            db,
+            chain_id,
+            wallet_id,
+            created_at,
+            &chunk_context,
+            note,
+            PendingOutputPoiRole::Recipient,
+        )?;
+        count += 1;
+        output_index += 1;
+
+        if output_index < private_output_count {
+            let note = chunk
+                .outputs
+                .get(output_index)
+                .ok_or_else(|| eyre!("missing send change output for pending POI"))?;
+            put_pending_output_poi_context(
+                db,
+                chain_id,
+                wallet_id,
+                created_at,
+                &chunk_context,
+                note,
+                PendingOutputPoiRole::Change,
+            )?;
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn persist_pending_unshield_output_poi_contexts(
+    db: &DbStore,
+    chain_id: u64,
+    wallet_id: &str,
+    chunks: &[TransactionPlanChunk],
+    pre_transaction_pois: &PreTransactionPoiMap,
+    poi_list_keys: &[FixedBytes<32>],
+    include_broadcaster_fee: bool,
+) -> Result<usize> {
+    let created_at = now_epoch_secs()?;
+    let mut count = 0;
+    for (chunk_index, chunk) in chunks.iter().enumerate() {
+        let chunk_context = pending_chunk_context(chunk, pre_transaction_pois, poi_list_keys)?;
+        let private_output_count = pending_private_output_count(chunk)?;
+        let mut output_index = 0;
+
+        if include_broadcaster_fee && chunk_index == 0 {
+            let note = chunk.outputs.get(output_index).ok_or_else(|| {
+                eyre!("missing public broadcaster unshield fee output for pending POI")
+            })?;
+            put_pending_output_poi_context(
+                db,
+                chain_id,
+                wallet_id,
+                created_at,
+                &chunk_context,
+                note,
+                PendingOutputPoiRole::BroadcasterFee,
+            )?;
+            count += 1;
+            output_index += 1;
+        }
+
+        if output_index < private_output_count {
+            let note = chunk
+                .outputs
+                .get(output_index)
+                .ok_or_else(|| eyre!("missing unshield change output for pending POI"))?;
+            put_pending_output_poi_context(
+                db,
+                chain_id,
+                wallet_id,
+                created_at,
+                &chunk_context,
+                note,
+                PendingOutputPoiRole::Change,
+            )?;
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+struct PendingOutputPoiChunkContext {
+    utxo_tree_in: u64,
+    railgun_txid: U256,
+    pre_transaction_pois: PreTransactionPoiMap,
+    poi_list_keys: Vec<FixedBytes<32>>,
+}
+
+fn pending_chunk_context(
+    chunk: &TransactionPlanChunk,
+    pre_transaction_pois: &PreTransactionPoiMap,
+    poi_list_keys: &[FixedBytes<32>],
+) -> Result<PendingOutputPoiChunkContext> {
+    let railgun_txid = chunk.railgun_txid();
+    let utxo_tree_in = u64::from(chunk.tree_number);
+    let txid_leaf_hash = u256_to_fixed(railgun_txid_leaf_hash(railgun_txid, utxo_tree_in));
+    let pre_transaction_pois = pre_transaction_pois
+        .iter()
+        .filter_map(|(list_key, per_leaf)| {
+            per_leaf
+                .get(&txid_leaf_hash)
+                .cloned()
+                .map(|poi| (*list_key, BTreeMap::from([(txid_leaf_hash, poi)])))
+        })
+        .collect::<PreTransactionPoiMap>();
+
+    for list_key in poi_list_keys {
+        let has_poi = pre_transaction_pois
+            .get(list_key)
+            .is_some_and(|per_leaf| per_leaf.contains_key(&txid_leaf_hash));
+        if !has_poi {
+            return Err(eyre!(
+                "missing pending output pre-transaction POI for list key {}",
+                hex::encode(list_key)
+            ));
+        }
+    }
+
+    Ok(PendingOutputPoiChunkContext {
+        utxo_tree_in,
+        railgun_txid,
+        pre_transaction_pois,
+        poi_list_keys: poi_list_keys.to_vec(),
+    })
+}
+
+fn pending_private_output_count(chunk: &TransactionPlanChunk) -> Result<usize> {
+    if chunk.has_unshield {
+        chunk
+            .outputs
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| eyre!("unshield chunk is missing public output"))
+    } else {
+        Ok(chunk.outputs.len())
+    }
+}
+
+fn put_pending_output_poi_context(
+    db: &DbStore,
+    chain_id: u64,
+    wallet_id: &str,
+    created_at: u64,
+    chunk_context: &PendingOutputPoiChunkContext,
+    note: &Note,
+    output_role: PendingOutputPoiRole,
+) -> Result<()> {
+    let record = PendingOutputPoiContextRecord {
+        chain_id,
+        wallet_id: wallet_id.to_string(),
+        txid_version: DEFAULT_TXID_VERSION.to_string(),
+        output_commitment: u256_to_fixed(note.commitment()),
+        output_npk: u256_to_fixed(note.npk),
+        utxo_tree_in: chunk_context.utxo_tree_in,
+        railgun_txid: chunk_context.railgun_txid,
+        pre_transaction_pois_per_txid_leaf_per_list: chunk_context.pre_transaction_pois.clone(),
+        required_poi_list_keys: chunk_context.poi_list_keys.clone(),
+        output_role,
+        created_at,
+        source_operation_id: None,
+        observation: None,
+        submitted_poi_list_keys: Vec::new(),
+        terminal_error: None,
+    };
+    db.put_pending_output_poi_context(&record)
+        .wrap_err("persist pending output POI context")
+}
+
+fn u256_to_fixed(value: U256) -> FixedBytes<32> {
+    FixedBytes::from(value.to_be_bytes::<32>())
+}
+
+fn now_epoch_secs() -> Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .wrap_err("system clock is before unix epoch")?
+        .as_secs())
 }
 
 const fn approximate_public_broadcaster_gas(shape: ApproximateTransactionShape) -> u64 {
@@ -1425,15 +1854,8 @@ pub async fn unshield(
     let mut forest = chain_handle.forest.read().await.clone();
     forest.compute_roots();
 
-    let utxos = synced
-        .handle
-        .utxos
-        .read()
-        .await
-        .iter()
-        .filter(|entry| !entry.is_spent())
-        .map(|entry| entry.utxo.clone())
-        .collect::<Vec<_>>();
+    let wallet_utxos = synced.handle.utxos.read().await;
+    let utxos = poi_verified_unspent_utxos_from_records(&wallet_utxos);
     let tx_builder = TransactionBuilder {
         chain_type: 0,
         chain_id: request.chain_id,
@@ -1545,8 +1967,12 @@ pub async fn prepare_desktop_unshield_calldata(
         broadcaster_fee: None,
         min_gas_price: 0,
     };
+    update_transaction_generation_stage(
+        request.progress_tx.as_ref(),
+        TransactionGenerationStage::SelectingPrivateNotes,
+    );
     let selection_info = unshield_selection_info(&utxos, request.token, request.amount, false)
-        .wrap_err("select unshield notes")?;
+        .wrap_err("select POI-verified unshield notes")?;
 
     let mut grant = request
         .vault_store
@@ -1564,6 +1990,10 @@ pub async fn prepare_desktop_unshield_calldata(
         relay_adapt_contract: chain_defaults.relay_adapt_contract,
     };
 
+    update_transaction_generation_stage(
+        request.progress_tx.as_ref(),
+        TransactionGenerationStage::ProvingTransaction,
+    );
     let plan = tx_builder
         .build_unshield_plan_with_signer(
             &request.view_session.scan_keys(),
@@ -1575,6 +2005,29 @@ pub async fn prepare_desktop_unshield_calldata(
         )
         .await
         .wrap_err("build desktop unshield calldata")?;
+
+    update_transaction_generation_stage(
+        request.progress_tx.as_ref(),
+        TransactionGenerationStage::GeneratingPoiProofs,
+    );
+    let (pending_poi_list_keys, pending_pois) = active_list_pre_transaction_pois(
+        &plan.chunks,
+        request.chain_id,
+        &prover,
+        request.verify_proof,
+        http,
+        "generate manual unshield pending output pre-transaction POI",
+    )
+    .await?;
+    persist_pending_unshield_output_poi_contexts(
+        request.session.db.as_ref(),
+        request.chain_id,
+        request.view_session.wallet_id(),
+        &plan.chunks,
+        &pending_pois,
+        &pending_poi_list_keys,
+        false,
+    )?;
 
     Ok(PreparedUnshieldCall {
         chain_id: request.chain_id,
@@ -1629,8 +2082,12 @@ pub async fn prepare_desktop_send_calldata(
         broadcaster_fee: None,
         min_gas_price: 0,
     };
+    update_transaction_generation_stage(
+        request.progress_tx.as_ref(),
+        TransactionGenerationStage::SelectingPrivateNotes,
+    );
     let selection_info = send_selection_info(&utxos, request.token, request.amount, false)
-        .wrap_err("select send notes")?;
+        .wrap_err("select POI-verified send notes")?;
 
     let mut grant = request
         .vault_store
@@ -1648,6 +2105,10 @@ pub async fn prepare_desktop_send_calldata(
         relay_adapt_contract: chain_defaults.relay_adapt_contract,
     };
 
+    update_transaction_generation_stage(
+        request.progress_tx.as_ref(),
+        TransactionGenerationStage::ProvingTransaction,
+    );
     let plan = tx_builder
         .build_send_plan_with_signer(
             &request.view_session.scan_keys(),
@@ -1659,6 +2120,29 @@ pub async fn prepare_desktop_send_calldata(
         )
         .await
         .wrap_err("build desktop send calldata")?;
+
+    update_transaction_generation_stage(
+        request.progress_tx.as_ref(),
+        TransactionGenerationStage::GeneratingPoiProofs,
+    );
+    let (pending_poi_list_keys, pending_pois) = active_list_pre_transaction_pois(
+        &plan.chunks,
+        request.chain_id,
+        &prover,
+        request.verify_proof,
+        http,
+        "generate manual send pending output pre-transaction POI",
+    )
+    .await?;
+    persist_pending_send_output_poi_contexts(
+        request.session.db.as_ref(),
+        request.chain_id,
+        request.view_session.wallet_id(),
+        &plan.chunks,
+        &pending_pois,
+        &pending_poi_list_keys,
+        false,
+    )?;
 
     Ok(PreparedSendCall {
         chain_id: request.chain_id,
@@ -1709,7 +2193,6 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
         .erased();
     let min_gas_price = buffered_gas_price(&provider).await?;
     let utxos = request.session.unspent_utxos().await;
-    let broadcaster_requires_poi = !broadcaster.required_poi_list_keys.is_empty();
 
     approximate_public_broadcaster_cost(
         broadcaster,
@@ -1728,11 +2211,6 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
             .map_err(|error| {
                 public_broadcaster_build_error(error, split.fee_amount, split.fee_mode)
             })?;
-            if selection.transaction_count > 1 && broadcaster_requires_poi {
-                return Err(eyre!(
-                    "batched public broadcaster transactions need wallet-side POI generation for broadcasters that require POI"
-                ));
-            }
             Ok(unshield_approximate_shape(
                 &selection,
                 selection.max_spendable,
@@ -1770,7 +2248,6 @@ pub async fn estimate_desktop_send_public_broadcaster_cost(
         .erased();
     let min_gas_price = buffered_gas_price(&provider).await?;
     let utxos = request.session.unspent_utxos().await;
-    let broadcaster_requires_poi = !broadcaster.required_poi_list_keys.is_empty();
 
     approximate_public_broadcaster_cost(
         broadcaster,
@@ -1789,11 +2266,6 @@ pub async fn estimate_desktop_send_public_broadcaster_cost(
             .map_err(|error| {
                 public_broadcaster_build_error(error, split.fee_amount, split.fee_mode)
             })?;
-            if selection.transaction_count > 1 && broadcaster_requires_poi {
-                return Err(eyre!(
-                    "batched public broadcaster transactions need wallet-side POI generation for broadcasters that require POI"
-                ));
-            }
             Ok(send_approximate_shape(&selection, selection.max_spendable))
         },
     )
@@ -1805,11 +2277,13 @@ pub async fn submit_desktop_unshield_public_broadcaster(
 ) -> Result<PublicBroadcasterSubmissionResult> {
     let waku = Arc::clone(&request.waku);
     let timeout = request.response_timeout;
+    let progress_tx = request.progress_tx.clone();
     let prepared = prepare_desktop_unshield_public_broadcaster(request, http).await?;
     submit_public_broadcaster_plan(
         waku,
         prepared.plan.call.to,
         prepared.plan.call.data,
+        prepared.pre_transaction_pois_per_txid_leaf_per_list,
         prepared.broadcaster,
         prepared.entered_amount,
         prepared.receiver_amount,
@@ -1821,6 +2295,7 @@ pub async fn submit_desktop_unshield_public_broadcaster(
         prepared.fee_mode,
         prepared.gas_limit,
         prepared.min_gas_price,
+        progress_tx,
         timeout,
     )
     .await
@@ -1832,11 +2307,13 @@ pub async fn submit_desktop_send_public_broadcaster(
 ) -> Result<PublicBroadcasterSubmissionResult> {
     let waku = Arc::clone(&request.waku);
     let timeout = request.response_timeout;
+    let progress_tx = request.progress_tx.clone();
     let prepared = prepare_desktop_send_public_broadcaster(request, http).await?;
     submit_public_broadcaster_plan(
         waku,
         prepared.plan.call.to,
         prepared.plan.call.data,
+        prepared.pre_transaction_pois_per_txid_leaf_per_list,
         prepared.broadcaster,
         prepared.entered_amount,
         prepared.receiver_amount,
@@ -1848,6 +2325,7 @@ pub async fn submit_desktop_send_public_broadcaster(
         prepared.fee_mode,
         prepared.gas_limit,
         prepared.min_gas_price,
+        progress_tx,
         timeout,
     )
     .await
@@ -1898,6 +2376,59 @@ async fn prepare_desktop_unshield_public_broadcaster(
     let mut forest = chain_handle.forest.read().await.clone();
     forest.compute_roots();
     let utxos = request.session.unspent_utxos().await;
+    update_transaction_generation_stage(
+        request.progress_tx.as_ref(),
+        TransactionGenerationStage::SelectingPrivateNotes,
+    );
+    let initial_fee_amount = match approximate_public_broadcaster_cost(
+        broadcaster.clone(),
+        request.amount,
+        request.fee_mode,
+        RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+        min_gas_price,
+        |split| {
+            let selection = unshield_selection_info_with_broadcaster_fee(
+                &utxos,
+                request.token,
+                split.receiver_amount,
+                split.fee_amount,
+                false,
+            )
+            .map_err(|error| {
+                public_broadcaster_build_error(error, split.fee_amount, split.fee_mode)
+            })?;
+            Ok(unshield_approximate_shape(
+                &selection,
+                selection.max_spendable,
+                request.unwrap,
+            ))
+        },
+    ) {
+        Ok(estimate) => {
+            tracing::info!(
+                fee_amount = %estimate.fee_amount,
+                gas_limit = estimate.gas_limit,
+                min_gas_price,
+                transaction_count = estimate.transaction_count,
+                input_count = estimate.input_count,
+                private_output_count = estimate.private_output_count,
+                public_output_count = estimate.public_output_count,
+                broadcaster = %broadcaster.railgun_address,
+                fees_id = %broadcaster.fees_id,
+                "using approximate public broadcaster unshield fee for first proof"
+            );
+            estimate.fee_amount
+        }
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                broadcaster = %broadcaster.railgun_address,
+                fees_id = %broadcaster.fees_id,
+                "failed to estimate initial public broadcaster unshield fee; starting at zero"
+            );
+            U256::ZERO
+        }
+    };
 
     let mut grant = request
         .vault_store
@@ -1920,7 +2451,7 @@ async fn prepare_desktop_unshield_public_broadcaster(
         relay_adapt_contract: chain_defaults.relay_adapt_contract,
     };
 
-    let mut fee_amount = U256::ZERO;
+    let mut fee_amount = initial_fee_amount;
     for attempt in 1..=PUBLIC_BROADCASTER_FEE_ATTEMPTS {
         let split = public_broadcaster_amount_split(request.amount, fee_amount, request.fee_mode)?;
         let unshield_request = RailgunUnshieldRequest {
@@ -1936,6 +2467,11 @@ async fn prepare_desktop_unshield_public_broadcaster(
             }),
             min_gas_price,
         };
+        update_transaction_generation_stage(
+            request.progress_tx.as_ref(),
+            TransactionGenerationStage::ProvingTransaction,
+        );
+        let proof_started = Instant::now();
         let plan = tx_builder
             .build_unshield_plan_with_signer(
                 &request.view_session.scan_keys(),
@@ -1948,7 +2484,23 @@ async fn prepare_desktop_unshield_public_broadcaster(
             .await
             .map_err(|error| public_broadcaster_build_error(error, fee_amount, split.fee_mode))
             .wrap_err("build public broadcaster unshield proof")?;
-        ensure_batched_public_broadcaster_poi_supported(&broadcaster, plan.transaction_count())?;
+        tracing::info!(
+            attempt,
+            fee_amount = %fee_amount,
+            elapsed_ms = proof_started.elapsed().as_millis(),
+            transaction_count = plan.transaction_count(),
+            input_count = plan.input_count(),
+            private_output_count = plan.private_output_count(),
+            public_output_count = plan.public_output_count(),
+            broadcaster = %broadcaster.railgun_address,
+            fees_id = %broadcaster.fees_id,
+            "built public broadcaster unshield proof"
+        );
+        update_transaction_generation_stage(
+            request.progress_tx.as_ref(),
+            TransactionGenerationStage::EstimatingBroadcasterFee,
+        );
+        let gas_started = Instant::now();
         let (gas_limit, computed_fee) = estimate_public_broadcaster_fee(
             &provider,
             request.chain_id,
@@ -1958,12 +2510,14 @@ async fn prepare_desktop_unshield_public_broadcaster(
             min_gas_price,
         )
         .await?;
+        let gas_elapsed_ms = gas_started.elapsed().as_millis();
         tracing::info!(
             attempt,
             available_fee = %fee_amount,
             computed_fee = %computed_fee,
             gas_limit,
             min_gas_price,
+            gas_elapsed_ms,
             broadcaster = %broadcaster.railgun_address,
             fees_id = %broadcaster.fees_id,
             "estimated public broadcaster unshield fee"
@@ -1982,8 +2536,38 @@ async fn prepare_desktop_unshield_public_broadcaster(
                 fees_id = %broadcaster.fees_id,
                 "public broadcaster unshield fee stabilized"
             );
+            update_transaction_generation_stage(
+                request.progress_tx.as_ref(),
+                TransactionGenerationStage::GeneratingPoiProofs,
+            );
+            let pre_transaction_pois = public_broadcaster_pre_transaction_pois(
+                &plan.chunks,
+                &broadcaster,
+                request.chain_id,
+                &prover,
+                request.verify_proof,
+                http,
+            )
+            .await?;
+            let pending_persist_started = Instant::now();
+            let pending_contexts = persist_pending_unshield_output_poi_contexts(
+                request.session.db.as_ref(),
+                request.chain_id,
+                request.view_session.wallet_id(),
+                &plan.chunks,
+                &pre_transaction_pois.pending_pois,
+                &pre_transaction_pois.pending_poi_list_keys,
+                true,
+            )?;
+            tracing::info!(
+                chain_id = request.chain_id,
+                pending_contexts,
+                elapsed_ms = pending_persist_started.elapsed().as_millis(),
+                "persisted public broadcaster unshield pending output POI contexts"
+            );
             return Ok(PreparedPublicBroadcasterPlan {
                 plan,
+                pre_transaction_pois_per_txid_leaf_per_list: pre_transaction_pois.request_pois,
                 broadcaster,
                 entered_amount: split.entered_amount,
                 receiver_amount: split.receiver_amount,
@@ -2055,6 +2639,55 @@ async fn prepare_desktop_send_public_broadcaster(
     let mut forest = chain_handle.forest.read().await.clone();
     forest.compute_roots();
     let utxos = request.session.unspent_utxos().await;
+    update_transaction_generation_stage(
+        request.progress_tx.as_ref(),
+        TransactionGenerationStage::SelectingPrivateNotes,
+    );
+    let initial_fee_amount = match approximate_public_broadcaster_cost(
+        broadcaster.clone(),
+        request.amount,
+        request.fee_mode,
+        0,
+        min_gas_price,
+        |split| {
+            let selection = send_selection_info_with_broadcaster_fee(
+                &utxos,
+                request.token,
+                split.receiver_amount,
+                split.fee_amount,
+                false,
+            )
+            .map_err(|error| {
+                public_broadcaster_build_error(error, split.fee_amount, split.fee_mode)
+            })?;
+            Ok(send_approximate_shape(&selection, selection.max_spendable))
+        },
+    ) {
+        Ok(estimate) => {
+            tracing::info!(
+                fee_amount = %estimate.fee_amount,
+                gas_limit = estimate.gas_limit,
+                min_gas_price,
+                transaction_count = estimate.transaction_count,
+                input_count = estimate.input_count,
+                private_output_count = estimate.private_output_count,
+                public_output_count = estimate.public_output_count,
+                broadcaster = %broadcaster.railgun_address,
+                fees_id = %broadcaster.fees_id,
+                "using approximate public broadcaster send fee for first proof"
+            );
+            estimate.fee_amount
+        }
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                broadcaster = %broadcaster.railgun_address,
+                fees_id = %broadcaster.fees_id,
+                "failed to estimate initial public broadcaster send fee; starting at zero"
+            );
+            U256::ZERO
+        }
+    };
 
     let mut grant = request
         .vault_store
@@ -2072,7 +2705,7 @@ async fn prepare_desktop_send_public_broadcaster(
         relay_adapt_contract: chain_defaults.relay_adapt_contract,
     };
 
-    let mut fee_amount = U256::ZERO;
+    let mut fee_amount = initial_fee_amount;
     for attempt in 1..=PUBLIC_BROADCASTER_FEE_ATTEMPTS {
         let split = public_broadcaster_amount_split(request.amount, fee_amount, request.fee_mode)?;
         let send_request = RailgunSendRequest {
@@ -2087,6 +2720,11 @@ async fn prepare_desktop_send_public_broadcaster(
             }),
             min_gas_price,
         };
+        update_transaction_generation_stage(
+            request.progress_tx.as_ref(),
+            TransactionGenerationStage::ProvingTransaction,
+        );
+        let proof_started = Instant::now();
         let plan = tx_builder
             .build_send_plan_with_signer(
                 &request.view_session.scan_keys(),
@@ -2099,7 +2737,23 @@ async fn prepare_desktop_send_public_broadcaster(
             .await
             .map_err(|error| public_broadcaster_build_error(error, fee_amount, split.fee_mode))
             .wrap_err("build public broadcaster send proof")?;
-        ensure_batched_public_broadcaster_poi_supported(&broadcaster, plan.transaction_count())?;
+        tracing::info!(
+            attempt,
+            fee_amount = %fee_amount,
+            elapsed_ms = proof_started.elapsed().as_millis(),
+            transaction_count = plan.transaction_count(),
+            input_count = plan.input_count(),
+            private_output_count = plan.private_output_count(),
+            public_output_count = plan.public_output_count(),
+            broadcaster = %broadcaster.railgun_address,
+            fees_id = %broadcaster.fees_id,
+            "built public broadcaster send proof"
+        );
+        update_transaction_generation_stage(
+            request.progress_tx.as_ref(),
+            TransactionGenerationStage::EstimatingBroadcasterFee,
+        );
+        let gas_started = Instant::now();
         let (gas_limit, computed_fee) = estimate_public_broadcaster_fee(
             &provider,
             request.chain_id,
@@ -2109,12 +2763,14 @@ async fn prepare_desktop_send_public_broadcaster(
             min_gas_price,
         )
         .await?;
+        let gas_elapsed_ms = gas_started.elapsed().as_millis();
         tracing::info!(
             attempt,
             available_fee = %fee_amount,
             computed_fee = %computed_fee,
             gas_limit,
             min_gas_price,
+            gas_elapsed_ms,
             broadcaster = %broadcaster.railgun_address,
             fees_id = %broadcaster.fees_id,
             "estimated public broadcaster send fee"
@@ -2130,8 +2786,38 @@ async fn prepare_desktop_send_public_broadcaster(
                 fees_id = %broadcaster.fees_id,
                 "public broadcaster send fee stabilized"
             );
+            update_transaction_generation_stage(
+                request.progress_tx.as_ref(),
+                TransactionGenerationStage::GeneratingPoiProofs,
+            );
+            let pre_transaction_pois = public_broadcaster_pre_transaction_pois(
+                &plan.chunks,
+                &broadcaster,
+                request.chain_id,
+                &prover,
+                request.verify_proof,
+                http,
+            )
+            .await?;
+            let pending_persist_started = Instant::now();
+            let pending_contexts = persist_pending_send_output_poi_contexts(
+                request.session.db.as_ref(),
+                request.chain_id,
+                request.view_session.wallet_id(),
+                &plan.chunks,
+                &pre_transaction_pois.pending_pois,
+                &pre_transaction_pois.pending_poi_list_keys,
+                true,
+            )?;
+            tracing::info!(
+                chain_id = request.chain_id,
+                pending_contexts,
+                elapsed_ms = pending_persist_started.elapsed().as_millis(),
+                "persisted public broadcaster send pending output POI contexts"
+            );
             return Ok(PreparedPublicBroadcasterPlan {
                 plan,
+                pre_transaction_pois_per_txid_leaf_per_list: pre_transaction_pois.request_pois,
                 broadcaster,
                 entered_amount: split.entered_amount,
                 receiver_amount: split.receiver_amount,
@@ -2189,10 +2875,31 @@ async fn estimate_public_broadcaster_fee(
     ))
 }
 
+fn public_broadcaster_transact_params(
+    broadcaster: &PublicBroadcasterCandidate,
+    to: Address,
+    data: Bytes,
+    min_gas_price: u128,
+    pre_transaction_pois_per_txid_leaf_per_list: PreTransactionPoiMap,
+) -> BroadcasterRawParamsTransact {
+    BroadcasterRawParamsTransact {
+        chain_type: 0,
+        chain_id: broadcaster.chain_id,
+        min_gas_price: Some(U256::from(min_gas_price)),
+        fees_id: Some(broadcaster.fees_id.clone()),
+        to,
+        data,
+        broadcaster_viewing_key: FixedBytes::from(broadcaster.viewing_public_key),
+        txid_version: Some(DEFAULT_TXID_VERSION.to_string()),
+        pre_transaction_pois_per_txid_leaf_per_list,
+    }
+}
+
 async fn submit_public_broadcaster_plan(
     waku: Arc<WakuClient>,
     to: Address,
     data: Bytes,
+    pre_transaction_pois_per_txid_leaf_per_list: PreTransactionPoiMap,
     broadcaster: PublicBroadcasterCandidate,
     entered_amount: U256,
     receiver_amount: U256,
@@ -2204,6 +2911,7 @@ async fn submit_public_broadcaster_plan(
     fee_mode: PublicBroadcasterFeeMode,
     gas_limit: u64,
     min_gas_price: u128,
+    progress_tx: Option<TransactionGenerationProgressSender>,
     timeout: Duration,
 ) -> Result<PublicBroadcasterSubmissionResult> {
     let transact_topic = transact_topic(broadcaster.chain_id);
@@ -2223,17 +2931,18 @@ async fn submit_public_broadcaster_plan(
         response_topic = %response_topic,
         "preparing public broadcaster transact request"
     );
-    let params = BroadcasterRawParamsTransact {
-        chain_type: 0,
-        chain_id: broadcaster.chain_id,
-        min_gas_price: Some(U256::from(min_gas_price)),
-        fees_id: Some(broadcaster.fees_id.clone()),
+    update_transaction_generation_stage(
+        progress_tx.as_ref(),
+        TransactionGenerationStage::PublishingToBroadcaster,
+    );
+    let params = public_broadcaster_transact_params(
+        &broadcaster,
         to,
         data,
-        broadcaster_viewing_key: FixedBytes::from(broadcaster.viewing_public_key),
-        txid_version: Some(DEFAULT_TXID_VERSION.to_string()),
-        pre_transaction_pois_per_txid_leaf_per_list: BTreeMap::new(),
-    };
+        min_gas_price,
+        pre_transaction_pois_per_txid_leaf_per_list,
+    );
+    let encrypt_started = Instant::now();
     let encrypted = encrypt_transact_request(broadcaster.viewing_public_key, &params)
         .wrap_err("encrypt public broadcaster transact request")?;
     let payload = build_transact_request_payload(&encrypted)
@@ -2243,6 +2952,7 @@ async fn submit_public_broadcaster_plan(
         broadcaster = %broadcaster.railgun_address,
         fees_id = %broadcaster.fees_id,
         payload_len = payload.len(),
+        elapsed_ms = encrypt_started.elapsed().as_millis(),
         "built public broadcaster encrypted Waku payload"
     );
     tracing::info!(
@@ -2250,24 +2960,35 @@ async fn submit_public_broadcaster_plan(
         response_topic = %response_topic,
         "subscribing to public broadcaster response topic"
     );
+    let subscribe_started = Instant::now();
     let mut response_rx = waku
         .subscribe(PUBSUB_PATH, vec![response_topic.clone()])
         .await
         .wrap_err("subscribe to public broadcaster response topic")?;
-    tracing::info!("subscribed to public broadcaster response topic");
+    tracing::info!(
+        response_topic = %response_topic,
+        elapsed_ms = subscribe_started.elapsed().as_millis(),
+        "subscribed to public broadcaster response topic"
+    );
     tracing::info!(
         pubsub_path = PUBSUB_PATH,
         transact_topic = %transact_topic,
         payload_len = payload.len(),
         "publishing public broadcaster transact request"
     );
+    let publish_started = Instant::now();
     waku.publish(PUBSUB_PATH, &transact_topic, &payload)
         .await
         .wrap_err("publish public broadcaster transact request")?;
     tracing::info!(
         pubsub_path = PUBSUB_PATH,
         transact_topic = %transact_topic,
+        elapsed_ms = publish_started.elapsed().as_millis(),
         "published public broadcaster transact request"
+    );
+    update_transaction_generation_stage(
+        progress_tx.as_ref(),
+        TransactionGenerationStage::WaitingForBroadcasterResponse,
     );
 
     let sleep = tokio::time::sleep(timeout);
@@ -2330,23 +3051,37 @@ pub fn utxo_outputs_from_utxos(mut utxos: Vec<WalletUtxo>) -> (Vec<UtxoOutput>, 
         other => other,
     });
 
+    let active_poi_list_keys = default_active_poi_list_keys();
     let mut totals_map: BTreeMap<Address, U256> = BTreeMap::new();
+    let mut poi_verified_totals_map: BTreeMap<Address, U256> = BTreeMap::new();
     let utxo_outputs = utxos
         .into_iter()
         .map(|wallet_utxo| {
             let utxo = wallet_utxo.utxo;
             let token_addr = token_address_from_utxo(&utxo);
+            let poi_spendable =
+                wallet_utxo.spent.is_none() && utxo.poi.is_valid_for_lists(&active_poi_list_keys);
             if wallet_utxo.spent.is_none() {
                 *totals_map.entry(token_addr).or_default() += utxo.note.value;
             }
+            if poi_spendable {
+                *poi_verified_totals_map.entry(token_addr).or_default() += utxo.note.value;
+            }
             let source = &utxo.source;
             let spent = wallet_utxo.spent.as_ref();
+            let poi_statuses = poi_statuses_for_output(&utxo, &active_poi_list_keys);
 
             UtxoOutput {
                 tree: utxo.tree,
                 position: utxo.position,
                 token: token_addr.to_checksum(None),
                 value: utxo.note.value.to_string(),
+                commitment_kind: commitment_kind_label(utxo.poi.commitment_kind).to_string(),
+                commitment: fixed_bytes_hex(&utxo.poi.commitment),
+                npk: fixed_bytes_hex(&utxo.poi.npk),
+                blinded_commitment: fixed_bytes_hex(&utxo.poi.blinded_commitment),
+                poi_statuses,
+                poi_spendable,
                 source_tx_hash: source_tx_hash(source),
                 source_block_number: source.block_number,
                 source_block_timestamp: source.block_timestamp,
@@ -2362,6 +3097,10 @@ pub fn utxo_outputs_from_utxos(mut utxos: Vec<WalletUtxo>) -> (Vec<UtxoOutput>, 
         .map(|(addr, total)| TokenTotal {
             token: addr.to_checksum(None),
             total: total.to_string(),
+            poi_verified_total: poi_verified_totals_map
+                .remove(&addr)
+                .unwrap_or_default()
+                .to_string(),
         })
         .collect();
 
@@ -2387,6 +3126,41 @@ async fn snapshot_from_handle(chain_id: u64, handle: &WalletHandle) -> ListUtxos
 
 fn source_tx_hash(source: &UtxoSource) -> String {
     format!("0x{}", hex::encode(source.tx_hash))
+}
+
+fn fixed_bytes_hex(value: &FixedBytes<32>) -> String {
+    format!("0x{}", hex::encode(value))
+}
+
+const fn commitment_kind_label(kind: UtxoCommitmentKind) -> &'static str {
+    match kind {
+        UtxoCommitmentKind::Shield => "Shield",
+        UtxoCommitmentKind::Transact => "Transact",
+    }
+}
+
+const fn poi_status_label(status: PoiStatus) -> &'static str {
+    match status {
+        PoiStatus::Valid => "Valid",
+        PoiStatus::ShieldBlocked => "ShieldBlocked",
+        PoiStatus::ProofSubmitted => "ProofSubmitted",
+        PoiStatus::Missing => "Missing",
+        PoiStatus::Unknown => "Unknown",
+    }
+}
+
+fn poi_statuses_for_output(
+    utxo: &Utxo,
+    active_poi_list_keys: &[FixedBytes<32>],
+) -> BTreeMap<String, String> {
+    let mut statuses = utxo.poi.statuses.clone();
+    for list_key in active_poi_list_keys {
+        statuses.entry(*list_key).or_insert(PoiStatus::Unknown);
+    }
+    statuses
+        .into_iter()
+        .map(|(list_key, status)| (hex::encode(list_key), poi_status_label(status).to_string()))
+        .collect()
 }
 
 fn token_address_from_utxo(utxo: &Utxo) -> Address {
@@ -2745,38 +3519,63 @@ async fn sign_send_wait(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, SystemTime};
 
+    use alloy::hex;
     use alloy::primitives::{Address, Bytes, FixedBytes, TxHash, U256};
-    use broadcaster_core::crypto::railgun::{Address as RailgunAddress, AddressData};
+    use broadcaster_core::crypto::railgun::{
+        Address as RailgunAddress, AddressData, ViewingKeyData,
+    };
     use broadcaster_core::notes::Note;
     use broadcaster_core::transact::{
-        BroadcasterRawParamsTransact, build_transact_request_payload,
-        encrypt_transact_request_with_seed, try_decrypt_transact_request,
+        PreTxPoi, SnarkJsProof, build_transact_request_payload, encrypt_transact_request_with_seed,
+        railgun_txid_leaf_hash, try_decrypt_transact_request,
     };
     use broadcaster_core::transact_response::build_transact_response_txhash;
     use broadcaster_monitor::FeeRow;
-    use railgun_wallet::tx::UnshieldSelectionInfo;
-    use railgun_wallet::{Utxo, UtxoSource, WalletKeys, WalletUtxo};
+    use local_db::{DbConfig, DbStore, PendingOutputPoiRole};
+    use poi::poi::default_active_poi_list_keys;
+    use railgun_wallet::tx::{
+        PrivateInputs, PublicInputs, TransactionPlanChunk, UnshieldSelectionInfo,
+    };
+    use railgun_wallet::{PoiStatus, Utxo, UtxoCommitmentKind, UtxoSource, WalletKeys, WalletUtxo};
     use serde_json::json;
 
     use super::{
         ApproximateTransactionShape, EvmMessageSigner, EvmTransactionSigner, ListUtxosOutput,
-        PublicBroadcasterFeeMode, PublicBroadcasterResultKind, PublicBroadcasterSelection,
-        RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS, SoftwareEvmSigner, TokenTotal, UtxoOutput,
-        approximate_public_broadcaster_cost, approximate_public_broadcaster_gas,
-        broadcaster_fee_amount, broadcaster_fee_covers, buffered_public_broadcaster_fee,
-        decode_public_broadcaster_response, eligible_public_broadcasters, is_wrapped_native_token,
-        max_send_amount_from_outputs, max_unshield_amount_from_outputs, parse_railgun_recipient,
+        PublicBroadcasterCandidate, PublicBroadcasterFeeMode, PublicBroadcasterResultKind,
+        PublicBroadcasterSelection, RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS, SoftwareEvmSigner,
+        TokenTotal, UtxoOutput, approximate_public_broadcaster_cost,
+        approximate_public_broadcaster_gas, broadcaster_fee_amount, broadcaster_fee_covers,
+        buffered_public_broadcaster_fee, decode_public_broadcaster_response,
+        eligible_public_broadcasters, is_wrapped_native_token, max_send_amount_from_outputs,
+        max_unshield_amount_from_outputs, parse_railgun_recipient, parse_required_poi_list_keys,
         parse_send_amount, parse_unshield_amount, public_broadcaster_amount_split,
-        public_broadcaster_max_entered_amount, select_public_broadcaster, send_approximate_shape,
-        sort_specific_public_broadcasters, transact_topic, unshield_approximate_shape,
-        utxo_outputs_from_utxos, wrapped_native_token_for_chain,
+        public_broadcaster_max_entered_amount, public_broadcaster_transact_params,
+        select_public_broadcaster, send_approximate_shape, sort_specific_public_broadcasters,
+        transact_topic, unshield_approximate_shape, utxo_outputs_from_utxos,
+        wrapped_native_token_for_chain,
     };
+
+    static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn address(byte: u8) -> Address {
         Address::from_slice(&[byte; 20])
+    }
+
+    fn temp_db_root() -> PathBuf {
+        let dir = std::env::temp_dir().join("railgun-broadcaster-wallet-ops-tests");
+        fs::create_dir_all(&dir).expect("create temp db dir");
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let counter = TEMP_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
+        dir.join(format!("db-{pid}-{nanos}-{counter}"))
     }
 
     fn source(byte: u8) -> UtxoSource {
@@ -2816,6 +3615,131 @@ mod tests {
             .to_string()
     }
 
+    fn sample_public_broadcaster_candidate(
+        seed: u8,
+    ) -> (PublicBroadcasterCandidate, ViewingKeyData) {
+        let viewing = ViewingKeyData::from_spending_public_key(
+            [seed; 32],
+            [U256::from(seed), U256::from(seed + 1)],
+        );
+        let railgun_address = viewing.derive_address(None).expect("derive address");
+        let address_data = AddressData::try_from(&RailgunAddress::from(railgun_address.as_ref()))
+            .expect("address data");
+        (
+            PublicBroadcasterCandidate {
+                chain_id: 1,
+                railgun_address: railgun_address.to_string(),
+                identifier: None,
+                token: address(0x33),
+                fee: U256::from(10_u8),
+                fees_id: "fees-id".to_string(),
+                fee_expiration: SystemTime::now() + Duration::from_secs(60),
+                reliability: 0.9,
+                available_wallets: 1,
+                version: "8.2.3".to_string(),
+                relay_adapt: address(0x44),
+                relay_adapt_7702: None,
+                required_poi_list_keys: Vec::new(),
+                viewing_public_key: address_data.viewing_public_key,
+                address_data,
+            },
+            viewing,
+        )
+    }
+
+    fn sample_pre_tx_poi(byte: u8) -> PreTxPoi {
+        PreTxPoi {
+            snark_proof: SnarkJsProof {
+                pi_a: [U256::from(byte), U256::from(byte + 1)],
+                pi_b: [
+                    [U256::from(byte + 2), U256::from(byte + 3)],
+                    [U256::from(byte + 4), U256::from(byte + 5)],
+                ],
+                pi_c: [U256::from(byte + 6), U256::from(byte + 7)],
+            },
+            txid_merkleroot: FixedBytes::from([byte; 32]),
+            poi_merkleroots: vec![FixedBytes::from([byte + 1; 32])],
+            blinded_commitments_out: vec![FixedBytes::from([byte + 2; 32])],
+            railgun_txid_if_has_unshield: Bytes::copy_from_slice(&[0_u8]),
+        }
+    }
+
+    fn sample_poi_map(
+        list_keys: &[FixedBytes<32>],
+        txid_leaf_hashes: &[FixedBytes<32>],
+    ) -> BTreeMap<FixedBytes<32>, BTreeMap<FixedBytes<32>, PreTxPoi>> {
+        list_keys
+            .iter()
+            .enumerate()
+            .map(|(list_index, list_key)| {
+                let per_leaf = txid_leaf_hashes
+                    .iter()
+                    .enumerate()
+                    .map(|(leaf_index, leaf)| {
+                        (
+                            *leaf,
+                            sample_pre_tx_poi(10 + (list_index * 4 + leaf_index) as u8),
+                        )
+                    })
+                    .collect();
+                (*list_key, per_leaf)
+            })
+            .collect()
+    }
+
+    fn sample_note(seed: u8, token: Address, value: u64) -> Note {
+        Note::new_change(U256::from(seed), token, U256::from(value), [seed; 16])
+    }
+
+    fn sample_chunk(
+        tree_number: u32,
+        bound_seed: u8,
+        outputs: Vec<Note>,
+        has_unshield: bool,
+    ) -> TransactionPlanChunk {
+        TransactionPlanChunk {
+            tree_number,
+            merkle_root: U256::from(bound_seed),
+            inputs: Vec::new(),
+            public_inputs: PublicInputs {
+                merkle_root: U256::from(bound_seed),
+                bound_params_hash: U256::from(bound_seed + 1),
+                nullifiers: Vec::new(),
+                commitments_out: outputs.iter().map(Note::commitment).collect(),
+            },
+            private_inputs: PrivateInputs {
+                token_address: U256::from(bound_seed + 2),
+                random_in: Vec::new(),
+                value_in: Vec::new(),
+                path_elements: Vec::new(),
+                leaves_indices: Vec::new(),
+                value_out: outputs.iter().map(|note| note.value).collect(),
+                public_key: [U256::from(bound_seed + 3), U256::from(bound_seed + 4)],
+                npk_out: outputs.iter().map(|note| note.npk).collect(),
+                nullifying_key: U256::from(bound_seed + 5),
+            },
+            outputs,
+            has_unshield,
+            signature: [U256::ZERO; 3],
+        }
+    }
+
+    fn poi_map_for_chunks(
+        list_keys: &[FixedBytes<32>],
+        chunks: &[TransactionPlanChunk],
+    ) -> BTreeMap<FixedBytes<32>, BTreeMap<FixedBytes<32>, PreTxPoi>> {
+        let leaves = chunks
+            .iter()
+            .map(|chunk| {
+                super::u256_to_fixed(railgun_txid_leaf_hash(
+                    chunk.railgun_txid(),
+                    u64::from(chunk.tree_number),
+                ))
+            })
+            .collect::<Vec<_>>();
+        sample_poi_map(list_keys, &leaves)
+    }
+
     fn fee_row(chain_id: u64, token: Address, fee: u64, reliability: f64, fees_id: &str) -> FeeRow {
         fee_row_with_broadcaster_seed(chain_id, token, fee, reliability, fees_id, 7)
     }
@@ -2848,18 +3772,258 @@ mod tests {
     }
 
     fn utxo(token: Address, value: u64, tree: u32, position: u64) -> WalletUtxo {
-        WalletUtxo::new(Utxo {
-            note: Note::new_unshield(Address::ZERO, token, U256::from(value)),
+        let mut wallet_utxo = WalletUtxo::new(Utxo::new(
+            Note::new_unshield(Address::ZERO, token, U256::from(value)),
             tree,
             position,
-            source: source(position as u8 + 1),
-        })
+            source(position as u8 + 1),
+            UtxoCommitmentKind::Transact,
+        ));
+        for list_key in default_active_poi_list_keys() {
+            wallet_utxo
+                .utxo
+                .poi
+                .statuses
+                .insert(list_key, PoiStatus::Valid);
+        }
+        wallet_utxo
     }
 
     fn spent_utxo(token: Address, value: u64, tree: u32, position: u64) -> WalletUtxo {
         let mut wallet_utxo = utxo(token, value, tree, position);
         wallet_utxo.spent = Some(source(9));
         wallet_utxo
+    }
+
+    #[test]
+    fn poi_verified_unspent_utxos_filter_planner_inputs() {
+        let token = address(0x11);
+        let valid = utxo(token, 5, 0, 1);
+        let mut unknown = utxo(token, 100, 0, 2);
+        unknown.utxo.poi.statuses.clear();
+        let mut blocked = utxo(token, 7, 0, 3);
+        blocked
+            .utxo
+            .poi
+            .statuses
+            .insert(default_active_poi_list_keys()[0], PoiStatus::ShieldBlocked);
+        let spent = spent_utxo(token, 9, 0, 4);
+
+        let selected =
+            super::poi_verified_unspent_utxos_from_records(&[valid, unknown, blocked, spent]);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].note.value, U256::from(5_u8));
+    }
+
+    #[test]
+    fn manual_send_pending_output_contexts_persist_without_tx_hash() {
+        let root_dir = temp_db_root();
+        let store = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db");
+        let token = address(0x33);
+        let recipient_note = sample_note(1, token, 5);
+        let change_note = sample_note(2, token, 3);
+        let chunk = sample_chunk(
+            4,
+            0x20,
+            vec![recipient_note.clone(), change_note.clone()],
+            false,
+        );
+        let poi_list_keys = default_active_poi_list_keys();
+        let pre_transaction_pois = poi_map_for_chunks(&poi_list_keys, std::slice::from_ref(&chunk));
+
+        let count = super::persist_pending_send_output_poi_contexts(
+            &store,
+            1,
+            "wallet-1",
+            &[chunk],
+            &pre_transaction_pois,
+            &poi_list_keys,
+            false,
+        )
+        .expect("persist pending send output contexts");
+
+        assert_eq!(count, 2);
+        let records = store
+            .list_pending_output_poi_contexts(1)
+            .expect("list pending output POI contexts");
+        assert_eq!(records.len(), 2);
+        let recipient = records
+            .iter()
+            .find(|record| record.output_role == PendingOutputPoiRole::Recipient)
+            .expect("recipient context");
+        assert_eq!(recipient.wallet_id, "wallet-1");
+        assert_eq!(
+            recipient.output_commitment,
+            super::u256_to_fixed(recipient_note.commitment())
+        );
+        assert!(recipient.source_operation_id.is_none());
+        assert!(recipient.observation.is_none());
+        assert_eq!(recipient.required_poi_list_keys, poi_list_keys);
+        let change = records
+            .iter()
+            .find(|record| record.output_role == PendingOutputPoiRole::Change)
+            .expect("change context");
+        assert_eq!(
+            change.output_commitment,
+            super::u256_to_fixed(change_note.commitment())
+        );
+
+        drop(store);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn manual_unshield_pending_output_contexts_skip_public_output_without_tx_hash() {
+        let root_dir = temp_db_root();
+        let store = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db");
+        let token = address(0x34);
+        let change_note = sample_note(3, token, 7);
+        let unshield_note = Note::new_unshield(address(0xaa), token, U256::from(5_u8));
+        let chunk = sample_chunk(
+            5,
+            0x30,
+            vec![change_note.clone(), unshield_note.clone()],
+            true,
+        );
+        let poi_list_keys = default_active_poi_list_keys();
+        let pre_transaction_pois = poi_map_for_chunks(&poi_list_keys, std::slice::from_ref(&chunk));
+
+        let count = super::persist_pending_unshield_output_poi_contexts(
+            &store,
+            1,
+            "wallet-1",
+            &[chunk],
+            &pre_transaction_pois,
+            &poi_list_keys,
+            false,
+        )
+        .expect("persist pending unshield output contexts");
+
+        assert_eq!(count, 1);
+        let records = store
+            .list_pending_output_poi_contexts(1)
+            .expect("list pending output POI contexts");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].output_role, PendingOutputPoiRole::Change);
+        assert_eq!(
+            records[0].output_commitment,
+            super::u256_to_fixed(change_note.commitment())
+        );
+        assert_ne!(
+            records[0].output_commitment,
+            super::u256_to_fixed(unshield_note.commitment())
+        );
+        assert!(records[0].source_operation_id.is_none());
+        assert!(records[0].observation.is_none());
+
+        drop(store);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn public_broadcaster_pending_output_contexts_include_fee_outputs() {
+        let root_dir = temp_db_root();
+        let store = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db");
+        let token = address(0x35);
+        let fee_note = sample_note(4, token, 1);
+        let recipient_note = sample_note(5, token, 8);
+        let change_note = sample_note(6, token, 2);
+        let chunk = sample_chunk(
+            6,
+            0x40,
+            vec![fee_note.clone(), recipient_note, change_note],
+            false,
+        );
+        let poi_list_keys = default_active_poi_list_keys();
+        let pre_transaction_pois = poi_map_for_chunks(&poi_list_keys, std::slice::from_ref(&chunk));
+
+        let count = super::persist_pending_send_output_poi_contexts(
+            &store,
+            1,
+            "wallet-1",
+            &[chunk],
+            &pre_transaction_pois,
+            &poi_list_keys,
+            true,
+        )
+        .expect("persist public broadcaster send output contexts");
+
+        assert_eq!(count, 3);
+        let records = store
+            .list_pending_output_poi_contexts(1)
+            .expect("list pending output POI contexts");
+        assert_eq!(records.len(), 3);
+        assert!(records.iter().any(|record| record.output_role
+            == PendingOutputPoiRole::BroadcasterFee
+            && record.output_commitment == super::u256_to_fixed(fee_note.commitment())));
+
+        drop(store);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn public_broadcaster_unshield_pending_output_contexts_skip_public_output() {
+        let root_dir = temp_db_root();
+        let store = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db");
+        let token = address(0x36);
+        let fee_note = sample_note(7, token, 1);
+        let change_note = sample_note(8, token, 4);
+        let unshield_note = Note::new_unshield(address(0xbb), token, U256::from(6_u8));
+        let chunk = sample_chunk(
+            7,
+            0x50,
+            vec![fee_note, change_note, unshield_note.clone()],
+            true,
+        );
+        let poi_list_keys = default_active_poi_list_keys();
+        let pre_transaction_pois = poi_map_for_chunks(&poi_list_keys, std::slice::from_ref(&chunk));
+
+        let count = super::persist_pending_unshield_output_poi_contexts(
+            &store,
+            1,
+            "wallet-1",
+            &[chunk],
+            &pre_transaction_pois,
+            &poi_list_keys,
+            true,
+        )
+        .expect("persist public broadcaster unshield output contexts");
+
+        assert_eq!(count, 2);
+        let records = store
+            .list_pending_output_poi_contexts(1)
+            .expect("list pending output POI contexts");
+        assert_eq!(records.len(), 2);
+        assert!(
+            records
+                .iter()
+                .any(|record| record.output_role == PendingOutputPoiRole::BroadcasterFee)
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| record.output_role == PendingOutputPoiRole::Change)
+        );
+        assert!(
+            records.iter().all(|record| record.output_commitment
+                != super::u256_to_fixed(unshield_note.commitment()))
+        );
+
+        drop(store);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
     }
 
     #[test]
@@ -2895,13 +4059,44 @@ mod tests {
                 TokenTotal {
                     token: token_a.to_checksum(None),
                     total: "7".to_string(),
+                    poi_verified_total: "7".to_string(),
                 },
                 TokenTotal {
                     token: token_b.to_checksum(None),
                     total: "7".to_string(),
+                    poi_verified_total: "7".to_string(),
                 },
             ]
         );
+    }
+
+    #[test]
+    fn token_totals_include_poi_verified_balance() {
+        let token = address(0x11);
+        let active_list_key = default_active_poi_list_keys()[0];
+        let mut valid = utxo(token, 5, 0, 1);
+        valid
+            .utxo
+            .poi
+            .statuses
+            .insert(active_list_key, PoiStatus::Valid);
+        let mut missing = utxo(token, 7, 0, 2);
+        missing.utxo.poi.statuses.clear();
+
+        let (outputs, totals) = utxo_outputs_from_utxos(vec![valid, missing]);
+
+        assert!(outputs[0].poi_spendable);
+        assert_eq!(
+            outputs[0].poi_statuses[&hex::encode(active_list_key)],
+            "Valid"
+        );
+        assert!(!outputs[1].poi_spendable);
+        assert_eq!(
+            outputs[1].poi_statuses[&hex::encode(active_list_key)],
+            "Unknown"
+        );
+        assert_eq!(totals[0].total, "12");
+        assert_eq!(totals[0].poi_verified_total, "5");
     }
 
     #[test]
@@ -2927,6 +4122,32 @@ mod tests {
     }
 
     #[test]
+    fn max_amount_from_outputs_excludes_non_poi_verified_utxos() {
+        let token = address(0x11);
+        let mut valid = utxo(token, 5, 0, 1);
+        let mut unknown = utxo(token, 100, 0, 2);
+        unknown.utxo.poi.statuses.clear();
+        let (outputs, _) = utxo_outputs_from_utxos(vec![valid.clone(), unknown]);
+
+        assert_eq!(
+            max_send_amount_from_outputs(&outputs, token),
+            U256::from(5_u8)
+        );
+        assert_eq!(
+            max_unshield_amount_from_outputs(&outputs, token),
+            U256::from(5_u8)
+        );
+
+        valid.spent = Some(source(9));
+        let (outputs, _) = utxo_outputs_from_utxos(vec![valid]);
+        assert_eq!(max_send_amount_from_outputs(&outputs, token), U256::ZERO);
+        assert_eq!(
+            max_unshield_amount_from_outputs(&outputs, token),
+            U256::ZERO
+        );
+    }
+
+    #[test]
     fn utxo_outputs_include_generation_timestamp() {
         let token = address(0x11);
         let (outputs, _) = utxo_outputs_from_utxos(vec![utxo(token, 1, 0, 7)]);
@@ -2947,6 +4168,18 @@ mod tests {
                 position: 3,
                 token: "0x0000000000000000000000000000000000000001".to_string(),
                 value: "4".to_string(),
+                commitment_kind: "Transact".to_string(),
+                commitment: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+                npk: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_string(),
+                blinded_commitment:
+                    "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string(),
+                poi_statuses: BTreeMap::from([(
+                    "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string(),
+                    "Unknown".to_string(),
+                )]),
+                poi_spendable: false,
                 source_tx_hash:
                     "0x1111111111111111111111111111111111111111111111111111111111111111".to_string(),
                 source_block_number: 11,
@@ -2961,6 +4194,7 @@ mod tests {
             totals: vec![TokenTotal {
                 token: "0x0000000000000000000000000000000000000001".to_string(),
                 total: "4".to_string(),
+                poi_verified_total: "0".to_string(),
             }],
         };
 
@@ -2977,6 +4211,14 @@ mod tests {
                     "position": 3,
                     "token": "0x0000000000000000000000000000000000000001",
                     "value": "4",
+                    "commitment_kind": "Transact",
+                    "commitment": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "npk": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "blinded_commitment": "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                    "poi_statuses": {
+                        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd": "Unknown",
+                    },
+                    "poi_spendable": false,
                     "source_tx_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
                     "source_block_number": 11,
                     "source_block_timestamp": 1_700_000_011,
@@ -2987,6 +4229,7 @@ mod tests {
                 "totals": [{
                     "token": "0x0000000000000000000000000000000000000001",
                     "total": "4",
+                    "poi_verified_total": "0",
                 }],
             })
         );
@@ -3478,28 +4721,17 @@ mod tests {
 
     #[test]
     fn public_broadcaster_transact_envelope_roundtrips() {
-        let broadcaster =
-            broadcaster_core::crypto::railgun::ViewingKeyData::from_spending_public_key(
-                [9u8; 32],
-                [U256::from(3_u8), U256::from(4_u8)],
-            );
-        let railgun_address = broadcaster.derive_address(None).expect("derive address");
-        let address_data = AddressData::try_from(&RailgunAddress::from(railgun_address.as_ref()))
-            .expect("address data");
-        let params = BroadcasterRawParamsTransact {
-            chain_type: 0,
-            chain_id: 1,
-            min_gas_price: Some(U256::from(20_000_000_000_u128)),
-            fees_id: Some("fees-id".to_string()),
-            to: address(0x33),
-            data: Bytes::from(vec![1, 2, 3, 4]),
-            broadcaster_viewing_key: FixedBytes::from(address_data.viewing_public_key),
-            txid_version: Some("V2_PoseidonMerkle".to_string()),
-            pre_transaction_pois_per_txid_leaf_per_list: BTreeMap::new(),
-        };
+        let (candidate, broadcaster) = sample_public_broadcaster_candidate(9);
+        let params = public_broadcaster_transact_params(
+            &candidate,
+            address(0x33),
+            Bytes::from(vec![1, 2, 3, 4]),
+            20_000_000_000,
+            BTreeMap::new(),
+        );
 
         let encrypted =
-            encrypt_transact_request_with_seed(address_data.viewing_public_key, &params, [8u8; 32])
+            encrypt_transact_request_with_seed(candidate.viewing_public_key, &params, [8u8; 32])
                 .expect("encrypt request");
         let payload = build_transact_request_payload(&encrypted).expect("serialize envelope");
         let value: serde_json::Value = serde_json::from_slice(&payload).expect("json envelope");
@@ -3519,6 +4751,95 @@ mod tests {
             decrypted.params.min_gas_price,
             Some(U256::from(20_000_000_000_u128))
         );
+        assert!(
+            decrypted
+                .params
+                .pre_transaction_pois_per_txid_leaf_per_list
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn public_broadcaster_transact_payload_includes_single_chunk_poi() {
+        let (mut candidate, broadcaster) = sample_public_broadcaster_candidate(10);
+        let list_key = FixedBytes::from([0x88; 32]);
+        let txid_leaf = FixedBytes::from([0x99; 32]);
+        candidate.required_poi_list_keys = vec![hex::encode(list_key)];
+        let required_keys = parse_required_poi_list_keys(&candidate).expect("required list keys");
+        let params = public_broadcaster_transact_params(
+            &candidate,
+            address(0x33),
+            Bytes::from(vec![1, 2, 3, 4]),
+            20_000_000_000,
+            sample_poi_map(&required_keys, &[txid_leaf]),
+        );
+
+        let encrypted =
+            encrypt_transact_request_with_seed(candidate.viewing_public_key, &params, [8u8; 32])
+                .expect("encrypt request");
+        let decrypted = try_decrypt_transact_request(
+            &broadcaster.viewing_private_key,
+            encrypted.pubkey,
+            &encrypted.encrypted_data,
+        )
+        .expect("decrypt request")
+        .expect("request for broadcaster");
+
+        let per_leaf = decrypted
+            .params
+            .pre_transaction_pois_per_txid_leaf_per_list
+            .get(&list_key)
+            .expect("list key");
+        assert_eq!(per_leaf.len(), 1);
+        assert!(per_leaf.contains_key(&txid_leaf));
+    }
+
+    #[test]
+    fn public_broadcaster_transact_payload_includes_batched_poi() {
+        let (mut candidate, broadcaster) = sample_public_broadcaster_candidate(11);
+        let list_keys = [FixedBytes::from([0x81; 32]), FixedBytes::from([0x82; 32])];
+        let leaves = [FixedBytes::from([0x91; 32]), FixedBytes::from([0x92; 32])];
+        candidate.required_poi_list_keys = list_keys.iter().map(hex::encode).collect();
+        let required_keys = parse_required_poi_list_keys(&candidate).expect("required list keys");
+        let params = public_broadcaster_transact_params(
+            &candidate,
+            address(0x33),
+            Bytes::from(vec![1, 2, 3, 4]),
+            20_000_000_000,
+            sample_poi_map(&required_keys, &leaves),
+        );
+
+        let encrypted =
+            encrypt_transact_request_with_seed(candidate.viewing_public_key, &params, [8u8; 32])
+                .expect("encrypt request");
+        let decrypted = try_decrypt_transact_request(
+            &broadcaster.viewing_private_key,
+            encrypted.pubkey,
+            &encrypted.encrypted_data,
+        )
+        .expect("decrypt request")
+        .expect("request for broadcaster");
+
+        let poi_map = decrypted.params.pre_transaction_pois_per_txid_leaf_per_list;
+        assert_eq!(poi_map.len(), 2);
+        for list_key in list_keys {
+            let per_leaf = poi_map.get(&list_key).expect("list key");
+            assert_eq!(per_leaf.len(), 2);
+            for leaf in leaves {
+                assert!(per_leaf.contains_key(&leaf));
+            }
+        }
+    }
+
+    #[test]
+    fn public_broadcaster_invalid_poi_list_key_fails_preparation() {
+        let (mut candidate, _) = sample_public_broadcaster_candidate(12);
+        candidate.required_poi_list_keys = vec!["poi-list".to_string()];
+
+        let error =
+            parse_required_poi_list_keys(&candidate).expect_err("invalid POI list key should fail");
+
+        assert!(error.to_string().contains("invalid required POI list key"));
     }
 
     #[test]

@@ -19,12 +19,13 @@ use wasmer::{Module, Store};
 
 use crate::artifacts::{
     ArtifactError, ArtifactSource, artifact_paths, ensure_artifacts_with_source,
-    expected_zkey_hash, variant_name,
+    ensure_poi_artifacts_with_source, expected_zkey_hash, poi_variant_name, variant_name,
 };
-use crate::tx::{PrivateInputs, PublicInputs};
+use crate::tx::{PoiProofInputs, PrivateInputs, PublicInputs};
 use crate::zkey_cache::load_or_parse_zkey;
 use broadcaster_core::contracts::railgun::{G1Point, G2Point, SnarkProof};
 use broadcaster_core::crypto::ark_utils::prime_field_to_u256;
+use broadcaster_core::transact::{MERKLE_ZERO_VALUE, SnarkJsProof};
 use local_db::{DbConfig, DbStore};
 
 #[derive(Debug, Error)]
@@ -49,6 +50,11 @@ pub enum ProverError {
 
 #[derive(Debug, Clone)]
 pub struct WitnessInputs {
+    values: BTreeMap<String, Vec<BigInt>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PoiWitnessInputs {
     values: BTreeMap<String, Vec<BigInt>>,
 }
 
@@ -154,14 +160,201 @@ impl WitnessInputs {
     }
 }
 
+impl PoiWitnessInputs {
+    #[must_use]
+    pub fn new(inputs: &PoiProofInputs, max_inputs: usize, max_outputs: usize) -> Self {
+        let mut values = BTreeMap::new();
+        values.insert(
+            "anyRailgunTxidMerklerootAfterTransaction".to_string(),
+            vec![inputs.any_railgun_txid_merkleroot_after_transaction.into()],
+        );
+        values.insert(
+            "boundParamsHash".to_string(),
+            vec![inputs.bound_params_hash.into()],
+        );
+        values.insert(
+            "nullifiers".to_string(),
+            pad_u256(inputs.nullifiers.clone(), max_inputs, MERKLE_ZERO_VALUE)
+                .into_iter()
+                .map(BigInt::from)
+                .collect(),
+        );
+        values.insert(
+            "commitmentsOut".to_string(),
+            pad_u256(
+                inputs.commitments_out.clone(),
+                max_outputs,
+                MERKLE_ZERO_VALUE,
+            )
+            .into_iter()
+            .map(BigInt::from)
+            .collect(),
+        );
+        values.insert(
+            "spendingPublicKey".to_string(),
+            inputs
+                .spending_public_key
+                .iter()
+                .map(BigInt::from)
+                .collect(),
+        );
+        values.insert(
+            "nullifyingKey".to_string(),
+            vec![inputs.nullifying_key.into()],
+        );
+        values.insert("token".to_string(), vec![inputs.token.into()]);
+        values.insert(
+            "randomsIn".to_string(),
+            pad_u256(inputs.randoms_in.clone(), max_inputs, MERKLE_ZERO_VALUE)
+                .into_iter()
+                .map(BigInt::from)
+                .collect(),
+        );
+        values.insert(
+            "valuesIn".to_string(),
+            pad_u256(inputs.values_in.clone(), max_inputs, U256::ZERO)
+                .into_iter()
+                .map(BigInt::from)
+                .collect(),
+        );
+        values.insert(
+            "utxoPositionsIn".to_string(),
+            pad_u256(
+                inputs.utxo_positions_in.clone(),
+                max_inputs,
+                MERKLE_ZERO_VALUE,
+            )
+            .into_iter()
+            .map(BigInt::from)
+            .collect(),
+        );
+        values.insert("utxoTreeIn".to_string(), vec![inputs.utxo_tree_in.into()]);
+        values.insert(
+            "npksOut".to_string(),
+            pad_u256(inputs.npks_out.clone(), max_outputs, MERKLE_ZERO_VALUE)
+                .into_iter()
+                .map(BigInt::from)
+                .collect(),
+        );
+        values.insert(
+            "valuesOut".to_string(),
+            pad_u256(inputs.values_out.clone(), max_outputs, U256::ZERO)
+                .into_iter()
+                .map(BigInt::from)
+                .collect(),
+        );
+        values.insert(
+            "utxoBatchGlobalStartPositionOut".to_string(),
+            vec![inputs.utxo_batch_global_start_position_out.into()],
+        );
+        values.insert(
+            "railgunTxidIfHasUnshield".to_string(),
+            vec![inputs.railgun_txid_if_has_unshield.into()],
+        );
+        values.insert(
+            "railgunTxidMerkleProofIndices".to_string(),
+            vec![inputs.railgun_txid_merkle_proof_indices.into()],
+        );
+        values.insert(
+            "railgunTxidMerkleProofPathElements".to_string(),
+            inputs
+                .railgun_txid_merkle_proof_path_elements
+                .iter()
+                .map(BigInt::from)
+                .collect(),
+        );
+        values.insert(
+            "poiMerkleroots".to_string(),
+            pad_u256(
+                inputs.poi_merkleroots.clone(),
+                max_inputs,
+                MERKLE_ZERO_VALUE,
+            )
+            .into_iter()
+            .map(BigInt::from)
+            .collect(),
+        );
+        values.insert(
+            "poiInMerkleProofIndices".to_string(),
+            pad_u256(
+                inputs.poi_in_merkle_proof_indices.clone(),
+                max_inputs,
+                U256::ZERO,
+            )
+            .into_iter()
+            .map(BigInt::from)
+            .collect(),
+        );
+        values.insert(
+            "poiInMerkleProofPathElements".to_string(),
+            pad_u256_rows(
+                inputs.poi_in_merkle_proof_path_elements.clone(),
+                max_inputs,
+                merkletree::tree::TREE_DEPTH,
+                MERKLE_ZERO_VALUE,
+            )
+            .into_iter()
+            .flatten()
+            .map(BigInt::from)
+            .collect(),
+        );
+
+        Self { values }
+    }
+
+    #[must_use]
+    pub fn to_hex_map(&self) -> BTreeMap<String, Vec<String>> {
+        self.values
+            .iter()
+            .map(|(k, v)| {
+                let values = v.iter().map(bigint_to_hex).collect();
+                (k.clone(), values)
+            })
+            .collect()
+    }
+
+    #[must_use]
+    pub fn into_inputs(self) -> BTreeMap<String, Vec<BigInt>> {
+        self.values
+    }
+}
+
+fn pad_u256(mut values: Vec<U256>, target: usize, fill: U256) -> Vec<U256> {
+    values.resize(target, fill);
+    values.truncate(target);
+    values
+}
+
+fn pad_u256_rows(
+    mut values: Vec<Vec<U256>>,
+    target_rows: usize,
+    row_len: usize,
+    fill: U256,
+) -> Vec<Vec<U256>> {
+    for row in &mut values {
+        row.resize(row_len, fill);
+        row.truncate(row_len);
+    }
+    values.resize_with(target_rows, || vec![fill; row_len]);
+    values.truncate(target_rows);
+    values
+}
+
 const DEFAULT_PROVER_QUEUE: usize = 4;
 
-struct ProverJob {
-    public_inputs: PublicInputs,
-    private_inputs: PrivateInputs,
-    signature: [U256; 3],
-    verify_proof: bool,
-    response: oneshot::Sender<Result<SnarkProof, ProverError>>,
+enum ProverJob {
+    Railgun {
+        public_inputs: PublicInputs,
+        private_inputs: PrivateInputs,
+        signature: [U256; 3],
+        verify_proof: bool,
+        response: oneshot::Sender<Result<SnarkProof, ProverError>>,
+    },
+    Poi {
+        inputs: PoiProofInputs,
+        verify_proof: bool,
+        response: oneshot::Sender<Result<SnarkJsProof, ProverError>>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -211,16 +404,37 @@ impl ProverService {
             // TODO: cache artifacts in memory to avoid repeated disk reads.
             while let Some(job) = receiver.blocking_recv() {
                 let _guard = runtime.enter();
-                let result = prove_unshield_blocking(
-                    &source,
-                    &job.public_inputs,
-                    &job.private_inputs,
-                    &job.signature,
-                    job.verify_proof,
-                    db_store.as_deref(),
-                );
-                if job.response.send(result).is_err() {
-                    debug!("failed to send prover response");
+                match job {
+                    ProverJob::Railgun {
+                        public_inputs,
+                        private_inputs,
+                        signature,
+                        verify_proof,
+                        response,
+                    } => {
+                        let result = prove_unshield_blocking(
+                            &source,
+                            &public_inputs,
+                            &private_inputs,
+                            &signature,
+                            verify_proof,
+                            db_store.as_deref(),
+                        );
+                        if response.send(result).is_err() {
+                            debug!("failed to send prover response");
+                        }
+                    }
+                    ProverJob::Poi {
+                        inputs,
+                        verify_proof,
+                        response,
+                    } => {
+                        let result =
+                            prove_poi_blocking(&source, &inputs, verify_proof, db_store.as_deref());
+                        if response.send(result).is_err() {
+                            debug!("failed to send POI prover response");
+                        }
+                    }
                 }
             }
         });
@@ -235,10 +449,28 @@ impl ProverService {
         verify_proof: bool,
     ) -> Result<SnarkProof, ProverError> {
         let (response, receiver) = oneshot::channel();
-        let job = ProverJob {
+        let job = ProverJob::Railgun {
             public_inputs: public_inputs.clone(),
             private_inputs: private_inputs.clone(),
             signature: *signature,
+            verify_proof,
+            response,
+        };
+        self.sender
+            .send(job)
+            .await
+            .map_err(|_| ProverError::QueueClosed)?;
+        receiver.await.map_err(|_| ProverError::WorkerDropped)?
+    }
+
+    pub async fn prove_poi(
+        &self,
+        inputs: &PoiProofInputs,
+        verify_proof: bool,
+    ) -> Result<SnarkJsProof, ProverError> {
+        let (response, receiver) = oneshot::channel();
+        let job = ProverJob::Poi {
+            inputs: inputs.clone(),
             verify_proof,
             response,
         };
@@ -337,6 +569,85 @@ fn prove_unshield_blocking(
     Ok(ark_proof_to_sol(proof))
 }
 
+fn prove_poi_blocking(
+    source: &ArtifactSource,
+    inputs: &PoiProofInputs,
+    verify_proof: bool,
+    db_store: Option<&DbStore>,
+) -> Result<SnarkJsProof, ProverError> {
+    let (max_inputs, max_outputs) = poi_circuit_size(inputs);
+    debug!(
+        max_inputs,
+        max_outputs,
+        nullifiers = inputs.nullifiers.len(),
+        commitments_out = inputs.commitments_out.len(),
+        ?source,
+        "ensuring POI artifacts"
+    );
+    ensure_poi_artifacts_with_source(max_inputs, max_outputs, source)?;
+    debug!("loading POI artifacts");
+    let variant = poi_variant_name(max_inputs, max_outputs);
+    let paths = artifact_paths(&variant, source);
+    let wasm = fs::read(&paths.wasm).map_err(|source| ArtifactError::ArtifactFile {
+        path: paths.wasm.clone(),
+        source,
+    })?;
+    let expected_hash = expected_zkey_hash(&variant, source)?;
+    let mut expected_hash_bytes = [0u8; 32];
+    expected_hash_bytes.copy_from_slice(expected_hash.as_slice());
+    let (proving_key, matrices) =
+        load_or_parse_zkey(db_store, &variant, expected_hash_bytes, &paths.zkey)
+            .map_err(|e| ProverError::Zkey(e.to_string()))?;
+    let num_instance_variables = matrices.num_instance_variables;
+    let num_constraints = matrices.num_constraints;
+    let proof_matrices = [matrices.a, matrices.b, matrices.c];
+
+    let mut store = Store::default();
+    let module = Module::new(&store, wasm).map_err(color_eyre::Report::from)?;
+    let mut calculator = WitnessCalculator::from_module(&mut store, module)?;
+
+    let witness_inputs = PoiWitnessInputs::new(inputs, max_inputs, max_outputs);
+    let witness = calculator.calculate_witness_element::<Fr, _>(
+        &mut store,
+        witness_inputs.into_inputs(),
+        false,
+    )?;
+
+    let mut rng = thread_rng();
+    let r = Fr::rand(&mut rng);
+    let s = Fr::rand(&mut rng);
+    let proof = Groth16::<Bn254, CircomReduction>::create_proof_with_reduction_and_matrices(
+        &proving_key,
+        r,
+        s,
+        &proof_matrices,
+        num_instance_variables,
+        num_constraints,
+        &witness,
+    )?;
+
+    if verify_proof {
+        let public_inputs = public_inputs_from_witness(&witness, num_instance_variables);
+        let pvk = prepare_verifying_key(&proving_key.vk);
+        let verified =
+            Groth16::<Bn254, CircomReduction>::verify_proof(&pvk, &proof, &public_inputs)
+                .map_err(|err: SynthesisError| ProverError::Verify(err.to_string()))?;
+        if !verified {
+            return Err(ProverError::InvalidProof);
+        }
+    }
+
+    Ok(ark_proof_to_snarkjs(proof))
+}
+
+fn poi_circuit_size(inputs: &PoiProofInputs) -> (usize, usize) {
+    if inputs.nullifiers.len() <= 3 && inputs.commitments_out.len() <= 3 {
+        (3, 3)
+    } else {
+        (13, 13)
+    }
+}
+
 fn ark_proof_to_sol(proof: Proof<Bn254>) -> SnarkProof {
     let a = G1Point {
         x: prime_field_to_u256(proof.a.x),
@@ -359,6 +670,29 @@ fn ark_proof_to_sol(proof: Proof<Bn254>) -> SnarkProof {
     SnarkProof { a, b, c }
 }
 
+fn ark_proof_to_snarkjs(proof: Proof<Bn254>) -> SnarkJsProof {
+    SnarkJsProof {
+        pi_a: [
+            prime_field_to_u256(proof.a.x),
+            prime_field_to_u256(proof.a.y),
+        ],
+        pi_b: [
+            [
+                prime_field_to_u256(proof.b.x.c1),
+                prime_field_to_u256(proof.b.x.c0),
+            ],
+            [
+                prime_field_to_u256(proof.b.y.c1),
+                prime_field_to_u256(proof.b.y.c0),
+            ],
+        ],
+        pi_c: [
+            prime_field_to_u256(proof.c.x),
+            prime_field_to_u256(proof.c.y),
+        ],
+    }
+}
+
 fn public_inputs_from_witness(witness: &[Fr], count: usize) -> Vec<Fr> {
     if count <= 1 {
         return Vec::new();
@@ -371,4 +705,50 @@ fn bigint_to_hex(value: &BigInt) -> String {
         return "0x0".to_string();
     }
     format!("0x{}", value.to_str_radix(16))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MERKLE_ZERO_VALUE, PoiProofInputs, PoiWitnessInputs};
+    use alloy::primitives::U256;
+
+    fn sample_poi_inputs() -> PoiProofInputs {
+        PoiProofInputs {
+            any_railgun_txid_merkleroot_after_transaction: U256::from(1_u8),
+            bound_params_hash: U256::from(2_u8),
+            nullifiers: vec![U256::from(3_u8)],
+            commitments_out: vec![U256::from(4_u8)],
+            spending_public_key: [U256::from(5_u8), U256::from(6_u8)],
+            nullifying_key: U256::from(7_u8),
+            token: U256::from(8_u8),
+            randoms_in: vec![U256::from(9_u8)],
+            values_in: vec![U256::from(10_u8)],
+            utxo_positions_in: vec![U256::from(11_u8)],
+            utxo_tree_in: U256::from(12_u8),
+            npks_out: vec![U256::from(13_u8)],
+            values_out: vec![U256::from(14_u8)],
+            utxo_batch_global_start_position_out: U256::from(15_u8),
+            railgun_txid_if_has_unshield: U256::ZERO,
+            railgun_txid_merkle_proof_indices: U256::ZERO,
+            railgun_txid_merkle_proof_path_elements: vec![U256::ZERO; 16],
+            poi_merkleroots: vec![U256::from(16_u8)],
+            poi_in_merkle_proof_indices: vec![U256::from(17_u8)],
+            poi_in_merkle_proof_path_elements: vec![vec![U256::from(18_u8); 16]],
+        }
+    }
+
+    #[test]
+    fn poi_witness_inputs_pad_public_and_private_signals() {
+        let witness = PoiWitnessInputs::new(&sample_poi_inputs(), 3, 3);
+        let hex = witness.to_hex_map();
+
+        assert_eq!(hex["nullifiers"].len(), 3);
+        assert_eq!(hex["commitmentsOut"].len(), 3);
+        assert_eq!(hex["valuesIn"], vec!["0xa", "0x0", "0x0"]);
+        assert_eq!(hex["valuesOut"], vec!["0xe", "0x0", "0x0"]);
+        assert_eq!(hex["spendingPublicKey"], vec!["0x5", "0x6"]);
+        assert_eq!(hex["poiInMerkleProofPathElements"].len(), 3 * 16);
+        assert_eq!(hex["nullifiers"][1], format!("0x{MERKLE_ZERO_VALUE:x}"));
+        assert_eq!(hex["poiMerkleroots"][1], format!("0x{MERKLE_ZERO_VALUE:x}"));
+    }
 }

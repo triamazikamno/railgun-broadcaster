@@ -23,6 +23,7 @@ hex = { workspace = true }
 hmac = { workspace = true }
 merkletree = { path = "../merkletree" }
 local-db = { path = "../local-db" }
+poi = { path = "../poi" }
 num-bigint = "0.4"
 num-traits = "0.2"
 tracing = { workspace = true }
