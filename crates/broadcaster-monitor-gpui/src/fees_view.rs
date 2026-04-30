@@ -5,13 +5,10 @@ use gpui::{
 };
 use gpui_component::{
     Sizable, Size,
-    button::{Button, ButtonVariants},
     input::{Input, InputState},
-    popover::Popover,
-    scroll::ScrollableElement,
+    select::{SearchableVec, Select, SelectItem, SelectState},
     table::{Column, ColumnSort, TableDelegate, TableState},
     tooltip::Tooltip,
-    v_flex,
 };
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -31,6 +28,138 @@ pub(crate) enum FeesFilter<T: Copy + PartialEq> {
     One(T),
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct FeesChainFilterItem {
+    value: FeesFilter<u64>,
+}
+
+impl FeesChainFilterItem {
+    pub(crate) const fn all() -> Self {
+        Self {
+            value: FeesFilter::All,
+        }
+    }
+
+    pub(crate) const fn chain(chain_id: u64) -> Self {
+        Self {
+            value: FeesFilter::One(chain_id),
+        }
+    }
+}
+
+impl SelectItem for FeesChainFilterItem {
+    type Value = FeesFilter<u64>;
+
+    fn title(&self) -> SharedString {
+        match self.value {
+            FeesFilter::All => SharedString::from("All"),
+            FeesFilter::One(chain_id) => SharedString::from(chain_label(chain_id)),
+        }
+    }
+
+    fn display_title(&self) -> Option<gpui::AnyElement> {
+        Some(self.render_title(px(16.0)).into_any_element())
+    }
+
+    fn render(&self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        self.render_title(px(16.0))
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.value
+    }
+}
+
+impl FeesChainFilterItem {
+    fn render_title(&self, icon_size: Pixels) -> gpui::AnyElement {
+        match self.value {
+            FeesFilter::All => div().child("All").into_any_element(),
+            FeesFilter::One(chain_id) => icon_label_row(
+                chain_id,
+                SharedString::from(chain_label(chain_id)),
+                icon_size,
+            )
+            .into_any_element(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct FeesTokenFilterItem {
+    value: FeesFilter<(u64, Address)>,
+    show_chain: bool,
+}
+
+impl FeesTokenFilterItem {
+    pub(crate) const fn all(show_chain: bool) -> Self {
+        Self {
+            value: FeesFilter::All,
+            show_chain,
+        }
+    }
+
+    const fn token(chain_id: u64, address: Address, show_chain: bool) -> Self {
+        Self {
+            value: FeesFilter::One((chain_id, address)),
+            show_chain,
+        }
+    }
+}
+
+impl SelectItem for FeesTokenFilterItem {
+    type Value = FeesFilter<(u64, Address)>;
+
+    fn title(&self) -> SharedString {
+        match self.value {
+            FeesFilter::All => SharedString::from("All"),
+            FeesFilter::One((chain_id, address)) => {
+                SharedString::from(token_menu_label(chain_id, &address, self.show_chain))
+            }
+        }
+    }
+
+    fn display_title(&self) -> Option<gpui::AnyElement> {
+        Some(self.render_title(px(16.0)).into_any_element())
+    }
+
+    fn render(&self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        self.render_title(px(16.0))
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.value
+    }
+
+    fn matches(&self, query: &str) -> bool {
+        let query = query.to_ascii_lowercase();
+        match self.value {
+            FeesFilter::All => "all".contains(&query),
+            FeesFilter::One((chain_id, address)) => {
+                chain_label(chain_id).to_ascii_lowercase().contains(&query)
+                    || token_label(chain_id, &address)
+                        .to_ascii_lowercase()
+                        .contains(&query)
+                    || address.to_string().to_ascii_lowercase().contains(&query)
+            }
+        }
+    }
+}
+
+impl FeesTokenFilterItem {
+    fn render_title(&self, icon_size: Pixels) -> gpui::AnyElement {
+        match self.value {
+            FeesFilter::All => div().child("All").into_any_element(),
+            FeesFilter::One((chain_id, address)) => token_trigger_content(
+                self.show_chain.then_some(chain_id),
+                Some((chain_id, address)),
+                SharedString::from(token_menu_label(chain_id, &address, self.show_chain)),
+                icon_size,
+            )
+            .into_any_element(),
+        }
+    }
+}
+
 /// `TableDelegate` backing the fees pane. Owns the full sorted row snapshot
 /// (`all_rows`) plus the post-filter visible subset (`rows`) that
 /// `rows_count` / `render_td` see. Header cells for the first three columns
@@ -39,22 +168,25 @@ pub(crate) struct FeesDelegate {
     all_rows: Arc<[FeeRow]>,
     rows: Arc<[FeeRow]>,
     columns: [Column; 8],
-    /// Static option set for the chain dropdown — resolved once from
-    /// `cli::Options::effective_chain_ids()` and never changes at runtime.
-    chain_ids: Vec<u64>,
+    chain_select: Entity<SelectState<Vec<FeesChainFilterItem>>>,
     chain_filter: FeesFilter<u64>,
     /// Lower-cased substring query for the broadcaster filter (empty = no filter).
     broadcaster_query: Arc<str>,
     /// Owned by the delegate so `render_th(col=1)` can render the live `Input`.
     broadcaster_input: Entity<InputState>,
     token_filter: FeesFilter<(u64, Address)>,
+    token_select: Entity<SelectState<SearchableVec<FeesTokenFilterItem>>>,
     /// Active sort state for the fee column. `Default` preserves the natural
     /// (chain, broadcaster, token) order set by `set_rows`.
     fee_sort: ColumnSort,
 }
 
 impl FeesDelegate {
-    pub(crate) fn new(chain_ids: Vec<u64>, broadcaster_input: Entity<InputState>) -> Self {
+    pub(crate) fn new(
+        broadcaster_input: Entity<InputState>,
+        chain_select: Entity<SelectState<Vec<FeesChainFilterItem>>>,
+        token_select: Entity<SelectState<SearchableVec<FeesTokenFilterItem>>>,
+    ) -> Self {
         Self {
             all_rows: Arc::from(Vec::<FeeRow>::new()),
             rows: Arc::from(Vec::<FeeRow>::new()),
@@ -82,11 +214,12 @@ impl FeesDelegate {
                     .width(px(120.0))
                     .movable(false),
             ],
-            chain_ids,
+            chain_select,
             chain_filter: FeesFilter::One(1),
             broadcaster_query: Arc::from(""),
             broadcaster_input,
             token_filter: FeesFilter::All,
+            token_select,
             fee_sort: ColumnSort::Default,
         }
     }
@@ -179,6 +312,40 @@ impl FeesDelegate {
         });
         seen
     }
+
+    fn token_filter_items(&self) -> Vec<FeesTokenFilterItem> {
+        let show_chain = matches!(self.chain_filter, FeesFilter::All);
+        std::iter::once(FeesTokenFilterItem::all(show_chain))
+            .chain(
+                self.token_options()
+                    .into_iter()
+                    .map(move |(chain_id, address)| {
+                        FeesTokenFilterItem::token(chain_id, address, show_chain)
+                    }),
+            )
+            .collect()
+    }
+
+    pub(crate) fn sync_filter_selects(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<'_, TableState<Self>>,
+    ) {
+        self.chain_select.update(cx, |select, cx| {
+            if select.selected_value().copied() != Some(self.chain_filter) {
+                select.set_selected_value(&self.chain_filter, window, cx);
+            }
+        });
+
+        let token_items = self.token_filter_items();
+        self.token_select.update(cx, |select, cx| {
+            let selected_value = select.selected_value().copied();
+            select.set_items(SearchableVec::new(token_items), window, cx);
+            if selected_value != Some(self.token_filter) {
+                select.set_selected_value(&self.token_filter, window, cx);
+            }
+        });
+    }
 }
 
 const fn matches_chain(row: &FeeRow, filter: FeesFilter<u64>) -> bool {
@@ -263,20 +430,6 @@ fn token_label_row(
     row.child(label)
 }
 
-fn trigger_content(
-    chain_id: Option<u64>,
-    label: SharedString,
-    icon_size: Pixels,
-) -> impl IntoElement {
-    let mut row = div().w_full().flex().items_center().gap_1().text_left();
-    if let Some(chain_id) = chain_id {
-        row = row.child(icon_label_row(chain_id, label, icon_size));
-    } else {
-        row = row.child(label);
-    }
-    row
-}
-
 fn token_trigger_content(
     chain_id: Option<u64>,
     token: Option<(u64, Address)>,
@@ -295,12 +448,6 @@ fn token_trigger_content(
         row = row.child(img(path).size(icon_size).rounded_full().flex_none());
     }
     row.child(label)
-}
-
-const FILTER_POPOVER_MAX_HEIGHT: Pixels = px(850.0);
-
-fn filter_popover_max_height(window: &Window) -> Pixels {
-    (window.viewport_size().height * 0.7).min(FILTER_POPOVER_MAX_HEIGHT)
 }
 
 impl TableDelegate for FeesDelegate {
@@ -324,7 +471,7 @@ impl TableDelegate for FeesDelegate {
     ) -> impl IntoElement {
         let table = cx.entity();
         match col_ix {
-            0 => render_chain_header(&self.chain_ids, self.chain_filter, table).into_any_element(),
+            0 => render_chain_header(&self.chain_select).into_any_element(),
             1 => div()
                 .id("fees-broadcaster-filter-input")
                 .size_full()
@@ -333,11 +480,7 @@ impl TableDelegate for FeesDelegate {
                 })
                 .child(Input::new(&self.broadcaster_input).with_size(Size::XSmall))
                 .into_any_element(),
-            2 => {
-                let options = self.token_options();
-                render_token_header(options, self.chain_filter, self.token_filter, table)
-                    .into_any_element()
-            }
+            2 => render_token_header(&self.token_select).into_any_element(),
             3 => render_fee_header(self.fee_sort, table).into_any_element(),
             _ => div()
                 .size_full()
@@ -537,180 +680,35 @@ impl TableDelegate for FeesDelegate {
     }
 }
 
-fn render_chain_header(
-    chain_ids: &[u64],
-    current: FeesFilter<u64>,
-    table: Entity<TableState<FeesDelegate>>,
-) -> impl IntoElement {
-    let (trigger_chain, trigger_label) = match current {
-        FeesFilter::All => (None, SharedString::from("All ▼")),
-        FeesFilter::One(id) => (Some(id), SharedString::from(" ▼")),
-    };
-    let ids: Vec<u64> = chain_ids.to_vec();
-
-    Popover::new("fees-chain-filter")
-        .trigger(
-            Button::new("fees-chain-filter-trigger")
-                .ghost()
+fn render_chain_header(select: &Entity<SelectState<Vec<FeesChainFilterItem>>>) -> impl IntoElement {
+    div()
+        .id("fees-chain-filter")
+        .size_full()
+        .on_click(|_event, _window, cx| cx.stop_propagation())
+        .child(
+            Select::new(select)
+                .appearance(false)
                 .xsmall()
-                .justify_start()
-                .on_click(|_event, _window, cx| {
-                    cx.stop_propagation();
-                })
-                .child(trigger_content(trigger_chain, trigger_label, px(16.0))),
+                .w_full()
+                .menu_width(px(170.0)),
         )
-        .content(move |_state, window, cx| {
-            let table = table.clone();
-            let ids = ids.clone();
-            let popover = cx.entity();
-            let max_height = filter_popover_max_height(window);
-            v_flex()
-                .gap_1()
-                .min_w(px(160.0))
-                .max_h(max_height)
-                .overflow_y_scrollbar()
-                .child({
-                    let table = table.clone();
-                    let popover = popover.clone();
-                    Button::new("fees-chain-filter-all")
-                        .ghost()
-                        .xsmall()
-                        .w_full()
-                        .justify_start()
-                        .child(trigger_content(None, SharedString::from("All"), px(16.0)))
-                        .on_click(move |_event, window, cx| {
-                            cx.stop_propagation();
-                            table.update(cx, |state, cx| {
-                                state.delegate_mut().set_chain_filter(FeesFilter::All);
-                                cx.notify();
-                            });
-                            popover.update(cx, |state, cx| state.dismiss(window, cx));
-                        })
-                })
-                .children(ids.into_iter().map(move |id| {
-                    let table = table.clone();
-                    let popover = popover.clone();
-                    Button::new(SharedString::from(format!("fees-chain-filter-{id}")))
-                        .ghost()
-                        .xsmall()
-                        .w_full()
-                        .justify_start()
-                        .child(trigger_content(
-                            Some(id),
-                            SharedString::from(chain_label(id)),
-                            px(16.0),
-                        ))
-                        .on_click(move |_event, window, cx| {
-                            cx.stop_propagation();
-                            table.update(cx, |state, cx| {
-                                state.delegate_mut().set_chain_filter(FeesFilter::One(id));
-                                cx.notify();
-                            });
-                            popover.update(cx, |state, cx| state.dismiss(window, cx));
-                        })
-                }))
-        })
 }
 
 fn render_token_header(
-    options: Vec<(u64, Address)>,
-    chain: FeesFilter<u64>,
-    current: FeesFilter<(u64, Address)>,
-    table: Entity<TableState<FeesDelegate>>,
+    select: &Entity<SelectState<SearchableVec<FeesTokenFilterItem>>>,
 ) -> impl IntoElement {
-    // When the chain filter is `All`, a cross-chain menu needs the chain
-    // prefix to disambiguate same-symbol tokens (`Ethereum: USDC` vs.
-    // `BSC: USDC`). The trigger label uses the same rule so a pinned
-    // cross-chain token is self-describing.
-    let show_chain = matches!(chain, FeesFilter::All);
-    let (trigger_chain, trigger_token, trigger_label) = match current {
-        FeesFilter::All => (None, None, SharedString::from("token: All")),
-        FeesFilter::One((chain_id, addr)) => (
-            show_chain.then_some(chain_id),
-            Some((chain_id, addr)),
-            SharedString::from(format!(
-                "token: {}",
-                token_menu_label(chain_id, &addr, show_chain)
-            )),
-        ),
-    };
-
-    Popover::new("fees-token-filter")
-        .trigger(
-            Button::new("fees-token-filter-trigger")
-                .ghost()
+    div()
+        .id("fees-token-filter")
+        .size_full()
+        .on_click(|_event, _window, cx| cx.stop_propagation())
+        .child(
+            Select::new(select)
+                .appearance(false)
                 .xsmall()
-                .justify_start()
-                .on_click(|_event, _window, cx| {
-                    cx.stop_propagation();
-                })
-                .child(token_trigger_content(
-                    trigger_chain,
-                    trigger_token,
-                    trigger_label,
-                    px(16.0),
-                )),
+                .w_full()
+                .menu_width(px(240.0))
+                .search_placeholder("Search tokens"),
         )
-        .content(move |_state, window, cx| {
-            let table = table.clone();
-            let options = options.clone();
-            let popover = cx.entity();
-            let max_height = filter_popover_max_height(window);
-            v_flex()
-                .gap_1()
-                .min_w(px(200.0))
-                .max_h(max_height)
-                .overflow_y_scrollbar()
-                .child({
-                    let table = table.clone();
-                    let popover = popover.clone();
-                    Button::new("fees-token-filter-all")
-                        .ghost()
-                        .xsmall()
-                        .w_full()
-                        .justify_start()
-                        .child(token_trigger_content(
-                            None,
-                            None,
-                            SharedString::from("All"),
-                            px(16.0),
-                        ))
-                        .on_click(move |_event, window, cx| {
-                            cx.stop_propagation();
-                            table.update(cx, |state, cx| {
-                                state.delegate_mut().set_token_filter(FeesFilter::All);
-                                cx.notify();
-                            });
-                            popover.update(cx, |state, cx| state.dismiss(window, cx));
-                        })
-                })
-                .children(options.into_iter().map(move |(chain_id, addr)| {
-                    let table = table.clone();
-                    let popover = popover.clone();
-                    let id = format!("fees-token-filter-{chain_id}-{addr:#x}");
-                    Button::new(SharedString::from(id))
-                        .ghost()
-                        .xsmall()
-                        .w_full()
-                        .justify_start()
-                        .child(token_trigger_content(
-                            show_chain.then_some(chain_id),
-                            Some((chain_id, addr)),
-                            SharedString::from(token_menu_label(chain_id, &addr, false)),
-                            px(16.0),
-                        ))
-                        .on_click(move |_event, window, cx| {
-                            cx.stop_propagation();
-                            table.update(cx, |state, cx| {
-                                state
-                                    .delegate_mut()
-                                    .set_token_filter(FeesFilter::One((chain_id, addr)));
-                                cx.notify();
-                            });
-                            popover.update(cx, |state, cx| state.dismiss(window, cx));
-                        })
-                }))
-        })
 }
 
 fn render_fee_header(

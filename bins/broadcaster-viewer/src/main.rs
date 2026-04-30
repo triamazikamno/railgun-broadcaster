@@ -90,7 +90,7 @@ fn main() -> Result<()> {
             app,
             monitor.clone(),
             event_rx,
-            chain_ids,
+            &chain_ids,
             logs,
         );
 

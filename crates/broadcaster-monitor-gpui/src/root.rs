@@ -8,9 +8,10 @@ use gpui::{
     WindowOptions, canvas, div, img, prelude::FluentBuilder as _, px, rgb, size,
 };
 use gpui_component::{
-    Root,
+    IndexPath, Root,
     input::{InputEvent, InputState},
     resizable::{ResizableState, h_resizable, resizable_panel, v_resizable},
+    select::{SearchableVec, SelectEvent, SelectState},
     table::{Table, TableDelegate, TableEvent, TableState},
     tooltip::Tooltip,
 };
@@ -19,7 +20,7 @@ use ui::logs::{LogStore, LogsPane};
 use ui::table::ColumnWidthSync;
 use ui::theme::{self, APP_FONT_FAMILY, APP_TEXT_SIZE};
 
-use crate::fees_view::FeesDelegate;
+use crate::fees_view::{FeesChainFilterItem, FeesDelegate, FeesTokenFilterItem};
 use crate::peers_view::{self, PeersDelegate};
 
 /// Lower bound between UI re-renders when events are arriving.
@@ -40,9 +41,10 @@ pub fn open_monitor_window(
     app: &mut App,
     shared: Shared,
     event_rx: EventRx,
-    chain_ids: Vec<u64>,
+    chain_ids: &[u64],
     logs: LogStore,
 ) {
+    let chain_ids = chain_ids.to_vec();
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds {
             origin: Point::default(),
@@ -58,7 +60,7 @@ pub fn open_monitor_window(
 
     if let Err(error) = app.open_window(options, |window, cx| {
         let pane =
-            cx.new(|cx| BroadcasterMonitorPane::new(shared, event_rx, chain_ids, window, cx));
+            cx.new(|cx| BroadcasterMonitorPane::new(shared, event_rx, &chain_ids, window, cx));
         let logs = cx.new(|cx| LogsPane::new(logs, window, cx));
         let root = cx.new(|cx| StandaloneMonitorRoot::new(pane, logs, cx));
         cx.new(|cx| Root::new(root, window, cx))
@@ -268,16 +270,44 @@ impl BroadcasterMonitorPane {
     pub fn new(
         shared: Shared,
         mut event_rx: EventRx,
-        chain_ids: Vec<u64>,
+        chain_ids: &[u64],
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
         let top_split = cx.new(|_| ResizableState::default());
         let broadcaster_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("search broadcaster"));
+        let chain_select_items: Vec<_> = std::iter::once(FeesChainFilterItem::all())
+            .chain(chain_ids.iter().copied().map(FeesChainFilterItem::chain))
+            .collect();
+        let initial_chain_index = chain_ids
+            .iter()
+            .position(|chain_id| *chain_id == 1)
+            .map_or(0, |ix| ix + 1);
+        let chain_select = cx.new(|cx| {
+            SelectState::new(
+                chain_select_items,
+                Some(IndexPath::default().row(initial_chain_index)),
+                window,
+                cx,
+            )
+        });
+        let token_select = cx.new(|cx| {
+            SelectState::new(
+                SearchableVec::new(vec![FeesTokenFilterItem::all(false)]),
+                Some(IndexPath::default().row(0)),
+                window,
+                cx,
+            )
+            .searchable(true)
+        });
         let fees_table = cx.new(|cx| {
             TableState::new(
-                FeesDelegate::new(chain_ids, broadcaster_input.clone()),
+                FeesDelegate::new(
+                    broadcaster_input.clone(),
+                    chain_select.clone(),
+                    token_select.clone(),
+                ),
                 window,
                 cx,
             )
@@ -295,6 +325,39 @@ impl BroadcasterMonitorPane {
         })
         .detach();
 
+        cx.subscribe_in(
+            &chain_select,
+            window,
+            |this, _select, event: &SelectEvent<Vec<FeesChainFilterItem>>, window, cx| {
+                let SelectEvent::Confirm(Some(filter)) = event else {
+                    return;
+                };
+                this.fees_table.update(cx, |state, cx| {
+                    state.delegate_mut().set_chain_filter(*filter);
+                    state.delegate_mut().sync_filter_selects(window, cx);
+                    cx.notify();
+                });
+                cx.defer_in(window, |_this, window, _cx| window.blur());
+            },
+        )
+        .detach();
+        cx.subscribe_in(
+            &token_select,
+            window,
+            |this, _select, event: &SelectEvent<SearchableVec<FeesTokenFilterItem>>, window, cx| {
+                let SelectEvent::Confirm(Some(filter)) = event else {
+                    return;
+                };
+                this.fees_table.update(cx, |state, cx| {
+                    state.delegate_mut().set_token_filter(*filter);
+                    state.delegate_mut().sync_filter_selects(window, cx);
+                    cx.notify();
+                });
+                cx.defer_in(window, |_this, window, _cx| window.blur());
+            },
+        )
+        .detach();
+
         Self::subscribe_column_width_sync(cx, &peers_table);
 
         // The peers table only occupies the right side of `top_split`, so its
@@ -304,7 +367,7 @@ impl BroadcasterMonitorPane {
         })
         .detach();
 
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let mut last_rev: u64 = 0;
             loop {
                 let tick = cx.background_executor().timer(UI_REFRESH_INTERVAL);
@@ -318,7 +381,7 @@ impl BroadcasterMonitorPane {
                     () = tick => {}
                 }
 
-                let notified = this.update(cx, |root, cx| {
+                let notified = this.update_in(cx, |root, window, cx| {
                     let state = root.shared.read();
                     let current = state.rev();
                     if current == last_rev {
@@ -331,6 +394,7 @@ impl BroadcasterMonitorPane {
 
                     root.fees_table.update(cx, |s, cx| {
                         s.delegate_mut().set_rows(fees);
+                        s.delegate_mut().sync_filter_selects(window, cx);
                         cx.notify();
                     });
                     root.peers_table.update(cx, |s, cx| {

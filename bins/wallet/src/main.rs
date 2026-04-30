@@ -85,7 +85,7 @@ fn main() -> Result<()> {
             monitor.clone(),
             wallet_waku.clone(),
             event_rx,
-            chain_ids.clone(),
+            &chain_ids,
             logs,
         );
 

@@ -22,7 +22,7 @@ use gpui_component::{
     progress::Progress as UiProgress,
     resizable::{ResizableState, resizable_panel, v_resizable},
     scroll::ScrollableElement,
-    select::{Select, SelectEvent, SelectItem, SelectState},
+    select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState},
     spinner::Spinner,
     tab::{Tab, TabBar},
     table::{Column, Table, TableDelegate, TableEvent, TableState},
@@ -152,10 +152,11 @@ pub(crate) fn open_wallet_window(
     monitor: Shared,
     waku: Arc<PublicBroadcasterWakuClient>,
     event_rx: EventRx,
-    chain_ids: Vec<u64>,
+    chain_ids: &[u64],
     logs: LogStore,
 ) {
     wallet_ops::vault::enable_best_effort_runtime_hardening();
+    let chain_ids = chain_ids.to_vec();
     let window_options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds {
             origin: Point::default(),
@@ -173,7 +174,7 @@ pub(crate) fn open_wallet_window(
         let monitor_state = monitor.clone();
         let monitor = cx.new(|cx| {
             broadcaster_monitor_gpui::BroadcasterMonitorPane::new(
-                monitor, event_rx, chain_ids, window, cx,
+                monitor, event_rx, &chain_ids, window, cx,
             )
         });
         let logs = cx.new(|cx| LogsPane::new(logs, window, cx));
@@ -284,6 +285,37 @@ impl WalletTab {
 struct WalletOption {
     wallet_id: Arc<str>,
     label: Arc<str>,
+}
+
+#[derive(Clone)]
+struct WalletSelectItem {
+    wallet_id: Arc<str>,
+    label: Arc<str>,
+}
+
+impl SelectItem for WalletSelectItem {
+    type Value = Arc<str>;
+
+    fn title(&self) -> SharedString {
+        SharedString::from(self.label.to_string())
+    }
+
+    fn display_title(&self) -> Option<gpui::AnyElement> {
+        Some(wallet_label_row(SharedString::from(self.label.to_string())).into_any_element())
+    }
+
+    fn render(&self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        wallet_label_row(SharedString::from(self.label.to_string()))
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.wallet_id
+    }
+
+    fn matches(&self, query: &str) -> bool {
+        let query = query.to_lowercase();
+        self.label.to_lowercase().contains(&query) || self.wallet_id.to_lowercase().contains(&query)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -539,6 +571,7 @@ pub(crate) struct WalletRoot {
     logs: Entity<LogsPane>,
     active_activity: Activity,
     active_wallet_tab: WalletTab,
+    wallet_select: Entity<SelectState<SearchableVec<WalletSelectItem>>>,
     wallet_options: Vec<WalletOption>,
     selected_wallet_id: Option<Arc<str>>,
     selected_chain: u64,
@@ -647,6 +680,9 @@ impl WalletRoot {
             cx.new(|cx| InputState::new(window, cx).placeholder("search tx hash"));
         let chain_select =
             cx.new(|cx| SelectState::new(chain_select_items, selected_chain_index, window, cx));
+        let wallet_select = cx.new(|cx| {
+            SelectState::new(SearchableVec::new(vec![]), None, window, cx).searchable(true)
+        });
         let utxo_table =
             cx.new(|cx| TableState::new(UtxoDelegate::new(tx_search_input.clone()), window, cx));
 
@@ -671,6 +707,7 @@ impl WalletRoot {
             logs,
             active_activity: Activity::Wallet,
             active_wallet_tab: WalletTab::default(),
+            wallet_select: wallet_select.clone(),
             wallet_options: Vec::new(),
             selected_wallet_id: None,
             chain_select: chain_select.clone(),
@@ -715,6 +752,20 @@ impl WalletRoot {
                     return;
                 };
                 this.select_chain(*chain_id, cx);
+                cx.defer_in(window, |_this, window, _cx| {
+                    window.blur();
+                });
+            },
+        )
+        .detach();
+        cx.subscribe_in(
+            &wallet_select,
+            window,
+            |this, _select, event: &SelectEvent<SearchableVec<WalletSelectItem>>, window, cx| {
+                let SelectEvent::Confirm(Some(wallet_id)) = event else {
+                    return;
+                };
+                this.select_wallet(Arc::clone(wallet_id), cx);
                 cx.defer_in(window, |_this, window, _cx| {
                     window.blur();
                 });
@@ -1212,20 +1263,6 @@ impl WalletRoot {
         cx.notify();
     }
 
-    fn selected_wallet_label(&self) -> SharedString {
-        self.selected_wallet_id
-            .as_ref()
-            .and_then(|selected| {
-                self.wallet_options
-                    .iter()
-                    .find(|option| option.wallet_id.as_ref() == selected.as_ref())
-            })
-            .map_or_else(
-                || SharedString::from("Primary wallet"),
-                |option| SharedString::from(option.label.to_string()),
-            )
-    }
-
     fn toggle_spent_visibility(&mut self, cx: &mut Context<'_, Self>) {
         self.show_spent_utxos = !self.show_spent_utxos;
         self.sync_utxo_table(cx);
@@ -1474,12 +1511,14 @@ impl WalletRoot {
                 .unlock_first_view_session(password.as_str())
                 .map(|session| (session, password))
         });
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let result = join.await;
-            let _ = this.update(cx, |root, cx| {
+            let _ = this.update_in(cx, |root, window, cx| {
                 root.unlock_in_progress = false;
                 match result {
-                    Ok(Ok((Some(session), _password))) => root.enter_view_unlocked(session, cx),
+                    Ok(Ok((Some(session), _password))) => {
+                        root.enter_view_unlocked(session, window, cx);
+                    }
                     Ok(Ok((None, password))) => {
                         root.setup_password = Some(password);
                         root.vault_error = None;
@@ -1533,7 +1572,7 @@ impl WalletRoot {
         cx.notify();
     }
 
-    fn store_generated_wallet(&mut self, cx: &mut Context<'_, Self>) {
+    fn store_generated_wallet(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         let wallet_id = match generate_opaque_id() {
             Ok(wallet_id) => wallet_id,
             Err(error) => {
@@ -1572,7 +1611,7 @@ impl WalletRoot {
         };
 
         match result {
-            Ok(session) => self.enter_view_unlocked(session, cx),
+            Ok(session) => self.enter_view_unlocked(session, window, cx),
             Err(error) => self.handle_vault_error(&error, cx),
         }
     }
@@ -1618,12 +1657,17 @@ impl WalletRoot {
         };
 
         match result {
-            Ok(session) => self.enter_view_unlocked(session, cx),
+            Ok(session) => self.enter_view_unlocked(session, window, cx),
             Err(error) => self.handle_vault_error(&error, cx),
         }
     }
 
-    fn install_view_session(&mut self, session: DesktopViewSession, cx: &mut Context<'_, Self>) {
+    fn install_view_session(
+        &mut self,
+        session: DesktopViewSession,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         let session = Arc::new(session);
         let wallet_id: Arc<str> = Arc::from(session.wallet_id().to_owned());
         self.view_session = Some(session);
@@ -1632,6 +1676,7 @@ impl WalletRoot {
             label: Arc::from("Primary wallet"),
         }];
         self.selected_wallet_id = Some(wallet_id);
+        self.sync_wallet_select(window, cx);
         self.send_forms.clear();
         self.unshield_forms.clear();
         self.active_wallet_tab = WalletTab::default();
@@ -1649,11 +1694,37 @@ impl WalletRoot {
         cx.notify();
     }
 
-    fn enter_view_unlocked(&mut self, session: DesktopViewSession, cx: &mut Context<'_, Self>) {
-        self.install_view_session(session, cx);
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    fn sync_wallet_select(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let items: Vec<_> = self
+            .wallet_options
+            .iter()
+            .map(|option| WalletSelectItem {
+                wallet_id: Arc::clone(&option.wallet_id),
+                label: Arc::clone(&option.label),
+            })
+            .collect();
+        let selected_wallet_id = self.selected_wallet_id.clone();
+        self.wallet_select.update(cx, |select, cx| {
+            select.set_items(SearchableVec::new(items), window, cx);
+            if let Some(wallet_id) = selected_wallet_id.as_ref() {
+                select.set_selected_value(wallet_id, window, cx);
+            } else {
+                select.set_selected_index(None, window, cx);
+            }
+        });
     }
 
-    fn lock_vault(&mut self, cx: &mut Context<'_, Self>) {
+    fn enter_view_unlocked(
+        &mut self,
+        session: DesktopViewSession,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.install_view_session(session, window, cx);
+    }
+
+    fn lock_vault(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         if let Some(store) = self.session_store.get().cloned() {
             self.runtime.spawn(async move {
                 store.shutdown().await;
@@ -1662,6 +1733,7 @@ impl WalletRoot {
         self.view_session = None;
         self.wallet_options.clear();
         self.selected_wallet_id = None;
+        self.sync_wallet_select(window, cx);
         self.send_forms.clear();
         self.unshield_forms.clear();
         self.active_wallet_tab = WalletTab::default();
@@ -3412,9 +3484,9 @@ impl WalletRoot {
             app_button("confirm-generated-wallet", "I saved it, create wallet")
                 .primary()
                 .w_full()
-                .on_click(move |_event, _window, cx| {
+                .on_click(move |_event, window, cx| {
                     confirm_root.update(cx, |root, cx| {
-                        root.store_generated_wallet(cx);
+                        root.store_generated_wallet(window, cx);
                     });
                 }),
         )
@@ -3583,7 +3655,7 @@ impl WalletRoot {
             .bg(rgb(theme::SURFACE))
             .border_b_1()
             .border_color(rgb(theme::BORDER))
-            .child(self.render_wallet_selector(root.clone()))
+            .child(self.render_wallet_selector())
             .child(self.render_chain_selector())
             .child(div().flex_1())
             .children(receive_address.clone().map(|address| {
@@ -3605,9 +3677,9 @@ impl WalletRoot {
                     .py(px(15.0))
                     .tooltip("Lock vault")
                     .child(img(icons::lock_icon_path()).size(px(12.0)).flex_none())
-                    .on_click(move |_event, _window, cx| {
+                    .on_click(move |_event, window, cx| {
                         lock_root.update(cx, |root, cx| {
-                            root.lock_vault(cx);
+                            root.lock_vault(window, cx);
                         });
                     }),
             )
@@ -3689,55 +3761,16 @@ impl WalletRoot {
             })
     }
 
-    fn render_wallet_selector(&self, root: Entity<Self>) -> impl IntoElement {
-        let selected_label = self.selected_wallet_label();
-        let selected_wallet_id = self.selected_wallet_id.clone();
-        let wallet_options = self.wallet_options.clone();
-
-        Popover::new("wallet-selector")
-            .trigger(
-                app_button_base("wallet-selector-trigger")
-                    .ghost()
-                    .small()
-                    .justify_start()
-                    .child(wallet_label_row(selected_label)),
-            )
-            .content(move |_state, _window, cx| {
-                let popover = cx.entity();
-                let root = root.clone();
-                let selected_wallet_id = selected_wallet_id.clone();
-                v_flex()
-                    .gap_1()
-                    .min_w(px(190.0))
-                    .children(wallet_options.clone().into_iter().map(move |option| {
-                        let root = root.clone();
-                        let popover = popover.clone();
-                        let wallet_id = Arc::clone(&option.wallet_id);
-                        let is_selected = selected_wallet_id
-                            .as_ref()
-                            .is_some_and(|selected| selected.as_ref() == option.wallet_id.as_ref());
-                        app_button_base(SharedString::from(format!(
-                            "wallet-selector-option-{}",
-                            option.wallet_id
-                        )))
-                        .ghost()
-                        .small()
-                        .w_full()
-                        .justify_start()
-                        .when(is_selected, |button| {
-                            button.bg(rgb(theme::SELECTED_SURFACE))
-                        })
-                        .child(wallet_label_row(SharedString::from(
-                            option.label.to_string(),
-                        )))
-                        .on_click(move |_event, window, cx| {
-                            root.update(cx, |root, cx| {
-                                root.select_wallet(Arc::clone(&wallet_id), cx);
-                            });
-                            popover.update(cx, |state, cx| state.dismiss(window, cx));
-                        })
-                    }))
-            })
+    fn render_wallet_selector(&self) -> impl IntoElement {
+        div().h(px(24.0)).w(px(220.0)).flex().items_center().child(
+            Select::new(&self.wallet_select)
+                .appearance(false)
+                .small()
+                .w(px(220.0))
+                .h(px(24.0))
+                .menu_width(px(300.0))
+                .search_placeholder("Search wallets"),
+        )
     }
 
     fn render_wallet_tabs(&self, root: &Entity<Self>) -> impl IntoElement {
