@@ -100,7 +100,7 @@ pub fn apply_zenburn_component_theme(cx: &mut App) {
     colors.primary_hover = rgb(PRIMARY_HOVER);
     colors.progress_bar = rgb(PRIMARY);
     colors.ring = rgb(PRIMARY);
-    colors.scrollbar = rgb(SURFACE);
+    colors.scrollbar = rgb(SURFACE).alpha(0.0);
     colors.scrollbar_thumb = rgb(BORDER);
     colors.scrollbar_thumb_hover = rgb(BORDER_STRONG);
     colors.secondary = rgb(SURFACE_ELEVATED);

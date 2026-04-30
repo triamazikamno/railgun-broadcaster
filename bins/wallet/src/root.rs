@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, U256};
 use broadcaster_monitor::{EventRx, Shared};
@@ -9,7 +9,7 @@ use chrono::{DateTime, Local, Utc};
 use gpui::{
     App, AppContext, Bounds, Context, Entity, FocusHandle, Focusable, InteractiveElement,
     IntoElement, KeyBinding, MouseButton, ParentElement, Pixels, Point, Render, SharedString,
-    StatefulInteractiveElement, Styled, Window, WindowBounds, WindowOptions, div, img,
+    StatefulInteractiveElement, Styled, WeakEntity, Window, WindowBounds, WindowOptions, div, img,
     prelude::FluentBuilder as _, px, rgb, size,
 };
 use gpui_component::{
@@ -18,6 +18,7 @@ use gpui_component::{
     button::{ButtonGroup, ButtonVariants},
     group_box::{GroupBox, GroupBoxVariants},
     input::{Input, InputEvent, InputState},
+    list::{List, ListDelegate, ListItem, ListState},
     popover::Popover,
     progress::Progress as UiProgress,
     resizable::{ResizableState, resizable_panel, v_resizable},
@@ -71,6 +72,7 @@ const LOGS_DRAWER_HEIGHT: Pixels = px(260.0);
 const LOGS_DRAWER_MIN_HEIGHT: Pixels = px(160.0);
 const LOGS_DRAWER_MAX_HEIGHT: Pixels = px(600.0);
 const BROADCASTER_PICKER_MAX_HEIGHT: Pixels = px(680.0);
+const BROADCASTER_PICKER_LIVE_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 const PRIVATE_ASSET_LIST_WIDTH: Pixels = px(760.0);
 const UNSHIELD_SPINNER_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const UTXO_AGE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -234,17 +236,219 @@ enum BroadcasterChoice {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BroadcasterPickerSort {
-    FeeAscReliabilityDesc,
-}
-
 struct BroadcasterPickerState {
     kind: DeliveryFormKind,
     key: UnshieldAssetKey,
     query_input: Entity<InputState>,
     focus_handle: FocusHandle,
-    sort: BroadcasterPickerSort,
+    list: Entity<ListState<BroadcasterPickerDelegate>>,
+}
+
+#[derive(Clone, PartialEq)]
+struct BroadcasterPickerRow {
+    railgun_address: String,
+    label: String,
+    fee_label: String,
+    reliability: f64,
+    selected: bool,
+}
+
+#[derive(Clone, PartialEq)]
+struct BroadcasterPickerContent {
+    rows: Vec<BroadcasterPickerRow>,
+    empty_message: SharedString,
+    generating: bool,
+    query: String,
+}
+
+struct BroadcasterPickerDelegate {
+    root: WeakEntity<WalletRoot>,
+    kind: DeliveryFormKind,
+    key: UnshieldAssetKey,
+    generating: bool,
+    rows: Vec<BroadcasterPickerRow>,
+    empty_message: SharedString,
+    query: String,
+    pending_content: Option<BroadcasterPickerContent>,
+    last_live_update: Option<Instant>,
+    live_update_scheduled: bool,
+}
+
+impl BroadcasterPickerDelegate {
+    fn new(root: WeakEntity<WalletRoot>, kind: DeliveryFormKind, key: UnshieldAssetKey) -> Self {
+        Self {
+            root,
+            kind,
+            key,
+            generating: false,
+            rows: Vec::new(),
+            empty_message: SharedString::from("No broadcasters match this search."),
+            query: String::new(),
+            pending_content: None,
+            last_live_update: None,
+            live_update_scheduled: false,
+        }
+    }
+
+    fn set_content(
+        &mut self,
+        content: BroadcasterPickerContent,
+        cx: &Context<'_, ListState<Self>>,
+    ) -> bool {
+        if self.current_content_matches(&content) {
+            return false;
+        }
+
+        if self.should_apply_immediately(&content) {
+            self.pending_content = None;
+            self.apply_content(content);
+            self.last_live_update = Some(Instant::now());
+            return true;
+        }
+
+        if self.last_live_update.is_some_and(|last_update| {
+            last_update.elapsed() >= BROADCASTER_PICKER_LIVE_UPDATE_INTERVAL
+        }) {
+            self.pending_content = None;
+            self.apply_content(content);
+            self.last_live_update = Some(Instant::now());
+            return true;
+        }
+
+        if self.pending_content.as_ref() == Some(&content) {
+            return false;
+        }
+
+        self.pending_content = Some(content);
+        if !self.live_update_scheduled {
+            self.live_update_scheduled = true;
+            let remaining = self.last_live_update.map_or(
+                BROADCASTER_PICKER_LIVE_UPDATE_INTERVAL,
+                |last_update| {
+                    BROADCASTER_PICKER_LIVE_UPDATE_INTERVAL.saturating_sub(last_update.elapsed())
+                },
+            );
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(remaining).await;
+                let _ = this.update(cx, |list, cx| {
+                    let delegate = list.delegate_mut();
+                    delegate.live_update_scheduled = false;
+                    let Some(content) = delegate.pending_content.take() else {
+                        return;
+                    };
+                    if !delegate.current_content_matches(&content) {
+                        delegate.apply_content(content);
+                        delegate.last_live_update = Some(Instant::now());
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
+        false
+    }
+
+    fn current_content_matches(&self, content: &BroadcasterPickerContent) -> bool {
+        self.rows == content.rows
+            && self.empty_message == content.empty_message
+            && self.generating == content.generating
+            && self.query == content.query
+    }
+
+    fn should_apply_immediately(&self, content: &BroadcasterPickerContent) -> bool {
+        self.last_live_update.is_none()
+            || self.query != content.query
+            || self.generating != content.generating
+            || selected_broadcaster_address(&self.rows)
+                != selected_broadcaster_address(&content.rows)
+    }
+
+    fn apply_content(&mut self, content: BroadcasterPickerContent) {
+        self.rows = content.rows;
+        self.empty_message = content.empty_message;
+        self.generating = content.generating;
+        self.query = content.query;
+    }
+}
+
+fn selected_broadcaster_address(rows: &[BroadcasterPickerRow]) -> Option<&str> {
+    rows.iter()
+        .find(|row| row.selected)
+        .map(|row| row.railgun_address.as_str())
+}
+
+impl ListDelegate for BroadcasterPickerDelegate {
+    type Item = ListItem;
+
+    fn items_count(&self, _section: usize, _cx: &App) -> usize {
+        self.rows.len()
+    }
+
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    fn render_item(
+        &mut self,
+        ix: IndexPath,
+        _window: &mut Window,
+        _cx: &mut Context<'_, ListState<Self>>,
+    ) -> Option<Self::Item> {
+        let row = self.rows.get(ix.row)?.clone();
+        let root = self.root.clone();
+        let kind = self.kind;
+        let key = self.key;
+        let selected = row.selected;
+        let railgun_address = row.railgun_address.clone();
+        Some(
+            ListItem::new(SharedString::from(format!(
+                "broadcaster-picker-list-row-{}",
+                stable_broadcaster_element_suffix(&row.railgun_address)
+            )))
+            .h(px(52.0))
+            .px(px(12.0))
+            .py(px(0.0))
+            .rounded_md()
+            .border_1()
+            .border_color(if selected {
+                rgb(theme::SUCCESS)
+            } else {
+                rgb(theme::SURFACE)
+            })
+            .disabled(self.generating)
+            .on_click(move |_event, _window, cx| {
+                cx.stop_propagation();
+                let railgun_address = railgun_address.clone();
+                let _ = root.update(cx, |root, cx| {
+                    root.choose_broadcaster_from_picker(kind, key, railgun_address, cx);
+                });
+            })
+            .child(render_broadcaster_picker_row(&row)),
+        )
+    }
+
+    fn render_empty(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<'_, ListState<Self>>,
+    ) -> impl IntoElement {
+        div()
+            .p(px(16.0))
+            .rounded_md()
+            .bg(rgb(theme::SURFACE))
+            .border_1()
+            .border_color(rgb(theme::BORDER))
+            .child(app_muted_text(self.empty_message.clone()))
+    }
+
+    fn set_selected_index(
+        &mut self,
+        _ix: Option<IndexPath>,
+        _window: &mut Window,
+        _cx: &mut Context<'_, ListState<Self>>,
+    ) {
+    }
+
+    fn is_eof(&self, _cx: &App) -> bool {
+        false
+    }
 }
 
 enum SendResult {
@@ -1891,6 +2095,15 @@ impl WalletRoot {
         if form.generating || form.error.is_some() || form.result.is_some() {
             return true;
         }
+        if form.delivery_mode != DeliveryMode::ManualCalldata
+            || form.broadcaster_choice != BroadcasterChoice::Random
+            || form.broadcaster_fee_mode != PublicBroadcasterFeeMode::DeductFromAmount
+            || form.cost_estimate.is_some()
+            || form.cost_estimate_pending
+            || form.estimating_cost
+        {
+            return true;
+        }
         if !form.recipient_input.read(cx).value().trim().is_empty() {
             return true;
         }
@@ -2266,12 +2479,17 @@ impl WalletRoot {
             }
         })
         .detach();
+        let root = cx.weak_entity();
+        let list = cx.new(|cx| {
+            ListState::new(BroadcasterPickerDelegate::new(root, kind, key), window, cx)
+                .selectable(false)
+        });
         self.broadcaster_picker = Some(BroadcasterPickerState {
             kind,
             key,
             query_input,
             focus_handle,
-            sort: BroadcasterPickerSort::FeeAscReliabilityDesc,
+            list,
         });
         if let Some(picker) = self.broadcaster_picker.as_ref() {
             picker.query_input.read(cx).focus_handle(cx).focus(window);
@@ -2647,6 +2865,14 @@ impl WalletRoot {
             || form.error.is_some()
             || form.result.is_some()
             || form.cost_estimate.is_some()
+            || form.cost_estimate_pending
+            || form.estimating_cost
+        {
+            return true;
+        }
+        if form.delivery_mode != DeliveryMode::ManualCalldata
+            || form.broadcaster_choice != BroadcasterChoice::Random
+            || form.broadcaster_fee_mode != PublicBroadcasterFeeMode::DeductFromAmount
         {
             return true;
         }
@@ -4807,7 +5033,7 @@ impl WalletRoot {
         &self,
         root: &Entity<Self>,
         window: &Window,
-        cx: &Context<'_, Self>,
+        cx: &mut Context<'_, Self>,
     ) -> gpui::Div {
         let Some(picker) = self.broadcaster_picker.as_ref() else {
             return div();
@@ -4845,18 +5071,14 @@ impl WalletRoot {
             .trim()
             .to_ascii_lowercase();
         let chain_label = chain_name(chain_id).map_or_else(|| chain_id.to_string(), str::to_owned);
-        let mut candidates = eligible_public_broadcasters_for_asset(
+        let candidates = eligible_public_broadcasters_for_asset(
             &self.monitor_fee_rows(),
             chain_id,
             token,
             unwrap,
         )
         .unwrap_or_default();
-        match picker.sort {
-            BroadcasterPickerSort::FeeAscReliabilityDesc => {
-                candidates = sort_specific_public_broadcasters(candidates);
-            }
-        }
+        let candidates = sort_specific_public_broadcasters(candidates);
         let total_count = candidates.len();
         let candidates: Vec<_> = candidates
             .into_iter()
@@ -4866,118 +5088,71 @@ impl WalletRoot {
         let close_root = root.clone();
         let modal_action_root = root.clone();
         let modal_focus = picker.focus_handle.clone();
-        let rows_focus = picker.focus_handle.clone();
-        let sort_focus = picker.focus_handle.clone();
         let max_height = (window.viewport_size().height * 0.82).min(BROADCASTER_PICKER_MAX_HEIGHT);
-
-        let mut rows = div()
-            .flex_1()
-            .min_h(px(0.0))
-            .flex()
-            .flex_col()
-            .gap_2()
-            .on_mouse_down(MouseButton::Left, move |_event, window, _cx| {
-                rows_focus.focus(window);
-            })
-            .overflow_y_scrollbar();
-
-        if candidates.is_empty() {
-            rows = rows.child(
-                div()
-                    .p(px(16.0))
-                    .rounded_md()
-                    .bg(rgb(theme::SURFACE))
-                    .border_1()
-                    .border_color(rgb(theme::BORDER))
-                    .child(app_muted_text(if total_count == 0 {
-                        "No eligible broadcaster currently advertises this token."
-                    } else {
-                        "No broadcasters match this search."
-                    })),
-            );
+        let empty_message = SharedString::from(if total_count == 0 {
+            "No eligible broadcaster currently advertises this token."
         } else {
-            for candidate in candidates {
-                let candidate_root = root.clone();
-                let railgun_address = candidate.railgun_address.clone();
-                let selected = matches!(
+            "No broadcasters match this search."
+        });
+        let rows = candidates
+            .iter()
+            .map(|candidate| BroadcasterPickerRow {
+                railgun_address: candidate.railgun_address.clone(),
+                label: broadcaster_candidate_label(candidate),
+                fee_label: broadcaster_candidate_fee_label(candidate),
+                reliability: candidate.reliability,
+                selected: matches!(
                     current_choice,
-                    BroadcasterChoice::Specific { railgun_address: ref selected } if selected == &railgun_address
-                );
-                let kind = picker.kind;
-                let key = picker.key;
-                rows = rows.child(
-                    div()
-                        .id(delivery_element_id(
-                            key,
-                            kind,
-                            &format!(
-                                "modal-{}",
-                                stable_broadcaster_element_suffix(&railgun_address)
-                            ),
-                        ))
-                        .w_full()
-                        .min_h(px(58.0))
-                        .p(px(10.0))
-                        .rounded_md()
-                        .border_1()
-                        .border_color(rgb(if selected {
-                            theme::SUCCESS
-                        } else {
-                            theme::BORDER
-                        }))
-                        .bg(rgb(if selected {
-                            theme::SELECTED_SURFACE
-                        } else {
-                            theme::SURFACE
-                        }))
-                        .when(!generating, |row| {
-                            row.cursor_pointer()
-                                .hover(|row| row.bg(rgb(theme::SURFACE_HOVER)))
-                        })
-                        .child(render_broadcaster_picker_row(&candidate, selected))
-                        .on_click(move |_event, _window, cx| {
-                            if generating {
-                                return;
-                            }
-                            candidate_root.update(cx, |root, cx| {
-                                root.choose_broadcaster_from_picker(
-                                    kind,
-                                    key,
-                                    railgun_address.clone(),
-                                    cx,
-                                );
-                            });
-                        }),
-                );
+                    BroadcasterChoice::Specific { railgun_address: ref selected } if selected == &candidate.railgun_address
+                ),
+            })
+            .collect::<Vec<_>>();
+        picker.list.update(cx, |list, cx| {
+            let content = BroadcasterPickerContent {
+                rows,
+                empty_message,
+                generating,
+                query: query.clone(),
+            };
+            if list.delegate_mut().set_content(content, cx) {
+                cx.notify();
             }
-        }
+        });
 
         div()
             .absolute()
+            .occlude()
             .size_full()
             .flex()
             .items_center()
             .justify_center()
             .p(px(24.0))
             .bg(rgb(theme::BACKGROUND))
+            .on_any_mouse_down(|_event, _window, cx| {
+                cx.stop_propagation();
+            })
             .child(
                 div()
+                    .occlude()
                     .w(px(760.0))
                     .max_w_full()
+                    .h(max_height)
                     .max_h(max_height)
                     .tab_group()
                     .key_context(BROADCASTER_PICKER_KEY_CONTEXT)
                     .track_focus(&modal_focus)
-                    .on_action(window.listener_for(
-                        &modal_action_root,
-                        Self::on_action_close_broadcaster_picker,
-                    ))
+                    .on_action(
+                        window.listener_for(
+                            &modal_action_root,
+                            Self::on_action_close_broadcaster_picker,
+                        ),
+                    )
                     .flex()
                     .flex_col()
                     .gap_3()
                     .p(px(18.0))
                     .rounded_lg()
-                    .bg(rgb(theme::SURFACE_ELEVATED))
+                    .bg(rgb(theme::SURFACE))
                     .border_1()
                     .border_color(rgb(theme::BORDER_STRONG))
                     .child(
@@ -4994,61 +5169,59 @@ impl WalletRoot {
                                     .gap_1()
                                     .child(app_strong_text("Choose public broadcaster"))
                                     .child(app_muted_text(format!(
-                                        "{asset_label} on {chain_label}. Specific selection is optional; random remains available."
+                                        "{asset_label} on {chain_label}"
                                     ))),
                             )
                             .child(
-                                app_button("broadcaster-picker-close", "Close")
-                                    .ghost()
-                                    .xsmall()
+                                div()
+                                    .id("broadcaster-picker-close")
+                                    .size(px(24.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .text_color(rgb(theme::TEXT_MUTED))
+                                    .hover(|this| {
+                                        this.bg(rgb(theme::SURFACE_HOVER))
+                                            .text_color(rgb(theme::TEXT))
+                                    })
+                                    .tooltip(|window, cx| Tooltip::new("Close").build(window, cx))
                                     .on_click(move |_event, _window, cx| {
+                                        cx.stop_propagation();
                                         close_root.update(cx, |root, cx| {
                                             root.close_broadcaster_picker(cx);
                                         });
-                                    }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_end()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .child(app_muted_text("Search"))
-                                    .child(app_input(&picker.query_input).disabled(generating)),
-                            )
-                            .child(
-                                div()
-                                    .w(px(210.0))
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .child(app_muted_text("Sort"))
+                                    })
                                     .child(
-                                        div()
-                                            .p(px(9.0))
-                                            .rounded_md()
-                                            .bg(rgb(theme::SURFACE))
-                                            .border_1()
-                                            .border_color(rgb(theme::BORDER))
-                                            .on_mouse_down(MouseButton::Left, move |_event, window, _cx| {
-                                                sort_focus.focus(window);
-                                            })
-                                            .text_color(rgb(theme::TEXT_MUTED))
-                                            .child("Fee asc, reliability desc"),
+                                        img(icons::close_icon_path()).size(px(14.0)).flex_none(),
                                     ),
                             ),
                     )
-                    .child(app_muted_text(format!(
-                        "Showing {filtered_count} of {total_count} eligible broadcasters"
-                    )))
-                    .child(rows),
+                    .child(
+                        div().flex().items_end().gap_3().child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(app_muted_text("Search"))
+                                .child(app_input(&picker.query_input).disabled(generating)),
+                        ),
+                    )
+                    .child(render_broadcaster_picker_header(
+                        filtered_count,
+                        total_count,
+                    ))
+                    .child(
+                        List::new(&picker.list)
+                            .p(px(8.0))
+                            .flex_1()
+                            .min_h(px(0.0))
+                            .w_full()
+                            .bg(rgb(theme::SURFACE)),
+                    ),
             )
     }
 }
@@ -5868,10 +6041,10 @@ fn selected_broadcaster_label(
             || "Specific broadcaster unavailable".to_string(),
             |candidate| {
                 format!(
-                    "{} · fee {} · rel {:.0}%",
+                    "{} · fee {} · reliability {}",
                     broadcaster_candidate_label(candidate),
                     broadcaster_candidate_fee_label(candidate),
-                    candidate.reliability * 100.0
+                    broadcaster_reliability_label(candidate.reliability)
                 )
             },
         )
@@ -5890,6 +6063,38 @@ fn broadcaster_candidate_fee_label(candidate: &PublicBroadcasterCandidate) -> St
         || candidate.fee.to_string(),
         |info| format_token_amount(candidate.fee, info.decimals),
     )
+}
+
+fn broadcaster_reliability_label(reliability: f64) -> String {
+    format!("{:.2}", reliability.clamp(0.0, 1.0))
+}
+
+const fn broadcaster_reliability_color(reliability: f64) -> u32 {
+    if reliability < 0.5 {
+        theme::DANGER
+    } else if reliability < 0.75 {
+        theme::WARNING
+    } else {
+        theme::SUCCESS
+    }
+}
+
+fn render_broadcaster_reliability_badge(reliability: f64) -> gpui::Div {
+    let color = broadcaster_reliability_color(reliability);
+    div()
+        .flex_none()
+        .w(px(52.0))
+        .px(px(8.0))
+        .py(px(4.0))
+        .rounded_md()
+        .bg(rgb(theme::SURFACE_ELEVATED))
+        .border_1()
+        .border_color(rgb(color))
+        .text_color(rgb(color))
+        .text_size(px(12.0))
+        .text_align(gpui::TextAlign::Center)
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .child(broadcaster_reliability_label(reliability))
 }
 
 fn format_exact_candidate_token_amount(
@@ -6137,20 +6342,31 @@ fn broadcaster_candidate_matches_query(
             .contains(query)
 }
 
-fn render_broadcaster_picker_row(
-    candidate: &PublicBroadcasterCandidate,
-    selected: bool,
-) -> gpui::Div {
-    let poi_hint = if candidate.required_poi_list_keys.is_empty() {
-        ""
+fn render_broadcaster_picker_header(filtered_count: usize, total_count: usize) -> gpui::Div {
+    let broadcaster_header = if filtered_count == total_count {
+        format!("Broadcaster ({total_count})")
     } else {
-        " · requires POI"
+        format!("Broadcaster ({filtered_count} of {total_count})")
     };
+    div()
+        .flex()
+        .items_center()
+        .gap_3()
+        .px(px(20.0))
+        .text_size(px(11.0))
+        .text_color(rgb(theme::TEXT_MUTED))
+        .child(div().flex_1().min_w(px(0.0)).child(broadcaster_header))
+        .child(div().w(px(150.0)).flex_none().child("Fee"))
+        .child(div().w(px(120.0)).flex_none().child("Reliability"))
+}
+
+fn render_broadcaster_picker_row(row: &BroadcasterPickerRow) -> gpui::Div {
     div()
         .w_full()
         .flex()
         .items_center()
         .gap_3()
+        .text_size(APP_TEXT_SIZE)
         .child(
             div()
                 .flex_1()
@@ -6162,29 +6378,22 @@ fn render_broadcaster_picker_row(
                     div()
                         .text_color(rgb(theme::TEXT))
                         .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .child(broadcaster_candidate_label(candidate)),
-                )
-                .child(app_muted_text(format!(
-                    "fee {} · reliability {:.0}% · wallets {} · v{}{}",
-                    broadcaster_candidate_fee_label(candidate),
-                    candidate.reliability * 100.0,
-                    candidate.available_wallets,
-                    candidate.version,
-                    poi_hint
-                ))),
+                        .child(row.label.clone()),
+                ),
         )
         .child(
             div()
-                .w(px(92.0))
+                .w(px(150.0))
                 .flex_none()
-                .flex()
-                .justify_end()
-                .text_color(rgb(if selected {
-                    theme::SUCCESS
-                } else {
-                    theme::TEXT_MUTED
-                }))
-                .child(if selected { "Selected" } else { "Use" }),
+                .text_color(rgb(theme::WARNING))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child(row.fee_label.clone()),
+        )
+        .child(
+            div()
+                .w(px(120.0))
+                .flex_none()
+                .child(render_broadcaster_reliability_badge(row.reliability)),
         )
 }
 
