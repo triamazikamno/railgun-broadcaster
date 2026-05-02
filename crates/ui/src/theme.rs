@@ -40,7 +40,7 @@ pub const SPENT_TEXT: u32 = TEXT_MUTED;
 pub const PRIMARY_FOREGROUND: u32 = 0x2b2b2b;
 pub const SELECTED_SURFACE: u32 = 0x2f5f5f;
 
-const PRIMARY_ACTIVE: u32 = 0x5f8787;
+const PRIMARY_ACTIVE: u32 = PRIMARY;
 const PRIMARY_HOVER: u32 = 0x93e0e3;
 const OVERLAY: u32 = 0x202020;
 

@@ -17,6 +17,7 @@ use gpui_component::{
     Disableable, IconName, IndexPath, Root, Selectable, Sizable, StyledExt,
     alert::Alert,
     button::{ButtonGroup, ButtonVariants},
+    checkbox::Checkbox,
     group_box::{GroupBox, GroupBoxVariants},
     input::{Input, InputEvent, InputState},
     list::{List, ListDelegate, ListItem, ListState},
@@ -74,6 +75,7 @@ const LOGS_DRAWER_MIN_HEIGHT: Pixels = px(160.0);
 const LOGS_DRAWER_MAX_HEIGHT: Pixels = px(600.0);
 const BROADCASTER_PICKER_MAX_HEIGHT: Pixels = px(680.0);
 const BROADCASTER_PICKER_LIVE_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
+const PRIVATE_ACTION_FORM_MAX_HEIGHT: Pixels = px(760.0);
 const PRIVATE_ASSET_LIST_WIDTH: Pixels = px(760.0);
 const UNSHIELD_SPINNER_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const UTXO_AGE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -86,6 +88,7 @@ const SECONDS_PER_MONTH: u64 = 30 * SECONDS_PER_DAY;
 const SECONDS_PER_YEAR: u64 = 365 * SECONDS_PER_DAY;
 const TABLE_KEY_CONTEXT: &str = "Table";
 const BROADCASTER_PICKER_KEY_CONTEXT: &str = "BroadcasterPicker";
+const PRIVATE_ACTION_FORM_KEY_CONTEXT: &str = "PrivateActionForm";
 const COST_ESTIMATE_DETAIL_TEXT_SIZE: Pixels = px(11.0);
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, gpui::Action)]
@@ -108,6 +111,10 @@ pub(crate) struct UtxoEnd;
 #[action(no_json)]
 pub(crate) struct CloseBroadcasterPicker;
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, gpui::Action)]
+#[action(no_json)]
+pub(crate) struct ClosePrivateActionForm;
+
 pub(crate) fn install_utxo_navigation_bindings(app: &mut App) {
     app.bind_keys([
         KeyBinding::new("pageup", UtxoPageUp, Some(TABLE_KEY_CONTEXT)),
@@ -118,6 +125,11 @@ pub(crate) fn install_utxo_navigation_bindings(app: &mut App) {
             "escape",
             CloseBroadcasterPicker,
             Some(BROADCASTER_PICKER_KEY_CONTEXT),
+        ),
+        KeyBinding::new(
+            "escape",
+            ClosePrivateActionForm,
+            Some(PRIVATE_ACTION_FORM_KEY_CONTEXT),
         ),
     ]);
 }
@@ -243,6 +255,12 @@ struct BroadcasterPickerState {
     query_input: Entity<InputState>,
     focus_handle: FocusHandle,
     list: Entity<ListState<BroadcasterPickerDelegate>>,
+}
+
+struct PrivateActionFormState {
+    kind: DeliveryFormKind,
+    key: UnshieldAssetKey,
+    focus_handle: FocusHandle,
 }
 
 #[derive(Clone, PartialEq)]
@@ -414,11 +432,11 @@ impl ListDelegate for BroadcasterPickerDelegate {
                 rgb(theme::SURFACE)
             })
             .disabled(self.generating)
-            .on_click(move |_event, _window, cx| {
+            .on_click(move |_event, window, cx| {
                 cx.stop_propagation();
                 let railgun_address = railgun_address.clone();
                 let _ = root.update(cx, |root, cx| {
-                    root.choose_broadcaster_from_picker(kind, key, railgun_address, cx);
+                    root.choose_broadcaster_from_picker(kind, key, railgun_address, window, cx);
                 });
             })
             .child(render_broadcaster_picker_row(&row)),
@@ -669,10 +687,6 @@ impl ChainUtxoState {
         )
     }
 
-    const fn is_ready(&self) -> bool {
-        matches!(self, Self::Ready { .. })
-    }
-
     const fn is_syncing(&self) -> bool {
         matches!(self, Self::Loading { .. } | Self::Syncing { .. })
     }
@@ -763,7 +777,6 @@ pub(crate) struct WalletRoot {
     wallet_setup_mode: WalletSetupMode,
     vault_error: Option<Arc<str>>,
     unlock_in_progress: bool,
-    spend_status: Option<Arc<str>>,
     repair_cache_error: Option<Arc<str>>,
     setup_password: Option<Zeroizing<String>>,
     view_session: Option<Arc<DesktopViewSession>>,
@@ -787,8 +800,8 @@ pub(crate) struct WalletRoot {
     new_password_input: Entity<InputState>,
     confirm_password_input: Entity<InputState>,
     import_mnemonic_input: Entity<InputState>,
-    spend_password_input: Entity<InputState>,
     send_forms: BTreeMap<UnshieldAssetKey, SendFormState>,
+    private_action_form: Option<PrivateActionFormState>,
     send_generation_seq: u64,
     unshield_generation_seq: u64,
     cost_estimate_seq: u64,
@@ -874,11 +887,6 @@ impl WalletRoot {
                 .auto_grow(3, 6)
                 .placeholder("paste recovery phrase")
         });
-        let spend_password_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("spend password")
-                .masked(true)
-        });
         let repair_cache_block_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("0 = deployment block"));
         let tx_search_input =
@@ -899,7 +907,6 @@ impl WalletRoot {
             wallet_setup_mode: WalletSetupMode::Choose,
             vault_error,
             unlock_in_progress: false,
-            spend_status: None,
             repair_cache_error: None,
             setup_password: None,
             view_session: None,
@@ -922,8 +929,8 @@ impl WalletRoot {
             new_password_input,
             confirm_password_input,
             import_mnemonic_input,
-            spend_password_input,
             send_forms: BTreeMap::new(),
+            private_action_form: None,
             send_generation_seq: 0,
             unshield_generation_seq: 0,
             cost_estimate_seq: 0,
@@ -933,7 +940,7 @@ impl WalletRoot {
             repair_cache_block_input,
             tx_search_input: tx_search_input.clone(),
             tx_search_query: Arc::from(""),
-            show_spent_utxos: true,
+            show_spent_utxos: false,
             utxo_table,
             focus_unlock_password_on_render,
             focus_utxo_table_on_render: false,
@@ -1018,16 +1025,6 @@ impl WalletRoot {
             |this, _input, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
                     this.create_vault_from_inputs(window, cx);
-                }
-            },
-        )
-        .detach();
-        cx.subscribe_in(
-            &root.spend_password_input,
-            window,
-            |this, _input, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.authorize_spend_from_input(window, cx);
                 }
             },
         )
@@ -1433,6 +1430,8 @@ impl WalletRoot {
         self.selected_chain = chain_id;
         self.send_forms.clear();
         self.unshield_forms.clear();
+        self.private_action_form = None;
+        self.broadcaster_picker = None;
         self.sync_utxo_table(cx);
         if should_focus_utxo_table(
             self.active_activity,
@@ -1452,6 +1451,8 @@ impl WalletRoot {
         self.selected_wallet_id = Some(wallet_id);
         self.send_forms.clear();
         self.unshield_forms.clear();
+        self.private_action_form = None;
+        self.broadcaster_picker = None;
         cx.notify();
     }
 
@@ -1468,8 +1469,11 @@ impl WalletRoot {
         cx.notify();
     }
 
-    fn toggle_spent_visibility(&mut self, cx: &mut Context<'_, Self>) {
-        self.show_spent_utxos = !self.show_spent_utxos;
+    fn set_spent_visibility(&mut self, show_spent: bool, cx: &mut Context<'_, Self>) {
+        if self.show_spent_utxos == show_spent {
+            return;
+        }
+        self.show_spent_utxos = show_spent;
         self.sync_utxo_table(cx);
         cx.notify();
     }
@@ -1884,6 +1888,8 @@ impl WalletRoot {
         self.sync_wallet_select(window, cx);
         self.send_forms.clear();
         self.unshield_forms.clear();
+        self.private_action_form = None;
+        self.broadcaster_picker = None;
         self.active_wallet_tab = WalletTab::default();
         self.setup_password = None;
         self.generated_seed = None;
@@ -1941,11 +1947,12 @@ impl WalletRoot {
         self.sync_wallet_select(window, cx);
         self.send_forms.clear();
         self.unshield_forms.clear();
+        self.private_action_form = None;
+        self.broadcaster_picker = None;
         self.active_wallet_tab = WalletTab::default();
         self.setup_password = None;
         self.generated_seed = None;
         self.vault_error = None;
-        self.spend_status = None;
         self.repair_cache_error = None;
         self.vault_state = VaultState::UnlockVault;
         self.wallet_setup_mode = WalletSetupMode::Choose;
@@ -1958,58 +1965,62 @@ impl WalletRoot {
         cx.notify();
     }
 
-    fn authorize_spend_from_input(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if !self
-            .chain_states
-            .get(&self.selected_chain)
-            .is_some_and(ChainUtxoState::is_ready)
+    fn private_action_form_is_generating(&self) -> bool {
+        self.send_forms.values().any(|form| form.generating)
+            || self.unshield_forms.values().any(|form| form.generating)
+    }
+
+    fn close_send_form(&mut self, key: UnshieldAssetKey, cx: &mut Context<'_, Self>) {
+        if self
+            .send_forms
+            .get(&key)
+            .is_some_and(|form| form.generating)
         {
-            self.spend_status = None;
-            self.set_vault_error(
-                "Wait for wallet sync to finish before authorizing a spend",
-                cx,
-            );
             return;
         }
-        let Some(store) = self.vault_store.as_ref() else {
-            self.set_vault_error("Wallet vault storage is unavailable", cx);
-            return;
-        };
-        let Some(view_session) = self.view_session.as_ref() else {
-            self.set_vault_error("Unlock the wallet vault before authorizing a spend", cx);
-            return;
-        };
-        let password = Self::read_and_clear_input(&self.spend_password_input, window, cx);
-        if password.trim().is_empty() {
-            self.set_vault_error(
-                "Enter the vault password to authorize this spend action",
-                cx,
-            );
+        self.send_forms.remove(&key);
+        if self
+            .private_action_form
+            .as_ref()
+            .is_some_and(|form| form.kind == DeliveryFormKind::Send && form.key == key)
+        {
+            self.private_action_form = None;
+            self.broadcaster_picker = None;
+        }
+        cx.notify();
+    }
+
+    fn close_unshield_form(&mut self, key: UnshieldAssetKey, cx: &mut Context<'_, Self>) {
+        if self
+            .unshield_forms
+            .get(&key)
+            .is_some_and(|form| form.generating)
+        {
             return;
         }
+        self.unshield_forms.remove(&key);
+        if self
+            .private_action_form
+            .as_ref()
+            .is_some_and(|form| form.kind == DeliveryFormKind::Unshield && form.key == key)
+        {
+            self.private_action_form = None;
+            self.broadcaster_picker = None;
+        }
+        cx.notify();
+    }
 
-        let result = store
-            .create_spend_grant(password.as_str())
-            .and_then(|mut grant| {
-                let _signer = store.railgun_spend_signer(&mut grant, view_session.wallet_id())?;
-                if grant.is_valid() {
-                    grant.invalidate();
-                }
-                Ok(())
-            });
-
-        match result {
-            Ok(()) => {
-                self.vault_error = None;
-                self.spend_status = Some(Arc::from(
-                    "Spend password accepted. The one-use grant was consumed.",
-                ));
-                cx.notify();
-            }
-            Err(error) => {
-                self.spend_status = None;
-                self.handle_vault_error(&error, cx);
-            }
+    fn close_private_action_form(&mut self, cx: &mut Context<'_, Self>) {
+        let Some((kind, key)) = self
+            .private_action_form
+            .as_ref()
+            .map(|form| (form.kind, form.key))
+        else {
+            return;
+        };
+        match kind {
+            DeliveryFormKind::Send => self.close_send_form(key, cx),
+            DeliveryFormKind::Unshield => self.close_unshield_form(key, cx),
         }
     }
 
@@ -2019,13 +2030,10 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let key = UnshieldAssetKey::from_asset(&asset);
-        if self.send_forms.contains_key(&key) {
+        if self.private_action_form_is_generating() {
             return;
         }
-        self.send_forms.retain(|existing_key, form| {
-            *existing_key == key || Self::send_form_is_dirty(form, cx)
-        });
+        let key = UnshieldAssetKey::from_asset(&asset);
         let amount = format_send_amount_input(asset.max_batched, asset.decimals);
         let amount_input = cx.new(|cx| {
             let mut input = InputState::new(window, cx).placeholder("amount");
@@ -2033,11 +2041,13 @@ impl WalletRoot {
             input
         });
         let recipient_input = cx.new(|cx| InputState::new(window, cx).placeholder("0zk recipient"));
+        let focus_recipient_input = recipient_input.clone();
         let password_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("vault password")
                 .masked(true)
         });
+        let focus_handle = cx.focus_handle();
         cx.subscribe_in(
             &password_input,
             window,
@@ -2068,6 +2078,9 @@ impl WalletRoot {
             },
         )
         .detach();
+        self.send_forms.clear();
+        self.unshield_forms.clear();
+        self.broadcaster_picker = None;
         self.send_forms.insert(
             key,
             SendFormState {
@@ -2089,31 +2102,16 @@ impl WalletRoot {
                 result: None,
             },
         );
+        self.private_action_form = Some(PrivateActionFormState {
+            kind: DeliveryFormKind::Send,
+            key,
+            focus_handle,
+        });
+        focus_recipient_input
+            .read(cx)
+            .focus_handle(cx)
+            .focus(window);
         cx.notify();
-    }
-
-    fn send_form_is_dirty(form: &SendFormState, cx: &Context<'_, Self>) -> bool {
-        if form.generating || form.error.is_some() || form.result.is_some() {
-            return true;
-        }
-        if form.delivery_mode != DeliveryMode::ManualCalldata
-            || form.broadcaster_choice != BroadcasterChoice::Random
-            || form.broadcaster_fee_mode != PublicBroadcasterFeeMode::DeductFromAmount
-            || form.cost_estimate.is_some()
-            || form.cost_estimate_pending
-            || form.estimating_cost
-        {
-            return true;
-        }
-        if !form.recipient_input.read(cx).value().trim().is_empty() {
-            return true;
-        }
-        if !form.password_input.read(cx).value().trim().is_empty() {
-            return true;
-        }
-
-        let default_amount = format_send_amount_input(form.asset.max_batched, form.asset.decimals);
-        form.amount_input.read(cx).value().trim() != default_amount
     }
 
     fn clear_send_form_prepared_output(
@@ -2498,8 +2496,15 @@ impl WalletRoot {
         cx.notify();
     }
 
-    fn close_broadcaster_picker(&mut self, cx: &mut Context<'_, Self>) {
+    fn focus_private_action_form_if_open(&self, window: &mut Window) {
+        if let Some(form) = self.private_action_form.as_ref() {
+            form.focus_handle.focus(window);
+        }
+    }
+
+    fn close_broadcaster_picker(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.broadcaster_picker = None;
+        self.focus_private_action_form_if_open(window);
         cx.notify();
     }
 
@@ -2508,6 +2513,7 @@ impl WalletRoot {
         kind: DeliveryFormKind,
         key: UnshieldAssetKey,
         railgun_address: String,
+        window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
         let choice = BroadcasterChoice::Specific { railgun_address };
@@ -2516,6 +2522,7 @@ impl WalletRoot {
             DeliveryFormKind::Unshield => self.set_unshield_broadcaster_choice(key, choice, cx),
         }
         self.broadcaster_picker = None;
+        self.focus_private_action_form_if_open(window);
         cx.notify();
     }
 
@@ -2777,13 +2784,10 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let key = UnshieldAssetKey::from_asset(&asset);
-        if self.unshield_forms.contains_key(&key) {
+        if self.private_action_form_is_generating() {
             return;
         }
-        self.unshield_forms.retain(|existing_key, form| {
-            *existing_key == key || Self::unshield_form_is_dirty(form, cx)
-        });
+        let key = UnshieldAssetKey::from_asset(&asset);
         let amount = format_unshield_amount_input(asset.max_batched, asset.decimals);
         let amount_input = cx.new(|cx| {
             let mut input = InputState::new(window, cx).placeholder("amount");
@@ -2791,11 +2795,13 @@ impl WalletRoot {
             input
         });
         let recipient_input = cx.new(|cx| InputState::new(window, cx).placeholder("0x recipient"));
+        let focus_recipient_input = recipient_input.clone();
         let password_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("vault password")
                 .masked(true)
         });
+        let focus_handle = cx.focus_handle();
         cx.subscribe_in(
             &password_input,
             window,
@@ -2834,6 +2840,9 @@ impl WalletRoot {
             },
         )
         .detach();
+        self.send_forms.clear();
+        self.unshield_forms.clear();
+        self.broadcaster_picker = None;
         self.unshield_forms.insert(
             key,
             UnshieldFormState {
@@ -2856,36 +2865,16 @@ impl WalletRoot {
                 result: None,
             },
         );
+        self.private_action_form = Some(PrivateActionFormState {
+            kind: DeliveryFormKind::Unshield,
+            key,
+            focus_handle,
+        });
+        focus_recipient_input
+            .read(cx)
+            .focus_handle(cx)
+            .focus(window);
         cx.notify();
-    }
-
-    fn unshield_form_is_dirty(form: &UnshieldFormState, cx: &Context<'_, Self>) -> bool {
-        if form.generating
-            || form.unwrap
-            || form.error.is_some()
-            || form.result.is_some()
-            || form.cost_estimate.is_some()
-            || form.cost_estimate_pending
-            || form.estimating_cost
-        {
-            return true;
-        }
-        if form.delivery_mode != DeliveryMode::ManualCalldata
-            || form.broadcaster_choice != BroadcasterChoice::Random
-            || form.broadcaster_fee_mode != PublicBroadcasterFeeMode::DeductFromAmount
-        {
-            return true;
-        }
-        if !form.recipient_input.read(cx).value().trim().is_empty() {
-            return true;
-        }
-        if !form.password_input.read(cx).value().trim().is_empty() {
-            return true;
-        }
-
-        let default_amount =
-            format_unshield_amount_input(form.asset.max_batched, form.asset.decimals);
-        form.amount_input.read(cx).value().trim() != default_amount
     }
 
     fn set_unshield_unwrap(
@@ -4043,9 +4032,9 @@ impl WalletRoot {
             }
             Some(ChainUtxoState::Syncing {
                 snapshot, progress, ..
-            }) => self.render_private_asset_snapshot(root, snapshot, false, true, *progress),
+            }) => Self::render_private_asset_snapshot(root, snapshot, false, true, *progress),
             Some(ChainUtxoState::Ready { snapshot, .. }) => {
-                self.render_private_asset_snapshot(root, snapshot, true, false, None)
+                Self::render_private_asset_snapshot(root, snapshot, true, false, None)
             }
             Some(ChainUtxoState::Idle) | None => {
                 centered_message("Select a chain to load private balances").into_any_element()
@@ -4054,7 +4043,6 @@ impl WalletRoot {
     }
 
     fn render_private_asset_snapshot(
-        &self,
         root: &Entity<Self>,
         snapshot: &ListUtxosOutput,
         chain_ready: bool,
@@ -4062,27 +4050,7 @@ impl WalletRoot {
         progress: Option<SyncProgressUpdate>,
     ) -> gpui::AnyElement {
         let assets = format_private_asset_rows(snapshot.chain_id, &snapshot.totals);
-        let asset_keys = assets
-            .iter()
-            .filter_map(unshield_asset_key_from_formatted)
-            .collect::<Vec<_>>();
-        let extra_form_keys = self
-            .send_forms
-            .keys()
-            .filter(|key| key.chain_id == snapshot.chain_id && !asset_keys.contains(key))
-            .map(|key| (DeliveryFormKind::Send, *key))
-            .chain(
-                self.unshield_forms
-                    .keys()
-                    .filter(|key| {
-                        key.chain_id == snapshot.chain_id
-                            && !asset_keys.contains(key)
-                            && !self.send_forms.contains_key(key)
-                    })
-                    .map(|key| (DeliveryFormKind::Unshield, *key)),
-            )
-            .collect::<Vec<_>>();
-        if assets.is_empty() && extra_form_keys.is_empty() {
+        if assets.is_empty() {
             return centered_message(if syncing {
                 loading_summary(progress)
             } else {
@@ -4105,38 +4073,14 @@ impl WalletRoot {
                     .flex_col()
                     .gap_3()
                     .children(assets.into_iter().enumerate().map(|(ix, asset)| {
-                        let send_form_key = send_asset_key_from_formatted(&asset);
-                        if let Some(key) = send_form_key
-                            && self.send_forms.contains_key(&key)
-                        {
-                            return self.render_send_form(root.clone(), key).into_any_element();
-                        }
-                        let form_key = unshield_asset_key_from_formatted(&asset);
-                        if let Some(key) = form_key
-                            && self.unshield_forms.contains_key(&key)
-                        {
-                            self.render_unshield_form(root.clone(), key)
-                                .into_any_element()
-                        } else {
-                            Self::render_private_asset_row(
-                                root.clone(),
-                                ix,
-                                asset,
-                                snapshot,
-                                chain_ready,
-                            )
-                            .into_any_element()
-                        }
-                    }))
-                    .children(extra_form_keys.into_iter().map(|(kind, key)| {
-                        match kind {
-                            DeliveryFormKind::Send => {
-                                self.render_send_form(root.clone(), key).into_any_element()
-                            }
-                            DeliveryFormKind::Unshield => self
-                                .render_unshield_form(root.clone(), key)
-                                .into_any_element(),
-                        }
+                        Self::render_private_asset_row(
+                            root.clone(),
+                            ix,
+                            asset,
+                            snapshot,
+                            chain_ready,
+                        )
+                        .into_any_element()
                     })),
             )
             .into_any_element()
@@ -4277,12 +4221,6 @@ impl WalletRoot {
         } else {
             "Raw base units for this unknown token".to_string()
         };
-        let description = if form.delivery_mode == DeliveryMode::PublicBroadcaster {
-            "Submit a private transfer through a public broadcaster."
-        } else {
-            "Generate calldata for a private transfer to another 0zk address."
-        };
-
         let delivery_root = root.clone();
         let chooser_root = root.clone();
         let fee_mode_root = root.clone();
@@ -4315,24 +4253,40 @@ impl WalletRoot {
                                 div()
                                     .text_color(rgb(theme::TEXT))
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .child(private_asset_label_row(
-                                        SharedString::from(format!("Send {}", asset.label)),
+                                    .child(private_action_title_row(
+                                        "Send",
+                                        &asset.label,
                                         asset.icon_path.clone(),
                                     )),
-                            )
-                            .child(app_muted_text(description)),
+                            ),
                     )
                     .child(
-                        app_button(send_element_id(key, "cancel"), "Cancel")
-                            .ghost()
-                            .xsmall()
-                            .disabled(form.generating)
-                            .on_click(move |_event, _window, cx| {
-                                cancel_root.update(cx, |root, cx| {
-                                    root.send_forms.remove(&key);
-                                    cx.notify();
-                                });
-                            }),
+                        div()
+                            .id(send_element_id(key, "cancel"))
+                            .size(px(24.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_sm()
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .opacity(if form.generating { 0.45 } else { 1.0 })
+                            .tooltip(|window, cx| Tooltip::new("Close").build(window, cx))
+                            .when(!form.generating, |close| {
+                                close
+                                    .cursor_pointer()
+                                    .hover(|close| {
+                                        close
+                                            .bg(rgb(theme::SURFACE_HOVER))
+                                            .text_color(rgb(theme::TEXT))
+                                    })
+                                    .on_click(move |_event, _window, cx| {
+                                        cx.stop_propagation();
+                                        cancel_root.update(cx, |root, cx| {
+                                            root.close_send_form(key, cx);
+                                        });
+                                    })
+                            })
+                            .child(img(icons::close_icon_path()).size(px(14.0)).flex_none()),
                     ),
             )
             .child(render_private_action_metrics(
@@ -4453,7 +4407,7 @@ impl WalletRoot {
                     ),
             );
 
-        if form.delivery_mode == DeliveryMode::PublicBroadcaster {
+        if form.delivery_mode == DeliveryMode::PublicBroadcaster && form.result.is_none() {
             if let Some(status) =
                 public_broadcaster_cost_status(form.cost_estimate_pending, form.estimating_cost)
             {
@@ -4506,12 +4460,6 @@ impl WalletRoot {
         } else {
             "Raw base units for this unknown token".to_string()
         };
-        let description = if form.delivery_mode == DeliveryMode::PublicBroadcaster {
-            "Submit an unshield transaction through a public broadcaster."
-        } else {
-            "Generate calldata only. This does not submit a public transaction."
-        };
-
         let delivery_root = root.clone();
         let chooser_root = root.clone();
         let fee_mode_root = root.clone();
@@ -4545,24 +4493,40 @@ impl WalletRoot {
                                 div()
                                     .text_color(rgb(theme::TEXT))
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .child(private_asset_label_row(
-                                        SharedString::from(format!("Unshield {}", asset.label)),
+                                    .child(private_action_title_row(
+                                        "Unshield",
+                                        &asset.label,
                                         asset.icon_path.clone(),
                                     )),
-                            )
-                            .child(app_muted_text(description)),
+                            ),
                     )
                     .child(
-                        app_button(unshield_element_id(key, "cancel"), "Cancel")
-                            .ghost()
-                            .xsmall()
-                            .disabled(form.generating)
-                            .on_click(move |_event, _window, cx| {
-                                cancel_root.update(cx, |root, cx| {
-                                    root.unshield_forms.remove(&key);
-                                    cx.notify();
-                                });
-                            }),
+                        div()
+                            .id(unshield_element_id(key, "cancel"))
+                            .size(px(24.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_sm()
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .opacity(if form.generating { 0.45 } else { 1.0 })
+                            .tooltip(|window, cx| Tooltip::new("Close").build(window, cx))
+                            .when(!form.generating, |close| {
+                                close
+                                    .cursor_pointer()
+                                    .hover(|close| {
+                                        close
+                                            .bg(rgb(theme::SURFACE_HOVER))
+                                            .text_color(rgb(theme::TEXT))
+                                    })
+                                    .on_click(move |_event, _window, cx| {
+                                        cx.stop_propagation();
+                                        cancel_root.update(cx, |root, cx| {
+                                            root.close_unshield_form(key, cx);
+                                        });
+                                    })
+                            })
+                            .child(img(icons::close_icon_path()).size(px(14.0)).flex_none()),
                     ),
             )
             .child(render_private_action_metrics(
@@ -4692,7 +4656,7 @@ impl WalletRoot {
                     ),
             );
 
-        if form.delivery_mode == DeliveryMode::PublicBroadcaster {
+        if form.delivery_mode == DeliveryMode::PublicBroadcaster && form.result.is_none() {
             if let Some(status) =
                 public_broadcaster_cost_status(form.cost_estimate_pending, form.estimating_cost)
             {
@@ -4811,12 +4775,7 @@ impl WalletRoot {
     }
 
     fn render_utxo_controls(&self, root: Entity<Self>) -> impl IntoElement {
-        let spend_root = root.clone();
         let search_active = !self.tx_search_query.is_empty();
-        let chain_ready = self
-            .chain_states
-            .get(&self.selected_chain)
-            .is_some_and(ChainUtxoState::is_ready);
         let clear_search_input = self.tx_search_input.clone();
         let clear_search_table = self.utxo_table.clone();
         let search_input = app_input(&self.tx_search_input).when(search_active, |input| {
@@ -4842,27 +4801,18 @@ impl WalletRoot {
                     .child(img(icons::close_icon_path()).size(px(12.0)).flex_none()),
             )
         });
-        let spent_toggle_label = if self.show_spent_utxos {
-            "Hide spent"
-        } else {
-            "Show spent"
-        };
-        let spent_toggle = app_button("wallet-toggle-spent-utxos", spent_toggle_label)
+        let spent_toggle = Checkbox::new("wallet-toggle-spent-utxos")
+            .label("Show spent")
+            .checked(self.show_spent_utxos)
             .xsmall()
-            .outline()
-            .p(px(12.0))
             .disabled(search_active)
             .opacity(if search_active { 0.45 } else { 1.0 })
-            .on_click(move |_event, _window, cx| {
+            .on_click(move |checked, _window, cx| {
+                let checked = *checked;
                 root.update(cx, |root, cx| {
-                    root.toggle_spent_visibility(cx);
+                    root.set_spent_visibility(checked, cx);
                 });
             });
-        let spent_toggle = if self.show_spent_utxos || search_active {
-            spent_toggle.ghost()
-        } else {
-            spent_toggle.primary()
-        };
 
         div()
             .flex_none()
@@ -4872,29 +4822,6 @@ impl WalletRoot {
             .gap_2()
             .child(div().w(px(280.0)).child(search_input))
             .child(spent_toggle)
-            .child(
-                div()
-                    .w(px(180.0))
-                    .child(app_input(&self.spend_password_input).disabled(!chain_ready)),
-            )
-            .child(
-                app_button("wallet-authorize-spend", "Authorize spend")
-                    .xsmall()
-                    .outline()
-                    .p(px(12.0))
-                    .disabled(!chain_ready)
-                    .on_click(move |_event, window, cx| {
-                        spend_root.update(cx, |root, cx| {
-                            root.authorize_spend_from_input(window, cx);
-                        });
-                    }),
-            )
-            .children(self.spend_status.as_ref().map(|message| {
-                div()
-                    .text_size(APP_TEXT_SIZE)
-                    .text_color(rgb(theme::SUCCESS))
-                    .child(SharedString::from(message.to_string()))
-            }))
     }
 
     fn on_action_utxo_page_up(
@@ -4926,12 +4853,21 @@ impl WalletRoot {
     fn on_action_close_broadcaster_picker(
         &mut self,
         _: &CloseBroadcasterPicker,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
         if self.broadcaster_picker.is_some() {
-            self.close_broadcaster_picker(cx);
+            self.close_broadcaster_picker(window, cx);
         }
+    }
+
+    fn on_action_close_private_action_form(
+        &mut self,
+        _: &ClosePrivateActionForm,
+        _: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.close_private_action_form(cx);
     }
 
     fn navigate_utxo_table(&self, navigation: UtxoNavigation, cx: &mut Context<'_, Self>) {
@@ -5027,6 +4963,52 @@ impl WalletRoot {
                     .min_w(px(0.0))
                     .min_h(px(0.0))
                     .child(self.logs.clone()),
+            )
+    }
+
+    fn render_private_action_form_modal(&self, root: &Entity<Self>, window: &Window) -> gpui::Div {
+        let Some(form) = self.private_action_form.as_ref() else {
+            return div();
+        };
+        let kind = form.kind;
+        let key = form.key;
+        let modal_focus = form.focus_handle.clone();
+        let modal_action_root = root.clone();
+        let max_height = (window.viewport_size().height * 0.88).min(PRIVATE_ACTION_FORM_MAX_HEIGHT);
+        let form = match kind {
+            DeliveryFormKind::Send => self.render_send_form(root.clone(), key).into_any_element(),
+            DeliveryFormKind::Unshield => self
+                .render_unshield_form(root.clone(), key)
+                .into_any_element(),
+        };
+
+        div()
+            .absolute()
+            .occlude()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .p(px(24.0))
+            .bg(rgb(theme::BACKGROUND))
+            .on_any_mouse_down(|_event, _window, cx| {
+                cx.stop_propagation();
+            })
+            .child(
+                div()
+                    .occlude()
+                    .w(PRIVATE_ASSET_LIST_WIDTH)
+                    .max_w_full()
+                    .max_h(max_height)
+                    .tab_group()
+                    .key_context(PRIVATE_ACTION_FORM_KEY_CONTEXT)
+                    .track_focus(&modal_focus)
+                    .on_action(window.listener_for(
+                        &modal_action_root,
+                        Self::on_action_close_private_action_form,
+                    ))
+                    .overflow_y_scrollbar()
+                    .child(form),
             )
     }
 
@@ -5188,10 +5170,10 @@ impl WalletRoot {
                                             .text_color(rgb(theme::TEXT))
                                     })
                                     .tooltip(|window, cx| Tooltip::new("Close").build(window, cx))
-                                    .on_click(move |_event, _window, cx| {
+                                    .on_click(move |_event, window, cx| {
                                         cx.stop_propagation();
                                         close_root.update(cx, |root, cx| {
-                                            root.close_broadcaster_picker(cx);
+                                            root.close_broadcaster_picker(window, cx);
                                         });
                                     })
                                     .child(
@@ -5255,6 +5237,7 @@ impl Render for WalletRoot {
             .font_family(APP_FONT_FAMILY)
             .text_size(APP_TEXT_SIZE)
             .on_action(window.listener_for(&root, Self::on_action_close_broadcaster_picker))
+            .on_action(window.listener_for(&root, Self::on_action_close_private_action_form))
             .child(self.render_activity_rail(root.clone()))
             .child(
                 div()
@@ -5263,6 +5246,11 @@ impl Render for WalletRoot {
                     .min_w(px(0.0))
                     .min_h(px(0.0))
                     .child(self.render_workspace(root, window)),
+            )
+            .children(
+                self.private_action_form
+                    .as_ref()
+                    .map(|_| self.render_private_action_form_modal(&cx.entity(), window)),
             )
             .children(
                 self.broadcaster_picker
@@ -5793,6 +5781,23 @@ fn private_asset_label_row(label: SharedString, icon_path: Option<PathBuf>) -> g
     row.child(label)
 }
 
+fn private_action_title_row(
+    action: &'static str,
+    label: &str,
+    icon_path: Option<PathBuf>,
+) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .child(action)
+        .child(token_label_row(
+            SharedString::from(label.to_owned()),
+            icon_path,
+            px(20.0),
+        ))
+}
+
 #[derive(Clone)]
 struct FormattedTokenTotal {
     chain_id: u64,
@@ -5981,6 +5986,7 @@ fn refresh_form_asset_from_snapshot(
     }
 }
 
+#[cfg(test)]
 fn send_asset_key_from_formatted(asset: &FormattedTokenTotal) -> Option<UnshieldAssetKey> {
     unshield_asset_key_from_formatted(asset)
 }
@@ -5998,6 +6004,7 @@ fn send_element_id(key: UnshieldAssetKey, action: &str) -> SharedString {
     ))
 }
 
+#[cfg(test)]
 fn unshield_asset_key_from_formatted(asset: &FormattedTokenTotal) -> Option<UnshieldAssetKey> {
     asset
         .token
@@ -6458,27 +6465,19 @@ fn render_private_action_metrics(
     disabled: bool,
 ) -> gpui::Div {
     let decimals = asset.decimals;
-    div()
-        .flex()
-        .flex_wrap()
-        .gap_2()
-        .children(
-            private_action_metrics(asset)
-                .into_iter()
-                .map(move |metric| {
-                    render_private_action_metric(
-                        amount_input.clone(),
-                        delivery_element_id(
-                            key,
-                            kind,
-                            private_action_metric_id_suffix(metric.label),
-                        ),
-                        metric,
-                        decimals,
-                        disabled,
-                    )
-                }),
-        )
+    div().w_full().flex().flex_wrap().gap_2().children(
+        private_action_metrics(asset)
+            .into_iter()
+            .map(move |metric| {
+                render_private_action_metric(
+                    amount_input.clone(),
+                    delivery_element_id(key, kind, private_action_metric_id_suffix(metric.label)),
+                    metric,
+                    decimals,
+                    disabled,
+                )
+            }),
+    )
 }
 
 fn render_private_action_metric(
@@ -6492,7 +6491,8 @@ fn render_private_action_metric(
     let click_value = value.clone();
     div()
         .id(id)
-        .flex_none()
+        .flex_1()
+        .min_w(px(280.0))
         .px(px(12.0))
         .py(px(10.0))
         .rounded_md()
@@ -6501,6 +6501,7 @@ fn render_private_action_metric(
         .border_color(rgb(theme::BORDER))
         .flex()
         .items_center()
+        .justify_between()
         .gap_2()
         .when(!disabled, |this| {
             this.cursor_pointer()
@@ -6512,9 +6513,11 @@ fn render_private_action_metric(
                     });
                 })
         })
-        .child(app_muted_text(metric.label))
+        .child(app_muted_text(metric.label).whitespace_nowrap().flex_none())
         .child(
             div()
+                .flex_none()
+                .whitespace_nowrap()
                 .text_color(rgb(theme::WARNING))
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .child(SharedString::from(value)),
@@ -6575,50 +6578,46 @@ fn render_delivery_selector(
         .gap_2()
         .child(app_muted_text("Delivery mode"))
         .child(
-            div()
-                .flex()
-                .flex_wrap()
-                .gap_2()
-                .child(
-                    ButtonGroup::new(delivery_element_id(key, kind, "mode-toggle"))
-                        .outline()
-                        .disabled(generating)
-                        .child(
-                            app_button(delivery_element_id(key, kind, "manual"), "Manual calldata")
-                                .selected(mode == DeliveryMode::ManualCalldata),
-                        )
-                        .child(
-                            app_button(
-                                delivery_element_id(key, kind, "public"),
-                                "Public broadcaster",
-                            )
-                            .selected(mode == DeliveryMode::PublicBroadcaster),
-                        )
-                        .on_click(move |selected, window, cx| {
-                            let Some(index) = selected.first() else {
-                                return;
-                            };
-                            let mode = if *index == 0 {
-                                DeliveryMode::ManualCalldata
-                            } else {
-                                DeliveryMode::PublicBroadcaster
-                            };
-                            selector_root.update(cx, |root, cx| match kind {
-                                DeliveryFormKind::Send => {
-                                    root.set_send_delivery_mode(key, mode, window, cx);
-                                }
-                                DeliveryFormKind::Unshield => {
-                                    root.set_unshield_delivery_mode(key, mode, window, cx);
-                                }
-                            });
-                        }),
-                )
-                .child(
-                    app_button(delivery_element_id(key, kind, "self"), "Self-broadcast")
-                        .outline()
-                        .disabled(generating)
-                        .disabled(true),
-                ),
+            ButtonGroup::new(delivery_element_id(key, kind, "mode-toggle"))
+                .w_full()
+                .children([
+                    private_action_segment_button(
+                        delivery_element_id(key, kind, "manual"),
+                        "Manual calldata",
+                        mode == DeliveryMode::ManualCalldata,
+                    )
+                    .disabled(generating),
+                    private_action_segment_button(
+                        delivery_element_id(key, kind, "public"),
+                        "Public broadcaster",
+                        mode == DeliveryMode::PublicBroadcaster,
+                    )
+                    .disabled(generating),
+                    private_action_segment_button(
+                        delivery_element_id(key, kind, "self"),
+                        "Self-broadcast",
+                        mode == DeliveryMode::SelfBroadcast,
+                    )
+                    .disabled(true),
+                ])
+                .on_click(move |selected, window, cx| {
+                    let Some(index) = selected.first() else {
+                        return;
+                    };
+                    let mode = match *index {
+                        0 => DeliveryMode::ManualCalldata,
+                        1 => DeliveryMode::PublicBroadcaster,
+                        _ => return,
+                    };
+                    selector_root.update(cx, |root, cx| match kind {
+                        DeliveryFormKind::Send => {
+                            root.set_send_delivery_mode(key, mode, window, cx);
+                        }
+                        DeliveryFormKind::Unshield => {
+                            root.set_unshield_delivery_mode(key, mode, window, cx);
+                        }
+                    });
+                }),
         )
 }
 
@@ -6644,7 +6643,7 @@ fn render_broadcaster_chooser(
         .border_1()
         .border_color(rgb(theme::BORDER))
         .child(app_muted_text(format!(
-            "Eligible same-token broadcasters: {}",
+            "Eligible broadcasters: {}",
             sorted.len()
         )))
         .child(
@@ -6695,10 +6694,7 @@ fn render_broadcaster_chooser(
             "No eligible broadcaster currently advertises this token.",
         ));
     }
-
-    list.child(app_muted_text(
-        "Open the broadcaster picker to search, inspect, and choose a specific broadcaster.",
-    ))
+    list
 }
 
 fn render_unshield_output_toggle(
@@ -6770,52 +6766,54 @@ fn render_broadcaster_fee_mode_toggle(
     div()
         .flex()
         .flex_col()
-        .gap_2()
-        .p(px(10.0))
-        .rounded_md()
-        .bg(rgb(theme::SURFACE_ELEVATED))
-        .border_1()
-        .border_color(rgb(theme::BORDER))
+        .gap_1()
+        .child(app_muted_text("Broadcaster fee"))
         .child(
-            div().flex().gap_2().child(
-                ButtonGroup::new(delivery_element_id(key, kind, "fee-mode-toggle"))
-                    .outline()
-                    .disabled(generating)
-                    .child(
-                        app_button(
-                            delivery_element_id(key, kind, "fee-mode-deduct"),
-                            "Deduct fee from amount",
-                        )
-                        .selected(mode == PublicBroadcasterFeeMode::DeductFromAmount),
-                    )
-                    .child(
-                        app_button(
-                            delivery_element_id(key, kind, "fee-mode-add"),
-                            "Add fee on top",
-                        )
-                        .selected(mode == PublicBroadcasterFeeMode::AddToAmount),
-                    )
-                    .on_click(move |selected, window, cx| {
-                        let Some(index) = selected.first() else {
-                            return;
-                        };
-                        let mode = if *index == 0 {
-                            PublicBroadcasterFeeMode::DeductFromAmount
-                        } else {
-                            PublicBroadcasterFeeMode::AddToAmount
-                        };
-                        selector_root.update(cx, |root, cx| match kind {
-                            DeliveryFormKind::Send => {
-                                root.set_send_broadcaster_fee_mode(key, mode, window, cx);
-                            }
-                            DeliveryFormKind::Unshield => {
-                                root.set_unshield_broadcaster_fee_mode(key, mode, window, cx);
-                            }
-                        });
-                    }),
-            ),
+            ButtonGroup::new(delivery_element_id(key, kind, "fee-mode-toggle"))
+                .w_full()
+                .disabled(generating)
+                .child(private_action_segment_button(
+                    delivery_element_id(key, kind, "fee-mode-deduct"),
+                    "Deduct fee from amount",
+                    mode == PublicBroadcasterFeeMode::DeductFromAmount,
+                ))
+                .child(private_action_segment_button(
+                    delivery_element_id(key, kind, "fee-mode-add"),
+                    "Add fee on top",
+                    mode == PublicBroadcasterFeeMode::AddToAmount,
+                ))
+                .on_click(move |selected, window, cx| {
+                    let Some(index) = selected.first() else {
+                        return;
+                    };
+                    let mode = if *index == 0 {
+                        PublicBroadcasterFeeMode::DeductFromAmount
+                    } else {
+                        PublicBroadcasterFeeMode::AddToAmount
+                    };
+                    selector_root.update(cx, |root, cx| match kind {
+                        DeliveryFormKind::Send => {
+                            root.set_send_broadcaster_fee_mode(key, mode, window, cx);
+                        }
+                        DeliveryFormKind::Unshield => {
+                            root.set_unshield_broadcaster_fee_mode(key, mode, window, cx);
+                        }
+                    });
+                }),
         )
         .child(app_muted_text(helper))
+}
+
+fn private_action_segment_button(
+    id: SharedString,
+    label: &'static str,
+    selected: bool,
+) -> gpui_component::button::Button {
+    let button = app_button(id, label)
+        .flex_1()
+        .min_w(px(0.0))
+        .selected(selected);
+    if selected { button.primary() } else { button }
 }
 
 fn render_send_result(key: UnshieldAssetKey, result: &PreparedSendCall) -> gpui::Div {
@@ -6849,7 +6847,7 @@ fn render_public_broadcaster_result(
     kind: DeliveryFormKind,
     result: &PublicBroadcasterSubmissionResult,
 ) -> gpui::Div {
-    let (title, detail, border, extra) = match &result.result {
+    let (title, detail, border, tx_hash) = match &result.result {
         PublicBroadcasterResultKind::Submitted { tx_hash } => (
             "Submitted via public broadcaster",
             format!(
@@ -6857,7 +6855,7 @@ fn render_public_broadcaster_result(
                 broadcaster_candidate_label(&result.broadcaster)
             ),
             theme::SUCCESS,
-            Some(("Tx hash", tx_hash.clone(), "copy-public-tx")),
+            Some(tx_hash.clone()),
         ),
         PublicBroadcasterResultKind::Failed { error } => (
             "Public broadcaster failed",
@@ -6924,14 +6922,37 @@ fn render_public_broadcaster_result(
             result.protocol_fee_amount,
             &result.broadcaster,
         )));
-    if let Some((label, value, action)) = extra {
-        card = card.child(render_unshield_copy_field(
-            label,
-            value,
-            delivery_element_id(key, kind, action),
+    if let Some(tx_hash) = tx_hash {
+        card = card.child(render_public_broadcaster_tx_hash_row(
+            tx_hash,
+            delivery_element_id(key, kind, "copy-public-tx"),
         ));
     }
     card
+}
+
+fn render_public_broadcaster_tx_hash_row(tx_hash: String, button_id: SharedString) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .w(px(72.0))
+                .flex_none()
+                .text_color(rgb(theme::TEXT_MUTED))
+                .child("Tx hash"),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .font_family(APP_FONT_FAMILY)
+                .text_size(APP_TEXT_SIZE)
+                .text_color(rgb(theme::TEXT))
+                .child(SharedString::from(tx_hash.clone())),
+        )
+        .child(clipboard_with_toast(button_id, tx_hash))
 }
 
 fn render_public_broadcaster_cost_estimate(
@@ -8360,7 +8381,7 @@ mod tests {
 
         assert!(state.renders_table());
         assert!(state.is_syncing());
-        assert!(!state.is_ready());
+        assert!(!matches!(state, ChainUtxoState::Ready { .. }));
         assert!(state.snapshot().is_none());
     }
 

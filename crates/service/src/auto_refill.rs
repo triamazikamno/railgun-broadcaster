@@ -1,4 +1,4 @@
-use crate::{pretty_number, submit_tx};
+use crate::{pretty_number, submit_tx, unspent_utxos};
 use alloy::network::{EthereumWallet, TransactionBuilder};
 use alloy::primitives::{Address, ChainId, U256};
 use alloy::providers::Provider;
@@ -145,15 +145,7 @@ impl AutoRefillService {
                 }
             }
 
-            let utxos = self
-                .wallet_handle
-                .utxos
-                .read()
-                .await
-                .iter()
-                .filter(|entry| !entry.is_spent())
-                .map(|entry| entry.utxo.clone())
-                .collect::<Vec<_>>();
+            let utxos = unspent_utxos(&self.wallet_handle).await;
             if utxos.is_empty() {
                 warn!(wallet = %wallet_address, "no unspent utxos available for auto-refill");
                 continue;

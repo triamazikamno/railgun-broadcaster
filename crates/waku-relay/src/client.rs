@@ -154,7 +154,7 @@ impl Client {
                 let nwaku_url = self.nwaku_url.clone();
                 let waku_fleet = Arc::clone(&self.waku_fleet);
                 tokio::spawn(async move {
-                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+                    let mut tick = tokio::time::interval(Duration::from_secs(2));
                     let pubsub_path = urlencoding::encode(&topic);
                     let nwaku_messages_url = nwaku_url
                         .as_ref()

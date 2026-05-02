@@ -42,7 +42,7 @@ use crate::fee_note_assurance::{FeeNoteAssuranceRecordOutcome, process_fee_note_
 use crate::utxo_consolidation::{UtxoConsolidationConfig, UtxoConsolidationService};
 use poi::error::PoiError;
 use railgun_wallet::wallet_cache::wallet_cache_key;
-use railgun_wallet::{ProverService, WalletKeys};
+use railgun_wallet::{ProverService, Utxo, WalletKeys};
 use serde::{Deserialize, Serialize};
 use sync_service::manager::SyncManagerError;
 use sync_service::{
@@ -50,6 +50,17 @@ use sync_service::{
     WalletConfig,
 };
 use waku_relay::msg::ContentTopic;
+
+async fn unspent_utxos(wallet_handle: &sync_service::WalletHandle) -> Vec<Utxo> {
+    wallet_handle
+        .utxos
+        .read()
+        .await
+        .iter()
+        .filter(|entry| !entry.is_spent())
+        .map(|entry| entry.utxo.clone())
+        .collect()
+}
 
 sol! {
     function balanceOf(address account) external view returns (uint256);

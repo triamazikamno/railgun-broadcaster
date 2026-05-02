@@ -112,7 +112,7 @@ pub struct BroadcasterRawParamsTransact {
     // pub dev_log: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EncryptedTransactRequest {
     pub pubkey: [u8; 32],
     pub encrypted_data: [Bytes; 2],

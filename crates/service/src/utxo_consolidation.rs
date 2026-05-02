@@ -1,4 +1,4 @@
-use crate::submit_tx;
+use crate::{submit_tx, unspent_utxos};
 use alloy::network::{EthereumWallet, TransactionBuilder};
 use alloy::primitives::{Address, ChainId, U256};
 use alloy::providers::Provider;
@@ -128,15 +128,7 @@ impl UtxoConsolidationService {
             }
         }
 
-        let utxos = self
-            .wallet_handle
-            .utxos
-            .read()
-            .await
-            .iter()
-            .filter(|entry| !entry.is_spent())
-            .map(|entry| entry.utxo.clone())
-            .collect::<Vec<_>>();
+        let utxos = unspent_utxos(&self.wallet_handle).await;
         if utxos.is_empty() {
             warn!("no unspent utxos available for utxo consolidation");
             return;

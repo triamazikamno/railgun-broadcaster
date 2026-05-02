@@ -151,54 +151,32 @@ pub fn parse_wallet_delta_from_logs(
             let tree_number: u32 = event.treeNumber.to();
             let start_pos: u64 = event.startPosition.to();
             let source = source_from_log(raw_log, block_timestamps)?;
-            for (index, preimage) in event.commitments.iter().enumerate() {
-                let position = start_pos + index as u64;
-                commitment_observations.push(commitment_observation(
-                    tree_number,
-                    position,
-                    preimage.hash(),
-                    source.clone(),
-                ));
-                if let Some(ciphertext) = event.shieldCiphertext.get(index)
-                    && let Some(utxo) = scan_shield_commitment(
-                        tree_number,
-                        position,
-                        preimage,
-                        ciphertext,
-                        source.clone(),
-                        keys,
-                    )
-                {
-                    utxos.push(utxo);
-                }
-            }
+            scan_shield_event_commitments(
+                tree_number,
+                start_pos,
+                &event.commitments,
+                &event.shieldCiphertext,
+                &source,
+                keys,
+                &mut utxos,
+                &mut commitment_observations,
+            );
         } else if topic0 == ShieldLegacyPreMar23::SIGNATURE_HASH {
             let event = ShieldLegacyPreMar23::decode_log(&raw_log.inner)?.data;
 
             let tree_number: u32 = event.treeNumber.to();
             let start_pos: u64 = event.startPosition.to();
             let source = source_from_log(raw_log, block_timestamps)?;
-            for (index, preimage) in event.commitments.iter().enumerate() {
-                let position = start_pos + index as u64;
-                commitment_observations.push(commitment_observation(
-                    tree_number,
-                    position,
-                    preimage.hash(),
-                    source.clone(),
-                ));
-                if let Some(ciphertext) = event.shieldCiphertext.get(index)
-                    && let Some(utxo) = scan_shield_commitment(
-                        tree_number,
-                        position,
-                        preimage,
-                        ciphertext,
-                        source.clone(),
-                        keys,
-                    )
-                {
-                    utxos.push(utxo);
-                }
-            }
+            scan_shield_event_commitments(
+                tree_number,
+                start_pos,
+                &event.commitments,
+                &event.shieldCiphertext,
+                &source,
+                keys,
+                &mut utxos,
+                &mut commitment_observations,
+            );
         } else if topic0 == Nullifiers::SIGNATURE_HASH {
             let event = Nullifiers::decode_log(&raw_log.inner)?.data;
             let tree_number: u32 = event.treeNumber.to();
@@ -409,6 +387,39 @@ const fn commitment_observation(
         position,
         commitment,
         source,
+    }
+}
+
+fn scan_shield_event_commitments(
+    tree_number: u32,
+    start_pos: u64,
+    commitments: &[CommitmentPreimage],
+    shield_ciphertext: &[ShieldCiphertext],
+    source: &UtxoSource,
+    keys: &WalletScanKeys,
+    utxos: &mut Vec<Utxo>,
+    commitment_observations: &mut Vec<CommitmentObservation>,
+) {
+    for (index, preimage) in commitments.iter().enumerate() {
+        let position = start_pos + index as u64;
+        commitment_observations.push(commitment_observation(
+            tree_number,
+            position,
+            preimage.hash(),
+            source.clone(),
+        ));
+        if let Some(ciphertext) = shield_ciphertext.get(index)
+            && let Some(utxo) = scan_shield_commitment(
+                tree_number,
+                position,
+                preimage,
+                ciphertext,
+                source.clone(),
+                keys,
+            )
+        {
+            utxos.push(utxo);
+        }
     }
 }
 
