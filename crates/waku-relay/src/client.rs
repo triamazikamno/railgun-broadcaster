@@ -13,7 +13,8 @@ use waku::proto::{HashKey, WakuMessage};
 use waku::types::{parse_multiaddr, parse_peer_id};
 use waku::{PeerSnapshot, PeerStats, StoreQueryOptions, WakuConfig, WakuNode};
 
-pub const PUBSUB_PATH: &str = "/waku/2/rs/5/1";
+pub const DEFAULT_CLUSTER_ID: u32 = 5;
+pub const DEFAULT_SHARD_ID: u32 = 1;
 const FEE_HISTORY_LOOKBACK: Duration = Duration::from_secs(120);
 const FEE_HISTORY_PAGE_LIMIT: u64 = 500;
 const CACHE_SIZE: NonZeroUsize = match NonZeroUsize::new(500) {
@@ -30,21 +31,23 @@ enum RelayMessageOutcome {
 pub struct Client {
     http_client: reqwest::Client,
     nwaku_url: Option<String>,
+    pubsub_path: String,
     waku_fleet: Arc<WakuNode>,
 }
 
 impl Client {
     pub fn new(cfg: &config::Waku) -> Result<Self, ClientError> {
         let mut config = WakuConfig::default();
+        let cluster_id = cfg.cluster_id.unwrap_or(DEFAULT_CLUSTER_ID);
+        let shard_id = cfg.shard_id.unwrap_or(DEFAULT_SHARD_ID);
         if let Some(dns_enr_trees) = &cfg.dns_enr_trees {
             config.discovery.enr_trees.clone_from(dns_enr_trees);
         }
         if let Some(doh_endpoint) = &cfg.doh_endpoint {
             config.discovery.doh_endpoint.clone_from(doh_endpoint);
         }
-        if let Some(cluster_id) = cfg.cluster_id {
-            config.cluster_id = cluster_id;
-        }
+        config.cluster_id = cluster_id;
+        config.shard_id = shard_id;
         if let Some(max_peers) = cfg.max_peers {
             config.node.connection_cap = max_peers;
         }
@@ -73,8 +76,14 @@ impl Client {
         Ok(Self {
             http_client: reqwest::Client::new(),
             nwaku_url: cfg.nwaku_url.clone(),
+            pubsub_path: relay_shard_pubsub_path(cluster_id, shard_id),
             waku_fleet: waku,
         })
+    }
+
+    #[must_use]
+    pub fn pubsub_path(&self) -> &str {
+        &self.pubsub_path
     }
 
     /// Current aggregate peer statistics from the underlying Waku node.
@@ -91,15 +100,13 @@ impl Client {
 
     pub async fn subscribe(
         &self,
-        topic: &str,
         content_topics: Vec<String>,
     ) -> Result<mpsc::Receiver<WakuMessage>, ClientError> {
-        self.subscribe_internal(topic, content_topics, None).await
+        self.subscribe_internal(content_topics, None).await
     }
 
     pub async fn subscribe_with_fee_history(
         &self,
-        topic: &str,
         content_topics: Vec<String>,
     ) -> Result<mpsc::Receiver<WakuMessage>, ClientError> {
         let history_lookback = content_topics
@@ -108,25 +115,24 @@ impl Client {
             .then_some(FEE_HISTORY_LOOKBACK);
         if history_lookback.is_none() {
             tracing::warn!(
-                pubsub_path = topic,
+                pubsub_path = %self.pubsub_path,
                 topics = ?content_topics,
                 "fee history requested for non-fee topics; using live-only subscription"
             );
         }
 
-        self.subscribe_internal(topic, content_topics, history_lookback)
+        self.subscribe_internal(content_topics, history_lookback)
             .await
     }
 
     async fn subscribe_internal(
         &self,
-        topic: &str,
         content_topics: Vec<String>,
         history_lookback: Option<Duration>,
     ) -> Result<mpsc::Receiver<WakuMessage>, ClientError> {
         let mut rx = self
             .waku_fleet
-            .filter_subscribe(topic.to_string(), content_topics.clone())
+            .filter_subscribe(self.pubsub_path.clone(), content_topics.clone())
             .await
             .map_err(ClientError::FleetSubscribe)?;
         if let Some(nwaku_url) = &self.nwaku_url {
@@ -134,7 +140,7 @@ impl Client {
             if let Err(error) = self
                 .http_client
                 .post(url)
-                .json(&vec![topic])
+                .json(&[self.pubsub_path.as_str()])
                 .send()
                 .await
                 .and_then(reqwest::Response::error_for_status)
@@ -150,15 +156,15 @@ impl Client {
                 rx = sink_rx;
                 let mut cache = LruCache::new(CACHE_SIZE);
 
-                let topic = topic.to_string();
+                let pubsub_path = self.pubsub_path.clone();
                 let nwaku_url = self.nwaku_url.clone();
                 let waku_fleet = Arc::clone(&self.waku_fleet);
                 tokio::spawn(async move {
                     let mut tick = tokio::time::interval(Duration::from_secs(2));
-                    let pubsub_path = urlencoding::encode(&topic);
-                    let nwaku_messages_url = nwaku_url
-                        .as_ref()
-                        .map(|nwaku_url| format!("{nwaku_url}/relay/v1/messages/{pubsub_path}"));
+                    let encoded_pubsub_path = urlencoding::encode(&pubsub_path);
+                    let nwaku_messages_url = nwaku_url.as_ref().map(|nwaku_url| {
+                        format!("{nwaku_url}/relay/v1/messages/{encoded_pubsub_path}")
+                    });
                     let http = reqwest::Client::new();
                     let mut store_peer_rx =
                         history_lookback.map(|_| waku_fleet.subscribe_store_peers());
@@ -194,7 +200,7 @@ impl Client {
                             let end = now_nanos();
                             let start = end.saturating_sub(duration_nanos(lookback));
                             let query = StoreQueryOptions {
-                                pubsub_topic: topic.clone(),
+                                pubsub_topic: pubsub_path.clone(),
                                 content_topics: content_topics.clone(),
                                 time_start: Some(start),
                                 time_end: Some(end),
@@ -322,10 +328,10 @@ impl Client {
 
     pub async fn publish(
         &self,
-        pubsub_path: &str,
         content_topic: &str,
         json_payload_utf8: &[u8],
     ) -> Result<(), ClientError> {
+        let pubsub_path = self.pubsub_path.as_str();
         tracing::debug!(
             pubsub_path,
             content_topic,
@@ -341,7 +347,7 @@ impl Client {
         if let Err(error) = self
             .waku_fleet
             .lightpush_all(
-                PUBSUB_PATH.to_string(),
+                self.pubsub_path.clone(),
                 content_topic.to_string(),
                 json_payload_utf8.to_vec(),
             )
@@ -403,6 +409,12 @@ impl Client {
         Ok(())
     }
 }
+
+#[must_use]
+pub fn relay_shard_pubsub_path(cluster_id: u32, shard_id: u32) -> String {
+    format!("/waku/2/rs/{cluster_id}/{shard_id}")
+}
+
 fn now_micros() -> u64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => duration.as_micros() as u64,
@@ -433,7 +445,13 @@ fn is_fee_content_topic(topic: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_fee_content_topic;
+    use super::{is_fee_content_topic, relay_shard_pubsub_path};
+
+    #[test]
+    fn relay_shard_pubsub_path_uses_static_sharding_format() {
+        assert_eq!(relay_shard_pubsub_path(5, 1), "/waku/2/rs/5/1");
+        assert_eq!(relay_shard_pubsub_path(7, 2), "/waku/2/rs/7/2");
+    }
 
     #[test]
     fn fee_history_topic_detection_only_matches_fees() {

@@ -3,7 +3,7 @@ mod pprof_server;
 
 use broadcaster_monitor::{DEFAULT_EVENT_CAPACITY, event_channel, shared};
 use broadcaster_monitor_waku::{
-    DEFAULT_CLUSTER_ID, WakuViewerConfig, build_waku_client, spawn_workers,
+    DEFAULT_CLUSTER_ID, DEFAULT_SHARD_ID, WakuViewerConfig, build_waku_client, spawn_workers,
 };
 use eyre::{Result, WrapErr};
 use gpui::{App, Application};
@@ -38,6 +38,7 @@ fn main() -> Result<()> {
     let waku_config = WakuViewerConfig {
         chain_ids: chain_ids.clone(),
         cluster_id: opts.cluster_id,
+        shard_id: opts.shard_id,
         doh_endpoint: opts.doh_endpoint.clone(),
         max_peers: opts.max_peers,
         peer_connection_timeout: opts.peer_connection_timeout,
@@ -47,6 +48,7 @@ fn main() -> Result<()> {
     tracing::info!(
         chains = ?chain_ids,
         cluster_id = waku_config.cluster_id.unwrap_or(DEFAULT_CLUSTER_ID),
+        shard_id = waku_config.shard_id.unwrap_or(DEFAULT_SHARD_ID),
         nwaku_url = opts.nwaku_url.as_deref().unwrap_or(""),
         "starting broadcaster-viewer"
     );

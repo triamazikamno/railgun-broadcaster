@@ -40,6 +40,14 @@ pub(crate) struct Options {
     /// Route wallet operation HTTP traffic through a proxy.
     #[structopt(long)]
     pub(crate) proxy: Option<Url>,
+
+    /// Waku cluster ID for broadcaster discovery and public broadcaster traffic.
+    #[structopt(long = "cluster-id")]
+    pub(crate) cluster_id: Option<u32>,
+
+    /// Waku static shard ID for broadcaster discovery and public broadcaster traffic.
+    #[structopt(long = "shard-id")]
+    pub(crate) shard_id: Option<u32>,
 }
 
 impl Options {
@@ -69,6 +77,7 @@ pub(crate) const fn default_initial_chain_id() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use structopt::StructOpt;
 
     #[test]
     fn default_chain_set_accepts_supported_chains() {
@@ -80,5 +89,13 @@ mod tests {
     #[test]
     fn default_chain_set_rejects_unknown_chain() {
         assert!(!is_default_chain(10));
+    }
+
+    #[test]
+    fn waku_cluster_and_shard_parse() {
+        let opts =
+            Options::from_iter_safe(["wallet", "--cluster-id", "7", "--shard-id", "2"]).unwrap();
+        assert_eq!(opts.cluster_id, Some(7));
+        assert_eq!(opts.shard_id, Some(2));
     }
 }

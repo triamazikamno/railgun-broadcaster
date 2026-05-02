@@ -1241,7 +1241,7 @@ impl WakuNode {
 
         let metadata_response = proto::metadata::WakuMetadataResponse {
             cluster_id: Some(config.cluster_id),
-            shards: Vec::new(),
+            shards: vec![config.shard_id],
         };
 
         let (store_peer_tx, _) = broadcast::channel(STORE_PEER_EVENT_CAPACITY);

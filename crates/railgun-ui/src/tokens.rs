@@ -270,8 +270,7 @@ mod tests {
 
     #[test]
     fn lookup_disambiguates_native_usdc_across_chains() {
-        // The YAML lists native USDC on Arbitrum with 18 decimals — unusual
-        // but that's what the broadcaster parses, so the viewer mirrors it.
+        // Native Arbitrum USDC uses 6 token decimals in the example config.
         let arb_usdc = address!("0xaf88d065e77c8cc2239327c5edb3a432268e5831");
         let info = lookup_token(42161, &arb_usdc).expect("Arbitrum USDC present");
         assert_eq!(info.symbol, "USDC");

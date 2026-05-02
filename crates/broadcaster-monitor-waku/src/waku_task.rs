@@ -5,11 +5,11 @@ use eyre::{Result, WrapErr};
 use tokio::sync::mpsc;
 use waku::PeerSnapshot;
 use waku::proto::WakuMessage;
-use waku_relay::client::{Client, PUBSUB_PATH};
+use waku_relay::client::Client;
+pub use waku_relay::client::{DEFAULT_CLUSTER_ID, DEFAULT_SHARD_ID};
 
 use broadcaster_monitor::{EventTx, FeeRow, MonitorEvent, PeerRow, PeerSummary, Shared};
 
-pub const DEFAULT_CLUSTER_ID: u32 = 5;
 pub const DEFAULT_DOH_ENDPOINT: &str = "https://cloudflare-dns.com/dns-query";
 pub const DEFAULT_MAX_PEERS: usize = 10;
 pub const DEFAULT_PEER_CONNECTION_TIMEOUT_SECS: u64 = 10;
@@ -18,6 +18,7 @@ pub const DEFAULT_PEER_CONNECTION_TIMEOUT_SECS: u64 = 10;
 pub struct WakuViewerConfig {
     pub chain_ids: Vec<u64>,
     pub cluster_id: Option<u32>,
+    pub shard_id: Option<u32>,
     pub doh_endpoint: Option<String>,
     pub max_peers: Option<usize>,
     pub peer_connection_timeout: Option<Duration>,
@@ -45,6 +46,7 @@ pub fn waku_config(opts: &WakuViewerConfig) -> config::Waku {
         dns_enr_trees: None,
         doh_endpoint: Some(doh),
         cluster_id: Some(opts.cluster_id.unwrap_or(DEFAULT_CLUSTER_ID)),
+        shard_id: Some(opts.shard_id.unwrap_or(DEFAULT_SHARD_ID)),
         max_peers: Some(opts.max_peers.unwrap_or(DEFAULT_MAX_PEERS)),
         peer_connection_timeout: Some(humantime_serde::Serde::from(timeout)),
     }
@@ -77,7 +79,7 @@ pub async fn spawn_workers(
     );
 
     let msg_rx = waku
-        .subscribe_with_fee_history(PUBSUB_PATH, content_topics)
+        .subscribe_with_fee_history(content_topics)
         .await
         .wrap_err("subscribe to fees content topics")?;
 
@@ -277,6 +279,7 @@ mod tests {
         let opts = WakuViewerConfig::default();
         let cfg = waku_config(&opts);
         assert_eq!(cfg.cluster_id, Some(DEFAULT_CLUSTER_ID));
+        assert_eq!(cfg.shard_id, Some(DEFAULT_SHARD_ID));
         assert_eq!(cfg.max_peers, Some(DEFAULT_MAX_PEERS));
         assert_eq!(cfg.doh_endpoint.as_deref(), Some(DEFAULT_DOH_ENDPOINT));
         assert_eq!(
@@ -293,6 +296,7 @@ mod tests {
         let opts = WakuViewerConfig {
             chain_ids: Vec::new(),
             cluster_id: Some(7),
+            shard_id: Some(3),
             max_peers: Some(42),
             doh_endpoint: Some("https://example.invalid/dns-query".to_string()),
             peer_connection_timeout: Some(Duration::from_secs(3)),
@@ -300,6 +304,7 @@ mod tests {
         };
         let cfg = waku_config(&opts);
         assert_eq!(cfg.cluster_id, Some(7));
+        assert_eq!(cfg.shard_id, Some(3));
         assert_eq!(cfg.max_peers, Some(42));
         assert_eq!(
             cfg.doh_endpoint.as_deref(),

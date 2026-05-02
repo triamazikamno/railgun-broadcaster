@@ -50,7 +50,7 @@ use sync_service::{
 };
 pub use sync_service::{SyncProgressStage, SyncProgressUpdate};
 use tokio::sync::watch;
-use waku_relay::client::{Client as WakuClient, PUBSUB_PATH};
+use waku_relay::client::Client as WakuClient;
 use zeroize::{Zeroize, Zeroizing};
 
 pub use waku_relay::client::Client as PublicBroadcasterWakuClient;
@@ -2961,14 +2961,15 @@ async fn submit_public_broadcaster_plan(
         elapsed_ms = encrypt_started.elapsed().as_millis(),
         "built public broadcaster encrypted Waku payload"
     );
+    let pubsub_path = waku.pubsub_path();
     tracing::info!(
-        pubsub_path = PUBSUB_PATH,
+        pubsub_path = %pubsub_path,
         response_topic = %response_topic,
         "subscribing to public broadcaster response topic"
     );
     let subscribe_started = Instant::now();
     let mut response_rx = waku
-        .subscribe(PUBSUB_PATH, vec![response_topic.clone()])
+        .subscribe(vec![response_topic.clone()])
         .await
         .wrap_err("subscribe to public broadcaster response topic")?;
     tracing::info!(
@@ -2977,17 +2978,17 @@ async fn submit_public_broadcaster_plan(
         "subscribed to public broadcaster response topic"
     );
     tracing::info!(
-        pubsub_path = PUBSUB_PATH,
+        pubsub_path = %pubsub_path,
         transact_topic = %transact_topic,
         payload_len = payload.len(),
         "publishing public broadcaster transact request"
     );
     let publish_started = Instant::now();
-    waku.publish(PUBSUB_PATH, &transact_topic, &payload)
+    waku.publish(&transact_topic, &payload)
         .await
         .wrap_err("publish public broadcaster transact request")?;
     tracing::info!(
-        pubsub_path = PUBSUB_PATH,
+        pubsub_path = %pubsub_path,
         transact_topic = %transact_topic,
         elapsed_ms = publish_started.elapsed().as_millis(),
         "published public broadcaster transact request"

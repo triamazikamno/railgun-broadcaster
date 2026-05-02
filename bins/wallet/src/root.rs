@@ -8,20 +8,19 @@ use alloy::uint;
 use broadcaster_monitor::{EventRx, Shared};
 use chrono::{DateTime, Local, Utc};
 use gpui::{
-    App, AppContext, Bounds, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyBinding, MouseButton, ParentElement, Pixels, Point, Render, SharedString,
+    App, AppContext, Bounds, Context, Entity, Focusable, InteractiveElement, IntoElement,
+    KeyBinding, MouseButton, ParentElement, Pixels, Point, Render, SharedString,
     StatefulInteractiveElement, Styled, WeakEntity, Window, WindowBounds, WindowOptions, div, img,
     prelude::FluentBuilder as _, px, rgb, size,
 };
 use gpui_component::{
-    Disableable, IconName, IndexPath, Root, Selectable, Sizable, StyledExt,
+    Disableable, IconName, IndexPath, Root, Selectable, Sizable, StyledExt, WindowExt,
     alert::Alert,
     button::{ButtonGroup, ButtonVariants},
     checkbox::Checkbox,
-    group_box::{GroupBox, GroupBoxVariants},
+    dialog::DialogButtonProps,
     input::{Input, InputEvent, InputState},
     list::{List, ListDelegate, ListItem, ListState},
-    popover::Popover,
     progress::Progress as UiProgress,
     resizable::{ResizableState, resizable_panel, v_resizable},
     scroll::ScrollableElement,
@@ -31,7 +30,6 @@ use gpui_component::{
     table::{Column, Table, TableDelegate, TableEvent, TableState},
     tag::Tag,
     tooltip::Tooltip,
-    v_flex,
 };
 use railgun_ui::{
     DEFAULT_CHAINS, chain_icon_path, chain_name, format_broadcaster_address_label,
@@ -87,8 +85,6 @@ const SECONDS_PER_DAY: u64 = 24 * SECONDS_PER_HOUR;
 const SECONDS_PER_MONTH: u64 = 30 * SECONDS_PER_DAY;
 const SECONDS_PER_YEAR: u64 = 365 * SECONDS_PER_DAY;
 const TABLE_KEY_CONTEXT: &str = "Table";
-const BROADCASTER_PICKER_KEY_CONTEXT: &str = "BroadcasterPicker";
-const PRIVATE_ACTION_FORM_KEY_CONTEXT: &str = "PrivateActionForm";
 const COST_ESTIMATE_DETAIL_TEXT_SIZE: Pixels = px(11.0);
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, gpui::Action)]
@@ -107,30 +103,12 @@ pub(crate) struct UtxoHome;
 #[action(no_json)]
 pub(crate) struct UtxoEnd;
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, gpui::Action)]
-#[action(no_json)]
-pub(crate) struct CloseBroadcasterPicker;
-
-#[derive(Clone, Debug, Default, Eq, PartialEq, gpui::Action)]
-#[action(no_json)]
-pub(crate) struct ClosePrivateActionForm;
-
 pub(crate) fn install_utxo_navigation_bindings(app: &mut App) {
     app.bind_keys([
         KeyBinding::new("pageup", UtxoPageUp, Some(TABLE_KEY_CONTEXT)),
         KeyBinding::new("pagedown", UtxoPageDown, Some(TABLE_KEY_CONTEXT)),
         KeyBinding::new("home", UtxoHome, Some(TABLE_KEY_CONTEXT)),
         KeyBinding::new("end", UtxoEnd, Some(TABLE_KEY_CONTEXT)),
-        KeyBinding::new(
-            "escape",
-            CloseBroadcasterPicker,
-            Some(BROADCASTER_PICKER_KEY_CONTEXT),
-        ),
-        KeyBinding::new(
-            "escape",
-            ClosePrivateActionForm,
-            Some(PRIVATE_ACTION_FORM_KEY_CONTEXT),
-        ),
     ]);
 }
 
@@ -253,14 +231,175 @@ struct BroadcasterPickerState {
     kind: DeliveryFormKind,
     key: UnshieldAssetKey,
     query_input: Entity<InputState>,
-    focus_handle: FocusHandle,
     list: Entity<ListState<BroadcasterPickerDelegate>>,
 }
 
 struct PrivateActionFormState {
     kind: DeliveryFormKind,
     key: UnshieldAssetKey,
-    focus_handle: FocusHandle,
+}
+
+struct PrivateActionDialogContent {
+    root: Entity<WalletRoot>,
+    kind: DeliveryFormKind,
+    key: UnshieldAssetKey,
+}
+
+impl PrivateActionDialogContent {
+    fn new(
+        root: Entity<WalletRoot>,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        cx: &mut Context<'_, Self>,
+    ) -> Self {
+        cx.observe(&root, |_this, _root, cx| cx.notify()).detach();
+        Self { root, kind, key }
+    }
+}
+
+impl Render for PrivateActionDialogContent {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        match self.kind {
+            DeliveryFormKind::Send => self
+                .root
+                .read(cx)
+                .render_send_form(self.root.clone(), self.key),
+            DeliveryFormKind::Unshield => self
+                .root
+                .read(cx)
+                .render_unshield_form(self.root.clone(), self.key),
+        }
+    }
+}
+
+struct BroadcasterPickerDialogContent {
+    root: Entity<WalletRoot>,
+}
+
+impl BroadcasterPickerDialogContent {
+    fn new(root: Entity<WalletRoot>, cx: &mut Context<'_, Self>) -> Self {
+        cx.observe(&root, |_this, _root, cx| cx.notify()).detach();
+        Self { root }
+    }
+}
+
+impl Render for BroadcasterPickerDialogContent {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        let Some(snapshot) = self
+            .root
+            .read(cx)
+            .broadcaster_picker_dialog_snapshot(window, cx)
+        else {
+            return div();
+        };
+        let BroadcasterPickerDialogSnapshot {
+            query_input,
+            list,
+            rows,
+            empty_message,
+            generating,
+            query,
+            filtered_count,
+            total_count,
+            list_height,
+        } = snapshot;
+        list.update(cx, |list, cx| {
+            let content = BroadcasterPickerContent {
+                rows,
+                empty_message,
+                generating,
+                query,
+            };
+            if list.delegate_mut().set_content(content, cx) {
+                cx.notify();
+            }
+        });
+
+        div()
+            .w_full()
+            .h_full()
+            .min_h(px(0.0))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div().flex().items_end().gap_3().child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(app_muted_text("Search"))
+                        .child(app_input(&query_input).disabled(generating)),
+                ),
+            )
+            .child(render_broadcaster_picker_header(
+                filtered_count,
+                total_count,
+            ))
+            .child(
+                List::new(&list)
+                    .p(px(8.0))
+                    .h(list_height)
+                    .min_h(px(0.0))
+                    .w_full()
+                    .bg(rgb(theme::SURFACE)),
+            )
+    }
+}
+
+struct RepairCacheDialogContent {
+    root: Entity<WalletRoot>,
+}
+
+impl RepairCacheDialogContent {
+    fn new(root: Entity<WalletRoot>, cx: &mut Context<'_, Self>) -> Self {
+        cx.observe(&root, |_this, _root, cx| cx.notify()).detach();
+        Self { root }
+    }
+}
+
+impl Render for RepairCacheDialogContent {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        self.root.read(cx).render_repair_cache_dialog_content()
+    }
+}
+
+struct VaultDialogTitleContent {
+    root: Entity<WalletRoot>,
+}
+
+impl VaultDialogTitleContent {
+    fn new(root: Entity<WalletRoot>, cx: &mut Context<'_, Self>) -> Self {
+        cx.observe(&root, |_this, _root, cx| cx.notify()).detach();
+        Self { root }
+    }
+}
+
+impl Render for VaultDialogTitleContent {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        app_strong_text(self.root.read(cx).vault_dialog_title())
+    }
+}
+
+struct VaultDialogContent {
+    root: Entity<WalletRoot>,
+}
+
+impl VaultDialogContent {
+    fn new(root: Entity<WalletRoot>, cx: &mut Context<'_, Self>) -> Self {
+        cx.observe(&root, |_this, _root, cx| cx.notify()).detach();
+        Self { root }
+    }
+}
+
+impl Render for VaultDialogContent {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        self.root
+            .read(cx)
+            .render_vault_dialog_content(self.root.clone())
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -278,6 +417,18 @@ struct BroadcasterPickerContent {
     empty_message: SharedString,
     generating: bool,
     query: String,
+}
+
+struct BroadcasterPickerDialogSnapshot {
+    query_input: Entity<InputState>,
+    list: Entity<ListState<BroadcasterPickerDelegate>>,
+    rows: Vec<BroadcasterPickerRow>,
+    empty_message: SharedString,
+    generating: bool,
+    query: String,
+    filtered_count: usize,
+    total_count: usize,
+    list_height: Pixels,
 }
 
 struct BroadcasterPickerDelegate {
@@ -815,6 +966,7 @@ pub(crate) struct WalletRoot {
     utxo_table: Entity<TableState<UtxoDelegate>>,
     focus_unlock_password_on_render: bool,
     focus_utxo_table_on_render: bool,
+    vault_dialog_open: bool,
     logs_open: bool,
     drawer_split: Entity<ResizableState>,
 }
@@ -944,6 +1096,7 @@ impl WalletRoot {
             utxo_table,
             focus_unlock_password_on_render,
             focus_utxo_table_on_render: false,
+            vault_dialog_open: false,
             logs_open: false,
             drawer_split: cx.new(|_| ResizableState::default()),
         };
@@ -963,7 +1116,7 @@ impl WalletRoot {
                 let SelectEvent::Confirm(Some(chain_id)) = event else {
                     return;
                 };
-                this.select_chain(*chain_id, cx);
+                this.select_chain(*chain_id, window, cx);
                 cx.defer_in(window, |_this, window, _cx| {
                     window.blur();
                 });
@@ -977,7 +1130,7 @@ impl WalletRoot {
                 let SelectEvent::Confirm(Some(wallet_id)) = event else {
                     return;
                 };
-                this.select_wallet(Arc::clone(wallet_id), cx);
+                this.select_wallet(Arc::clone(wallet_id), window, cx);
                 cx.defer_in(window, |_this, window, _cx| {
                     window.blur();
                 });
@@ -1423,10 +1576,11 @@ impl WalletRoot {
         });
     }
 
-    fn select_chain(&mut self, chain_id: u64, cx: &mut Context<'_, Self>) {
+    fn select_chain(&mut self, chain_id: u64, window: &mut Window, cx: &mut Context<'_, Self>) {
         if self.selected_chain == chain_id {
             return;
         }
+        window.close_all_dialogs(cx);
         self.selected_chain = chain_id;
         self.send_forms.clear();
         self.unshield_forms.clear();
@@ -1444,10 +1598,16 @@ impl WalletRoot {
         cx.notify();
     }
 
-    fn select_wallet(&mut self, wallet_id: Arc<str>, cx: &mut Context<'_, Self>) {
+    fn select_wallet(
+        &mut self,
+        wallet_id: Arc<str>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         if self.selected_wallet_id.as_deref() == Some(wallet_id.as_ref()) {
             return;
         }
+        window.close_all_dialogs(cx);
         self.selected_wallet_id = Some(wallet_id);
         self.send_forms.clear();
         self.unshield_forms.clear();
@@ -1765,10 +1925,14 @@ impl WalletRoot {
         }
     }
 
-    fn choose_import_wallet(&mut self, cx: &mut Context<'_, Self>) {
+    fn choose_import_wallet(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.generated_seed = None;
         self.vault_error = None;
         self.wallet_setup_mode = WalletSetupMode::Import;
+        self.import_mnemonic_input
+            .read(cx)
+            .focus_handle(cx)
+            .focus(window);
         cx.notify();
     }
 
@@ -1879,6 +2043,8 @@ impl WalletRoot {
     ) {
         let session = Arc::new(session);
         let wallet_id: Arc<str> = Arc::from(session.wallet_id().to_owned());
+        window.close_all_dialogs(cx);
+        self.vault_dialog_open = false;
         self.view_session = Some(session);
         self.wallet_options = vec![WalletOption {
             wallet_id: Arc::clone(&wallet_id),
@@ -1941,6 +2107,8 @@ impl WalletRoot {
                 store.shutdown().await;
             });
         }
+        window.close_all_dialogs(cx);
+        self.vault_dialog_open = false;
         self.view_session = None;
         self.wallet_options.clear();
         self.selected_wallet_id = None;
@@ -1965,19 +2133,7 @@ impl WalletRoot {
         cx.notify();
     }
 
-    fn private_action_form_is_generating(&self) -> bool {
-        self.send_forms.values().any(|form| form.generating)
-            || self.unshield_forms.values().any(|form| form.generating)
-    }
-
     fn close_send_form(&mut self, key: UnshieldAssetKey, cx: &mut Context<'_, Self>) {
-        if self
-            .send_forms
-            .get(&key)
-            .is_some_and(|form| form.generating)
-        {
-            return;
-        }
         self.send_forms.remove(&key);
         if self
             .private_action_form
@@ -1991,13 +2147,6 @@ impl WalletRoot {
     }
 
     fn close_unshield_form(&mut self, key: UnshieldAssetKey, cx: &mut Context<'_, Self>) {
-        if self
-            .unshield_forms
-            .get(&key)
-            .is_some_and(|form| form.generating)
-        {
-            return;
-        }
         self.unshield_forms.remove(&key);
         if self
             .private_action_form
@@ -2010,17 +2159,110 @@ impl WalletRoot {
         cx.notify();
     }
 
-    fn close_private_action_form(&mut self, cx: &mut Context<'_, Self>) {
-        let Some((kind, key)) = self
-            .private_action_form
-            .as_ref()
-            .map(|form| (form.kind, form.key))
-        else {
+    fn open_private_action_dialog(
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        title_action: &'static str,
+        asset_label: String,
+        icon_path: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let root = cx.entity();
+        let content = cx.new(|cx| PrivateActionDialogContent::new(root.clone(), kind, key, cx));
+        window.open_dialog(cx, move |dialog, window, _cx| {
+            let dialog_width = (window.viewport_size().width * 0.92).min(PRIVATE_ASSET_LIST_WIDTH);
+            let max_height =
+                (window.viewport_size().height * 0.88).min(PRIVATE_ACTION_FORM_MAX_HEIGHT);
+            let close_root = root.clone();
+            dialog
+                .w(dialog_width)
+                .h(max_height)
+                .title(private_action_title_row(
+                    title_action,
+                    &asset_label,
+                    icon_path.clone(),
+                ))
+                .on_close(move |_event, _window, cx| {
+                    close_root.update(cx, |root, cx| match kind {
+                        DeliveryFormKind::Send => root.close_send_form(key, cx),
+                        DeliveryFormKind::Unshield => root.close_unshield_form(key, cx),
+                    });
+                })
+                .child(content.clone())
+        });
+    }
+
+    fn open_repair_cache_dialog(window: &mut Window, cx: &mut Context<'_, Self>) {
+        let root = cx.entity();
+        let content_root = root.clone();
+        let content = cx.new(|cx| RepairCacheDialogContent::new(content_root, cx));
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            let submit_root = root.clone();
+            dialog
+                .w(px(420.0))
+                .title(app_strong_text("Repair wallet cache"))
+                .button_props(DialogButtonProps::default().ok_text("Repair"))
+                .footer(|ok, _, window, cx| vec![ok(window, cx)])
+                .on_ok(move |_event, _window, cx| {
+                    submit_root.update(cx, Self::repair_wallet_cache_from_input)
+                })
+                .child(content.clone())
+        });
+    }
+
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    fn ensure_vault_dialog_open(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if matches!(self.vault_state, VaultState::ViewUnlocked) || self.vault_dialog_open {
             return;
-        };
-        match kind {
-            DeliveryFormKind::Send => self.close_send_form(key, cx),
-            DeliveryFormKind::Unshield => self.close_unshield_form(key, cx),
+        }
+        self.vault_dialog_open = true;
+        cx.defer_in(window, |root, window, cx| {
+            if matches!(root.vault_state, VaultState::ViewUnlocked) {
+                root.vault_dialog_open = false;
+                return;
+            }
+            Self::open_vault_dialog(window, cx);
+            root.focus_vault_dialog_input(window, cx);
+        });
+    }
+
+    fn open_vault_dialog(window: &mut Window, cx: &mut Context<'_, Self>) {
+        let root = cx.entity();
+        let title_root = root.clone();
+        let content_root = root;
+        let title = cx.new(|cx| VaultDialogTitleContent::new(title_root, cx));
+        let content = cx.new(|cx| VaultDialogContent::new(content_root, cx));
+        window.open_dialog(cx, move |dialog, window, _cx| {
+            let dialog_width = (window.viewport_size().width * 0.92).min(px(520.0));
+            dialog
+                .w(dialog_width)
+                .title(title.clone())
+                .close_button(false)
+                .keyboard(false)
+                .overlay_closable(false)
+                .child(content.clone())
+        });
+    }
+
+    fn focus_vault_dialog_input(&self, window: &mut Window, cx: &Context<'_, Self>) {
+        match self.vault_state {
+            VaultState::CreateVault => self
+                .new_password_input
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window),
+            VaultState::UnlockVault => self
+                .unlock_password_input
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window),
+            VaultState::SetupWallet if self.wallet_setup_mode == WalletSetupMode::Import => self
+                .import_mnemonic_input
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window),
+            VaultState::SetupWallet | VaultState::ViewUnlocked | VaultState::Error(_) => {}
         }
     }
 
@@ -2030,10 +2272,10 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.private_action_form_is_generating() {
-            return;
-        }
+        window.close_all_dialogs(cx);
         let key = UnshieldAssetKey::from_asset(&asset);
+        let dialog_asset_label = asset.label.clone();
+        let dialog_icon_path = asset.icon_path.clone();
         let amount = format_send_amount_input(asset.max_batched, asset.decimals);
         let amount_input = cx.new(|cx| {
             let mut input = InputState::new(window, cx).placeholder("amount");
@@ -2047,7 +2289,6 @@ impl WalletRoot {
                 .placeholder("vault password")
                 .masked(true)
         });
-        let focus_handle = cx.focus_handle();
         cx.subscribe_in(
             &password_input,
             window,
@@ -2105,8 +2346,16 @@ impl WalletRoot {
         self.private_action_form = Some(PrivateActionFormState {
             kind: DeliveryFormKind::Send,
             key,
-            focus_handle,
         });
+        Self::open_private_action_dialog(
+            DeliveryFormKind::Send,
+            key,
+            "Send",
+            dialog_asset_label,
+            dialog_icon_path,
+            window,
+            cx,
+        );
         focus_recipient_input
             .read(cx)
             .focus_handle(cx)
@@ -2461,17 +2710,25 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let form_exists = match kind {
-            DeliveryFormKind::Send => self.send_forms.contains_key(&key),
-            DeliveryFormKind::Unshield => self.unshield_forms.contains_key(&key),
-        };
-        if !form_exists {
+        if self.broadcaster_picker.is_some() {
             return;
         }
+        let Some((asset_label, chain_id)) = (match kind {
+            DeliveryFormKind::Send => self
+                .send_forms
+                .get(&key)
+                .map(|form| (form.asset.label.clone(), form.asset.chain_id)),
+            DeliveryFormKind::Unshield => self
+                .unshield_forms
+                .get(&key)
+                .map(|form| (form.asset.label.clone(), form.asset.chain_id)),
+        }) else {
+            return;
+        };
 
         let query_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("search broadcasters"));
-        let focus_handle = cx.focus_handle();
+        let focus_query_input = query_input.clone();
         cx.subscribe(&query_input, |_this, _input, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 cx.notify();
@@ -2487,24 +2744,56 @@ impl WalletRoot {
             kind,
             key,
             query_input,
-            focus_handle,
             list,
         });
-        if let Some(picker) = self.broadcaster_picker.as_ref() {
-            picker.query_input.read(cx).focus_handle(cx).focus(window);
-        }
+        Self::open_broadcaster_picker_dialog(
+            asset_label,
+            chain_name(chain_id).map_or_else(|| chain_id.to_string(), str::to_owned),
+            window,
+            cx,
+        );
+        cx.defer_in(window, move |_this, window, cx| {
+            focus_query_input.read(cx).focus_handle(cx).focus(window);
+        });
         cx.notify();
     }
 
-    fn focus_private_action_form_if_open(&self, window: &mut Window) {
-        if let Some(form) = self.private_action_form.as_ref() {
-            form.focus_handle.focus(window);
-        }
+    fn open_broadcaster_picker_dialog(
+        asset_label: String,
+        chain_label: String,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let root = cx.entity();
+        let content_root = root.clone();
+        let content = cx.new(|cx| BroadcasterPickerDialogContent::new(content_root, cx));
+        window.open_dialog(cx, move |dialog, window, _cx| {
+            let dialog_width = (window.viewport_size().width * 0.92).min(PRIVATE_ASSET_LIST_WIDTH);
+            let max_height =
+                (window.viewport_size().height * 0.82).min(BROADCASTER_PICKER_MAX_HEIGHT);
+            let close_root = root.clone();
+            dialog
+                .w(dialog_width)
+                .h(max_height)
+                .title(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(app_strong_text("Choose public broadcaster"))
+                        .child(app_muted_text(format!("{asset_label} on {chain_label}"))),
+                )
+                .on_close(move |_event, _window, cx| {
+                    close_root.update(cx, |root, cx| {
+                        root.close_broadcaster_picker(cx);
+                    });
+                })
+                .child(content.clone())
+        });
     }
 
-    fn close_broadcaster_picker(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+    fn close_broadcaster_picker(&mut self, cx: &mut Context<'_, Self>) {
         self.broadcaster_picker = None;
-        self.focus_private_action_form_if_open(window);
         cx.notify();
     }
 
@@ -2522,8 +2811,8 @@ impl WalletRoot {
             DeliveryFormKind::Unshield => self.set_unshield_broadcaster_choice(key, choice, cx),
         }
         self.broadcaster_picker = None;
-        self.focus_private_action_form_if_open(window);
         cx.notify();
+        window.close_dialog(cx);
     }
 
     fn generate_send_calldata_from_form(
@@ -2784,10 +3073,10 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.private_action_form_is_generating() {
-            return;
-        }
+        window.close_all_dialogs(cx);
         let key = UnshieldAssetKey::from_asset(&asset);
+        let dialog_asset_label = asset.label.clone();
+        let dialog_icon_path = asset.icon_path.clone();
         let amount = format_unshield_amount_input(asset.max_batched, asset.decimals);
         let amount_input = cx.new(|cx| {
             let mut input = InputState::new(window, cx).placeholder("amount");
@@ -2801,7 +3090,6 @@ impl WalletRoot {
                 .placeholder("vault password")
                 .masked(true)
         });
-        let focus_handle = cx.focus_handle();
         cx.subscribe_in(
             &password_input,
             window,
@@ -2868,8 +3156,16 @@ impl WalletRoot {
         self.private_action_form = Some(PrivateActionFormState {
             kind: DeliveryFormKind::Unshield,
             key,
-            focus_handle,
         });
+        Self::open_private_action_dialog(
+            DeliveryFormKind::Unshield,
+            key,
+            "Unshield",
+            dialog_asset_label,
+            dialog_icon_path,
+            window,
+            cx,
+        );
         focus_recipient_input
             .read(cx)
             .focus_handle(cx)
@@ -3544,34 +3840,40 @@ impl WalletRoot {
             .child(img(icon).size(px(18.0)).flex_none())
     }
 
-    fn render_vault_gate(&self, root: Entity<Self>) -> impl IntoElement {
-        div()
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(rgb(theme::BACKGROUND))
-            .p(px(24.0))
-            .child(match &self.vault_state {
-                VaultState::CreateVault => self.render_create_vault(root).into_any_element(),
-                VaultState::UnlockVault => self.render_unlock_vault(root).into_any_element(),
-                VaultState::SetupWallet => self.render_wallet_setup(root).into_any_element(),
-                VaultState::ViewUnlocked => div().into_any_element(),
-                VaultState::Error(message) => self.render_vault_fatal(message).into_any_element(),
-            })
+    const fn vault_dialog_title(&self) -> &'static str {
+        match &self.vault_state {
+            VaultState::CreateVault => "Create wallet vault",
+            VaultState::UnlockVault => "Unlock wallet vault",
+            VaultState::SetupWallet => match self.wallet_setup_mode {
+                WalletSetupMode::Choose => "Add your first wallet",
+                WalletSetupMode::GeneratedReview => "Save recovery phrase",
+                WalletSetupMode::Import => "Import wallet",
+            },
+            VaultState::ViewUnlocked => "Wallet",
+            VaultState::Error(_) => "Wallet vault unavailable",
+        }
     }
 
-    fn render_create_vault(&self, root: Entity<Self>) -> gpui::AnyElement {
+    fn render_vault_dialog_content(&self, root: Entity<Self>) -> gpui::AnyElement {
+        match &self.vault_state {
+            VaultState::CreateVault => self.render_create_vault(root).into_any_element(),
+            VaultState::UnlockVault => self.render_unlock_vault(root).into_any_element(),
+            VaultState::SetupWallet => self.render_wallet_setup(root).into_any_element(),
+            VaultState::ViewUnlocked => div().into_any_element(),
+            VaultState::Error(message) => self.render_vault_fatal(message).into_any_element(),
+        }
+    }
+
+    fn render_create_vault(&self, root: Entity<Self>) -> gpui::Div {
         let submit_root = root;
-        let mut card = vault_card(
-            "Create wallet vault",
+        let mut body = vault_dialog_body(
             "Choose one password for this desktop wallet vault. It will be required every time the app starts.",
         );
         if let Some(error) = self.render_vault_error() {
-            card = card.child(error);
+            body = body.child(error);
         }
 
-        card.child(app_input(&self.new_password_input))
+        body.child(app_input(&self.new_password_input))
             .child(app_input(&self.confirm_password_input))
             .child(
                 app_button("create-wallet-vault", "Create vault")
@@ -3589,20 +3891,17 @@ impl WalletRoot {
                     .text_color(rgb(theme::TEXT_MUTED))
                     .child("No OS keychain or mnemonic startup argument is used in v1."),
             )
-            .into_any_element()
     }
 
-    fn render_unlock_vault(&self, root: Entity<Self>) -> gpui::AnyElement {
+    fn render_unlock_vault(&self, root: Entity<Self>) -> gpui::Div {
         let submit_root = root;
-        let mut card = vault_card(
-            "Unlock wallet vault",
-            "Enter the vault password to view wallet balances and history.",
-        );
+        let mut body =
+            vault_dialog_body("Enter the vault password to view wallet balances and history.");
         if let Some(error) = self.render_vault_error() {
-            card = card.child(error);
+            body = body.child(error);
         }
 
-        card.child(app_input(&self.unlock_password_input).disabled(self.unlock_in_progress))
+        body.child(app_input(&self.unlock_password_input).disabled(self.unlock_in_progress))
             .child(
                 app_button("unlock-wallet-vault", "Unlock vault")
                     .primary()
@@ -3621,7 +3920,6 @@ impl WalletRoot {
                     .text_color(rgb(theme::TEXT_MUTED))
                     .child("Unlocking view mode does not decrypt spend material."),
             )
-            .into_any_element()
     }
 
     fn render_wallet_setup(&self, root: Entity<Self>) -> gpui::AnyElement {
@@ -3635,15 +3933,14 @@ impl WalletRoot {
     fn render_wallet_setup_choice(&self, root: Entity<Self>) -> gpui::AnyElement {
         let generate_root = root.clone();
         let import_root = root;
-        let mut card = vault_card(
-            "Add your first wallet",
+        let mut body = vault_dialog_body(
             "Generate a new recovery phrase or import an existing one. Seed material will be encrypted into the vault.",
         );
         if let Some(error) = self.render_vault_error() {
-            card = card.child(error);
+            body = body.child(error);
         }
 
-        card.child(
+        body.child(
             app_button("generate-vault-wallet", "Generate new wallet")
                 .primary()
                 .w_full()
@@ -3657,9 +3954,9 @@ impl WalletRoot {
             app_button("import-vault-wallet", "Import recovery phrase")
                 .outline()
                 .w_full()
-                .on_click(move |_event, _window, cx| {
+                .on_click(move |_event, window, cx| {
                     import_root.update(cx, |root, cx| {
-                        root.choose_import_wallet(cx);
+                        root.choose_import_wallet(window, cx);
                     });
                 }),
         )
@@ -3673,15 +3970,14 @@ impl WalletRoot {
             .generated_seed
             .as_ref()
             .map_or_else(String::new, |seed| seed.mnemonic.to_string());
-        let mut card = vault_card(
-            "Save recovery phrase",
+        let mut body = vault_dialog_body(
             "Write this phrase down before continuing. It is shown once and then encrypted into the vault.",
         );
         if let Some(error) = self.render_vault_error() {
-            card = card.child(error);
+            body = body.child(error);
         }
 
-        card.child(
+        body.child(
             div()
                 .w_full()
                 .p(px(14.0))
@@ -3720,15 +4016,14 @@ impl WalletRoot {
     fn render_import_wallet(&self, root: Entity<Self>) -> gpui::AnyElement {
         let import_root = root.clone();
         let back_root = root;
-        let mut card = vault_card(
-            "Import wallet",
+        let mut body = vault_dialog_body(
             "Paste the recovery phrase. The phrase is validated, converted to canonical entropy, and cleared from the input.",
         );
         if let Some(error) = self.render_vault_error() {
-            card = card.child(error);
+            body = body.child(error);
         }
 
-        card.child(app_input(&self.import_mnemonic_input))
+        body.child(app_input(&self.import_mnemonic_input))
             .child(
                 app_button("store-imported-wallet", "Import wallet")
                     .primary()
@@ -3752,15 +4047,12 @@ impl WalletRoot {
             .into_any_element()
     }
 
-    fn render_vault_fatal(&self, message: &str) -> gpui::AnyElement {
-        let mut card = vault_card(
-            "Wallet vault unavailable",
-            SharedString::from(message.to_owned()),
-        );
+    fn render_vault_fatal(&self, message: &str) -> gpui::Div {
+        let mut body = vault_dialog_body(SharedString::from(message.to_owned()));
         if let Some(error) = self.render_vault_error() {
-            card = card.child(error);
+            body = body.child(error);
         }
-        card.into_any_element()
+        body
     }
 
     fn render_vault_error(&self) -> Option<gpui::AnyElement> {
@@ -3882,7 +4174,7 @@ impl WalletRoot {
                     .child(clipboard_with_toast("wallet-receive-address-copy", address))
             }))
             .children(receive_address.map(|_| header_divider()))
-            .child(self.render_repair_cache_popover(root.clone()))
+            .child(self.render_repair_cache_button(root.clone()))
             .child(
                 app_button_base("wallet-lock-vault")
                     .outline()
@@ -3899,80 +4191,51 @@ impl WalletRoot {
             )
     }
 
-    fn render_repair_cache_popover(&self, root: Entity<Self>) -> impl IntoElement {
-        let input = self.repair_cache_block_input.clone();
-        let error = self.repair_cache_error.clone();
+    fn render_repair_cache_button(&self, root: Entity<Self>) -> impl IntoElement {
         let disabled = matches!(
             self.chain_states.get(&self.selected_chain),
             Some(state) if state.is_syncing()
         );
 
-        Popover::new("wallet-repair-cache")
-            .trigger(
-                app_button_base("wallet-repair-cache-trigger")
-                    .outline()
-                    .xsmall()
-                    .px(px(10.0))
-                    .py(px(15.0))
-                    .disabled(disabled)
-                    .tooltip("Repair wallet cache")
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .child(img(icons::wrench_icon_path()).size(px(12.0)).flex_none()),
-                    ),
+        app_button_base("wallet-repair-cache-trigger")
+            .outline()
+            .xsmall()
+            .px(px(10.0))
+            .py(px(15.0))
+            .disabled(disabled)
+            .tooltip("Repair wallet cache")
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .child(img(icons::wrench_icon_path()).size(px(12.0)).flex_none()),
             )
-            .content(move |_state, _window, cx| {
-                let popover = cx.entity();
-                let submit_root = root.clone();
-                let cancel_popover = popover.clone();
-                let submit_popover = popover;
-                v_flex()
-                    .w(px(320.0))
-                    .gap_3()
-                    .child(app_strong_text("Repair wallet cache"))
-                    .child(app_muted_text(
-                        "Rewind and rescan this chain's wallet cache. Use 0 for deployment block.",
-                    ))
-                    .child(app_input(&input))
-                    .children(error.as_ref().map(|message| {
-                        div()
-                            .text_size(APP_TEXT_SIZE)
-                            .text_color(rgb(theme::DANGER))
-                            .child(SharedString::from(message.to_string()))
-                    }))
-                    .child(
-                        div()
-                            .flex()
-                            .justify_end()
-                            .gap_2()
-                            .child(
-                                app_button("wallet-repair-cache-cancel", "Cancel")
-                                    .ghost()
-                                    .small()
-                                    .on_click(move |_event, window, cx| {
-                                        cancel_popover
-                                            .update(cx, |state, cx| state.dismiss(window, cx));
-                                    }),
-                            )
-                            .child(
-                                app_button("wallet-repair-cache-submit", "Repair")
-                                    .primary()
-                                    .small()
-                                    .on_click(move |_event, window, cx| {
-                                        let submitted = submit_root.update(cx, |root, cx| {
-                                            root.repair_wallet_cache_from_input(cx)
-                                        });
-                                        if submitted {
-                                            submit_popover.update(cx, |state, cx| {
-                                                state.dismiss(window, cx);
-                                            });
-                                        }
-                                    }),
-                            ),
-                    )
+            .on_click(move |_event, window, cx| {
+                root.update(cx, |_root, cx| {
+                    Self::open_repair_cache_dialog(window, cx);
+                });
             })
+    }
+
+    fn render_repair_cache_dialog_content(&self) -> gpui::Div {
+        let input = self.repair_cache_block_input.clone();
+        let error = self.repair_cache_error.clone();
+
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(app_muted_text(
+                "Rewind and rescan this chain's wallet cache. Use 0 for deployment block.",
+            ))
+            .child(app_input(&input))
+            .children(error.as_ref().map(|message| {
+                div()
+                    .text_size(APP_TEXT_SIZE)
+                    .text_color(rgb(theme::DANGER))
+                    .child(SharedString::from(message.to_string()))
+            }))
     }
 
     fn render_wallet_selector(&self) -> impl IntoElement {
@@ -4224,78 +4487,21 @@ impl WalletRoot {
         let delivery_root = root.clone();
         let chooser_root = root.clone();
         let fee_mode_root = root.clone();
-        let submit_root = root.clone();
-        let cancel_root = root;
+        let submit_root = root;
 
-        let mut card = div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .p(px(16.0))
-            .rounded_lg()
-            .bg(rgb(theme::SURFACE))
-            .border_1()
-            .border_color(rgb(theme::BORDER_STRONG))
-            .child(
-                div()
-                    .flex()
-                    .items_start()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_color(rgb(theme::TEXT))
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .child(private_action_title_row(
-                                        "Send",
-                                        &asset.label,
-                                        asset.icon_path.clone(),
-                                    )),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id(send_element_id(key, "cancel"))
-                            .size(px(24.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_sm()
-                            .text_color(rgb(theme::TEXT_MUTED))
-                            .opacity(if form.generating { 0.45 } else { 1.0 })
-                            .tooltip(|window, cx| Tooltip::new("Close").build(window, cx))
-                            .when(!form.generating, |close| {
-                                close
-                                    .cursor_pointer()
-                                    .hover(|close| {
-                                        close
-                                            .bg(rgb(theme::SURFACE_HOVER))
-                                            .text_color(rgb(theme::TEXT))
-                                    })
-                                    .on_click(move |_event, _window, cx| {
-                                        cx.stop_propagation();
-                                        cancel_root.update(cx, |root, cx| {
-                                            root.close_send_form(key, cx);
-                                        });
-                                    })
-                            })
-                            .child(img(icons::close_icon_path()).size(px(14.0)).flex_none()),
-                    ),
-            )
-            .child(render_private_action_metrics(
-                key,
-                DeliveryFormKind::Send,
-                form.amount_input.clone(),
-                asset,
-                form.generating,
-            ));
+        let mut card =
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(render_private_action_metrics(
+                    key,
+                    DeliveryFormKind::Send,
+                    form.amount_input.clone(),
+                    asset,
+                    form.generating,
+                ));
 
         if asset.total > asset.max_batched {
             card = card.child(Alert::warning(
@@ -4464,78 +4670,21 @@ impl WalletRoot {
         let chooser_root = root.clone();
         let fee_mode_root = root.clone();
         let output_root = root.clone();
-        let submit_root = root.clone();
-        let cancel_root = root;
+        let submit_root = root;
 
-        let mut card = div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .p(px(16.0))
-            .rounded_lg()
-            .bg(rgb(theme::SURFACE))
-            .border_1()
-            .border_color(rgb(theme::BORDER_STRONG))
-            .child(
-                div()
-                    .flex()
-                    .items_start()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_color(rgb(theme::TEXT))
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .child(private_action_title_row(
-                                        "Unshield",
-                                        &asset.label,
-                                        asset.icon_path.clone(),
-                                    )),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id(unshield_element_id(key, "cancel"))
-                            .size(px(24.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_sm()
-                            .text_color(rgb(theme::TEXT_MUTED))
-                            .opacity(if form.generating { 0.45 } else { 1.0 })
-                            .tooltip(|window, cx| Tooltip::new("Close").build(window, cx))
-                            .when(!form.generating, |close| {
-                                close
-                                    .cursor_pointer()
-                                    .hover(|close| {
-                                        close
-                                            .bg(rgb(theme::SURFACE_HOVER))
-                                            .text_color(rgb(theme::TEXT))
-                                    })
-                                    .on_click(move |_event, _window, cx| {
-                                        cx.stop_propagation();
-                                        cancel_root.update(cx, |root, cx| {
-                                            root.close_unshield_form(key, cx);
-                                        });
-                                    })
-                            })
-                            .child(img(icons::close_icon_path()).size(px(14.0)).flex_none()),
-                    ),
-            )
-            .child(render_private_action_metrics(
-                key,
-                DeliveryFormKind::Unshield,
-                form.amount_input.clone(),
-                asset,
-                form.generating,
-            ));
+        let mut card =
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(render_private_action_metrics(
+                    key,
+                    DeliveryFormKind::Unshield,
+                    form.amount_input.clone(),
+                    asset,
+                    form.generating,
+                ));
 
         if asset.total > asset.max_batched {
             card = card.child(Alert::warning(
@@ -4850,26 +4999,6 @@ impl WalletRoot {
         self.navigate_utxo_table(UtxoNavigation::End, cx);
     }
 
-    fn on_action_close_broadcaster_picker(
-        &mut self,
-        _: &CloseBroadcasterPicker,
-        window: &mut Window,
-        cx: &mut Context<'_, Self>,
-    ) {
-        if self.broadcaster_picker.is_some() {
-            self.close_broadcaster_picker(window, cx);
-        }
-    }
-
-    fn on_action_close_private_action_form(
-        &mut self,
-        _: &ClosePrivateActionForm,
-        _: &mut Window,
-        cx: &mut Context<'_, Self>,
-    ) {
-        self.close_private_action_form(cx);
-    }
-
     fn navigate_utxo_table(&self, navigation: UtxoNavigation, cx: &mut Context<'_, Self>) {
         if !should_focus_utxo_table(
             self.active_activity,
@@ -4966,94 +5095,38 @@ impl WalletRoot {
             )
     }
 
-    fn render_private_action_form_modal(&self, root: &Entity<Self>, window: &Window) -> gpui::Div {
-        let Some(form) = self.private_action_form.as_ref() else {
-            return div();
-        };
-        let kind = form.kind;
-        let key = form.key;
-        let modal_focus = form.focus_handle.clone();
-        let modal_action_root = root.clone();
-        let max_height = (window.viewport_size().height * 0.88).min(PRIVATE_ACTION_FORM_MAX_HEIGHT);
-        let form = match kind {
-            DeliveryFormKind::Send => self.render_send_form(root.clone(), key).into_any_element(),
-            DeliveryFormKind::Unshield => self
-                .render_unshield_form(root.clone(), key)
-                .into_any_element(),
-        };
-
-        div()
-            .absolute()
-            .occlude()
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .p(px(24.0))
-            .bg(rgb(theme::BACKGROUND))
-            .on_any_mouse_down(|_event, _window, cx| {
-                cx.stop_propagation();
-            })
-            .child(
-                div()
-                    .occlude()
-                    .w(PRIVATE_ASSET_LIST_WIDTH)
-                    .max_w_full()
-                    .max_h(max_height)
-                    .tab_group()
-                    .key_context(PRIVATE_ACTION_FORM_KEY_CONTEXT)
-                    .track_focus(&modal_focus)
-                    .on_action(window.listener_for(
-                        &modal_action_root,
-                        Self::on_action_close_private_action_form,
-                    ))
-                    .overflow_y_scrollbar()
-                    .child(form),
-            )
-    }
-
-    fn render_broadcaster_picker_modal(
+    fn broadcaster_picker_dialog_snapshot(
         &self,
-        root: &Entity<Self>,
         window: &Window,
-        cx: &mut Context<'_, Self>,
-    ) -> gpui::Div {
-        let Some(picker) = self.broadcaster_picker.as_ref() else {
-            return div();
-        };
-        let Some((asset_label, chain_id, token, unwrap, current_choice, generating)) =
-            (match picker.kind {
-                DeliveryFormKind::Send => self.send_forms.get(&picker.key).map(|form| {
-                    (
-                        form.asset.label.clone(),
-                        form.asset.chain_id,
-                        form.asset.token,
-                        false,
-                        form.broadcaster_choice.clone(),
-                        form.generating,
-                    )
-                }),
-                DeliveryFormKind::Unshield => self.unshield_forms.get(&picker.key).map(|form| {
-                    (
-                        form.asset.label.clone(),
-                        form.asset.chain_id,
-                        form.asset.token,
-                        form.unwrap,
-                        form.broadcaster_choice.clone(),
-                        form.generating,
-                    )
-                }),
-            })
-        else {
-            return div();
-        };
+        cx: &App,
+    ) -> Option<BroadcasterPickerDialogSnapshot> {
+        let picker = self.broadcaster_picker.as_ref()?;
+        let (chain_id, token, unwrap, current_choice, generating) = (match picker.kind {
+            DeliveryFormKind::Send => self.send_forms.get(&picker.key).map(|form| {
+                (
+                    form.asset.chain_id,
+                    form.asset.token,
+                    false,
+                    form.broadcaster_choice.clone(),
+                    form.generating,
+                )
+            }),
+            DeliveryFormKind::Unshield => self.unshield_forms.get(&picker.key).map(|form| {
+                (
+                    form.asset.chain_id,
+                    form.asset.token,
+                    form.unwrap,
+                    form.broadcaster_choice.clone(),
+                    form.generating,
+                )
+            }),
+        })?;
         let query = picker
             .query_input
             .read(cx)
             .value()
             .trim()
             .to_ascii_lowercase();
-        let chain_label = chain_name(chain_id).map_or_else(|| chain_id.to_string(), str::to_owned);
         let candidates = eligible_public_broadcasters_for_asset(
             &self.monitor_fee_rows(),
             chain_id,
@@ -5068,10 +5141,7 @@ impl WalletRoot {
             .filter(|candidate| broadcaster_candidate_matches_query(candidate, &query))
             .collect();
         let filtered_count = candidates.len();
-        let close_root = root.clone();
-        let modal_action_root = root.clone();
-        let modal_focus = picker.focus_handle.clone();
-        let max_height = (window.viewport_size().height * 0.82).min(BROADCASTER_PICKER_MAX_HEIGHT);
+        let list_height = (window.viewport_size().height * 0.52).min(px(440.0));
         let empty_message = SharedString::from(if total_count == 0 {
             "No eligible broadcaster currently advertises this token."
         } else {
@@ -5090,122 +5160,17 @@ impl WalletRoot {
                 ),
             })
             .collect::<Vec<_>>();
-        picker.list.update(cx, |list, cx| {
-            let content = BroadcasterPickerContent {
-                rows,
-                empty_message,
-                generating,
-                query: query.clone(),
-            };
-            if list.delegate_mut().set_content(content, cx) {
-                cx.notify();
-            }
-        });
-
-        div()
-            .absolute()
-            .occlude()
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .p(px(24.0))
-            .bg(rgb(theme::BACKGROUND))
-            .on_any_mouse_down(|_event, _window, cx| {
-                cx.stop_propagation();
-            })
-            .child(
-                div()
-                    .occlude()
-                    .w(px(760.0))
-                    .max_w_full()
-                    .h(max_height)
-                    .max_h(max_height)
-                    .tab_group()
-                    .key_context(BROADCASTER_PICKER_KEY_CONTEXT)
-                    .track_focus(&modal_focus)
-                    .on_action(
-                        window.listener_for(
-                            &modal_action_root,
-                            Self::on_action_close_broadcaster_picker,
-                        ),
-                    )
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .p(px(18.0))
-                    .rounded_lg()
-                    .bg(rgb(theme::SURFACE))
-                    .border_1()
-                    .border_color(rgb(theme::BORDER_STRONG))
-                    .child(
-                        div()
-                            .flex()
-                            .items_start()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .child(app_strong_text("Choose public broadcaster"))
-                                    .child(app_muted_text(format!(
-                                        "{asset_label} on {chain_label}"
-                                    ))),
-                            )
-                            .child(
-                                div()
-                                    .id("broadcaster-picker-close")
-                                    .size(px(24.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_sm()
-                                    .cursor_pointer()
-                                    .text_color(rgb(theme::TEXT_MUTED))
-                                    .hover(|this| {
-                                        this.bg(rgb(theme::SURFACE_HOVER))
-                                            .text_color(rgb(theme::TEXT))
-                                    })
-                                    .tooltip(|window, cx| Tooltip::new("Close").build(window, cx))
-                                    .on_click(move |_event, window, cx| {
-                                        cx.stop_propagation();
-                                        close_root.update(cx, |root, cx| {
-                                            root.close_broadcaster_picker(window, cx);
-                                        });
-                                    })
-                                    .child(
-                                        img(icons::close_icon_path()).size(px(14.0)).flex_none(),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div().flex().items_end().gap_3().child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .flex()
-                                .flex_col()
-                                .gap_1()
-                                .child(app_muted_text("Search"))
-                                .child(app_input(&picker.query_input).disabled(generating)),
-                        ),
-                    )
-                    .child(render_broadcaster_picker_header(
-                        filtered_count,
-                        total_count,
-                    ))
-                    .child(
-                        List::new(&picker.list)
-                            .p(px(8.0))
-                            .flex_1()
-                            .min_h(px(0.0))
-                            .w_full()
-                            .bg(rgb(theme::SURFACE)),
-                    ),
-            )
+        Some(BroadcasterPickerDialogSnapshot {
+            query_input: picker.query_input.clone(),
+            list: picker.list.clone(),
+            rows,
+            empty_message,
+            generating,
+            query,
+            filtered_count,
+            total_count,
+            list_height,
+        })
     }
 }
 
@@ -5217,6 +5182,7 @@ impl Render for WalletRoot {
 
         let root = cx.entity();
         if !matches!(self.vault_state, VaultState::ViewUnlocked) {
+            self.ensure_vault_dialog_open(window, cx);
             return div()
                 .relative()
                 .size_full()
@@ -5224,9 +5190,10 @@ impl Render for WalletRoot {
                 .text_color(rgb(theme::TEXT))
                 .font_family(APP_FONT_FAMILY)
                 .text_size(APP_TEXT_SIZE)
-                .child(self.render_vault_gate(root))
+                .children(Root::render_dialog_layer(window, cx))
                 .children(Root::render_notification_layer(window, cx));
         }
+        self.vault_dialog_open = false;
 
         div()
             .relative()
@@ -5236,8 +5203,6 @@ impl Render for WalletRoot {
             .text_color(rgb(theme::TEXT))
             .font_family(APP_FONT_FAMILY)
             .text_size(APP_TEXT_SIZE)
-            .on_action(window.listener_for(&root, Self::on_action_close_broadcaster_picker))
-            .on_action(window.listener_for(&root, Self::on_action_close_private_action_form))
             .child(self.render_activity_rail(root.clone()))
             .child(
                 div()
@@ -5247,16 +5212,7 @@ impl Render for WalletRoot {
                     .min_h(px(0.0))
                     .child(self.render_workspace(root, window)),
             )
-            .children(
-                self.private_action_form
-                    .as_ref()
-                    .map(|_| self.render_private_action_form_modal(&cx.entity(), window)),
-            )
-            .children(
-                self.broadcaster_picker
-                    .as_ref()
-                    .map(|_| self.render_broadcaster_picker_modal(&cx.entity(), window, cx)),
-            )
+            .children(Root::render_dialog_layer(window, cx))
             .children(Root::render_notification_layer(window, cx))
     }
 }
@@ -5646,13 +5602,13 @@ fn private_action_input(state: &Entity<InputState>) -> Input {
     Input::new(state).px(px(12.0)).py(px(8.0))
 }
 
-fn vault_card(title: &'static str, subtitle: impl Into<SharedString>) -> GroupBox {
+fn vault_dialog_body(subtitle: impl Into<SharedString>) -> gpui::Div {
     let subtitle = subtitle.into();
-    GroupBox::new()
-        .outline()
-        .w(px(500.0))
-        .max_w_full()
-        .child(app_strong_text(title))
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap_3()
         .child(app_muted_text(subtitle).line_height(px(18.0)))
 }
 

@@ -143,6 +143,7 @@ impl Manager {
         rpcs: Arc<QueryRpcPool>,
         multicall_addr: Address,
         wrapped_native_token: Address,
+        fee_id_cache_ttl: Duration,
     ) -> Self {
         let mut oracle_instances = Vec::with_capacity(config.len());
         let mut prices = HashMap::with_capacity(config.len());
@@ -172,7 +173,7 @@ impl Manager {
         Self {
             prices: RwLock::new(prices),
             cache: moka::future::Cache::builder()
-                .time_to_live(Duration::from_secs(180))
+                .time_to_live(fee_id_cache_ttl)
                 .build(),
             oracle_instances,
             fee_bonus,
@@ -299,5 +300,28 @@ impl Manager {
             .map_or(calldata.fee_amount, |price| {
                 calldata.fee_amount * self.fee_bonus / price
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fee_id_cache_uses_configured_ttl() {
+        let manager = Manager::new(
+            &HashMap::new(),
+            uint!(1_U256),
+            Arc::new(QueryRpcPool::new(Vec::new(), Duration::from_secs(1))),
+            Address::ZERO,
+            Address::ZERO,
+            Duration::from_millis(10),
+        );
+
+        let (fees_id, _) = manager.create_fees().await;
+        assert!(manager.is_fees_id_valid(&fees_id));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!manager.is_fees_id_valid(&fees_id));
     }
 }

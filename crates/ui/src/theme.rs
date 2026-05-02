@@ -1,7 +1,7 @@
 use gpui::{App, Hsla, Pixels, px, rgb};
 
-pub const APP_FONT_FAMILY: &str = "Menlo";
-pub const APP_TEXT_SIZE: Pixels = px(12.0);
+pub const APP_FONT_FAMILY: &str = ".SystemUIFont";
+pub const APP_TEXT_SIZE: Pixels = px(14.0);
 pub const ASSET_SYMBOL_TEXT_SIZE: Pixels = px(16.0);
 pub const BALANCE_TEXT_SIZE: Pixels = px(18.0);
 pub const APP_TEXT_COLOR: u32 = TEXT;

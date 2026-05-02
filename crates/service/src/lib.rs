@@ -35,7 +35,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::{Instrument, debug, error, info, info_span, warn};
 use tx_submit::{Queue, TxBroadcaster};
-use waku_relay::client::{Client, PUBSUB_PATH};
+use waku_relay::client::Client;
 
 use crate::auto_refill::{AutoRefillConfig, AutoRefillService};
 use crate::fee_note_assurance::{FeeNoteAssuranceRecordOutcome, process_fee_note_assurance_record};
@@ -285,12 +285,14 @@ impl BroadcasterService {
             .ok_or(BroadcasterServiceError::MissingMulticallContract)?;
         let fee_bonus = uint!(1000000000000000000_U256)
             + U256::from(chain_cfg.fee_bonus * 1000.0) * uint!(10000000000000_U256);
+        let fees_ttl = chain_cfg.fees_ttl.into_inner();
         let fees_manager = Arc::new(FeesManager::new(
             &chain_cfg.fees,
             fee_bonus,
             query_rpc_pool.clone(),
             multicall_contract,
             chain_cfg.wrapped_native_token,
+            fees_ttl.saturating_mul(5),
         ));
 
         let (key, master_public_key, addr) = match &chain_cfg.key {
@@ -538,7 +540,7 @@ impl BroadcasterService {
             relay_adapt_7702_contract: chain_cfg.relay_adapt_7702_contract,
             identifier: chain_cfg.identifier,
             fees_refresh_interval: chain_cfg.fees_refresh_interval.into_inner(),
-            fees_ttl: chain_cfg.fees_ttl.into_inner(),
+            fees_ttl,
         })
     }
 
@@ -635,7 +637,6 @@ impl BroadcasterService {
                                     Ok(payload) => {
                                         if let Err(error) = client
                                             .publish(
-                                                PUBSUB_PATH,
                                                 &format!("/railgun/v2/0-{chain_id}-fees/json"),
                                                 payload.as_bytes(),
                                             )
@@ -810,12 +811,11 @@ impl BroadcasterService {
                             )
                                 .inspect_err(
                                     |error| error!(%error, "build error transact response failed"),
-                                ) && let Err(error) = client
-                                .publish(
-                                    PUBSUB_PATH,
-                                    &format!("/railgun/v2/0-{chain_id}-transact-response/json"),
-                                    &transact_response,
-                                )
+                                 ) && let Err(error) = client
+                                 .publish(
+                                     &format!("/railgun/v2/0-{chain_id}-transact-response/json"),
+                                     &transact_response,
+                                 )
                                 .await
                             {
                                 error!(%error, "publish error transact response failed");
@@ -859,13 +859,12 @@ impl BroadcasterService {
                                 &decrypted_payload.shared_key,
                                 tx_hash,
                             )
-                                .inspect_err(|error| error!(%error, "build transact response failed"))
-                                && let Err(error) = client
-                                .publish(
-                                    PUBSUB_PATH,
-                                    &format!("/railgun/v2/0-{chain_id}-transact-response/json"),
-                                    &transact_response,
-                                )
+                                 .inspect_err(|error| error!(%error, "build transact response failed"))
+                                 && let Err(error) = client
+                                 .publish(
+                                     &format!("/railgun/v2/0-{chain_id}-transact-response/json"),
+                                     &transact_response,
+                                 )
                                 .await
                             {
                                 error!(%error, "publish transact response failed");
@@ -1273,13 +1272,10 @@ impl BroadcasterManager {
             .map(|chain_id| format!("/railgun/v2/0-{chain_id}-fees/json"))
             .collect();
 
-        let mut transact_rx = self
-            .waku
-            .subscribe(PUBSUB_PATH, transact_content_topics)
-            .await?;
+        let mut transact_rx = self.waku.subscribe(transact_content_topics).await?;
         let mut fee_rx = self
             .waku
-            .subscribe_with_fee_history(PUBSUB_PATH, fee_content_topics)
+            .subscribe_with_fee_history(fee_content_topics)
             .await?;
 
         loop {

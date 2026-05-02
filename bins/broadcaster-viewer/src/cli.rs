@@ -22,6 +22,10 @@ pub(crate) struct Options {
     #[structopt(long = "cluster-id")]
     pub(crate) cluster_id: Option<u32>,
 
+    /// Waku static shard ID.
+    #[structopt(long = "shard-id")]
+    pub(crate) shard_id: Option<u32>,
+
     /// DNS-over-HTTPS endpoint used for ENR discovery.
     #[structopt(long = "doh-endpoint")]
     pub(crate) doh_endpoint: Option<String>,
@@ -139,6 +143,12 @@ mod tests {
             opts.peer_connection_timeout,
             Some(Duration::from_millis(250))
         );
+    }
+
+    #[test]
+    fn shard_id_parses() {
+        let opts = Options::from_iter_safe(["broadcaster-viewer", "--shard-id", "2"]).unwrap();
+        assert_eq!(opts.shard_id, Some(2));
     }
 
     #[test]

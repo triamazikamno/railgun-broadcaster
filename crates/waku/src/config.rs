@@ -27,6 +27,7 @@ pub struct WakuConfig {
     pub discovery: DiscoveryConfig,
     pub node: NodeConfig,
     pub cluster_id: u32,
+    pub shard_id: u32,
     pub peer_exchange_cooldown: Duration,
 }
 
@@ -36,6 +37,7 @@ impl Default for WakuConfig {
             discovery: DiscoveryConfig::default(),
             node: NodeConfig::default(),
             cluster_id: 1,
+            shard_id: 1,
             peer_exchange_cooldown: Duration::from_secs(60),
         }
     }

@@ -26,6 +26,7 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct Waku {
     pub nwaku_url: Option<String>,
+    pub shard_id: Option<u32>,
     #[serde(default)]
     pub direct_peers: Vec<AdditionalWakuPeer>,
     pub dns_enr_trees: Option<Vec<String>>,

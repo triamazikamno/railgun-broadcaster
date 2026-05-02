@@ -227,7 +227,7 @@ chains:
       # USDC
       0xaf88d065e77c8cc2239327c5edb3a432268e5831: !Oracle
         addr: 0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612
-        token_decimals: 18
+        token_decimals: 6
       # DAI
       0xda10009cbd5d07dd0cecc66161fc93d7c9000da1: !Oracle
         addr: 0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612
@@ -270,6 +270,9 @@ waku:
 
   # Waku cluster id
   cluster_id: 5
+
+  # Waku static shard id.
+  shard_id: 1
 
   # List of custom DNS-based enr trees to bootstrap the libp2p network.
   #  Leave commented out to use default bootstrap nodes.

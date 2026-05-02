@@ -1604,15 +1604,6 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
             .fold(U256::ZERO, |sum, utxo| sum + utxo.note.value)
     }
 
-    /// Get the merkle root for the input tree.
-    fn get_root(&self) -> Result<U256, BuildError> {
-        self.forest
-            .roots()
-            .get(&self.tree_number())
-            .copied()
-            .ok_or(BuildError::MissingRoot)
-    }
-
     /// Compute nullifiers for all inputs.
     fn compute_nullifiers(&self) -> Vec<FixedBytes<32>> {
         self.inputs
@@ -1645,6 +1636,16 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
             .collect()
     }
 
+    /// Build witnesses and derive the public root from their proofs.
+    fn build_input_witnesses_and_root(&self) -> Result<(Vec<InputWitness>, U256), BuildError> {
+        let inputs = self.build_input_witnesses()?;
+        let root = inputs
+            .first()
+            .map(|input| input.merkle_proof.root)
+            .ok_or(BuildError::MissingRoot)?;
+        Ok((inputs, root))
+    }
+
     /// Validate that the total signature inputs don't exceed the limit.
     fn validate_signature_limit(&self, num_outputs: usize) -> Result<(), BuildError> {
         let signature_input_len = 2 + self.inputs.len() + num_outputs;
@@ -1675,7 +1676,7 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
         self.validate_signature_limit(outputs.len())?;
 
         let tree_number = self.tree_number();
-        let root = self.get_root()?;
+        let (inputs, root) = self.build_input_witnesses_and_root()?;
         let nullifiers = self.compute_nullifiers();
         let commitments = Self::compute_commitments(&outputs);
         let commitment_ciphertext = commitment_ciphertext
@@ -1703,7 +1704,6 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
                 request.token_address,
             ),
         };
-        let inputs = self.build_input_witnesses()?;
         let private_inputs = PrivateInputs::from_inputs(
             request.token_address,
             &inputs,
@@ -1732,7 +1732,7 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
         self.validate_signature_limit(outputs.len())?;
 
         let tree_number = self.tree_number();
-        let root = self.get_root()?;
+        let (inputs, root) = self.build_input_witnesses_and_root()?;
         let nullifiers = self.compute_nullifiers();
         let commitments = Self::compute_commitments(&outputs);
         let commitment_ciphertext = commitment_ciphertext
@@ -1757,7 +1757,6 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
             boundParams: bound_params,
             unshieldPreimage: CommitmentPreimage::empty(),
         };
-        let inputs = self.build_input_witnesses()?;
         let private_inputs = PrivateInputs::from_inputs(
             request.token_address,
             &inputs,
@@ -1806,7 +1805,7 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
         self.validate_signature_limit(outputs.len())?;
 
         let tree_number = self.tree_number();
-        let root = self.get_root()?;
+        let (inputs, root) = self.build_input_witnesses_and_root()?;
 
         // Build transaction
         let nullifiers = self.compute_nullifiers();
@@ -1830,8 +1829,7 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
             unshieldPreimage: CommitmentPreimage::empty(),
         };
 
-        // Build witnesses and inputs
-        let inputs = self.build_input_witnesses()?;
+        // Build inputs from the same proof-derived root used in the transaction.
         let public_inputs = PublicInputs::from_transaction(root, &transaction, &outputs);
         let private_inputs = PrivateInputs::from_inputs(
             self.token_address,
@@ -2858,6 +2856,7 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+    use crate::artifacts::ArtifactSource;
     use broadcaster_core::utxo::{UtxoCommitmentKind, UtxoSource};
 
     struct MockSpendSigner {
@@ -3031,6 +3030,82 @@ mod tests {
             [seed; 32],
             [U256::from(seed), U256::from(seed + 1)],
         )
+    }
+
+    #[test]
+    fn unproven_send_uses_proof_root_from_dirty_forest() {
+        let token = Address::from([0xaa; 20]);
+        let input = test_utxo(token, 10, 0, 0);
+        let mut forest = MerkleForest::new();
+        forest
+            .insert_leaf(merkletree::tree::MerkleTreeUpdate {
+                tree_number: input.tree,
+                tree_position: input.position,
+                hash: input.note.commitment(),
+            })
+            .expect("insert leaf");
+        assert_eq!(forest.roots().get(&input.tree), Some(&U256::ZERO));
+
+        let sender = sample_address_data(21);
+        let recipient = sample_address_data(22).address_data();
+        let outputs = build_send_outputs(
+            token,
+            uint!(4_U256),
+            uint!(6_U256),
+            &sender.address_data(),
+            &recipient,
+            None,
+            &sender.viewing_private_key,
+        )
+        .expect("send outputs");
+        let builder = TransactionBuilder {
+            chain_type: 0,
+            chain_id: 1,
+            railgun_contract: Address::ZERO,
+            relay_adapt_contract: Address::ZERO,
+        };
+        let signer = MockSpendSigner {
+            signed_msg: Cell::new(None),
+        };
+        let prover = ProverService::with_capacity_db(ArtifactSource::default(), 1, None);
+        let plan_builder = TransactionPlanBuilder::new(
+            &builder,
+            &sender,
+            &signer,
+            &forest,
+            &prover,
+            vec![input.clone()],
+            token,
+        )
+        .expect("plan builder");
+
+        let plan = plan_builder
+            .build_unproven_send(
+                SendRequest {
+                    token_address: token,
+                    amount: uint!(4_U256),
+                    recipient,
+                    verify_proof: false,
+                    spend_up_to: false,
+                    broadcaster_fee: None,
+                    min_gas_price: 0,
+                },
+                outputs.outputs,
+                outputs.commitment_ciphertext,
+            )
+            .expect("unproven send");
+        let expected_root = forest
+            .prove(input.tree, input.position)
+            .expect("proof")
+            .root;
+
+        assert_ne!(expected_root, U256::ZERO);
+        assert_eq!(plan.merkle_root, expected_root);
+        assert_eq!(plan.inputs[0].merkle_proof.root, expected_root);
+        assert_eq!(
+            plan.transaction.merkleRoot,
+            FixedBytes::from(expected_root.to_be_bytes::<32>())
+        );
     }
 
     #[test]
