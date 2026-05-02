@@ -203,7 +203,8 @@ fn now_epoch_secs() -> Result<u64, std::io::Error> {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{FixedBytes, U256};
+    use alloy::primitives::FixedBytes;
+    use alloy::uint;
     use broadcaster_core::notes::Note;
     use std::collections::BTreeMap;
 
@@ -224,10 +225,10 @@ mod tests {
         let mut wallet_utxo = WalletUtxo {
             utxo: Utxo::new(
                 Note {
-                    token_hash: U256::from(1_u8),
-                    value: U256::from(2_u8),
+                    token_hash: uint!(1_U256),
+                    value: uint!(2_U256),
                     random: [3_u8; 16],
-                    npk: U256::from(4_u8),
+                    npk: uint!(4_U256),
                 },
                 5,
                 6,

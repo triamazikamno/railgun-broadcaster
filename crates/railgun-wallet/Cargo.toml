@@ -38,7 +38,8 @@ thiserror = { workspace = true }
 url = { workspace = true }
 bytes = { workspace = true }
 byteorder = { workspace = true }
-wasmer = "6.1"
+wasmer = { version = "6.1", features = ["singlepass"] }
+wasmer-compiler-singlepass = "6.1"
 tokio = { workspace = true, features = ["sync"] }
 rayon = { workspace = true }
 

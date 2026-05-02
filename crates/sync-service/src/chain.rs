@@ -3,12 +3,11 @@ use crate::types::{
     SyncProgressStage, SyncProgressUpdate, WalletConfig,
 };
 use crate::wallet::{
-    PendingOutputPoiSubmitter, WalletHandle, apply_wallet_delta_to_vec,
-    process_pending_output_poi_observations, refresh_wallet_poi_statuses, spawn_wallet_worker,
-    wallet_cache_store, wallet_poi_status_client, wallet_poi_status_refresh_needed,
+    WalletHandle, WalletWorkerServices, apply_wallet_delta_to_vec,
+    process_pending_output_poi_observations, spawn_wallet_worker, wallet_cache_store,
 };
 use alloy::eips::BlockNumberOrTag;
-use alloy::primitives::Address;
+use alloy::primitives::{Address, FixedBytes};
 use alloy::sol_types::SolEvent;
 use alloy_provider::{DynProvider, Provider};
 use alloy_rpc_types_eth::{Filter, Log};
@@ -36,14 +35,14 @@ use merkletree::wallet::{
     IndexedNullifierInput, IndexedShieldCommitmentInput, IndexedTransactCommitmentInput,
     WalletScanError, apply_commitment_updates_from_logs, parse_indexed_wallet_delta,
 };
-use poi::poi::default_active_poi_list_keys;
 use railgun_wallet::UtxoSource;
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info, warn};
@@ -61,6 +60,57 @@ impl IndexedWalletPageKind {
             Self::Modern => "modern",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalletStartupSyncStrategy {
+    Rpc,
+    Indexed,
+}
+
+impl WalletStartupSyncStrategy {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rpc => "rpc",
+            Self::Indexed => "indexed",
+        }
+    }
+}
+
+#[derive(Debug)]
+enum WalletStartupSyncError {
+    Cancelled,
+    Chain(ChainError),
+    Indexed(SyncError),
+}
+
+impl std::fmt::Display for WalletStartupSyncError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => f.write_str("cancelled"),
+            Self::Chain(err) => write!(f, "{err}"),
+            Self::Indexed(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl From<ChainError> for WalletStartupSyncError {
+    fn from(err: ChainError) -> Self {
+        Self::Chain(err)
+    }
+}
+
+impl From<SyncError> for WalletStartupSyncError {
+    fn from(err: SyncError) -> Self {
+        Self::Indexed(err)
+    }
+}
+
+#[derive(Debug)]
+struct WalletStartupSyncCandidate {
+    strategy: WalletStartupSyncStrategy,
+    events: Vec<BackfillEvent>,
+    elapsed_ms: u128,
 }
 
 fn send_sync_progress(progress_tx: Option<&SyncProgressSender>, update: SyncProgressUpdate) {
@@ -133,6 +183,7 @@ pub struct ChainService {
     forest_last_tx: watch::Sender<u64>,
     live_log_tx: broadcast::Sender<SharedLogBatch>,
     backfill_tx: mpsc::Sender<BackfillRequest>,
+    archive_provider: Option<DynProvider>,
     wallets: RwLock<HashMap<String, WalletRegistration>>,
     cancel: CancellationToken,
     anchor_last: AtomicU64,
@@ -186,6 +237,7 @@ impl ChainService {
             forest_last_tx,
             live_log_tx,
             backfill_tx,
+            archive_provider: archive_provider.clone(),
             wallets: RwLock::new(HashMap::new()),
             cancel: cancel.clone(),
             anchor_last: AtomicU64::new(last_anchor),
@@ -314,7 +366,12 @@ impl ChainService {
         let live_rx = self.live_log_tx.subscribe();
         let (backfill_sender, backfill_rx) = mpsc::channel(128);
         let handle = spawn_wallet_worker(
-            self.db.clone(),
+            WalletWorkerServices {
+                db: self.db.clone(),
+                rpcs: self.chain.rpcs.clone(),
+                http_client: self.chain.http_client.clone(),
+                forest: self.forest.clone(),
+            },
             cfg.clone(),
             live_rx,
             backfill_rx,
@@ -339,6 +396,20 @@ impl ChainService {
         let catch_up_handle = handle.clone();
         let catch_up_cancel = cancel;
         tokio::spawn(async move {
+            if service
+                .hedged_wallet_startup_sync(
+                    &catch_up_cfg,
+                    start_block,
+                    last_scanned,
+                    sync_target,
+                    backfill_sender.clone(),
+                    &catch_up_cancel,
+                )
+                .await
+            {
+                return;
+            }
+
             let mut checkpoint = last_scanned;
             if catch_up_cfg.use_indexed_wallet_catch_up {
                 checkpoint = service
@@ -418,6 +489,407 @@ impl ChainService {
         }
     }
 
+    async fn hedged_wallet_startup_sync(
+        self: &Arc<Self>,
+        cfg: &WalletConfig,
+        start_block: u64,
+        last_scanned: u64,
+        sync_target: u64,
+        backfill_sender: mpsc::Sender<BackfillEvent>,
+        cancel: &CancellationToken,
+    ) -> bool {
+        if !cfg.use_indexed_wallet_catch_up
+            || self.chain.quick_sync_endpoint.is_none()
+            || !should_hedge_wallet_startup(
+                last_scanned,
+                start_block,
+                sync_target,
+                self.chain.block_range,
+            )
+        {
+            return false;
+        }
+
+        let started = Instant::now();
+        info!(
+            cache_key = %cfg.cache_key,
+            start_block,
+            last_scanned,
+            sync_target,
+            block_range = self.chain.block_range,
+            "wallet startup hedge started"
+        );
+
+        let hedge_cancel = cancel.child_token();
+        let (result_tx, mut result_rx) = mpsc::channel(2);
+
+        let rpc_service = Arc::clone(self);
+        let rpc_cfg = cfg.clone();
+        let rpc_cancel = hedge_cancel.child_token();
+        let rpc_result_tx = result_tx.clone();
+        let rpc_handle = tokio::spawn(async move {
+            let result = rpc_service
+                .wallet_startup_rpc_candidate(
+                    &rpc_cfg,
+                    start_block,
+                    last_scanned,
+                    sync_target,
+                    rpc_cancel,
+                )
+                .await;
+            let _ = rpc_result_tx
+                .send((WalletStartupSyncStrategy::Rpc, result))
+                .await;
+        });
+
+        let indexed_service = Arc::clone(self);
+        let indexed_cfg = cfg.clone();
+        let indexed_cancel = hedge_cancel.child_token();
+        let indexed_result_tx = result_tx.clone();
+        let indexed_handle = tokio::spawn(async move {
+            let result = indexed_service
+                .wallet_startup_indexed_candidate(
+                    &indexed_cfg,
+                    start_block,
+                    last_scanned,
+                    sync_target,
+                    indexed_cancel,
+                )
+                .await;
+            let _ = indexed_result_tx
+                .send((WalletStartupSyncStrategy::Indexed, result))
+                .await;
+        });
+        drop(result_tx);
+
+        let mut failures = 0_u8;
+        while let Some((strategy, result)) = result_rx.recv().await {
+            match result {
+                Ok(candidate) => {
+                    hedge_cancel.cancel();
+                    rpc_handle.abort();
+                    indexed_handle.abort();
+                    let sent = send_wallet_startup_events(
+                        &cfg.cache_key,
+                        candidate.events,
+                        sync_target,
+                        &backfill_sender,
+                    )
+                    .await;
+                    info!(
+                        cache_key = %cfg.cache_key,
+                        winner = candidate.strategy.as_str(),
+                        reported_by = strategy.as_str(),
+                        candidate_elapsed_ms = candidate.elapsed_ms,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        cancelled_loser = true,
+                        sent,
+                        "wallet startup hedge complete"
+                    );
+                    return sent;
+                }
+                Err(err) => {
+                    failures = failures.saturating_add(1);
+                    debug!(
+                        err = %err,
+                        cache_key = %cfg.cache_key,
+                        strategy = strategy.as_str(),
+                        failures,
+                        "wallet startup hedge candidate failed"
+                    );
+                    if failures >= 2 {
+                        break;
+                    }
+                }
+            }
+        }
+
+        hedge_cancel.cancel();
+        rpc_handle.abort();
+        indexed_handle.abort();
+        warn!(
+            cache_key = %cfg.cache_key,
+            elapsed_ms = started.elapsed().as_millis(),
+            "wallet startup hedge failed; falling back to indexed-then-rpc startup sync"
+        );
+        false
+    }
+
+    async fn wallet_startup_rpc_candidate(
+        self: Arc<Self>,
+        cfg: &WalletConfig,
+        start_block: u64,
+        last_scanned: u64,
+        sync_target: u64,
+        cancel: CancellationToken,
+    ) -> Result<WalletStartupSyncCandidate, WalletStartupSyncError> {
+        let started = Instant::now();
+        let from_block = wallet_backfill_from_block(last_scanned, start_block);
+        let events = self
+            .fetch_wallet_rpc_backfill_events(from_block, sync_target, &cancel)
+            .await?;
+        debug!(
+            cache_key = %cfg.cache_key,
+            from_block,
+            sync_target,
+            events = events.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "wallet startup RPC candidate complete"
+        );
+        Ok(WalletStartupSyncCandidate {
+            strategy: WalletStartupSyncStrategy::Rpc,
+            events,
+            elapsed_ms: started.elapsed().as_millis(),
+        })
+    }
+
+    async fn wallet_startup_indexed_candidate(
+        self: Arc<Self>,
+        cfg: &WalletConfig,
+        start_block: u64,
+        last_scanned: u64,
+        sync_target: u64,
+        cancel: CancellationToken,
+    ) -> Result<WalletStartupSyncCandidate, WalletStartupSyncError> {
+        let started = Instant::now();
+        let endpoint = self
+            .chain
+            .quick_sync_endpoint
+            .clone()
+            .ok_or(WalletStartupSyncError::Cancelled)?;
+        let client = match self.chain.http_client.clone() {
+            Some(http_client) => QuickSyncClient::with_http_client(endpoint, http_client),
+            None => QuickSyncClient::new(endpoint),
+        };
+        let probe_started = Instant::now();
+        let probe = wait_or_cancel(&cancel, client.probe_indexed_wallet_support()).await??;
+        debug!(
+            cache_key = %cfg.cache_key,
+            elapsed_ms = probe_started.elapsed().as_millis(),
+            "indexed wallet hedge probe complete"
+        );
+
+        let target = probe.height.min(sync_target);
+        let mut from_block = wallet_backfill_from_block(last_scanned, start_block);
+        let progress_start = from_block;
+        let progress_tx = cfg
+            .progress_tx
+            .clone()
+            .or_else(|| self.chain.progress_tx.clone());
+        let mut checkpoint = last_scanned;
+        let mut events = Vec::new();
+        info!(
+            cache_key = %cfg.cache_key,
+            indexed_height = probe.height,
+            sync_target,
+            from_block,
+            target,
+            indexed_block_range = self.chain.indexed_wallet_block_range,
+            "indexed wallet hedge target"
+        );
+
+        if from_block <= target {
+            send_sync_progress(
+                progress_tx.as_ref(),
+                SyncProgressUpdate::new(
+                    SyncProgressStage::IndexingUtxos,
+                    progress_start,
+                    progress_start,
+                    target,
+                ),
+            );
+        }
+
+        while from_block <= target {
+            if cancel.is_cancelled() {
+                return Err(WalletStartupSyncError::Cancelled);
+            }
+            let page_started = Instant::now();
+            let page_kind = indexed_wallet_page_kind(from_block, self.chain.v2_start_block);
+            let to_block = indexed_wallet_to_block(
+                from_block,
+                target,
+                self.chain.v2_start_block,
+                self.chain.indexed_wallet_block_range,
+            );
+            let fetch_started = Instant::now();
+            let page = wait_or_cancel(
+                &cancel,
+                fetch_indexed_wallet_page(&client, page_kind, from_block, to_block),
+            )
+            .await??;
+            let fetch_elapsed_ms = fetch_started.elapsed().as_millis();
+            let parse_started = Instant::now();
+            let delta = parse_indexed_wallet_delta(
+                &page.transact_commitments,
+                &page.shield_commitments,
+                &page.legacy_encrypted_commitments,
+                &page.legacy_generated_commitments,
+                &page.nullifiers,
+                &cfg.scan_keys,
+            );
+            let delta_utxos = delta.utxos.len();
+            let delta_nullifiers = delta.nullifiers.len();
+            let commitment_observations = delta.commitment_observations.len();
+            let parse_elapsed_ms = parse_started.elapsed().as_millis();
+            checkpoint = page.checkpoint_block;
+            events.push(BackfillEvent::IndexedDelta {
+                from_block,
+                to_block: checkpoint,
+                delta: Box::new(delta),
+            });
+            debug!(
+                cache_key = %cfg.cache_key,
+                page_kind = page_kind.as_str(),
+                from_block,
+                to_block,
+                checkpoint,
+                transact_rows = page.transact_rows,
+                shield_rows = page.shield_rows,
+                legacy_encrypted_rows = page.legacy_encrypted_rows,
+                legacy_generated_rows = page.legacy_generated_rows,
+                nullifier_rows = page.nullifier_rows,
+                delta_utxos,
+                delta_nullifiers,
+                commitment_observations,
+                fetch_elapsed_ms,
+                parse_elapsed_ms,
+                elapsed_ms = page_started.elapsed().as_millis(),
+                "indexed wallet hedge page complete"
+            );
+            send_sync_progress(
+                progress_tx.as_ref(),
+                SyncProgressUpdate::new(
+                    SyncProgressStage::IndexingUtxos,
+                    progress_start,
+                    checkpoint,
+                    target,
+                ),
+            );
+            from_block = checkpoint.saturating_add(1);
+        }
+
+        if checkpoint < sync_target {
+            let tail_from = wallet_backfill_from_block(checkpoint, start_block);
+            let mut tail_events = self
+                .fetch_wallet_rpc_backfill_events(tail_from, sync_target, &cancel)
+                .await?;
+            events.append(&mut tail_events);
+        }
+
+        Ok(WalletStartupSyncCandidate {
+            strategy: WalletStartupSyncStrategy::Indexed,
+            events,
+            elapsed_ms: started.elapsed().as_millis(),
+        })
+    }
+
+    async fn fetch_wallet_rpc_backfill_events(
+        &self,
+        from_block: u64,
+        to_block: u64,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<BackfillEvent>, WalletStartupSyncError> {
+        if from_block > to_block {
+            return Ok(Vec::new());
+        }
+        let rpc = self
+            .chain
+            .rpcs
+            .random_provider()
+            .ok_or(ChainError::NoHealthyRpc)?;
+        let started = Instant::now();
+        let fetch_logs_started = Instant::now();
+        let mut logs = match wait_or_cancel(
+            cancel,
+            self.chain.fetch_logs_for_range(
+                &rpc.provider,
+                self.archive_provider.as_ref(),
+                from_block,
+                to_block,
+            ),
+        )
+        .await?
+        {
+            Ok(logs) => logs,
+            Err(err) => {
+                self.chain.rpcs.mark_bad_provider(&rpc);
+                return Err(err.into());
+            }
+        };
+        debug!(
+            from_block,
+            to_block,
+            num_logs = logs.len(),
+            elapsed_ms = fetch_logs_started.elapsed().as_millis(),
+            "fetched hedged wallet RPC logs"
+        );
+        sort_logs(&mut logs);
+
+        let timestamps_started = Instant::now();
+        let block_timestamps = match wait_or_cancel(
+            cancel,
+            self.chain.fetch_log_block_timestamps(
+                &rpc.provider,
+                self.archive_provider.as_ref(),
+                &logs,
+            ),
+        )
+        .await?
+        {
+            Ok(block_timestamps) => block_timestamps,
+            Err(err) => {
+                self.chain.rpcs.mark_bad_provider(&rpc);
+                return Err(err.into());
+            }
+        };
+        debug!(
+            from_block,
+            to_block,
+            num_logs = logs.len(),
+            elapsed_ms = timestamps_started.elapsed().as_millis(),
+            "fetched hedged wallet RPC log block timestamps"
+        );
+
+        let block_hash_started = Instant::now();
+        let to_block_hash = match wait_or_cancel(
+            cancel,
+            self.chain
+                .fetch_block_hash(&rpc.provider, self.archive_provider.as_ref(), to_block),
+        )
+        .await?
+        {
+            Ok(hash) => hash,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    to_block, "failed to fetch hedged wallet RPC block hash"
+                );
+                None
+            }
+        };
+        debug!(
+            to_block,
+            elapsed_ms = block_hash_started.elapsed().as_millis(),
+            "fetched hedged wallet RPC block hash"
+        );
+
+        let batch = Arc::new(LogBatch {
+            from_block,
+            to_block,
+            logs,
+            block_timestamps,
+            to_block_hash,
+        });
+        debug!(
+            from_block,
+            to_block,
+            elapsed_ms = started.elapsed().as_millis(),
+            "hedged wallet RPC backfill candidate complete"
+        );
+        Ok(vec![BackfillEvent::Logs(batch)])
+    }
+
     pub async fn unregister_wallet(&self, cache_key: &str) {
         if let Some((_key, registration)) = self.wallets.write().await.remove_entry(cache_key) {
             registration.cancel.cancel();
@@ -459,6 +931,8 @@ impl ChainService {
             Some(http_client) => QuickSyncClient::with_http_client(endpoint, http_client),
             None => QuickSyncClient::new(endpoint),
         };
+        let catch_up_started = Instant::now();
+        let probe_started = Instant::now();
         let probe = match client.probe_indexed_wallet_support().await {
             Ok(probe) => probe,
             Err(err) => {
@@ -470,6 +944,11 @@ impl ChainService {
                 return last_scanned;
             }
         };
+        debug!(
+            cache_key = %cfg.cache_key,
+            elapsed_ms = probe_started.elapsed().as_millis(),
+            "indexed wallet probe complete"
+        );
         let target = probe.height.min(safe_head);
         let mut from_block = last_scanned.saturating_add(1).max(start_block);
         let progress_start = from_block;
@@ -487,6 +966,11 @@ impl ChainService {
             "indexed wallet catch-up target"
         );
         if from_block > target {
+            debug!(
+                cache_key = %cfg.cache_key,
+                elapsed_ms = catch_up_started.elapsed().as_millis(),
+                "indexed wallet catch-up skipped; cache already at target"
+            );
             return last_scanned;
         }
         send_sync_progress(
@@ -500,13 +984,12 @@ impl ChainService {
         );
 
         let cache_store = wallet_cache_store(&self.db, cfg);
-        let poi_client = wallet_poi_status_client();
-        let active_poi_list_keys = default_active_poi_list_keys();
         let mut checkpoint = last_scanned;
         while from_block <= target {
             if cancel.is_cancelled() {
                 return checkpoint;
             }
+            let page_started = Instant::now();
             let page_kind = indexed_wallet_page_kind(from_block, self.chain.v2_start_block);
             let to_block = indexed_wallet_to_block(
                 from_block,
@@ -514,6 +997,7 @@ impl ChainService {
                 self.chain.v2_start_block,
                 self.chain.indexed_wallet_block_range,
             );
+            let fetch_started = Instant::now();
             let page =
                 match fetch_indexed_wallet_page(&client, page_kind, from_block, to_block).await {
                     Ok(page) => page,
@@ -527,9 +1011,11 @@ impl ChainService {
                         return checkpoint;
                     }
                 };
+            let fetch_elapsed_ms = fetch_started.elapsed().as_millis();
             if cancel.is_cancelled() {
                 return checkpoint;
             }
+            let parse_started = Instant::now();
             let delta = parse_indexed_wallet_delta(
                 &page.transact_commitments,
                 &page.shield_commitments,
@@ -538,36 +1024,29 @@ impl ChainService {
                 &page.nullifiers,
                 &cfg.scan_keys,
             );
-            let poi_submitter = poi_client
-                .as_ref()
-                .map(|client| client as &dyn PendingOutputPoiSubmitter);
+            let delta_utxos = delta.utxos.len();
+            let delta_nullifiers = delta.nullifiers.len();
+            let commitment_observations = delta.commitment_observations.len();
+            let parse_elapsed_ms = parse_started.elapsed().as_millis();
+            let poi_observation_started = Instant::now();
             process_pending_output_poi_observations(
                 self.db.as_ref(),
                 self.chain.chain_id,
                 &delta.commitment_observations,
-                poi_submitter,
+                None,
             )
             .await;
-            let (indexed_total, indexed_unspent, indexed_spent, changed, poi_status_changed) = {
-                let mut wallet_utxos = handle.utxos.write().await;
-                let mut changed = apply_wallet_delta_to_vec(cfg, &mut wallet_utxos, delta);
-                let poi_status_changed = if changed
-                    && wallet_poi_status_refresh_needed(&wallet_utxos, &active_poi_list_keys)
-                    && let Some(client) = poi_client.as_ref()
-                {
-                    refresh_wallet_poi_statuses(
-                        client,
-                        self.chain.chain_id,
-                        &active_poi_list_keys,
-                        &mut wallet_utxos,
-                    )
-                    .await
-                } else {
-                    false
-                };
-                changed |= poi_status_changed;
+            let poi_observation_elapsed_ms = poi_observation_started.elapsed().as_millis();
+            let lock_wait_started = Instant::now();
+            let mut wallet_utxos = handle.utxos.write().await;
+            let lock_wait_elapsed_ms = lock_wait_started.elapsed().as_millis();
+            let apply_started = Instant::now();
+            let changed = apply_wallet_delta_to_vec(cfg, &mut wallet_utxos, delta);
+            let apply_elapsed_ms = apply_started.elapsed().as_millis();
+            let (indexed_total, indexed_unspent, indexed_spent, persist_elapsed_ms) = {
                 let indexed_spent = wallet_utxos.iter().filter(|utxo| utxo.is_spent()).count();
                 let indexed_unspent = wallet_utxos.len().saturating_sub(indexed_spent);
+                let persist_started = Instant::now();
                 if let Err(err) = cache_store.store_wallet_utxos(
                     &cfg.cache_key,
                     &wallet_utxos,
@@ -582,19 +1061,20 @@ impl ChainService {
                     );
                     return checkpoint;
                 }
+                let persist_elapsed_ms = persist_started.elapsed().as_millis();
                 (
                     wallet_utxos.len(),
                     indexed_unspent,
                     indexed_spent,
-                    changed,
-                    poi_status_changed,
+                    persist_elapsed_ms,
                 )
             };
+            drop(wallet_utxos);
             if changed {
                 handle.notify_changed();
             }
             checkpoint = page.checkpoint_block;
-            info!(
+            debug!(
                 cache_key = %cfg.cache_key,
                 page_kind = page_kind.as_str(),
                 from_block,
@@ -608,7 +1088,17 @@ impl ChainService {
                 total = indexed_total,
                 unspent = indexed_unspent,
                 spent = indexed_spent,
-                poi_status_changed,
+                delta_utxos,
+                delta_nullifiers,
+                commitment_observations,
+                poi_status_deferred = true,
+                fetch_elapsed_ms,
+                parse_elapsed_ms,
+                poi_observation_elapsed_ms,
+                lock_wait_elapsed_ms,
+                apply_elapsed_ms,
+                persist_elapsed_ms,
+                elapsed_ms = page_started.elapsed().as_millis(),
                 "indexed wallet catch-up page complete"
             );
             from_block = checkpoint.saturating_add(1);
@@ -622,6 +1112,13 @@ impl ChainService {
                 ),
             );
         }
+        info!(
+            cache_key = %cfg.cache_key,
+            checkpoint,
+            target,
+            elapsed_ms = catch_up_started.elapsed().as_millis(),
+            "indexed wallet catch-up complete"
+        );
         send_sync_progress(
             progress_tx.as_ref(),
             SyncProgressUpdate::new(
@@ -975,6 +1472,66 @@ fn wallet_sync_target(safe_head: u64, sync_to_block: Option<u64>) -> u64 {
         Some(sync_to_block) => sync_to_block.min(safe_head),
         None => safe_head,
     }
+}
+
+fn wallet_startup_hedge_block_count(
+    last_scanned: u64,
+    start_block: u64,
+    sync_target: u64,
+) -> Option<u64> {
+    if sync_target == 0 {
+        return None;
+    }
+    let from_block = wallet_backfill_from_block(last_scanned, start_block);
+    if from_block > sync_target {
+        return None;
+    }
+    Some(sync_target.saturating_sub(from_block).saturating_add(1))
+}
+
+fn should_hedge_wallet_startup(
+    last_scanned: u64,
+    start_block: u64,
+    sync_target: u64,
+    block_range: u64,
+) -> bool {
+    block_range > 0
+        && wallet_startup_hedge_block_count(last_scanned, start_block, sync_target)
+            .is_some_and(|block_count| block_count <= block_range)
+}
+
+async fn wait_or_cancel<T>(
+    cancel: &CancellationToken,
+    future: impl Future<Output = T>,
+) -> Result<T, WalletStartupSyncError> {
+    tokio::select! {
+        result = future => Ok(result),
+        _ = cancel.cancelled() => Err(WalletStartupSyncError::Cancelled),
+    }
+}
+
+async fn send_wallet_startup_events(
+    cache_key: &str,
+    events: Vec<BackfillEvent>,
+    sync_target: u64,
+    sender: &mpsc::Sender<BackfillEvent>,
+) -> bool {
+    for event in events {
+        if let Err(err) = sender.send(event).await {
+            debug!(?err, cache_key, "failed to send wallet startup sync event");
+            return false;
+        }
+    }
+    if let Err(err) = sender
+        .send(BackfillEvent::Done {
+            last_block: sync_target,
+        })
+        .await
+    {
+        debug!(?err, cache_key, "failed to send wallet startup sync done");
+        return false;
+    }
+    true
 }
 
 #[async_trait]
@@ -1486,7 +2043,7 @@ fn spawn_backfill_loop(
             }
 
             let min_from = cursors.values().map(|cursor| cursor.from_block).min();
-            info!(block=?min_from, "scanning wallet events");
+            debug!(block=?min_from, "scanning wallet events");
             let Some(from_block) = min_from else {
                 continue;
             };
@@ -1515,6 +2072,7 @@ fn spawn_backfill_loop(
                 continue;
             };
             let to_block = min(from_block + service.chain.block_range - 1, target_block);
+            let fetch_logs_started = Instant::now();
             match service.chain.fetch_logs_for_range(
                 &rpc.provider,
                 archive_provider.as_ref(),
@@ -1524,8 +2082,15 @@ fn spawn_backfill_loop(
             .await
             {
                 Ok(mut logs) => {
-                    info!(from_block, to_block, num_logs=logs.len(), "fetched backfill logs");
+                    debug!(
+                        from_block,
+                        to_block,
+                        num_logs = logs.len(),
+                        elapsed_ms = fetch_logs_started.elapsed().as_millis(),
+                        "fetched backfill logs"
+                    );
                     sort_logs(&mut logs);
+                    let timestamps_started = Instant::now();
                     let block_timestamps = match service
                         .chain
                         .fetch_log_block_timestamps(&rpc.provider, archive_provider.as_ref(), &logs)
@@ -1538,6 +2103,14 @@ fn spawn_backfill_loop(
                             continue;
                         }
                     };
+                    debug!(
+                        from_block,
+                        to_block,
+                        num_logs = logs.len(),
+                        elapsed_ms = timestamps_started.elapsed().as_millis(),
+                        "fetched backfill log block timestamps"
+                    );
+                    let block_hash_started = Instant::now();
                     let to_block_hash = service.chain.fetch_block_hash(
                         &rpc.provider,
                         archive_provider.as_ref(),
@@ -1548,6 +2121,11 @@ fn spawn_backfill_loop(
                         warn!(?err, to_block, "failed to fetch backfill block hash");
                         None
                     });
+                    debug!(
+                        to_block,
+                        elapsed_ms = block_hash_started.elapsed().as_millis(),
+                        "fetched backfill block hash"
+                    );
                     let batch = Arc::new(LogBatch {
                         from_block,
                         to_block,
@@ -1987,6 +2565,23 @@ async fn fetch_logs_for_range_with_provider(
     v2_start_block: u64,
     legacy_shield_block: u64,
 ) -> Result<Vec<Log>, ChainError> {
+    if from_block > to_block {
+        return Ok(Vec::new());
+    }
+
+    if let Some(event_signatures) = combined_log_event_signatures_for_range(
+        from_block,
+        to_block,
+        v2_start_block,
+        legacy_shield_block,
+    ) {
+        let filter = Filter::new()
+            .select(from_block..=to_block)
+            .address(contract)
+            .event_signature(event_signatures);
+        return Ok(provider.get_logs(&filter).await?);
+    }
+
     let mut logs = Vec::new();
 
     if from_block <= v2_start_block {
@@ -2042,6 +2637,46 @@ async fn fetch_logs_for_range_with_provider(
     Ok(logs)
 }
 
+fn combined_log_event_signatures_for_range(
+    from_block: u64,
+    to_block: u64,
+    v2_start_block: u64,
+    legacy_shield_block: u64,
+) -> Option<Vec<FixedBytes<32>>> {
+    if v2_start_block > 0 && to_block < v2_start_block {
+        return Some(vec![
+            CommitmentBatch::SIGNATURE_HASH,
+            GeneratedCommitmentBatch::SIGNATURE_HASH,
+            Nullifiers::SIGNATURE_HASH,
+            Nullified::SIGNATURE_HASH,
+        ]);
+    }
+
+    if from_block < v2_start_block {
+        return None;
+    }
+
+    if to_block <= legacy_shield_block {
+        return Some(vec![
+            Transact::SIGNATURE_HASH,
+            ShieldLegacyPreMar23::SIGNATURE_HASH,
+            Nullifiers::SIGNATURE_HASH,
+            Nullified::SIGNATURE_HASH,
+        ]);
+    }
+
+    if from_block > legacy_shield_block {
+        return Some(vec![
+            Transact::SIGNATURE_HASH,
+            Shield::SIGNATURE_HASH,
+            Nullifiers::SIGNATURE_HASH,
+            Nullified::SIGNATURE_HASH,
+        ]);
+    }
+
+    None
+}
+
 fn sort_logs(logs: &mut [Log]) {
     logs.sort_by_key(|log| {
         (
@@ -2068,9 +2703,14 @@ fn parse_anchor_block(chain_id: u64, contract: Address, name: &str) -> Option<u6
 
 #[cfg(test)]
 mod tests {
+    use alloy::sol_types::SolEvent;
+
     use super::{
-        IndexedWalletPageKind, complete_stream_checkpoint, indexed_wallet_page_kind,
-        indexed_wallet_to_block, wallet_backfill_from_block, wallet_sync_target,
+        CommitmentBatch, GeneratedCommitmentBatch, IndexedWalletPageKind, Nullified, Nullifiers,
+        Shield, ShieldLegacyPreMar23, Transact, combined_log_event_signatures_for_range,
+        complete_stream_checkpoint, indexed_wallet_page_kind, indexed_wallet_to_block,
+        should_hedge_wallet_startup, wallet_backfill_from_block, wallet_startup_hedge_block_count,
+        wallet_sync_target,
     };
 
     #[test]
@@ -2099,6 +2739,49 @@ mod tests {
         assert_eq!(wallet_sync_target(1_000, Some(900)), 900);
         assert_eq!(wallet_sync_target(1_000, Some(1_100)), 1_000);
         assert_eq!(wallet_sync_target(0, Some(900)), 900);
+    }
+
+    #[test]
+    fn wallet_startup_hedge_is_limited_to_one_rpc_range() {
+        assert_eq!(wallet_startup_hedge_block_count(100, 10, 110), Some(10));
+        assert!(should_hedge_wallet_startup(100, 10, 110, 10));
+        assert!(!should_hedge_wallet_startup(100, 10, 111, 10));
+        assert!(!should_hedge_wallet_startup(100, 10, 0, 10));
+        assert!(!should_hedge_wallet_startup(100, 10, 110, 0));
+        assert!(!should_hedge_wallet_startup(110, 10, 110, 10));
+    }
+
+    #[test]
+    fn combined_log_event_signatures_cover_homogeneous_ranges() {
+        let legacy = combined_log_event_signatures_for_range(10, 99, 100, 200)
+            .expect("legacy range can be combined");
+        assert_eq!(legacy.len(), 4);
+        assert!(legacy.contains(&CommitmentBatch::SIGNATURE_HASH));
+        assert!(legacy.contains(&GeneratedCommitmentBatch::SIGNATURE_HASH));
+        assert!(legacy.contains(&Nullifiers::SIGNATURE_HASH));
+        assert!(legacy.contains(&Nullified::SIGNATURE_HASH));
+
+        let legacy_shield = combined_log_event_signatures_for_range(100, 200, 100, 200)
+            .expect("legacy shield range can be combined");
+        assert_eq!(legacy_shield.len(), 4);
+        assert!(legacy_shield.contains(&Transact::SIGNATURE_HASH));
+        assert!(legacy_shield.contains(&ShieldLegacyPreMar23::SIGNATURE_HASH));
+        assert!(legacy_shield.contains(&Nullifiers::SIGNATURE_HASH));
+        assert!(legacy_shield.contains(&Nullified::SIGNATURE_HASH));
+
+        let modern = combined_log_event_signatures_for_range(201, 300, 100, 200)
+            .expect("modern range can be combined");
+        assert_eq!(modern.len(), 4);
+        assert!(modern.contains(&Transact::SIGNATURE_HASH));
+        assert!(modern.contains(&Shield::SIGNATURE_HASH));
+        assert!(modern.contains(&Nullifiers::SIGNATURE_HASH));
+        assert!(modern.contains(&Nullified::SIGNATURE_HASH));
+    }
+
+    #[test]
+    fn combined_log_event_signatures_skip_boundary_crossing_ranges() {
+        assert!(combined_log_event_signatures_for_range(99, 100, 100, 200).is_none());
+        assert!(combined_log_event_signatures_for_range(200, 201, 100, 200).is_none());
     }
 
     #[test]

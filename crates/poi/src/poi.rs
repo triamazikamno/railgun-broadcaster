@@ -1,10 +1,11 @@
 use crate::error::{PoiError, PoiRpcError};
+use alloy::hex;
 use alloy::primitives::{FixedBytes, U256};
-use broadcaster_core::crypto::poseidon::poseidon;
 use broadcaster_core::crypto::snark_proof::Prover;
 use broadcaster_core::transact::{
     BroadcasterRawParamsTransact, FeeNoteAssuranceContext, ParsedTransactCalldata,
-    ParsedTransactTransaction, PreTxPoi, railgun_txid_leaf_hash, txid_version_or_default,
+    ParsedTransactTransaction, PreTxPoi, SnarkJsProof, dummy_txid_root, railgun_txid_leaf_hash,
+    txid_version_or_default,
 };
 pub use broadcaster_core::utxo::PoiStatus;
 use reqwest::Url;
@@ -139,8 +140,8 @@ impl Poi {
             chain_type,
             chain_id,
             txid_version = %context.txid_version,
-            fee_commitment = %encode_fixed_bytes(&context.fee_commitment),
-            fee_note_npk = %encode_fixed_bytes(&context.fee_note_npk),
+            fee_commitment = %hex::encode_prefixed(context.fee_commitment),
+            fee_note_npk = %hex::encode_prefixed(context.fee_note_npk),
             railgun_txid = %encode_u256(context.railgun_txid),
             utxo_tree_in = context.utxo_tree_in,
             utxo_tree_out,
@@ -185,8 +186,8 @@ impl Poi {
             chain_type,
             chain_id,
             txid_version = %context.txid_version,
-            commitment = %encode_fixed_bytes(&context.commitment),
-            npk = %encode_fixed_bytes(&context.npk),
+            commitment = %hex::encode_prefixed(context.commitment),
+            npk = %hex::encode_prefixed(context.npk),
             railgun_txid = %encode_u256(context.railgun_txid),
             utxo_tree_in = context.utxo_tree_in,
             utxo_tree_out,
@@ -224,7 +225,7 @@ impl Poi {
             chain_type,
             chain_id,
             txid_version,
-            fee_blinded_commitment = %encode_fixed_bytes(blinded_commitment),
+            fee_blinded_commitment = %hex::encode_prefixed(blinded_commitment),
             required_poi_list_keys = ?required_poi_list_keys.iter().map(hex::encode).collect::<Vec<_>>(),
             "query fee-note poi statuses for candidate commitment"
         );
@@ -253,6 +254,9 @@ impl Poi {
 }
 
 const POI_VALIDATE_MERKLEROOTS_METHOD: &str = "ppoi_validate_poi_merkleroots";
+const POI_VALIDATE_TXID_MERKLEROOT_METHOD: &str = "ppoi_validate_txid_merkleroot";
+const POI_VALIDATED_TXID_METHOD: &str = "ppoi_validated_txid";
+const POI_SUBMIT_TRANSACT_PROOF_METHOD: &str = "ppoi_submit_transact_proof";
 const POI_SUBMIT_SINGLE_COMMITMENT_PROOFS_METHOD: &str = "ppoi_submit_single_commitment_proofs";
 const POI_POIS_PER_LIST_METHOD: &str = "ppoi_pois_per_list";
 const POI_MERKLE_PROOFS_METHOD: &str = "ppoi_merkle_proofs";
@@ -304,6 +308,47 @@ struct SubmitSingleCommitmentProofsParams {
     single_commitment_proofs_data: SingleCommitmentProofsData,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SubmitTransactProofParams {
+    #[serde(flatten)]
+    chain: ChainParams,
+    list_key: String,
+    transact_proof_data: SubmitTransactProofData,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SubmitTransactProofData {
+    #[serde(flatten)]
+    proof: SubmitPoiProofData,
+    txid_merkleroot_index: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GetLatestValidatedRailgunTxidParams {
+    #[serde(flatten)]
+    chain: ChainParams,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidatedRailgunTxidStatus {
+    pub validated_txid_index: Option<u64>,
+    pub validated_merkleroot: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ValidateTxidMerklerootParams {
+    #[serde(flatten)]
+    chain: ChainParams,
+    tree: u64,
+    index: u64,
+    merkleroot: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct SingleCommitmentProofContext {
     pub txid_version: String,
@@ -340,12 +385,12 @@ struct SingleCommitmentProofsData {
     utxo_tree_out: u64,
     utxo_position_out: u64,
     railgun_txid: String,
-    pois: BTreeMap<String, BTreeMap<String, SubmitPreTxPoi>>,
+    pois: BTreeMap<String, BTreeMap<String, SubmitPoiProofData>>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct SubmitPreTxPoi {
+struct SubmitPoiProofData {
     snark_proof: SubmitSnarkJsProof,
     txid_merkleroot: String,
     poi_merkleroots: Vec<String>,
@@ -358,6 +403,36 @@ struct SubmitSnarkJsProof {
     pi_a: [String; 2],
     pi_b: [[String; 2]; 2],
     pi_c: [String; 2],
+}
+
+impl From<&PreTxPoi> for SubmitPoiProofData {
+    fn from(poi: &PreTxPoi) -> Self {
+        Self {
+            snark_proof: SubmitSnarkJsProof::from(&poi.snark_proof),
+            txid_merkleroot: hex::encode(poi.txid_merkleroot),
+            poi_merkleroots: poi.poi_merkleroots.iter().map(hex::encode).collect(),
+            blinded_commitments_out: poi
+                .blinded_commitments_out
+                .iter()
+                .map(hex::encode_prefixed)
+                .collect(),
+            railgun_txid_if_has_unshield: if poi.railgun_txid_if_has_unshield.is_empty() {
+                "0x00".to_string()
+            } else {
+                hex::encode_prefixed(&poi.railgun_txid_if_has_unshield)
+            },
+        }
+    }
+}
+
+impl From<&SnarkJsProof> for SubmitSnarkJsProof {
+    fn from(proof: &SnarkJsProof) -> Self {
+        Self {
+            pi_a: proof.pi_a.map(|value| value.to_string()),
+            pi_b: proof.pi_b.map(|row| row.map(|value| value.to_string())),
+            pi_c: proof.pi_c.map(|value| value.to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -546,12 +621,12 @@ impl PoiRpcClient {
         }
 
         let body = resp.text().await?;
-        decode_json_rpc_ack_response(&body)
+        decode_json_rpc_ack_response(method, &body)
     }
 
     fn submit_single_commitment_pois(
         context: &SingleCommitmentProofContext,
-    ) -> BTreeMap<String, BTreeMap<String, SubmitPreTxPoi>> {
+    ) -> BTreeMap<String, BTreeMap<String, SubmitPoiProofData>> {
         context
             .pre_transaction_pois_per_txid_leaf_per_list
             .iter()
@@ -560,35 +635,7 @@ impl PoiRpcClient {
                     hex::encode(list_key),
                     per_leaf
                         .iter()
-                        .map(|(leaf, poi)| {
-                            (
-                                hex::encode(leaf),
-                                SubmitPreTxPoi {
-                                    snark_proof: SubmitSnarkJsProof {
-                                        pi_a: poi.snark_proof.pi_a.map(|value| value.to_string()),
-                                        pi_b: poi
-                                            .snark_proof
-                                            .pi_b
-                                            .map(|row| row.map(|value| value.to_string())),
-                                        pi_c: poi.snark_proof.pi_c.map(|value| value.to_string()),
-                                    },
-                                    txid_merkleroot: hex::encode(poi.txid_merkleroot),
-                                    poi_merkleroots: poi
-                                        .poi_merkleroots
-                                        .iter()
-                                        .map(hex::encode)
-                                        .collect(),
-                                    blinded_commitments_out: poi
-                                        .blinded_commitments_out
-                                        .iter()
-                                        .map(encode_fixed_bytes)
-                                        .collect(),
-                                    railgun_txid_if_has_unshield: encode_bytes(
-                                        &poi.railgun_txid_if_has_unshield,
-                                    ),
-                                },
-                            )
-                        })
+                        .map(|(leaf, poi)| (hex::encode(leaf), poi.into()))
                         .collect(),
                 )
             })
@@ -609,6 +656,32 @@ impl PoiRpcClient {
         }
     }
 
+    fn validate_txid_merkleroot_params(
+        txid_version: &str,
+        chain_type: u8,
+        chain_id: u64,
+        tree: u64,
+        index: u64,
+        merkleroot: &FixedBytes<32>,
+    ) -> ValidateTxidMerklerootParams {
+        ValidateTxidMerklerootParams {
+            chain: Self::chain_params(txid_version, chain_type, chain_id),
+            tree,
+            index,
+            merkleroot: hex::encode(merkleroot),
+        }
+    }
+
+    fn latest_validated_txid_params(
+        txid_version: &str,
+        chain_type: u8,
+        chain_id: u64,
+    ) -> GetLatestValidatedRailgunTxidParams {
+        GetLatestValidatedRailgunTxidParams {
+            chain: Self::chain_params(txid_version, chain_type, chain_id),
+        }
+    }
+
     fn submit_single_commitment_proofs_params(
         txid_version: &str,
         chain_type: u8,
@@ -620,13 +693,31 @@ impl PoiRpcClient {
         SubmitSingleCommitmentProofsParams {
             chain: Self::chain_params(txid_version, chain_type, chain_id),
             single_commitment_proofs_data: SingleCommitmentProofsData {
-                commitment: encode_fixed_bytes(&context.commitment),
-                npk: encode_fixed_bytes(&context.npk),
+                commitment: hex::encode_prefixed(context.commitment),
+                npk: hex::encode_prefixed(context.npk),
                 utxo_tree_in: context.utxo_tree_in,
                 utxo_tree_out,
                 utxo_position_out,
                 railgun_txid: encode_u256_bare(context.railgun_txid),
                 pois: Self::submit_single_commitment_pois(context),
+            },
+        }
+    }
+
+    fn submit_transact_proof_params(
+        txid_version: &str,
+        chain_type: u8,
+        chain_id: u64,
+        list_key: &FixedBytes<32>,
+        txid_merkleroot_index: u64,
+        poi: &PreTxPoi,
+    ) -> SubmitTransactProofParams {
+        SubmitTransactProofParams {
+            chain: Self::chain_params(txid_version, chain_type, chain_id),
+            list_key: hex::encode(list_key),
+            transact_proof_data: SubmitTransactProofData {
+                proof: poi.into(),
+                txid_merkleroot_index,
             },
         }
     }
@@ -644,7 +735,7 @@ impl PoiRpcClient {
             blinded_commitment_datas: blinded_commitment_datas
                 .iter()
                 .map(|data| BlindedCommitmentDataParam {
-                    blinded_commitment: encode_fixed_bytes(&data.blinded_commitment),
+                    blinded_commitment: hex::encode_prefixed(data.blinded_commitment),
                     commitment_type: data.commitment_type.as_str(),
                 })
                 .collect(),
@@ -661,11 +752,14 @@ impl PoiRpcClient {
         GetMerkleProofsParams {
             chain: Self::chain_params(txid_version, chain_type, chain_id),
             list_key: hex::encode(list_key),
-            blinded_commitments: blinded_commitments.iter().map(encode_fixed_bytes).collect(),
+            blinded_commitments: blinded_commitments
+                .iter()
+                .map(hex::encode_prefixed)
+                .collect(),
         }
     }
 
-    async fn validate_poi_merkleroots(
+    pub async fn validate_poi_merkleroots(
         &self,
         txid_version: &str,
         chain_type: u8,
@@ -682,6 +776,42 @@ impl PoiRpcClient {
                 list_key,
                 poi_merkleroots,
             ),
+        )
+        .await
+    }
+
+    pub async fn validate_txid_merkleroot(
+        &self,
+        txid_version: &str,
+        chain_type: u8,
+        chain_id: u64,
+        tree: u64,
+        index: u64,
+        merkleroot: &FixedBytes<32>,
+    ) -> Result<bool, PoiRpcError> {
+        self.send_request(
+            POI_VALIDATE_TXID_MERKLEROOT_METHOD,
+            Self::validate_txid_merkleroot_params(
+                txid_version,
+                chain_type,
+                chain_id,
+                tree,
+                index,
+                merkleroot,
+            ),
+        )
+        .await
+    }
+
+    pub async fn latest_validated_railgun_txid(
+        &self,
+        txid_version: &str,
+        chain_type: u8,
+        chain_id: u64,
+    ) -> Result<ValidatedRailgunTxidStatus, PoiRpcError> {
+        self.send_request(
+            POI_VALIDATED_TXID_METHOD,
+            Self::latest_validated_txid_params(txid_version, chain_type, chain_id),
         )
         .await
     }
@@ -704,6 +834,29 @@ impl PoiRpcClient {
                 context,
                 utxo_tree_out,
                 utxo_position_out,
+            ),
+        )
+        .await
+    }
+
+    pub async fn submit_transact_proof(
+        &self,
+        txid_version: &str,
+        chain_type: u8,
+        chain_id: u64,
+        list_key: &FixedBytes<32>,
+        txid_merkleroot_index: u64,
+        poi: &PreTxPoi,
+    ) -> Result<(), PoiRpcError> {
+        self.send_request_allow_missing_result(
+            POI_SUBMIT_TRANSACT_PROOF_METHOD,
+            Self::submit_transact_proof_params(
+                txid_version,
+                chain_type,
+                chain_id,
+                list_key,
+                txid_merkleroot_index,
+                poi,
             ),
         )
         .await
@@ -733,7 +886,7 @@ impl PoiRpcClient {
         Ok(blinded_commitment_datas
             .iter()
             .map(|data| {
-                let blinded_commitment_hex = encode_fixed_bytes(&data.blinded_commitment);
+                let blinded_commitment_hex = hex::encode_prefixed(data.blinded_commitment);
                 let per_list = response
                     .get(&blinded_commitment_hex)
                     .cloned()
@@ -791,7 +944,7 @@ where
     parsed.result.ok_or(PoiRpcError::MissingResult)
 }
 
-fn decode_json_rpc_ack_response(body: &str) -> Result<(), PoiRpcError> {
+fn decode_json_rpc_ack_response(method: &'static str, body: &str) -> Result<(), PoiRpcError> {
     let parsed: JsonRpcResp<serde_json::Value> =
         serde_json::from_str(body).map_err(PoiRpcError::JsonDecode)?;
     if let Some(error) = parsed.error {
@@ -801,21 +954,12 @@ fn decode_json_rpc_ack_response(body: &str) -> Result<(), PoiRpcError> {
             data: error.data,
         });
     }
-    Ok(())
-}
-
-const TREE_DEPTH: usize = 16;
-
-fn dummy_txid_root(leaf: U256) -> U256 {
-    let mut acc = leaf;
-    for _ in 0..TREE_DEPTH {
-        acc = poseidon(vec![acc, U256::ZERO]);
+    if let Some(result) = parsed.result
+        && !result.is_null()
+    {
+        debug!(method, result = %result, "POI RPC ack response contained result");
     }
-    acc
-}
-
-fn encode_fixed_bytes(value: &FixedBytes<32>) -> String {
-    format!("0x{}", hex::encode(value))
+    Ok(())
 }
 
 fn encode_u256(value: U256) -> String {
@@ -826,24 +970,20 @@ fn encode_u256_bare(value: U256) -> String {
     format!("{value:064x}")
 }
 
-fn encode_bytes(value: &alloy::primitives::Bytes) -> String {
-    if value.is_empty() {
-        "0x00".to_string()
-    } else {
-        format!("0x{}", hex::encode(value))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         BlindedCommitmentData, DEFAULT_ACTIVE_POI_LIST_KEY_HEX, DEFAULT_WALLET_POI_RPC_URL,
         PoiMerkleProof, PoiRpcClient, PoiStatus, SingleCommitmentProofContext,
-        decode_json_rpc_ack_response, decode_json_rpc_response, default_active_poi_list_key,
-        encode_fixed_bytes, encode_u256_bare, railgun_txid_leaf_hash,
+        ValidatedRailgunTxidStatus, decode_json_rpc_ack_response, decode_json_rpc_response,
+        default_active_poi_list_key, encode_u256_bare, railgun_txid_leaf_hash,
     };
     use crate::error::PoiRpcError;
-    use alloy::primitives::{FixedBytes, U256};
+    use alloy::{
+        hex,
+        primitives::{FixedBytes, U256},
+        uint,
+    };
     use broadcaster_core::transact::{FeeNoteAssuranceContext, PreTxPoi, SnarkJsProof};
     use serde_json::to_value;
     use std::collections::BTreeMap;
@@ -852,11 +992,7 @@ mod tests {
         let list_key = FixedBytes::from([0x11; 32]);
         let leaf = FixedBytes::from([0x22; 32]);
         let poi = PreTxPoi {
-            snark_proof: SnarkJsProof {
-                pi_a: [U256::ZERO, U256::ZERO],
-                pi_b: [[U256::ZERO, U256::ZERO], [U256::ZERO, U256::ZERO]],
-                pi_c: [U256::ZERO, U256::ZERO],
-            },
+            snark_proof: SnarkJsProof::zero(),
             txid_merkleroot: FixedBytes::from([0x33; 32]),
             poi_merkleroots: vec![FixedBytes::from([0x44; 32])],
             blinded_commitments_out: vec![FixedBytes::from([0x55; 32])],
@@ -870,7 +1006,7 @@ mod tests {
         FeeNoteAssuranceContext {
             chain_type: 0,
             txid_version: "V3_PoseidonMerkle".to_string(),
-            railgun_txid: U256::from(9_u8),
+            railgun_txid: uint!(9_U256),
             utxo_tree_in: 7,
             fee_commitment: FixedBytes::from([0x66; 32]),
             fee_note_npk: FixedBytes::from([0x77; 32]),
@@ -930,11 +1066,11 @@ mod tests {
         assert_eq!(json["txidVersion"], "V3_PoseidonMerkle");
         assert_eq!(
             json["singleCommitmentProofsData"]["commitment"],
-            encode_fixed_bytes(&context.fee_commitment)
+            hex::encode_prefixed(context.fee_commitment)
         );
         assert_eq!(
             json["singleCommitmentProofsData"]["npk"],
-            encode_fixed_bytes(&context.fee_note_npk)
+            hex::encode_prefixed(context.fee_note_npk)
         );
         assert_eq!(
             json["singleCommitmentProofsData"]["railgunTxid"],
@@ -949,11 +1085,65 @@ mod tests {
         );
         assert!(
             json["singleCommitmentProofsData"]["pois"]
-                .get(format!(
-                    "0x{}",
-                    hex::encode(context.required_poi_list_keys[0])
-                ))
+                .get(hex::encode_prefixed(context.required_poi_list_keys[0]))
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn transact_proof_submit_request_serializes_railway_shape() {
+        let context = sample_context();
+        let list_key = context.required_poi_list_keys[0];
+        let poi = context
+            .pre_transaction_pois_per_txid_leaf_per_list
+            .get(&list_key)
+            .expect("list")
+            .values()
+            .next()
+            .expect("poi");
+        let params = PoiRpcClient::submit_transact_proof_params(
+            &context.txid_version,
+            0,
+            1,
+            &list_key,
+            105_572,
+            poi,
+        );
+        let json = to_value(params).expect("serialize transact proof params");
+
+        assert_eq!(json["txidVersion"], "V3_PoseidonMerkle");
+        assert_eq!(json["listKey"], hex::encode(list_key));
+        assert!(json.get("singleCommitmentProofsData").is_none());
+        assert_eq!(
+            json["transactProofData"]["txidMerkleroot"],
+            hex::encode(poi.txid_merkleroot)
+        );
+        assert_eq!(json["transactProofData"]["txidMerklerootIndex"], 105_572);
+        assert_eq!(
+            json["transactProofData"]["poiMerkleroots"][0],
+            hex::encode(poi.poi_merkleroots[0])
+        );
+        assert_eq!(
+            json["transactProofData"]["blindedCommitmentsOut"][0],
+            hex::encode_prefixed(poi.blinded_commitments_out[0])
+        );
+        assert_eq!(
+            json["transactProofData"]["railgunTxidIfHasUnshield"],
+            "0x00"
+        );
+    }
+
+    #[test]
+    fn validated_txid_response_deserializes() {
+        let status: ValidatedRailgunTxidStatus = decode_json_rpc_response(
+            r#"{"result":{"validatedTxidIndex":105578,"validatedMerkleroot":"2946581b750a59be1865ea5499ed515957865df1dcecf5db07ea5c7fcf473396"}}"#,
+        )
+        .expect("decode validated txid");
+
+        assert_eq!(status.validated_txid_index, Some(105_578));
+        assert_eq!(
+            status.validated_merkleroot.as_deref(),
+            Some("2946581b750a59be1865ea5499ed515957865df1dcecf5db07ea5c7fcf473396")
         );
     }
 
@@ -1003,7 +1193,7 @@ mod tests {
         assert_eq!(
             json["singleCommitmentProofsData"]["pois"][&list_key][&leaf_key]["blindedCommitmentsOut"]
                 [0],
-            encode_fixed_bytes(&FixedBytes::from([0x55; 32]))
+            hex::encode_prefixed(FixedBytes::from([0x55; 32]))
         );
         assert_eq!(
             json["singleCommitmentProofsData"]["pois"][&list_key][&leaf_key]["railgunTxidIfHasUnshield"],
@@ -1041,12 +1231,12 @@ mod tests {
         assert_eq!(json["blindedCommitmentDatas"][0]["type"], "Transact");
         assert_eq!(
             json["blindedCommitmentDatas"][0]["blindedCommitment"],
-            encode_fixed_bytes(&blinded_commitment)
+            hex::encode_prefixed(blinded_commitment)
         );
         assert_eq!(json["blindedCommitmentDatas"][1]["type"], "Shield");
         assert_eq!(
             json["blindedCommitmentDatas"][1]["blindedCommitment"],
-            encode_fixed_bytes(&shield_blinded_commitment)
+            hex::encode_prefixed(shield_blinded_commitment)
         );
     }
 
@@ -1068,11 +1258,11 @@ mod tests {
         assert_eq!(json["listKey"], hex::encode(list_key));
         assert_eq!(
             json["blindedCommitments"][0],
-            encode_fixed_bytes(&blinded_commitments[0])
+            hex::encode_prefixed(blinded_commitments[0])
         );
         assert_eq!(
             json["blindedCommitments"][1],
-            encode_fixed_bytes(&blinded_commitments[1])
+            hex::encode_prefixed(blinded_commitments[1])
         );
     }
 
@@ -1094,12 +1284,12 @@ mod tests {
     fn missing_list_status_defaults_to_missing() {
         let blinded_commitment = FixedBytes::from([0x88; 32]);
         let response = BTreeMap::from([(
-            encode_fixed_bytes(&blinded_commitment),
+            hex::encode_prefixed(blinded_commitment),
             BTreeMap::from([("deadbeef".to_string(), PoiStatus::Valid)]),
         )]);
         let list_key = FixedBytes::from([0x11; 32]);
         let per_list = response
-            .get(&encode_fixed_bytes(&blinded_commitment))
+            .get(&hex::encode_prefixed(blinded_commitment))
             .cloned()
             .unwrap_or_default();
 
@@ -1112,7 +1302,7 @@ mod tests {
 
     #[test]
     fn txid_leaf_hash_matches_existing_poseidon_path() {
-        let leaf = railgun_txid_leaf_hash(U256::from(1_u8), 2);
+        let leaf = railgun_txid_leaf_hash(uint!(1_U256), 2);
         assert_ne!(leaf, U256::ZERO);
     }
 
@@ -1152,13 +1342,14 @@ mod tests {
 
     #[test]
     fn decode_json_rpc_ack_response_without_result_is_success() {
-        decode_json_rpc_ack_response(r#"{"jsonrpc":"2.0","id":2}"#)
+        decode_json_rpc_ack_response("test_method", r#"{"jsonrpc":"2.0","id":2}"#)
             .expect("ack response should succeed");
     }
 
     #[test]
     fn decode_json_rpc_ack_response_with_error_fails() {
         let error = decode_json_rpc_ack_response(
+            "test_method",
             r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"bad request"}}"#,
         )
         .expect_err("ack error");

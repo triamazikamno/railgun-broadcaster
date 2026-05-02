@@ -165,6 +165,7 @@ pub fn event_channel(capacity: usize) -> (EventTx, EventRx) {
 mod tests {
     use super::*;
     use alloy::primitives::address;
+    use alloy::uint;
 
     fn sample_row(chain_id: u64, token: Address, fee: u64, fees_id: &str) -> FeeRow {
         sample_row_with_metadata(chain_id, token, fee, fees_id, 1, "8.2.3", Vec::new())
@@ -212,7 +213,7 @@ mod tests {
             "same (chain, broadcaster, token) must not duplicate"
         );
         let row = &rows[0];
-        assert_eq!(row.fee, U256::from(200));
+        assert_eq!(row.fee, uint!(200_U256));
         assert_eq!(row.fees_id.as_ref(), "b");
     }
 

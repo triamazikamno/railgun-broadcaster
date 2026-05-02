@@ -11,6 +11,7 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::k256::ecdsa::SigningKey;
 use alloy::signers::local::PrivateKeySigner;
+use alloy::uint;
 use broadcaster_core::contracts::shield::{
     build_approve_calldata, build_shield_calldata, derive_shield_private_key,
 };
@@ -63,7 +64,7 @@ const GAS_LIMIT_BUFFER: u64 = 100_000;
 const GAS_PRICE_BUFFER_NUMERATOR: u128 = 105;
 const GAS_PRICE_BUFFER_DENOMINATOR: u128 = 100;
 const PUBLIC_BROADCASTER_FEE_ATTEMPTS: usize = 5;
-const PUBLIC_BROADCASTER_FEE_BUFFER_DIVISOR: u64 = 100;
+const PUBLIC_BROADCASTER_FEE_BUFFER_DIVISOR: U256 = uint!(100_U256);
 const APPROX_BASE_GAS: u64 = 650_000;
 const APPROX_GAS_PER_INPUT: u64 = 155_000;
 const APPROX_GAS_PER_PRIVATE_OUTPUT: u64 = 85_000;
@@ -73,8 +74,8 @@ const APPROX_SEND_EXTRA_GAS: u64 = 40_000;
 const APPROX_UNWRAP_EXTRA_GAS: u64 = 50_000;
 const APPROX_SAFETY_GAS: u64 = 150_000;
 const PUBLIC_BROADCASTER_MAX_ENTERED_AMOUNT_ERROR: &str = "public broadcaster max entered amount: ";
-const FEE_BASIS_POINTS_DENOMINATOR: u16 = 10_000;
-pub const RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS: u16 = 25;
+const FEE_BASIS_POINTS_DENOMINATOR: U256 = uint!(10_000_U256);
+pub const RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS: U256 = uint!(25_U256);
 
 /// WETH `deposit()` function selector - no arguments, ETH value is the deposit
 /// amount.
@@ -375,7 +376,7 @@ pub struct PublicBroadcasterCostEstimate {
     pub total_private_spend: U256,
     pub fee_amount: U256,
     pub protocol_fee_amount: U256,
-    pub protocol_fee_bps: u16,
+    pub protocol_fee_bps: U256,
     pub fee_mode: PublicBroadcasterFeeMode,
     pub max_receiver_amount: U256,
     pub max_entered_amount: U256,
@@ -404,7 +405,7 @@ pub struct PublicBroadcasterSubmissionResult {
     pub total_private_spend: U256,
     pub fee_amount: U256,
     pub protocol_fee_amount: U256,
-    pub protocol_fee_bps: u16,
+    pub protocol_fee_bps: U256,
     pub fee_mode: PublicBroadcasterFeeMode,
     pub gas_limit: u64,
     pub min_gas_price: u128,
@@ -422,7 +423,7 @@ struct PreparedPublicBroadcasterPlan<P> {
     total_private_spend: U256,
     fee_amount: U256,
     protocol_fee_amount: U256,
-    protocol_fee_bps: u16,
+    protocol_fee_bps: U256,
     fee_mode: PublicBroadcasterFeeMode,
     gas_limit: u64,
     min_gas_price: u128,
@@ -807,8 +808,8 @@ pub fn broadcaster_fee_amount(
     gas_limit: u64,
     gas_price: u128,
 ) -> U256 {
-    const FEE_SCALE: u128 = 1_000_000_000_000_000_000;
-    token_fee_per_unit_gas * U256::from(gas_limit) * U256::from(gas_price) / U256::from(FEE_SCALE)
+    const FEE_SCALE: U256 = uint!(1_000_000_000_000_000_000_U256);
+    token_fee_per_unit_gas * U256::from(gas_limit) * U256::from(gas_price) / FEE_SCALE
 }
 
 fn broadcaster_fee_covers(available_fee: U256, required_fee: U256) -> bool {
@@ -816,10 +817,10 @@ fn broadcaster_fee_covers(available_fee: U256, required_fee: U256) -> bool {
 }
 
 fn buffered_public_broadcaster_fee(required_fee: U256) -> U256 {
-    let buffer = required_fee / U256::from(PUBLIC_BROADCASTER_FEE_BUFFER_DIVISOR);
+    let buffer = required_fee / PUBLIC_BROADCASTER_FEE_BUFFER_DIVISOR;
     required_fee
         + if buffer.is_zero() {
-            U256::from(1_u8)
+            uint!(1_U256)
         } else {
             buffer
         }
@@ -881,8 +882,8 @@ fn public_broadcaster_max_entered_amount(
     }
 }
 
-fn railgun_protocol_fee_amount(amount: U256, fee_bps: u16) -> U256 {
-    amount * U256::from(fee_bps) / U256::from(FEE_BASIS_POINTS_DENOMINATOR)
+fn railgun_protocol_fee_amount(amount: U256, fee_bps: U256) -> U256 {
+    amount * fee_bps / FEE_BASIS_POINTS_DENOMINATOR
 }
 
 const fn recipient_amount_after_protocol_fee(amount: U256, protocol_fee_amount: U256) -> U256 {
@@ -1185,7 +1186,8 @@ fn pending_chunk_context(
 ) -> Result<PendingOutputPoiChunkContext> {
     let railgun_txid = chunk.railgun_txid();
     let utxo_tree_in = u64::from(chunk.tree_number);
-    let txid_leaf_hash = u256_to_fixed(railgun_txid_leaf_hash(railgun_txid, utxo_tree_in));
+    let txid_leaf_hash =
+        FixedBytes::from(railgun_txid_leaf_hash(railgun_txid, utxo_tree_in).to_be_bytes::<32>());
     let pre_transaction_pois = pre_transaction_pois
         .iter()
         .filter_map(|(list_key, per_leaf)| {
@@ -1241,10 +1243,11 @@ fn put_pending_output_poi_context(
         chain_id,
         wallet_id: wallet_id.to_string(),
         txid_version: DEFAULT_TXID_VERSION.to_string(),
-        output_commitment: u256_to_fixed(note.commitment()),
-        output_npk: u256_to_fixed(note.npk),
+        output_commitment: FixedBytes::from(note.commitment().to_be_bytes::<32>()),
+        output_npk: FixedBytes::from(note.npk.to_be_bytes::<32>()),
         utxo_tree_in: chunk_context.utxo_tree_in,
         railgun_txid: chunk_context.railgun_txid,
+        txid_merkleroot_index: None,
         pre_transaction_pois_per_txid_leaf_per_list: chunk_context.pre_transaction_pois.clone(),
         required_poi_list_keys: chunk_context.poi_list_keys.clone(),
         output_role,
@@ -1256,10 +1259,6 @@ fn put_pending_output_poi_context(
     };
     db.put_pending_output_poi_context(&record)
         .wrap_err("persist pending output POI context")
-}
-
-fn u256_to_fixed(value: U256) -> FixedBytes<32> {
-    FixedBytes::from(value.to_be_bytes::<32>())
 }
 
 fn now_epoch_secs() -> Result<u64> {
@@ -1288,7 +1287,7 @@ fn approximate_public_broadcaster_cost(
     broadcaster: PublicBroadcasterCandidate,
     entered_amount: U256,
     fee_mode: PublicBroadcasterFeeMode,
-    protocol_fee_bps: u16,
+    protocol_fee_bps: U256,
     min_gas_price: u128,
     mut select_shape: impl FnMut(PublicBroadcasterAmountSplit) -> Result<ApproximateTransactionShape>,
 ) -> Result<PublicBroadcasterCostEstimate> {
@@ -1501,7 +1500,7 @@ fn parse_scaled_amount(input: &str, decimals: u8) -> Result<U256> {
     } else {
         U256::from_str_radix(whole, 10).wrap_err("invalid whole amount")?
     };
-    let scale = U256::from(10_u8).pow(U256::from(decimals));
+    let scale = uint!(10_U256).pow(U256::from(decimals));
     let fractional_value = if decimals == 0 || fractional.is_empty() {
         U256::ZERO
     } else {
@@ -1732,7 +1731,7 @@ pub async fn shield(
         let wrap = if request.wrap {
             Some(TxOutput {
                 to: request.token,
-                data: format!("0x{}", hex::encode(WETH_DEPOSIT_SELECTOR)),
+                data: hex::encode_prefixed(WETH_DEPOSIT_SELECTOR),
                 value: Some(amount.to_string()),
             })
         } else {
@@ -1743,12 +1742,12 @@ pub async fn shield(
             wrap,
             approve: TxOutput {
                 to: request.token,
-                data: format!("0x{}", hex::encode(&approve_data)),
+                data: hex::encode_prefixed(&approve_data),
                 value: None,
             },
             shield: TxOutput {
                 to: chain_defaults.contract,
-                data: format!("0x{}", hex::encode(&shield_data)),
+                data: hex::encode_prefixed(&shield_data),
                 value: None,
             },
         }));
@@ -1895,7 +1894,7 @@ pub async fn unshield(
     let Some(private_key) = request.private_key.as_deref() else {
         return Ok(UnshieldResult::Calldata(UnshieldOutput {
             to: plan.call.to,
-            data: format!("0x{}", hex::encode(&plan.call.data)),
+            data: hex::encode_prefixed(&plan.call.data),
         }));
     };
 
@@ -2048,7 +2047,7 @@ pub async fn prepare_desktop_unshield_calldata(
         private_output_count: plan.private_output_count(),
         public_output_count: plan.public_output_count(),
         to: plan.call.to,
-        data: format!("0x{}", hex::encode(&plan.call.data)),
+        data: hex::encode_prefixed(&plan.call.data),
     })
 }
 
@@ -2162,7 +2161,7 @@ pub async fn prepare_desktop_send_calldata(
         private_output_count: plan.private_output_count(),
         public_output_count: plan.public_output_count(),
         to: plan.call.to,
-        data: format!("0x{}", hex::encode(&plan.call.data)),
+        data: hex::encode_prefixed(&plan.call.data),
     })
 }
 
@@ -2260,7 +2259,7 @@ pub async fn estimate_desktop_send_public_broadcaster_cost(
         broadcaster,
         request.amount,
         request.fee_mode,
-        0,
+        U256::ZERO,
         min_gas_price,
         |split| {
             let selection = send_selection_info_with_broadcaster_fee(
@@ -2654,7 +2653,7 @@ async fn prepare_desktop_send_public_broadcaster(
         broadcaster.clone(),
         request.amount,
         request.fee_mode,
-        0,
+        U256::ZERO,
         min_gas_price,
         |split| {
             let selection = send_selection_info_with_broadcaster_fee(
@@ -2835,7 +2834,7 @@ async fn prepare_desktop_send_public_broadcaster(
                 total_private_spend: split.total_private_spend,
                 fee_amount,
                 protocol_fee_amount,
-                protocol_fee_bps: 0,
+                protocol_fee_bps: U256::ZERO,
                 fee_mode: split.fee_mode,
                 gas_limit,
                 min_gas_price,
@@ -2914,7 +2913,7 @@ async fn submit_public_broadcaster_plan(
     total_private_spend: U256,
     fee_amount: U256,
     protocol_fee_amount: U256,
-    protocol_fee_bps: u16,
+    protocol_fee_bps: U256,
     fee_mode: PublicBroadcasterFeeMode,
     gas_limit: u64,
     min_gas_price: u128,
@@ -3065,7 +3064,7 @@ pub fn utxo_outputs_from_utxos(mut utxos: Vec<WalletUtxo>) -> (Vec<UtxoOutput>, 
         .into_iter()
         .map(|wallet_utxo| {
             let utxo = wallet_utxo.utxo;
-            let token_addr = token_address_from_utxo(&utxo);
+            let token_addr = utxo.token_address();
             let poi_spendable =
                 wallet_utxo.spent.is_none() && utxo.poi.is_valid_for_lists(&active_poi_list_keys);
             if wallet_utxo.spent.is_none() {
@@ -3084,16 +3083,16 @@ pub fn utxo_outputs_from_utxos(mut utxos: Vec<WalletUtxo>) -> (Vec<UtxoOutput>, 
                 token: token_addr.to_checksum(None),
                 value: utxo.note.value.to_string(),
                 commitment_kind: commitment_kind_label(utxo.poi.commitment_kind).to_string(),
-                commitment: fixed_bytes_hex(&utxo.poi.commitment),
-                npk: fixed_bytes_hex(&utxo.poi.npk),
-                blinded_commitment: fixed_bytes_hex(&utxo.poi.blinded_commitment),
+                commitment: hex::encode_prefixed(utxo.poi.commitment),
+                npk: hex::encode_prefixed(utxo.poi.npk),
+                blinded_commitment: hex::encode_prefixed(utxo.poi.blinded_commitment),
                 poi_statuses,
                 poi_spendable,
-                source_tx_hash: source_tx_hash(source),
+                source_tx_hash: hex::encode_prefixed(source.tx_hash),
                 source_block_number: source.block_number,
                 source_block_timestamp: source.block_timestamp,
                 is_spent: wallet_utxo.spent.is_some(),
-                spent_tx_hash: spent.map(source_tx_hash),
+                spent_tx_hash: spent.map(|source| hex::encode_prefixed(source.tx_hash)),
                 spent_block_number: spent.map(|source| source.block_number),
             }
         })
@@ -3131,14 +3130,6 @@ async fn snapshot_from_handle(chain_id: u64, handle: &WalletHandle) -> ListUtxos
     }
 }
 
-fn source_tx_hash(source: &UtxoSource) -> String {
-    format!("0x{}", hex::encode(source.tx_hash))
-}
-
-fn fixed_bytes_hex(value: &FixedBytes<32>) -> String {
-    format!("0x{}", hex::encode(value))
-}
-
 const fn commitment_kind_label(kind: UtxoCommitmentKind) -> &'static str {
     match kind {
         UtxoCommitmentKind::Shield => "Shield",
@@ -3168,11 +3159,6 @@ fn poi_statuses_for_output(
         .into_iter()
         .map(|(list_key, status)| (hex::encode(list_key), poi_status_label(status).to_string()))
         .collect()
-}
-
-fn token_address_from_utxo(utxo: &Utxo) -> Address {
-    let token_bytes = utxo.note.token_hash.to_be_bytes::<32>();
-    Address::from_slice(&token_bytes[12..32])
 }
 
 struct SyncedWallet {
@@ -3249,6 +3235,7 @@ async fn setup_synced_wallet_with_store(
 
     let wallet = WalletKeys::from_mnemonic(mnemonic, 0).wrap_err("derive wallet keys")?;
     let scan_keys = wallet.viewing;
+    let poi_recovery_prover = ProverService::new_with_db(artifact_source(http), Arc::clone(&db));
     let wallet_id = scan_keys
         .derive_address(None)
         .wrap_err("derive wallet id")?;
@@ -3266,9 +3253,12 @@ async fn setup_synced_wallet_with_store(
         cache_key,
         start_block: Some(start_block),
         sync_to_block,
+        quick_sync_endpoint: chain_defaults.quick_sync_endpoint.clone(),
         scan_keys,
+        spending_public_key: Some(wallet.spending_public_key),
         progress_tx,
         cache_store: None,
+        poi_recovery_prover: Some(poi_recovery_prover),
         use_indexed_wallet_catch_up,
     };
 
@@ -3360,14 +3350,18 @@ async fn setup_synced_view_wallet_with_store(
         .wrap_err("create encrypted wallet cache")?,
     );
     let scan_keys = view_session.scan_keys();
+    let poi_recovery_prover = ProverService::new_with_db(artifact_source(http), Arc::clone(&db));
     let wallet_cfg = WalletConfig {
         chain: chain_key,
         cache_key,
         start_block: Some(start_block),
         sync_to_block,
+        quick_sync_endpoint: chain_defaults.quick_sync_endpoint.clone(),
         scan_keys,
+        spending_public_key: Some(view_session.spending_public_key()),
         progress_tx,
         cache_store: Some(cache_store),
+        poi_recovery_prover: Some(poi_recovery_prover),
         use_indexed_wallet_catch_up,
     };
 
@@ -3516,7 +3510,7 @@ async fn sign_send_wait(
     }
 
     Ok(TxReceiptOutput {
-        tx_hash: format!("0x{}", hex::encode(tx_hash)),
+        tx_hash: hex::encode_prefixed(tx_hash),
         status,
         block_number,
         gas_used,
@@ -3534,6 +3528,7 @@ mod tests {
 
     use alloy::hex;
     use alloy::primitives::{Address, Bytes, FixedBytes, TxHash, U256};
+    use alloy::uint;
     use broadcaster_core::crypto::railgun::{
         Address as RailgunAddress, AddressData, ViewingKeyData,
     };
@@ -3578,7 +3573,7 @@ mod tests {
         let dir = std::env::temp_dir().join("railgun-broadcaster-wallet-ops-tests");
         fs::create_dir_all(&dir).expect("create temp db dir");
         let pid = std::process::id();
-        let nanos = std::time::SystemTime::now()
+        let nanos = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
         let counter = TEMP_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -3612,7 +3607,7 @@ mod tests {
     }
 
     fn sample_railgun_address(seed: u8) -> String {
-        let viewing = broadcaster_core::crypto::railgun::ViewingKeyData::from_spending_public_key(
+        let viewing = ViewingKeyData::from_spending_public_key(
             [seed; 32],
             [U256::from(seed), U256::from(seed + 1)],
         );
@@ -3638,7 +3633,7 @@ mod tests {
                 railgun_address: railgun_address.to_string(),
                 identifier: None,
                 token: address(0x33),
-                fee: U256::from(10_u8),
+                fee: uint!(10_U256),
                 fees_id: "fees-id".to_string(),
                 fee_expiration: SystemTime::now() + Duration::from_secs(60),
                 reliability: 0.9,
@@ -3738,10 +3733,10 @@ mod tests {
         let leaves = chunks
             .iter()
             .map(|chunk| {
-                super::u256_to_fixed(railgun_txid_leaf_hash(
-                    chunk.railgun_txid(),
-                    u64::from(chunk.tree_number),
-                ))
+                FixedBytes::from(
+                    railgun_txid_leaf_hash(chunk.railgun_txid(), u64::from(chunk.tree_number))
+                        .to_be_bytes::<32>(),
+                )
             })
             .collect::<Vec<_>>();
         sample_poi_map(list_keys, &leaves)
@@ -3820,7 +3815,7 @@ mod tests {
             super::poi_verified_unspent_utxos_from_records(&[valid, unknown, blocked, spent]);
 
         assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].note.value, U256::from(5_u8));
+        assert_eq!(selected[0].note.value, uint!(5_U256));
     }
 
     #[test]
@@ -3865,7 +3860,7 @@ mod tests {
         assert_eq!(recipient.wallet_id, "wallet-1");
         assert_eq!(
             recipient.output_commitment,
-            super::u256_to_fixed(recipient_note.commitment())
+            FixedBytes::from(recipient_note.commitment().to_be_bytes::<32>())
         );
         assert!(recipient.source_operation_id.is_none());
         assert!(recipient.observation.is_none());
@@ -3876,7 +3871,7 @@ mod tests {
             .expect("change context");
         assert_eq!(
             change.output_commitment,
-            super::u256_to_fixed(change_note.commitment())
+            FixedBytes::from(change_note.commitment().to_be_bytes::<32>())
         );
 
         drop(store);
@@ -3892,7 +3887,7 @@ mod tests {
         .expect("open db");
         let token = address(0x34);
         let change_note = sample_note(3, token, 7);
-        let unshield_note = Note::new_unshield(address(0xaa), token, U256::from(5_u8));
+        let unshield_note = Note::new_unshield(address(0xaa), token, uint!(5_U256));
         let chunk = sample_chunk(
             5,
             0x30,
@@ -3921,11 +3916,11 @@ mod tests {
         assert_eq!(records[0].output_role, PendingOutputPoiRole::Change);
         assert_eq!(
             records[0].output_commitment,
-            super::u256_to_fixed(change_note.commitment())
+            FixedBytes::from(change_note.commitment().to_be_bytes::<32>())
         );
         assert_ne!(
             records[0].output_commitment,
-            super::u256_to_fixed(unshield_note.commitment())
+            FixedBytes::from(unshield_note.commitment().to_be_bytes::<32>())
         );
         assert!(records[0].source_operation_id.is_none());
         assert!(records[0].observation.is_none());
@@ -3972,7 +3967,8 @@ mod tests {
         assert_eq!(records.len(), 3);
         assert!(records.iter().any(|record| record.output_role
             == PendingOutputPoiRole::BroadcasterFee
-            && record.output_commitment == super::u256_to_fixed(fee_note.commitment())));
+            && record.output_commitment
+                == FixedBytes::from(fee_note.commitment().to_be_bytes::<32>())));
 
         drop(store);
         fs::remove_dir_all(root_dir).expect("remove temp db dir");
@@ -3988,7 +3984,7 @@ mod tests {
         let token = address(0x36);
         let fee_note = sample_note(7, token, 1);
         let change_note = sample_note(8, token, 4);
-        let unshield_note = Note::new_unshield(address(0xbb), token, U256::from(6_u8));
+        let unshield_note = Note::new_unshield(address(0xbb), token, uint!(6_U256));
         let chunk = sample_chunk(
             7,
             0x50,
@@ -4024,10 +4020,8 @@ mod tests {
                 .iter()
                 .any(|record| record.output_role == PendingOutputPoiRole::Change)
         );
-        assert!(
-            records.iter().all(|record| record.output_commitment
-                != super::u256_to_fixed(unshield_note.commitment()))
-        );
+        assert!(records.iter().all(|record| record.output_commitment
+            != FixedBytes::from(unshield_note.commitment().to_be_bytes::<32>())));
 
         drop(store);
         fs::remove_dir_all(root_dir).expect("remove temp db dir");
@@ -4120,11 +4114,11 @@ mod tests {
 
         assert_eq!(
             max_unshield_amount_from_outputs(&outputs, token),
-            U256::from(35_u8)
+            uint!(35_U256)
         );
         assert_eq!(
             max_send_amount_from_outputs(&outputs, token),
-            U256::from(35_u8)
+            uint!(35_U256)
         );
     }
 
@@ -4136,13 +4130,10 @@ mod tests {
         unknown.utxo.poi.statuses.clear();
         let (outputs, _) = utxo_outputs_from_utxos(vec![valid.clone(), unknown]);
 
-        assert_eq!(
-            max_send_amount_from_outputs(&outputs, token),
-            U256::from(5_u8)
-        );
+        assert_eq!(max_send_amount_from_outputs(&outputs, token), uint!(5_U256));
         assert_eq!(
             max_unshield_amount_from_outputs(&outputs, token),
-            U256::from(5_u8)
+            uint!(5_U256)
         );
 
         valid.spent = Some(source(9));
@@ -4268,11 +4259,11 @@ mod tests {
     fn parse_unshield_amount_scales_known_token_decimals() {
         assert_eq!(
             parse_unshield_amount("1.23", Some(6)).expect("parsed amount"),
-            U256::from(1_230_000_u64)
+            uint!(1_230_000_U256)
         );
         assert_eq!(
             parse_unshield_amount(".5", Some(18)).expect("parsed amount"),
-            U256::from(5_u8) * U256::from(10_u8).pow(U256::from(17_u8))
+            uint!(5_U256) * uint!(10_U256).pow(uint!(17_U256))
         );
     }
 
@@ -4285,7 +4276,7 @@ mod tests {
     fn parse_unshield_amount_requires_raw_units_for_unknown_tokens() {
         assert_eq!(
             parse_unshield_amount("123", None).expect("parsed raw amount"),
-            U256::from(123_u8)
+            uint!(123_U256)
         );
         assert!(parse_unshield_amount("1.23", None).is_err());
     }
@@ -4294,11 +4285,11 @@ mod tests {
     fn parse_send_amount_reuses_token_aware_amount_parsing() {
         assert_eq!(
             parse_send_amount("1.23", Some(6)).expect("parsed amount"),
-            U256::from(1_230_000_u64)
+            uint!(1_230_000_U256)
         );
         assert_eq!(
             parse_send_amount("123", None).expect("parsed raw amount"),
-            U256::from(123_u8)
+            uint!(123_U256)
         );
         assert!(parse_send_amount("1.23", None).is_err());
     }
@@ -4470,56 +4461,53 @@ mod tests {
     #[test]
     fn broadcaster_fee_amount_uses_same_token_fee_rate() {
         let fee = broadcaster_fee_amount(
-            U256::from(2_000_000_000_000_000_000_u128),
+            uint!(2_000_000_000_000_000_000_U256),
             150_000,
             20_000_000_000,
         );
 
-        assert_eq!(fee, U256::from(6_000_000_000_000_000_u128));
+        assert_eq!(fee, uint!(6_000_000_000_000_000_U256));
     }
 
     #[test]
     fn railgun_protocol_fee_uses_hardcoded_unshield_bps() {
-        let amount = U256::from(1_000_000_u64);
+        let amount = uint!(1_000_000_U256);
 
         assert_eq!(
             super::railgun_protocol_fee_amount(amount, RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS),
-            U256::from(2_500_u64)
+            uint!(2_500_U256)
         );
-        assert_eq!(super::railgun_protocol_fee_amount(amount, 0), U256::ZERO);
+        assert_eq!(
+            super::railgun_protocol_fee_amount(amount, U256::ZERO),
+            U256::ZERO
+        );
     }
 
     #[test]
     fn public_broadcaster_fee_stabilization_accepts_covering_fee() {
-        let required = U256::from(1_000_u64);
+        let required = uint!(1_000_U256);
 
         assert!(broadcaster_fee_covers(required, required));
-        assert!(broadcaster_fee_covers(
-            required + U256::from(1_u8),
-            required
-        ));
-        assert!(!broadcaster_fee_covers(
-            required - U256::from(1_u8),
-            required
-        ));
+        assert!(broadcaster_fee_covers(required + uint!(1_U256), required));
+        assert!(!broadcaster_fee_covers(required - uint!(1_U256), required));
     }
 
     #[test]
     fn public_broadcaster_fee_stabilization_buffers_retries() {
         assert_eq!(
-            buffered_public_broadcaster_fee(U256::from(10_000_u64)),
-            U256::from(10_100_u64)
+            buffered_public_broadcaster_fee(uint!(10_000_U256)),
+            uint!(10_100_U256)
         );
         assert_eq!(
-            buffered_public_broadcaster_fee(U256::from(1_u8)),
-            U256::from(2_u8)
+            buffered_public_broadcaster_fee(uint!(1_U256)),
+            uint!(2_U256)
         );
     }
 
     #[test]
     fn public_broadcaster_fee_mode_deducts_or_adds_fee() {
-        let entered = U256::from(100_u8);
-        let fee = U256::from(7_u8);
+        let entered = uint!(100_U256);
+        let fee = uint!(7_U256);
 
         let deducted = public_broadcaster_amount_split(
             entered,
@@ -4527,22 +4515,22 @@ mod tests {
             PublicBroadcasterFeeMode::DeductFromAmount,
         )
         .expect("deduct split");
-        assert_eq!(deducted.receiver_amount, U256::from(93_u8));
+        assert_eq!(deducted.receiver_amount, uint!(93_U256));
         assert_eq!(deducted.total_private_spend, entered);
 
         let added =
             public_broadcaster_amount_split(entered, fee, PublicBroadcasterFeeMode::AddToAmount)
                 .expect("add split");
         assert_eq!(added.receiver_amount, entered);
-        assert_eq!(added.total_private_spend, U256::from(107_u8));
+        assert_eq!(added.total_private_spend, uint!(107_U256));
     }
 
     #[test]
     fn public_broadcaster_fee_mode_rejects_deducting_full_amount() {
         assert!(
             public_broadcaster_amount_split(
-                U256::from(7_u8),
-                U256::from(7_u8),
+                uint!(7_U256),
+                uint!(7_U256),
                 PublicBroadcasterFeeMode::DeductFromAmount,
             )
             .is_err()
@@ -4551,8 +4539,8 @@ mod tests {
 
     #[test]
     fn public_broadcaster_max_entered_amount_depends_on_fee_mode() {
-        let max_receiver_amount = U256::from(100_u8);
-        let fee = U256::from(7_u8);
+        let max_receiver_amount = uint!(100_U256);
+        let fee = uint!(7_U256);
 
         assert_eq!(
             public_broadcaster_max_entered_amount(
@@ -4560,7 +4548,7 @@ mod tests {
                 fee,
                 PublicBroadcasterFeeMode::DeductFromAmount,
             ),
-            U256::from(107_u8)
+            uint!(107_U256)
         );
         assert_eq!(
             public_broadcaster_max_entered_amount(
@@ -4591,14 +4579,14 @@ mod tests {
         .into_iter()
         .next()
         .expect("candidate");
-        let entered = U256::from(1_000_000_000_u64);
-        let selected_total = U256::from(2_000_000_000_u64);
+        let entered = uint!(1_000_000_000_U256);
+        let selected_total = uint!(2_000_000_000_U256);
 
         let deducted = approximate_public_broadcaster_cost(
             broadcaster.clone(),
             entered,
             PublicBroadcasterFeeMode::DeductFromAmount,
-            0,
+            U256::ZERO,
             100,
             |_split| {
                 let selection = selection_info(selected_total, 1, 1, 2, 0, selected_total);
@@ -4620,7 +4608,7 @@ mod tests {
             broadcaster,
             entered,
             PublicBroadcasterFeeMode::AddToAmount,
-            0,
+            U256::ZERO,
             100,
             |_split| {
                 let selection = selection_info(selected_total, 1, 1, 2, 0, selected_total);
@@ -4655,8 +4643,8 @@ mod tests {
         .into_iter()
         .next()
         .expect("candidate");
-        let entered = U256::from(1_000_000_u64);
-        let selected_total = U256::from(2_000_000_u64);
+        let entered = uint!(1_000_000_U256);
+        let selected_total = uint!(2_000_000_U256);
 
         let estimate = approximate_public_broadcaster_cost(
             broadcaster,
@@ -4675,7 +4663,7 @@ mod tests {
         )
         .expect("unshield estimate");
 
-        let expected_fee = estimate.receiver_amount * U256::from(25_u8) / U256::from(10_000_u64);
+        let expected_fee = estimate.receiver_amount * uint!(25_U256) / uint!(10_000_U256);
         assert_eq!(estimate.protocol_fee_bps, RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS);
         assert_eq!(estimate.protocol_fee_amount, expected_fee);
         assert_eq!(
@@ -4710,15 +4698,15 @@ mod tests {
 
     #[test]
     fn approximate_shapes_include_broadcaster_fee_output_and_change() {
-        let send_selection = selection_info(U256::from(15_u8), 2, 1, 3, 0, U256::from(13_u8));
-        let send = send_approximate_shape(&send_selection, U256::from(13_u8));
+        let send_selection = selection_info(uint!(15_U256), 2, 1, 3, 0, uint!(13_U256));
+        let send = send_approximate_shape(&send_selection, uint!(13_U256));
         assert_eq!(send.input_count, 2);
         assert_eq!(send.transaction_count, 1);
         assert_eq!(send.private_output_count, 3);
         assert_eq!(send.public_output_count, 0);
 
-        let unshield_selection = selection_info(U256::from(12_u8), 1, 1, 1, 1, U256::from(10_u8));
-        let unshield = unshield_approximate_shape(&unshield_selection, U256::from(10_u8), true);
+        let unshield_selection = selection_info(uint!(12_U256), 1, 1, 1, 1, uint!(10_U256));
+        let unshield = unshield_approximate_shape(&unshield_selection, uint!(10_U256), true);
         assert_eq!(unshield.input_count, 1);
         assert_eq!(unshield.transaction_count, 1);
         assert_eq!(unshield.private_output_count, 1);
@@ -4756,7 +4744,7 @@ mod tests {
         assert_eq!(decrypted.params.fees_id.as_deref(), Some("fees-id"));
         assert_eq!(
             decrypted.params.min_gas_price,
-            Some(U256::from(20_000_000_000_u128))
+            Some(uint!(20_000_000_000_U256))
         );
         assert!(
             decrypted

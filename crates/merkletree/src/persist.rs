@@ -120,7 +120,8 @@ fn temp_path(path: &Path) -> PathBuf {
 mod tests {
     use super::{PersistError, load_forest_snapshot, write_forest_snapshot};
     use crate::tree::{MerkleForest, MerkleTreeUpdate};
-    use alloy::primitives::{Address, U256};
+    use alloy::primitives::Address;
+    use alloy::uint;
     use std::fs;
     use std::path::PathBuf;
 
@@ -146,14 +147,14 @@ mod tests {
             .insert_leaf(MerkleTreeUpdate {
                 tree_number: 0,
                 tree_position: 0,
-                hash: U256::from(1),
+                hash: uint!(1_U256),
             })
             .expect("insert leaf");
         forest
             .insert_leaf(MerkleTreeUpdate {
                 tree_number: 0,
                 tree_position: 1,
-                hash: U256::from(2),
+                hash: uint!(2_U256),
             })
             .expect("insert leaf");
         forest.compute_roots();
@@ -184,7 +185,7 @@ mod tests {
             .insert_leaf(MerkleTreeUpdate {
                 tree_number: 0,
                 tree_position: 0,
-                hash: U256::from(1),
+                hash: uint!(1_U256),
             })
             .expect("insert leaf");
         forest.compute_roots();

@@ -6,7 +6,9 @@ use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit as HmacKeyInit, Mac};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
+use alloy::primitives::U256;
 use broadcaster_core::crypto::railgun::{RailgunError, ViewingKeyData};
 use local_db::{DbConfig, DbStore, WalletMeta};
 use railgun_wallet::keys::KeyError;
@@ -196,6 +198,7 @@ pub struct GeneratedSeedMaterial {
 pub struct DesktopViewSession {
     wallet_id: String,
     derivation_index: u32,
+    spending_public_key: [U256; 2],
     scan_keys: ViewingKeyData,
     view: ViewUnlock,
 }
@@ -781,6 +784,7 @@ impl DesktopViewSession {
         Self {
             wallet_id,
             derivation_index: bundle.derivation_index,
+            spending_public_key: bundle.spending_public_key(),
             scan_keys: bundle.scan_keys(),
             view,
         }
@@ -799,6 +803,11 @@ impl DesktopViewSession {
     #[must_use]
     pub const fn scan_keys(&self) -> ViewingKeyData {
         self.scan_keys
+    }
+
+    #[must_use]
+    pub const fn spending_public_key(&self) -> [U256; 2] {
+        self.spending_public_key
     }
 
     pub fn receive_address(&self) -> Result<String, RailgunError> {
@@ -861,7 +870,9 @@ impl sync_service::WalletCacheStore for DesktopEncryptedWalletCacheStore {
         last_scanned_block: Option<u64>,
         last_scanned_block_hash: Option<[u8; KEY_LEN]>,
     ) -> Result<(), WalletCacheError> {
+        let started = Instant::now();
         let wallet_chain_uuid = self.wallet_chain_uuid()?;
+        let encode_started = Instant::now();
         let mut records =
             Vec::with_capacity(utxos.len() + usize::from(last_scanned_block.is_some()));
 
@@ -881,9 +892,11 @@ impl sync_service::WalletCacheStore for DesktopEncryptedWalletCacheStore {
                 data,
             ));
         }
+        let encode_elapsed_ms = encode_started.elapsed().as_millis();
 
         let (unspent, spent) = wallet_cache_counts(utxos);
         if let Some(last_scanned_block) = last_scanned_block {
+            let metadata_started = Instant::now();
             let mut metadata = self.metadata.lock().map_err(|_| WalletCacheError::Crypto)?;
             metadata.last_scanned_block = last_scanned_block;
             metadata.last_scanned_block_hash = last_scanned_block_hash;
@@ -896,15 +909,38 @@ impl sync_service::WalletCacheStore for DesktopEncryptedWalletCacheStore {
                 wallet_chain_metadata_record_key(&metadata.wallet_chain_uuid),
                 data,
             ));
+            tracing::debug!(
+                wallet_chain_uuid = %metadata.wallet_chain_uuid,
+                last_scanned_block,
+                elapsed_ms = metadata_started.elapsed().as_millis(),
+                "encoded encrypted desktop wallet cache metadata"
+            );
         }
 
-        self.db.put_desktop_wallet_vault_records(&records)?;
+        let db_started = Instant::now();
+        if let Err(err) = self.db.put_desktop_wallet_vault_records(&records) {
+            tracing::debug!(
+                ?err,
+                wallet_chain_uuid,
+                rows = utxos.len(),
+                records = records.len(),
+                encode_elapsed_ms,
+                db_elapsed_ms = db_started.elapsed().as_millis(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "failed to upsert encrypted desktop wallet cache"
+            );
+            return Err(err.into());
+        }
         tracing::debug!(
             wallet_chain_uuid,
             rows = utxos.len(),
+            records = records.len(),
             unspent,
             spent,
             last_scanned_block,
+            encode_elapsed_ms,
+            db_elapsed_ms = db_started.elapsed().as_millis(),
+            elapsed_ms = started.elapsed().as_millis(),
             "upserted encrypted desktop wallet cache"
         );
 
@@ -912,9 +948,13 @@ impl sync_service::WalletCacheStore for DesktopEncryptedWalletCacheStore {
     }
 
     fn load_wallet_utxos(&self, _wallet_id: &str) -> Result<Vec<WalletUtxo>, WalletCacheError> {
+        let started = Instant::now();
         let wallet_chain_uuid = self.wallet_chain_uuid()?;
         let row_prefix = wallet_cache_row_prefix(&wallet_chain_uuid);
+        let db_started = Instant::now();
         let records = self.db.list_desktop_wallet_vault_records(&row_prefix)?;
+        let db_elapsed_ms = db_started.elapsed().as_millis();
+        let decode_started = Instant::now();
         let mut out = Vec::with_capacity(records.len());
         for stored in records {
             let Some(row_id_hex) = stored.key.strip_prefix(&row_prefix) else {
@@ -938,6 +978,9 @@ impl sync_service::WalletCacheStore for DesktopEncryptedWalletCacheStore {
             rows = out.len(),
             unspent,
             spent,
+            db_elapsed_ms,
+            decode_elapsed_ms = decode_started.elapsed().as_millis(),
+            elapsed_ms = started.elapsed().as_millis(),
             "loaded encrypted desktop wallet cache"
         );
         Ok(out)
@@ -958,6 +1001,7 @@ impl sync_service::WalletCacheStore for DesktopEncryptedWalletCacheStore {
         last_scanned_block: u64,
         last_scanned_block_hash: Option<[u8; KEY_LEN]>,
     ) -> Result<(), WalletCacheError> {
+        let started = Instant::now();
         let mut metadata = self.metadata.lock().map_err(|_| WalletCacheError::Crypto)?;
         metadata.last_scanned_block = last_scanned_block;
         metadata.last_scanned_block_hash = last_scanned_block_hash;
@@ -973,6 +1017,7 @@ impl sync_service::WalletCacheStore for DesktopEncryptedWalletCacheStore {
         tracing::debug!(
             wallet_chain_uuid = %metadata.wallet_chain_uuid,
             last_scanned_block,
+            elapsed_ms = started.elapsed().as_millis(),
             "updated encrypted desktop wallet cache metadata"
         );
         Ok(())
@@ -1299,6 +1344,14 @@ impl WalletViewBundle {
             nullifying_key: alloy::primitives::U256::from_be_bytes(self.nullifying_key),
             master_public_key: alloy::primitives::U256::from_be_bytes(self.master_public_key),
         }
+    }
+
+    #[must_use]
+    pub const fn spending_public_key(&self) -> [U256; 2] {
+        [
+            U256::from_be_bytes(self.spending_public_key[0]),
+            U256::from_be_bytes(self.spending_public_key[1]),
+        ]
     }
 }
 
@@ -1649,6 +1702,7 @@ fn vault_error_from_wallet_cache(error: WalletCacheError) -> VaultError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::uint;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2128,7 +2182,7 @@ mod tests {
         let signer = store
             .railgun_spend_signer(&mut grant, wallet_id)
             .expect("load signer");
-        let signature = signer.sign_spend_message(alloy::primitives::U256::from(7_u8));
+        let signature = signer.sign_spend_message(uint!(7_U256));
 
         assert_ne!(signature, [alloy::primitives::U256::ZERO; 3]);
         assert!(!grant.is_valid());
@@ -2475,7 +2529,7 @@ mod tests {
             utxo: Utxo::new(
                 Note {
                     token_hash: U256::from_be_bytes([0x11; KEY_LEN]),
-                    value: U256::from(1_u8),
+                    value: uint!(1_U256),
                     random: [0x22; 16],
                     npk: U256::from_be_bytes([0x33; KEY_LEN]),
                 },

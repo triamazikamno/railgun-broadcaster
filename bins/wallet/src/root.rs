@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, U256};
+use alloy::uint;
 use broadcaster_monitor::{EventRx, Shared};
 use chrono::{DateTime, Local, Utc};
 use gpui::{
@@ -1154,7 +1155,7 @@ impl WalletRoot {
             cx.notify();
             return;
         };
-        let (progress_tx, mut progress_rx) = tokio::sync::watch::channel(None);
+        let (progress_tx, mut progress_rx) = watch::channel(None);
         let request = ViewWalletChainSessionRequest {
             view_session,
             chain_id,
@@ -2694,10 +2695,9 @@ impl WalletRoot {
         };
         Self::watch_send_generation_stage(key, generation_id, progress_rx, cx);
         cx.spawn(async move |this, cx| {
-            let result = match join.await {
-                Ok(result) => result,
-                Err(error) => Err(eyre::eyre!("send generation task failed: {error}")),
-            };
+            let result = join
+                .await
+                .unwrap_or_else(|error| Err(eyre::eyre!("send generation task failed: {error}")));
             let _ = this.update(cx, |root, cx| {
                 let Some(form) = root.send_forms.get_mut(&key) else {
                     return;
@@ -3352,10 +3352,9 @@ impl WalletRoot {
         };
         Self::watch_unshield_generation_stage(key, generation_id, progress_rx, cx);
         cx.spawn(async move |this, cx| {
-            let result = match join.await {
-                Ok(result) => result,
-                Err(error) => Err(eyre::eyre!("unshield generation task failed: {error}")),
-            };
+            let result = join.await.unwrap_or_else(|error| {
+                Err(eyre::eyre!("unshield generation task failed: {error}"))
+            });
             let _ = this.update(cx, |root, cx| {
                 let Some(form) = root.unshield_forms.get_mut(&key) else {
                     return;
@@ -4213,9 +4212,11 @@ impl WalletRoot {
                             .child(SharedString::from(asset.amount)),
                     )
                     .when(show_pending_poi, |column| {
-                        column.child(app_muted_text(format!(
-                            "*Pending POI: {pending_poi_amount}"
-                        )))
+                        column.child(
+                            app_muted_text(format!("*Pending POI: {pending_poi_amount}"))
+                                .whitespace_nowrap()
+                                .text_align(gpui::TextAlign::Right),
+                        )
                     }),
             )
             .child(
@@ -6413,7 +6414,7 @@ fn format_unshield_amount_input(amount: U256, decimals: Option<u8>) -> String {
         return amount.to_string();
     }
 
-    let divisor = U256::from(10_u8).pow(U256::from(decimals));
+    let divisor = uint!(10_U256).pow(U256::from(decimals));
     let whole = amount / divisor;
     let fractional = amount % divisor;
     if fractional.is_zero() {
@@ -6898,7 +6899,7 @@ fn render_public_broadcaster_result(
             "Broadcaster fee",
             format_exact_candidate_token_amount(&result.broadcaster, result.fee_amount),
         ))
-        .when(result.protocol_fee_bps > 0, |card| {
+        .when(!result.protocol_fee_bps.is_zero(), |card| {
             card.child(cost_estimate_row(
                 "RAILGUN protocol fee",
                 format!(
@@ -6962,7 +6963,7 @@ fn render_public_broadcaster_cost_estimate(
             "Broadcaster fee",
             format_exact_asset_amount_for_display(estimate.fee_amount, asset),
         ))
-        .when(estimate.protocol_fee_bps > 0, |card| {
+        .when(!estimate.protocol_fee_bps.is_zero(), |card| {
             card.child(cost_estimate_row(
                 "RAILGUN protocol fee",
                 format!(
@@ -7395,6 +7396,7 @@ mod tests {
     use std::path::PathBuf;
 
     use alloy::primitives::{Address, U256};
+    use alloy::uint;
     use wallet_ops::{
         ListUtxosOutput, SyncProgressStage, SyncProgressUpdate, TransactionGenerationStage,
         UtxoOutput,
@@ -7633,23 +7635,23 @@ mod tests {
         };
 
         assert_eq!(
-            format_exact_asset_amount_for_display(U256::from(388_429_885_u64), &asset),
+            format_exact_asset_amount_for_display(uint!(388_429_885_U256), &asset),
             "388.429885 USDC"
         );
         assert_eq!(
-            format_exact_asset_amount_for_display(U256::from(14_390_115_u64), &asset),
+            format_exact_asset_amount_for_display(uint!(14_390_115_U256), &asset),
             "14.390115 USDC"
         );
     }
 
     #[test]
     fn public_broadcaster_estimate_hides_duplicate_amount_rows() {
-        let entered = U256::from(388_429_885_u64);
+        let entered = uint!(388_429_885_U256);
 
         assert!(!should_show_distinct_amount(entered, entered));
         assert!(should_show_distinct_amount(
             entered,
-            entered + U256::from(1_u8)
+            entered + uint!(1_U256)
         ));
     }
 
@@ -7671,27 +7673,15 @@ mod tests {
     #[test]
     fn amount_adjustment_clamps_or_raises_only_at_mode_max() {
         assert_eq!(
-            adjusted_amount_for_max_change(
-                U256::from(120_u8),
-                Some(U256::from(120_u8)),
-                U256::from(100_u8),
-            ),
-            Some(U256::from(100_u8))
+            adjusted_amount_for_max_change(uint!(120_U256), Some(uint!(120_U256)), uint!(100_U256),),
+            Some(uint!(100_U256))
         );
         assert_eq!(
-            adjusted_amount_for_max_change(
-                U256::from(100_u8),
-                Some(U256::from(100_u8)),
-                U256::from(120_u8),
-            ),
-            Some(U256::from(120_u8))
+            adjusted_amount_for_max_change(uint!(100_U256), Some(uint!(100_U256)), uint!(120_U256),),
+            Some(uint!(120_U256))
         );
         assert_eq!(
-            adjusted_amount_for_max_change(
-                U256::from(90_u8),
-                Some(U256::from(100_u8)),
-                U256::from(120_u8),
-            ),
+            adjusted_amount_for_max_change(uint!(90_U256), Some(uint!(100_U256)), uint!(120_U256),),
             None
         );
     }
@@ -7735,7 +7725,7 @@ mod tests {
         assert_eq!(rows[0].label, "USDC");
         assert_eq!(rows[0].amount, "1.23");
         assert_eq!(rows[0].pending_poi_amount, "0.23457");
-        assert_eq!(rows[0].pending_poi_total, Some(U256::from(234_567_u64)));
+        assert_eq!(rows[0].pending_poi_total, Some(uint!(234_567_U256)));
         assert!(should_show_pending_poi_amount(rows[0].pending_poi_total));
         assert!(rows[0].icon_path.is_some());
     }
@@ -7759,27 +7749,27 @@ mod tests {
     #[test]
     fn unshield_amount_input_formats_exact_token_units() {
         assert_eq!(
-            format_unshield_amount_input(U256::from(1_230_000_u64), Some(6)),
+            format_unshield_amount_input(uint!(1_230_000_U256), Some(6)),
             "1.23"
         );
         assert_eq!(
-            format_unshield_amount_input(U256::from(1_000_000_u64), Some(6)),
+            format_unshield_amount_input(uint!(1_000_000_U256), Some(6)),
             "1"
         );
-        assert_eq!(format_unshield_amount_input(U256::from(42_u8), None), "42");
+        assert_eq!(format_unshield_amount_input(uint!(42_U256), None), "42");
     }
 
     #[test]
     fn send_amount_input_formats_exact_token_units() {
         assert_eq!(
-            format_send_amount_input(U256::from(1_230_000_u64), Some(6)),
+            format_send_amount_input(uint!(1_230_000_U256), Some(6)),
             "1.23"
         );
         assert_eq!(
-            format_send_amount_input(U256::from(1_000_000_u64), Some(6)),
+            format_send_amount_input(uint!(1_000_000_U256), Some(6)),
             "1"
         );
-        assert_eq!(format_send_amount_input(U256::from(42_u8), None), "42");
+        assert_eq!(format_send_amount_input(uint!(42_U256), None), "42");
     }
 
     #[test]
@@ -7810,9 +7800,9 @@ mod tests {
             token,
             label: "WETH".to_string(),
             decimals: Some(18),
-            total: U256::from(10_u8),
-            poi_verified_total: U256::from(10_u8),
-            max_batched: U256::from(10_u8),
+            total: uint!(10_U256),
+            poi_verified_total: uint!(10_U256),
+            max_batched: uint!(10_U256),
             icon_path: None,
         };
 
@@ -7820,37 +7810,37 @@ mod tests {
             private_action_metrics(&asset),
             vec![PrivateActionMetric {
                 label: "Total private balance",
-                amount: U256::from(10_u8),
+                amount: uint!(10_U256),
             }]
         );
 
-        asset.poi_verified_total = U256::from(7_u8);
+        asset.poi_verified_total = uint!(7_U256);
         assert_eq!(
             private_action_metrics(&asset),
             vec![
                 PrivateActionMetric {
                     label: "Total private balance",
-                    amount: U256::from(10_u8),
+                    amount: uint!(10_U256),
                 },
                 PrivateActionMetric {
                     label: "POI-verified balance",
-                    amount: U256::from(7_u8),
+                    amount: uint!(7_U256),
                 },
             ]
         );
 
         asset.poi_verified_total = asset.total;
-        asset.max_batched = U256::from(8_u8);
+        asset.max_batched = uint!(8_U256);
         assert_eq!(
             private_action_metrics(&asset),
             vec![
                 PrivateActionMetric {
                     label: "Total private balance",
-                    amount: U256::from(10_u8),
+                    amount: uint!(10_U256),
                 },
                 PrivateActionMetric {
                     label: "Max batched transaction",
-                    amount: U256::from(8_u8),
+                    amount: uint!(8_U256),
                 },
             ]
         );
@@ -7890,7 +7880,7 @@ mod tests {
 
         assert_eq!(
             max_unshield_amount_from_snapshot(&snapshot, token),
-            U256::from(35_u8)
+            uint!(35_U256)
         );
     }
 
@@ -7934,9 +7924,9 @@ mod tests {
 
         let updated = refresh_form_asset_from_snapshot(&updated_snapshot, &original_asset, false);
 
-        assert_eq!(updated.total, U256::from(8_u8));
-        assert_eq!(updated.poi_verified_total, U256::from(8_u8));
-        assert_eq!(updated.max_batched, U256::from(8_u8));
+        assert_eq!(updated.total, uint!(8_U256));
+        assert_eq!(updated.poi_verified_total, uint!(8_U256));
+        assert_eq!(updated.max_batched, uint!(8_U256));
     }
 
     #[test]
@@ -7947,9 +7937,9 @@ mod tests {
             token,
             label: "WETH".to_string(),
             decimals: Some(18),
-            total: U256::from(5_u8),
-            poi_verified_total: U256::from(5_u8),
-            max_batched: U256::from(5_u8),
+            total: uint!(5_U256),
+            poi_verified_total: uint!(5_U256),
+            max_batched: uint!(5_U256),
             icon_path: None,
         };
         let mut spent = unshield_utxo_output(token, 5, 0, 1);
@@ -8002,7 +7992,7 @@ mod tests {
 
         assert_eq!(
             max_send_amount_from_snapshot(&snapshot, token),
-            U256::from(35_u8)
+            uint!(35_U256)
         );
     }
 
@@ -8032,8 +8022,8 @@ mod tests {
 
         let asset = build_unshield_asset(&snapshot, &row).expect("unshield asset");
 
-        assert_eq!(asset.total, U256::from(12_u8));
-        assert_eq!(asset.max_batched, U256::from(12_u8));
+        assert_eq!(asset.total, uint!(12_U256));
+        assert_eq!(asset.max_batched, uint!(12_U256));
     }
 
     #[test]
@@ -8062,8 +8052,8 @@ mod tests {
 
         let asset = build_send_asset(&snapshot, &row).expect("send asset");
 
-        assert_eq!(asset.total, U256::from(12_u8));
-        assert_eq!(asset.max_batched, U256::from(12_u8));
+        assert_eq!(asset.total, uint!(12_U256));
+        assert_eq!(asset.max_batched, uint!(12_U256));
     }
 
     #[test]

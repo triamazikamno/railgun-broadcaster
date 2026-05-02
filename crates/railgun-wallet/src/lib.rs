@@ -13,7 +13,7 @@ pub use broadcaster_core::utxo::{
 pub use keys::{RailgunSpendSigner, WalletKeys};
 pub use keys::{bip39_entropy_from_mnemonic, bip39_mnemonic_from_entropy, public_spending_key};
 pub use notes::{Note, NoteCiphertext};
-pub use prover::{ProverService, WitnessInputs};
+pub use prover::{ProverService, RailgunWitnessInputs};
 pub use tx::{
     BroadcasterFeeOutput, PoiCircuitVariant, PoiProofInputs, PreTransactionPoiChunkInputs,
     PreTransactionPoiGenerationRequest, PreTransactionPoiMap, PrivateInputs, PublicInputs,

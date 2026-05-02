@@ -2,8 +2,10 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::time::Instant;
 
+use alloy::hex;
 use alloy::primitives::{Address, Bytes, FixedBytes, U256, Uint};
 use alloy::sol_types::SolCall;
+use alloy::uint;
 use rand::Rng;
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelIterator;
@@ -15,7 +17,8 @@ use broadcaster_core::contracts::railgun::{
 use broadcaster_core::crypto::poseidon::poseidon;
 use broadcaster_core::crypto::railgun::{AddressData, ViewingKeyData};
 use broadcaster_core::transact::{
-    DEFAULT_TXID_VERSION, PreTxPoi, SnarkJsProof, pad_with_merkle_zero, railgun_txid_leaf_hash,
+    DEFAULT_TXID_VERSION, MERKLE_ZERO_VALUE, PreTxPoi, SnarkJsProof, dummy_txid_root,
+    pad_with_merkle_zero, railgun_txid_leaf_hash,
 };
 use broadcaster_core::utxo::Utxo;
 use merkletree::tree::{MerkleForest, MerkleProof};
@@ -60,7 +63,7 @@ pub enum BuildError {
     #[error("encrypt note failed: {0}")]
     Encrypt(#[from] crate::notes::NoteError),
     #[error("prove failed: {0}")]
-    Prover(#[from] crate::prover::ProverError),
+    Prover(#[from] ProverError),
 }
 
 #[derive(Debug, Error)]
@@ -86,6 +89,21 @@ pub enum PreTransactionPoiError {
         index: usize,
         expected: usize,
         got: usize,
+    },
+    #[error("TXID merkle proof path length mismatch: expected {expected}, got {got}")]
+    TxidMerkleProofPathLengthMismatch { expected: usize, got: usize },
+    #[error("TXID leaf hash mismatch: expected {expected}, got {actual}")]
+    TxidLeafHashMismatch {
+        expected: FixedBytes<32>,
+        actual: FixedBytes<32>,
+    },
+    #[error("POI public signal count mismatch: expected {expected}, got {got}")]
+    PublicSignalCountMismatch { expected: usize, got: usize },
+    #[error("POI public signal mismatch for {field}: expected {expected}, got {actual}")]
+    PublicSignalMismatch {
+        field: &'static str,
+        expected: FixedBytes<32>,
+        actual: FixedBytes<32>,
     },
     #[error("invalid hex field {field}: {value}")]
     InvalidHex { field: &'static str, value: String },
@@ -387,6 +405,16 @@ pub struct PreTransactionPoiChunkInputs {
 }
 
 #[derive(Debug, Clone)]
+pub struct PostTransactionPoiData {
+    pub txid_leaf_hash: FixedBytes<32>,
+    pub txid_merkleroot: FixedBytes<32>,
+    pub txid_merkleroot_index: u64,
+    pub txid_merkle_proof_indices: U256,
+    pub txid_merkle_proof_path_elements: Vec<U256>,
+    pub utxo_batch_global_start_position_out: U256,
+}
+
+#[derive(Debug, Clone)]
 struct PoiProofBaseInputs {
     any_railgun_txid_merkleroot_after_transaction: U256,
     bound_params_hash: U256,
@@ -493,11 +521,92 @@ impl PreTransactionPoiChunkInputs {
                 .poi_merkleroots
                 .iter()
                 .copied()
-                .map(u256_to_fixed)
+                .map(|value| FixedBytes::from(value.to_be_bytes::<32>()))
                 .collect(),
             blinded_commitments_out: self.blinded_commitments_out.clone(),
             railgun_txid_if_has_unshield: self.railgun_txid_if_has_unshield.clone(),
         }
+    }
+
+    pub fn post_tx_poi_from_public_signals(
+        &self,
+        snark_proof: SnarkJsProof,
+        proof_inputs: &PoiProofInputs,
+        public_signals: &[U256],
+        variant: PoiCircuitVariant,
+    ) -> Result<PreTxPoi, PreTransactionPoiError> {
+        let expected_len = variant.max_outputs + 2 + variant.max_inputs;
+        if public_signals.len() != expected_len {
+            return Err(PreTransactionPoiError::PublicSignalCountMismatch {
+                expected: expected_len,
+                got: public_signals.len(),
+            });
+        }
+
+        let mut expected_blinded_commitments_out = self.blinded_commitments_out.clone();
+        expected_blinded_commitments_out.resize(variant.max_outputs, FixedBytes::ZERO);
+        for (index, expected) in expected_blinded_commitments_out.iter().enumerate() {
+            validate_public_signal(
+                "blindedCommitmentsOut",
+                FixedBytes::from(public_signals[index].to_be_bytes::<32>()),
+                *expected,
+            )?;
+        }
+
+        let txid_merkleroot =
+            FixedBytes::from(public_signals[variant.max_outputs].to_be_bytes::<32>());
+        let expected_txid_merkleroot = FixedBytes::from(
+            self.proof_base_inputs
+                .any_railgun_txid_merkleroot_after_transaction
+                .to_be_bytes::<32>(),
+        );
+        validate_public_signal("txidMerkleroot", txid_merkleroot, expected_txid_merkleroot)?;
+
+        let railgun_txid_if_has_unshield = public_signals[variant.max_outputs + 1];
+        validate_public_signal(
+            "railgunTxidIfHasUnshield",
+            FixedBytes::from(railgun_txid_if_has_unshield.to_be_bytes::<32>()),
+            FixedBytes::from(
+                self.proof_base_inputs
+                    .railgun_txid_if_has_unshield
+                    .to_be_bytes::<32>(),
+            ),
+        )?;
+
+        let poi_merkleroots_start = variant.max_outputs + 2;
+        let mut expected_poi_merkleroots = proof_inputs.poi_merkleroots.clone();
+        expected_poi_merkleroots.resize(variant.max_inputs, MERKLE_ZERO_VALUE);
+        for (index, expected) in expected_poi_merkleroots.iter().enumerate() {
+            let actual = public_signals[poi_merkleroots_start + index];
+            validate_public_signal(
+                "poiMerkleroots",
+                FixedBytes::from(actual.to_be_bytes::<32>()),
+                FixedBytes::from(expected.to_be_bytes::<32>()),
+            )?;
+        }
+
+        let railgun_txid_if_has_unshield = if railgun_txid_if_has_unshield == U256::ZERO {
+            Bytes::copy_from_slice(&[0_u8])
+        } else {
+            Bytes::copy_from_slice(&railgun_txid_if_has_unshield.to_be_bytes::<32>())
+        };
+
+        Ok(PreTxPoi {
+            snark_proof,
+            txid_merkleroot,
+            poi_merkleroots: proof_inputs
+                .poi_merkleroots
+                .iter()
+                .copied()
+                .map(|value| FixedBytes::from(value.to_be_bytes::<32>()))
+                .collect(),
+            blinded_commitments_out: public_signals[..self.blinded_commitments_out.len()]
+                .iter()
+                .copied()
+                .map(|value| FixedBytes::from(value.to_be_bytes::<32>()))
+                .collect(),
+            railgun_txid_if_has_unshield,
+        })
     }
 }
 
@@ -573,8 +682,8 @@ pub fn pre_transaction_poi_inputs_from_chunk(
         .collect::<Vec<_>>();
 
     Ok(PreTransactionPoiChunkInputs {
-        txid_leaf_hash: u256_to_fixed(txid_leaf),
-        txid_merkleroot: u256_to_fixed(txid_merkleroot),
+        txid_leaf_hash: FixedBytes::from(txid_leaf.to_be_bytes::<32>()),
+        txid_merkleroot: FixedBytes::from(txid_merkleroot.to_be_bytes::<32>()),
         blinded_commitments_in,
         blinded_commitments_out,
         railgun_txid_if_has_unshield,
@@ -608,6 +717,151 @@ pub fn pre_transaction_poi_inputs_from_chunk(
             railgun_txid_if_has_unshield: railgun_txid_if_has_unshield_value,
             railgun_txid_merkle_proof_indices: U256::ZERO,
             railgun_txid_merkle_proof_path_elements: vec![U256::ZERO; merkletree::tree::TREE_DEPTH],
+        },
+    })
+}
+
+pub fn post_transaction_poi_inputs_from_chunk(
+    chunk: &TransactionPlanChunk,
+    txid_data: &PostTransactionPoiData,
+) -> Result<PreTransactionPoiChunkInputs, PreTransactionPoiError> {
+    if chunk.inputs.len() != chunk.public_inputs.nullifiers.len() {
+        return Err(PreTransactionPoiError::InputCountMismatch {
+            expected: chunk.public_inputs.nullifiers.len(),
+            got: chunk.inputs.len(),
+        });
+    }
+    if txid_data.txid_merkle_proof_path_elements.len() != merkletree::tree::TREE_DEPTH {
+        return Err(PreTransactionPoiError::TxidMerkleProofPathLengthMismatch {
+            expected: merkletree::tree::TREE_DEPTH,
+            got: txid_data.txid_merkle_proof_path_elements.len(),
+        });
+    }
+
+    let private_output_count = if chunk.has_unshield {
+        chunk
+            .public_inputs
+            .commitments_out
+            .len()
+            .checked_sub(1)
+            .ok_or(PreTransactionPoiError::MissingPrivateOutputBeforeUnshield)?
+    } else {
+        chunk.public_inputs.commitments_out.len()
+    };
+    if chunk.private_inputs.npk_out.len() < private_output_count
+        || chunk.private_inputs.value_out.len() < private_output_count
+    {
+        return Err(PreTransactionPoiError::OutputCountMismatch {
+            expected: private_output_count,
+            got: chunk
+                .private_inputs
+                .npk_out
+                .len()
+                .min(chunk.private_inputs.value_out.len()),
+        });
+    }
+
+    let railgun_txid = compute_railgun_txid_from_public_inputs(&chunk.public_inputs);
+    let expected_txid_leaf = poseidon(vec![
+        railgun_txid,
+        U256::from(chunk.tree_number),
+        txid_data.utxo_batch_global_start_position_out,
+    ]);
+    let expected_txid_leaf_hash = FixedBytes::from(expected_txid_leaf.to_be_bytes::<32>());
+    if expected_txid_leaf_hash != txid_data.txid_leaf_hash {
+        return Err(PreTransactionPoiError::TxidLeafHashMismatch {
+            expected: expected_txid_leaf_hash,
+            actual: txid_data.txid_leaf_hash,
+        });
+    }
+
+    let railgun_txid_if_has_unshield = if chunk.has_unshield {
+        Bytes::copy_from_slice(&railgun_txid.to_be_bytes::<32>())
+    } else {
+        Bytes::copy_from_slice(&[0_u8])
+    };
+    let railgun_txid_if_has_unshield_value = if chunk.has_unshield {
+        railgun_txid
+    } else {
+        U256::ZERO
+    };
+
+    let blinded_commitments_in = chunk
+        .inputs
+        .iter()
+        .map(|input| input.utxo.poi.blinded_commitment)
+        .collect::<Vec<_>>();
+    let blinded_commitments_out = chunk
+        .public_inputs
+        .commitments_out
+        .iter()
+        .take(private_output_count)
+        .zip(
+            chunk
+                .private_inputs
+                .npk_out
+                .iter()
+                .take(private_output_count),
+        )
+        .zip(
+            chunk
+                .private_inputs
+                .value_out
+                .iter()
+                .take(private_output_count),
+        )
+        .enumerate()
+        .map(|(index, ((commitment, npk), value))| {
+            if *value == U256::ZERO {
+                FixedBytes::ZERO
+            } else {
+                let global_position =
+                    txid_data.utxo_batch_global_start_position_out + U256::from(index);
+                poseidon(vec![*commitment, *npk, global_position]).into()
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Ok(PreTransactionPoiChunkInputs {
+        txid_leaf_hash: txid_data.txid_leaf_hash,
+        txid_merkleroot: txid_data.txid_merkleroot,
+        blinded_commitments_in,
+        blinded_commitments_out,
+        railgun_txid_if_has_unshield,
+        proof_base_inputs: PoiProofBaseInputs {
+            any_railgun_txid_merkleroot_after_transaction: U256::from_be_bytes(
+                txid_data.txid_merkleroot.0,
+            ),
+            bound_params_hash: chunk.public_inputs.bound_params_hash,
+            nullifiers: chunk.public_inputs.nullifiers.clone(),
+            commitments_out: chunk.public_inputs.commitments_out.clone(),
+            spending_public_key: chunk.private_inputs.public_key,
+            nullifying_key: chunk.private_inputs.nullifying_key,
+            token: chunk.private_inputs.token_address,
+            randoms_in: chunk.private_inputs.random_in.clone(),
+            values_in: chunk.private_inputs.value_in.clone(),
+            utxo_positions_in: chunk.private_inputs.leaves_indices.clone(),
+            utxo_tree_in: U256::from(chunk.tree_number),
+            npks_out: chunk
+                .private_inputs
+                .npk_out
+                .iter()
+                .take(private_output_count)
+                .copied()
+                .collect(),
+            values_out: chunk
+                .private_inputs
+                .value_out
+                .iter()
+                .take(private_output_count)
+                .copied()
+                .collect(),
+            utxo_batch_global_start_position_out: txid_data.utxo_batch_global_start_position_out,
+            railgun_txid_if_has_unshield: railgun_txid_if_has_unshield_value,
+            railgun_txid_merkle_proof_indices: txid_data.txid_merkle_proof_indices,
+            railgun_txid_merkle_proof_path_elements: txid_data
+                .txid_merkle_proof_path_elements
+                .clone(),
         },
     })
 }
@@ -653,7 +907,7 @@ pub async fn generate_pre_transaction_pois(
                 .prove_poi(&proof_inputs, request.verify_proof)
                 .await?;
             let prove_elapsed_ms = prove_started.elapsed().as_millis();
-            tracing::info!(
+            tracing::debug!(
                 chain_type = request.chain_type,
                 chain_id = request.chain_id,
                 tree_number = chunk.tree_number,
@@ -673,6 +927,75 @@ pub async fn generate_pre_transaction_pois(
                 pre_tx_poi,
             );
         }
+    }
+    Ok(map)
+}
+
+pub struct PostTransactionPoiGenerationRequest<'a> {
+    pub chunk: &'a TransactionPlanChunk,
+    pub txid_data: &'a PostTransactionPoiData,
+    pub chain_type: u8,
+    pub chain_id: u64,
+    pub txid_version: Option<&'a str>,
+    pub required_poi_list_keys: &'a [FixedBytes<32>],
+    pub poi_client: &'a PoiRpcClient,
+    pub prover: &'a ProverService,
+    pub verify_proof: bool,
+}
+
+pub async fn generate_post_transaction_pois(
+    request: PostTransactionPoiGenerationRequest<'_>,
+) -> Result<PreTransactionPoiMap, PreTransactionPoiError> {
+    let mut map = BTreeMap::new();
+    if request.required_poi_list_keys.is_empty() {
+        return Ok(map);
+    }
+    let txid_version = request.txid_version.unwrap_or(DEFAULT_TXID_VERSION);
+    let chunk_inputs = post_transaction_poi_inputs_from_chunk(request.chunk, request.txid_data)?;
+    for list_key in request.required_poi_list_keys {
+        let merkle_started = Instant::now();
+        let merkle_proofs = request
+            .poi_client
+            .poi_merkle_proofs(
+                txid_version,
+                request.chain_type,
+                request.chain_id,
+                list_key,
+                &chunk_inputs.blinded_commitments_in,
+            )
+            .await?;
+        let merkle_elapsed_ms = merkle_started.elapsed().as_millis();
+        let proof_inputs = chunk_inputs.proof_inputs(&merkle_proofs)?;
+        let variant = poi_circuit_variant(
+            request.chunk.public_inputs.nullifiers.len(),
+            request.chunk.public_inputs.commitments_out.len(),
+        );
+        let prove_started = Instant::now();
+        let proof_result = request
+            .prover
+            .prove_poi_with_public_signals(&proof_inputs, request.verify_proof)
+            .await?;
+        let prove_elapsed_ms = prove_started.elapsed().as_millis();
+        tracing::debug!(
+            chain_type = request.chain_type,
+            chain_id = request.chain_id,
+            tree_number = request.chunk.tree_number,
+            input_count = request.chunk.inputs.len(),
+            output_count = request.chunk.outputs.len(),
+            has_unshield = request.chunk.has_unshield,
+            list_key = %hex::encode(list_key),
+            txid_merkleroot_index = request.txid_data.txid_merkleroot_index,
+            merkle_elapsed_ms,
+            prove_elapsed_ms,
+            "generated post-transaction POI proof"
+        );
+        let pre_tx_poi = chunk_inputs.post_tx_poi_from_public_signals(
+            proof_result.snark_proof,
+            &proof_inputs,
+            &proof_result.public_signals,
+            variant,
+        )?;
+        insert_pre_transaction_poi(&mut map, *list_key, chunk_inputs.txid_leaf_hash, pre_tx_poi);
     }
     Ok(map)
 }
@@ -701,27 +1024,33 @@ fn compute_railgun_txid_from_public_inputs(public_inputs: &PublicInputs) -> U256
     ])
 }
 
-fn dummy_txid_root(leaf: U256) -> U256 {
-    let mut acc = leaf;
-    for _ in 0..merkletree::tree::TREE_DEPTH {
-        acc = poseidon(vec![acc, U256::ZERO]);
-    }
-    acc
+fn pre_transaction_output_global_position() -> U256 {
+    const PRE_TRANSACTION_POI_TREE: U256 = uint!(199_999_U256);
+    const PRE_TRANSACTION_POI_POSITION: U256 = uint!(199_999_U256);
+
+    PRE_TRANSACTION_POI_TREE * merkletree::tree::TREE_LEAF_COUNT_U256 + PRE_TRANSACTION_POI_POSITION
 }
 
-fn pre_transaction_output_global_position() -> U256 {
-    const PRE_TRANSACTION_POI_TREE: u64 = 199_999;
-    const PRE_TRANSACTION_POI_POSITION: u64 = 199_999;
-
-    U256::from(PRE_TRANSACTION_POI_TREE) * U256::from(merkletree::tree::TREE_LEAF_COUNT)
-        + U256::from(PRE_TRANSACTION_POI_POSITION)
+fn validate_public_signal(
+    field: &'static str,
+    actual: FixedBytes<32>,
+    expected: FixedBytes<32>,
+) -> Result<(), PreTransactionPoiError> {
+    if actual != expected {
+        return Err(PreTransactionPoiError::PublicSignalMismatch {
+            field,
+            expected,
+            actual,
+        });
+    }
+    Ok(())
 }
 
 fn parse_fixed_hex(
     value: &str,
     field: &'static str,
 ) -> Result<FixedBytes<32>, PreTransactionPoiError> {
-    parse_u256_hex(value, field).map(u256_to_fixed)
+    parse_u256_hex(value, field).map(|value| FixedBytes::from(value.to_be_bytes::<32>()))
 }
 
 fn parse_u256_hex(value: &str, field: &'static str) -> Result<U256, PreTransactionPoiError> {
@@ -738,10 +1067,6 @@ fn parse_u256_hex(value: &str, field: &'static str) -> Result<U256, PreTransacti
         value: value.to_string(),
     })?;
     Ok(U256::from_be_slice(&bytes))
-}
-
-fn u256_to_fixed(value: U256) -> FixedBytes<32> {
-    FixedBytes::from(value.to_be_bytes::<32>())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1449,333 +1774,6 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
             outputs,
             has_unshield: false,
             private_inputs,
-        })
-    }
-
-    /// Build an unshield plan.
-    #[allow(dead_code)]
-    async fn build_unshield(
-        self,
-        request: UnshieldRequest,
-        total: U256,
-    ) -> Result<UnshieldPlan, BuildError> {
-        let fee_amount = request.fee_amount();
-        if total < fee_amount {
-            return Err(BuildError::InsufficientBalance(total));
-        }
-        let spendable_after_fee = total - fee_amount;
-
-        // Validate spend amount
-        if !request.spend_up_to && spendable_after_fee < request.amount {
-            return Err(BuildError::InsufficientBalance(total));
-        }
-        let unshield_amount = if request.spend_up_to {
-            spendable_after_fee.min(request.amount)
-        } else {
-            request.amount
-        };
-        if unshield_amount.is_zero() {
-            return Err(BuildError::InsufficientBalance(total));
-        }
-
-        let change = spendable_after_fee - unshield_amount;
-        let receiver = self.viewing.address_data();
-
-        tracing::info!(
-            %unshield_amount,
-            %change,
-            len = self.inputs.len(),
-            "selected utxos"
-        );
-
-        let unshield_to = match request.mode {
-            UnshieldMode::Token => request.recipient,
-            UnshieldMode::UnwrapBase => self.builder.relay_adapt_contract,
-        };
-        let UnshieldOutputs {
-            outputs,
-            commitment_ciphertext,
-            broadcaster_fee_note,
-            unshield_note,
-            change_note,
-        } = build_unshield_outputs(
-            request.token_address,
-            unshield_amount,
-            unshield_to,
-            change,
-            &receiver,
-            request.broadcaster_fee,
-            &self.viewing.viewing_private_key,
-        )?;
-
-        self.validate_signature_limit(outputs.len())?;
-
-        // Create action data for unwrap mode
-        let action_data = if matches!(request.mode, UnshieldMode::UnwrapBase) {
-            let random = FixedBytes::<31>::from(rand_array());
-            Some(ActionData::unwrap_base(
-                self.builder.relay_adapt_contract,
-                request.recipient,
-                random,
-                true,
-            ))
-        } else {
-            None
-        };
-
-        let tree_number = self.tree_number();
-        let root = self.get_root()?;
-
-        // Build transaction
-        let nullifiers = self.compute_nullifiers();
-        let commitments = Self::compute_commitments(&outputs);
-        let commitment_ciphertext: Vec<_> = commitment_ciphertext
-            .into_iter()
-            .map(NoteCiphertext::into_commitment_ciphertext)
-            .collect();
-
-        let bound_params = BoundParams::new_unshield(
-            tree_number,
-            self.builder.chain_type,
-            self.builder.chain_id,
-            commitment_ciphertext,
-            Address::ZERO,
-            UNRELAYED_ADAPT_PARAMS,
-        )
-        .with_min_gas_price(request.min_gas_price)?;
-
-        let mut transaction = Transaction {
-            proof: SnarkProof::default(),
-            merkleRoot: FixedBytes::from(root.to_be_bytes::<32>()),
-            nullifiers,
-            commitments,
-            boundParams: bound_params,
-            unshieldPreimage: CommitmentPreimage::new_unshield(
-                &unshield_note,
-                request.token_address,
-            ),
-        };
-
-        // Apply adapt params for unwrap mode
-        if let Some(action_data) = action_data.as_ref() {
-            let adapt_params = action_data.adapt_params(&[&transaction]);
-            transaction.boundParams.adaptContract = self.builder.relay_adapt_contract;
-            transaction.boundParams.adaptParams = adapt_params;
-        }
-
-        // Build witnesses and inputs
-        let inputs = self.build_input_witnesses()?;
-        let public_inputs = PublicInputs::from_transaction(root, &transaction, &outputs);
-        let private_inputs = PrivateInputs::from_inputs(
-            request.token_address,
-            &inputs,
-            &outputs,
-            self.viewing,
-            self.signer,
-        );
-        let signature = public_inputs.signature(self.signer);
-
-        // Generate proof
-        tracing::info!("proving");
-        let proof = self
-            .prover
-            .prove_unshield(
-                &public_inputs,
-                &private_inputs,
-                &signature,
-                request.verify_proof,
-            )
-            .await?;
-        transaction.proof = proof;
-
-        // Build final call
-        tracing::info!("building transaction call");
-        let call = if matches!(request.mode, UnshieldMode::UnwrapBase) {
-            let action_data = action_data.ok_or(BuildError::MissingActionData)?;
-            let data = relayCall {
-                _transactions: vec![transaction],
-                _actionData: action_data,
-            }
-            .abi_encode();
-            TransactionCall {
-                to: self.builder.relay_adapt_contract,
-                data: data.into(),
-            }
-        } else {
-            let data = transactCall {
-                _transactions: vec![transaction],
-            }
-            .abi_encode();
-            TransactionCall {
-                to: self.builder.railgun_contract,
-                data: data.into(),
-            }
-        };
-
-        let chunk = TransactionPlanChunk {
-            tree_number,
-            merkle_root: root,
-            inputs: inputs.clone(),
-            outputs: outputs.clone(),
-            has_unshield: true,
-            public_inputs: public_inputs.clone(),
-            private_inputs: private_inputs.clone(),
-            signature,
-        };
-
-        Ok(UnshieldPlan {
-            call,
-            tree_number,
-            merkle_root: root,
-            inputs,
-            outputs,
-            chunks: vec![chunk],
-            broadcaster_fee_note,
-            unshield_note: unshield_note.clone(),
-            unshield_notes: vec![unshield_note],
-            change_note,
-            public_inputs,
-            private_inputs,
-            signature,
-        })
-    }
-
-    /// Build a private send plan.
-    #[allow(dead_code)]
-    async fn build_send(self, request: SendRequest, total: U256) -> Result<SendPlan, BuildError> {
-        let fee_amount = request.fee_amount();
-        if total < fee_amount {
-            return Err(BuildError::InsufficientBalance(total));
-        }
-        let spendable_after_fee = total - fee_amount;
-
-        if !request.spend_up_to && spendable_after_fee < request.amount {
-            return Err(BuildError::InsufficientBalance(total));
-        }
-        let send_amount = if request.spend_up_to {
-            spendable_after_fee.min(request.amount)
-        } else {
-            request.amount
-        };
-        if send_amount.is_zero() {
-            return Err(BuildError::InsufficientBalance(total));
-        }
-
-        let change = spendable_after_fee - send_amount;
-        let sender = self.viewing.address_data();
-
-        tracing::info!(
-            %send_amount,
-            %change,
-            len = self.inputs.len(),
-            "selected send utxos"
-        );
-
-        let SendOutputs {
-            outputs,
-            commitment_ciphertext,
-            broadcaster_fee_note,
-            recipient_note,
-            change_note,
-        } = build_send_outputs(
-            request.token_address,
-            send_amount,
-            change,
-            &sender,
-            &request.recipient,
-            request.broadcaster_fee,
-            &self.viewing.viewing_private_key,
-        )?;
-
-        self.validate_signature_limit(outputs.len())?;
-
-        let tree_number = self.tree_number();
-        let root = self.get_root()?;
-
-        let nullifiers = self.compute_nullifiers();
-        let commitments = Self::compute_commitments(&outputs);
-        let commitment_ciphertext: Vec<_> = commitment_ciphertext
-            .into_iter()
-            .map(NoteCiphertext::into_commitment_ciphertext)
-            .collect();
-
-        let bound_params = BoundParams::new_transact(
-            tree_number,
-            self.builder.chain_type,
-            self.builder.chain_id,
-            commitment_ciphertext,
-            Address::ZERO,
-            UNRELAYED_ADAPT_PARAMS,
-        )
-        .with_min_gas_price(request.min_gas_price)?;
-
-        let mut transaction = Transaction {
-            proof: SnarkProof::default(),
-            merkleRoot: FixedBytes::from(root.to_be_bytes::<32>()),
-            nullifiers,
-            commitments,
-            boundParams: bound_params,
-            unshieldPreimage: CommitmentPreimage::empty(),
-        };
-
-        let inputs = self.build_input_witnesses()?;
-        let public_inputs = PublicInputs::from_transaction(root, &transaction, &outputs);
-        let private_inputs = PrivateInputs::from_inputs(
-            request.token_address,
-            &inputs,
-            &outputs,
-            self.viewing,
-            self.signer,
-        );
-        let signature = public_inputs.signature(self.signer);
-
-        tracing::info!("proving private send");
-        let proof = self
-            .prover
-            .prove_unshield(
-                &public_inputs,
-                &private_inputs,
-                &signature,
-                request.verify_proof,
-            )
-            .await?;
-        transaction.proof = proof;
-
-        tracing::info!("building send transaction call");
-        let data = transactCall {
-            _transactions: vec![transaction],
-        }
-        .abi_encode();
-        let call = TransactionCall {
-            to: self.builder.railgun_contract,
-            data: data.into(),
-        };
-
-        let chunk = TransactionPlanChunk {
-            tree_number,
-            merkle_root: root,
-            inputs: inputs.clone(),
-            outputs: outputs.clone(),
-            has_unshield: false,
-            public_inputs: public_inputs.clone(),
-            private_inputs: private_inputs.clone(),
-            signature,
-        };
-
-        Ok(SendPlan {
-            call,
-            tree_number,
-            merkle_root: root,
-            inputs,
-            outputs,
-            chunks: vec![chunk],
-            broadcaster_fee_note,
-            recipient_note: recipient_note.clone(),
-            recipient_notes: vec![recipient_note],
-            change_note,
-            public_inputs,
-            private_inputs,
-            signature,
         })
     }
 
@@ -2522,7 +2520,7 @@ fn best_partial_selection_below_amount(
     amount: U256,
     base_output_count: usize,
 ) -> Option<UtxoSelection> {
-    if amount <= U256::from(1_u8) {
+    if amount <= uint!(1_U256) {
         return None;
     }
     let max_input_count = max_inputs_for_base_outputs(base_output_count);
@@ -2868,12 +2866,12 @@ mod tests {
 
     impl RailgunSpendSigner for MockSpendSigner {
         fn spending_public_key(&self) -> [U256; 2] {
-            [U256::from(11_u8), U256::from(12_u8)]
+            [uint!(11_U256), uint!(12_U256)]
         }
 
         fn sign_spend_message(&self, msg: U256) -> [U256; 3] {
             self.signed_msg.set(Some(msg));
-            [U256::from(1_u8), U256::from(2_u8), U256::from(3_u8)]
+            [uint!(1_U256), uint!(2_U256), uint!(3_U256)]
         }
     }
 
@@ -2940,12 +2938,12 @@ mod tests {
             outputs.push(Note::new_unshield(
                 Address::from([seed.saturating_add(1); 20]),
                 token,
-                U256::from(5_u8),
+                uint!(5_U256),
             ));
         }
 
         let public_inputs = PublicInputs {
-            merkle_root: U256::from(7_u8),
+            merkle_root: uint!(7_U256),
             bound_params_hash: U256::from(2_000_u64 + u64::from(seed)),
             nullifiers: (0..input_count)
                 .map(|index| U256::from(3_000_u64 + u64::from(seed) + index as u64))
@@ -2965,20 +2963,20 @@ mod tests {
                 .map(|input| U256::from(input.utxo.position))
                 .collect(),
             value_out: outputs.iter().map(|note| note.value).collect(),
-            public_key: [U256::from(11_u8), U256::from(12_u8)],
+            public_key: [uint!(11_U256), uint!(12_U256)],
             npk_out: outputs.iter().map(|note| note.npk).collect(),
-            nullifying_key: U256::from(13_u8),
+            nullifying_key: uint!(13_U256),
         };
 
         TransactionPlanChunk {
             tree_number: seed.into(),
-            merkle_root: U256::from(7_u8),
+            merkle_root: uint!(7_U256),
             inputs,
             outputs,
             has_unshield,
             public_inputs,
             private_inputs,
-            signature: [U256::from(1_u8), U256::from(2_u8), U256::from(3_u8)],
+            signature: [uint!(1_U256), uint!(2_U256), uint!(3_U256)],
         }
     }
 
@@ -2987,7 +2985,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, blinded_commitment)| PoiMerkleProof {
-                leaf: format!("0x{}", hex::encode(blinded_commitment)),
+                leaf: hex::encode_prefixed(blinded_commitment),
                 elements: (0..merkletree::tree::TREE_DEPTH)
                     .map(|level| format!("0x{:064x}", index + level + 1))
                     .collect(),
@@ -2999,15 +2997,32 @@ mod tests {
 
     fn sample_pre_tx_poi() -> PreTxPoi {
         PreTxPoi {
-            snark_proof: SnarkJsProof {
-                pi_a: [U256::ZERO, U256::ZERO],
-                pi_b: [[U256::ZERO, U256::ZERO], [U256::ZERO, U256::ZERO]],
-                pi_c: [U256::ZERO, U256::ZERO],
-            },
+            snark_proof: SnarkJsProof::zero(),
             txid_merkleroot: FixedBytes::ZERO,
             poi_merkleroots: vec![FixedBytes::ZERO],
             blinded_commitments_out: vec![FixedBytes::ZERO],
             railgun_txid_if_has_unshield: Bytes::copy_from_slice(&[0_u8]),
+        }
+    }
+
+    fn sample_post_txid_data(
+        chunk: &TransactionPlanChunk,
+        utxo_batch_global_start_position_out: U256,
+    ) -> PostTransactionPoiData {
+        let railgun_txid = compute_railgun_txid_from_public_inputs(&chunk.public_inputs);
+        let txid_leaf_hash = poseidon(vec![
+            railgun_txid,
+            U256::from(chunk.tree_number),
+            utxo_batch_global_start_position_out,
+        ]);
+
+        PostTransactionPoiData {
+            txid_leaf_hash: FixedBytes::from(txid_leaf_hash.to_be_bytes::<32>()),
+            txid_merkleroot: FixedBytes::from([0x77; 32]),
+            txid_merkleroot_index: 123,
+            txid_merkle_proof_indices: uint!(9_U256),
+            txid_merkle_proof_path_elements: vec![uint!(8_U256); merkletree::tree::TREE_DEPTH],
+            utxo_batch_global_start_position_out,
         }
     }
 
@@ -3127,12 +3142,118 @@ mod tests {
     }
 
     #[test]
+    fn post_transaction_poi_inputs_use_included_txid_leaf_and_global_output_positions() {
+        let chunk = sample_chunk(61, 2, 2, false);
+        let output_start = uint!(65_540_U256);
+        let txid_data = sample_post_txid_data(&chunk, output_start);
+
+        let chunk_inputs =
+            post_transaction_poi_inputs_from_chunk(&chunk, &txid_data).expect("chunk inputs");
+        let proof_inputs = chunk_inputs
+            .proof_inputs(&sample_poi_merkle_proofs(
+                &chunk_inputs.blinded_commitments_in,
+            ))
+            .expect("proof inputs");
+
+        assert_eq!(chunk_inputs.txid_leaf_hash, txid_data.txid_leaf_hash);
+        assert_eq!(chunk_inputs.txid_merkleroot, txid_data.txid_merkleroot);
+        assert_eq!(
+            proof_inputs.utxo_batch_global_start_position_out,
+            output_start
+        );
+        assert_eq!(
+            proof_inputs.railgun_txid_merkle_proof_indices,
+            uint!(9_U256)
+        );
+        assert_eq!(
+            proof_inputs.railgun_txid_merkle_proof_path_elements.len(),
+            16
+        );
+        for (index, blinded_commitment) in chunk_inputs.blinded_commitments_out.iter().enumerate() {
+            let expected = poseidon(vec![
+                chunk.public_inputs.commitments_out[index],
+                chunk.private_inputs.npk_out[index],
+                output_start + U256::from(index),
+            ]);
+            assert_eq!(
+                *blinded_commitment,
+                FixedBytes::from(expected.to_be_bytes::<32>())
+            );
+        }
+    }
+
+    #[test]
+    fn post_transaction_poi_from_public_signals_uses_canonical_public_outputs() {
+        let chunk = sample_chunk(62, 1, 1, false);
+        let txid_data = sample_post_txid_data(&chunk, uint!(123_456_U256));
+        let chunk_inputs =
+            post_transaction_poi_inputs_from_chunk(&chunk, &txid_data).expect("chunk inputs");
+        let proof_inputs = chunk_inputs
+            .proof_inputs(&sample_poi_merkle_proofs(
+                &chunk_inputs.blinded_commitments_in,
+            ))
+            .expect("proof inputs");
+        let variant = poi_circuit_variant(
+            chunk.public_inputs.nullifiers.len(),
+            chunk.public_inputs.commitments_out.len(),
+        );
+        let mut public_signals = vec![U256::ZERO; variant.max_outputs + 2 + variant.max_inputs];
+        public_signals[0] = U256::from_be_bytes(chunk_inputs.blinded_commitments_out[0].0);
+        public_signals[variant.max_outputs] = U256::from_be_bytes(txid_data.txid_merkleroot.0);
+        public_signals[variant.max_outputs + 1] = U256::ZERO;
+        public_signals[variant.max_outputs + 2] = proof_inputs.poi_merkleroots[0];
+        public_signals[variant.max_outputs + 3] = MERKLE_ZERO_VALUE;
+        public_signals[variant.max_outputs + 4] = MERKLE_ZERO_VALUE;
+
+        let poi = chunk_inputs
+            .post_tx_poi_from_public_signals(
+                sample_pre_tx_poi().snark_proof,
+                &proof_inputs,
+                &public_signals,
+                variant,
+            )
+            .expect("post tx poi");
+
+        assert_eq!(poi.txid_merkleroot, txid_data.txid_merkleroot);
+        assert_eq!(
+            poi.blinded_commitments_out,
+            chunk_inputs.blinded_commitments_out
+        );
+        assert_eq!(poi.poi_merkleroots.len(), 1);
+        assert_eq!(
+            poi.poi_merkleroots[0],
+            FixedBytes::from(proof_inputs.poi_merkleroots[0].to_be_bytes::<32>())
+        );
+        assert_eq!(
+            poi.railgun_txid_if_has_unshield,
+            Bytes::copy_from_slice(&[0_u8])
+        );
+
+        public_signals[variant.max_outputs + 3] = U256::ZERO;
+        let err = chunk_inputs
+            .post_tx_poi_from_public_signals(
+                sample_pre_tx_poi().snark_proof,
+                &proof_inputs,
+                &public_signals,
+                variant,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            PreTransactionPoiError::PublicSignalMismatch {
+                field: "poiMerkleroots",
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn public_inputs_signature_uses_spend_signer_boundary() {
         let public_inputs = PublicInputs {
-            merkle_root: U256::from(1_u8),
-            bound_params_hash: U256::from(2_u8),
-            nullifiers: vec![U256::from(3_u8)],
-            commitments_out: vec![U256::from(4_u8)],
+            merkle_root: uint!(1_U256),
+            bound_params_hash: uint!(2_U256),
+            nullifiers: vec![uint!(3_U256)],
+            commitments_out: vec![uint!(4_U256)],
         };
         let signer = MockSpendSigner {
             signed_msg: Cell::new(None),
@@ -3140,10 +3261,7 @@ mod tests {
 
         let signature = public_inputs.signature(&signer);
 
-        assert_eq!(
-            signature,
-            [U256::from(1_u8), U256::from(2_u8), U256::from(3_u8)]
-        );
+        assert_eq!(signature, [uint!(1_U256), uint!(2_U256), uint!(3_U256)]);
         assert_eq!(
             signer.signed_msg.get(),
             Some(poseidon(public_inputs.signature_message()))
@@ -3174,9 +3292,9 @@ mod tests {
             test_utxo(token, 5, 0, 3),
         ];
 
-        let (selected, total) = select_utxos(&utxos, token, U256::from(35_u8), false, 1).unwrap();
+        let (selected, total) = select_utxos(&utxos, token, uint!(35_U256), false, 1).unwrap();
 
-        assert_eq!(total, U256::from(40_u8));
+        assert_eq!(total, uint!(40_U256));
         assert_eq!(selected_positions(&selected), vec![1]);
     }
 
@@ -3190,9 +3308,9 @@ mod tests {
             test_utxo(token, 5, 0, 4),
         ];
 
-        let (selected, total) = select_utxos(&utxos, token, U256::from(16_u8), false, 1).unwrap();
+        let (selected, total) = select_utxos(&utxos, token, uint!(16_U256), false, 1).unwrap();
 
-        assert_eq!(total, U256::from(16_u8));
+        assert_eq!(total, uint!(16_U256));
         assert_eq!(selected_positions(&selected), vec![2, 3]);
     }
 
@@ -3205,9 +3323,9 @@ mod tests {
             test_utxo(token, 6, 0, 3),
         ];
 
-        let (selected, total) = select_utxos(&utxos, token, U256::from(12_u8), false, 1).unwrap();
+        let (selected, total) = select_utxos(&utxos, token, uint!(12_U256), false, 1).unwrap();
 
-        assert_eq!(total, U256::from(13_u8));
+        assert_eq!(total, uint!(13_U256));
         assert_eq!(selected_positions(&selected), vec![2, 3]);
     }
 
@@ -3218,10 +3336,10 @@ mod tests {
             .map(|position| test_utxo(token, 2, 0, position))
             .collect::<Vec<_>>();
 
-        let (selected, total) = select_utxos(&utxos, token, U256::from(23_u8), false, 1).unwrap();
+        let (selected, total) = select_utxos(&utxos, token, uint!(23_U256), false, 1).unwrap();
 
         assert_eq!(selected.len(), 12);
-        assert_eq!(total, U256::from(24_u8));
+        assert_eq!(total, uint!(24_U256));
     }
 
     #[test]
@@ -3231,10 +3349,10 @@ mod tests {
             .map(|position| test_utxo(token, 2, 0, position))
             .collect::<Vec<_>>();
 
-        let (selected, total) = select_utxos(&utxos, token, U256::from(26_u8), false, 1).unwrap();
+        let (selected, total) = select_utxos(&utxos, token, uint!(26_U256), false, 1).unwrap();
 
         assert_eq!(selected.len(), 13);
-        assert_eq!(total, U256::from(26_u8));
+        assert_eq!(total, uint!(26_U256));
     }
 
     #[test]
@@ -3245,7 +3363,7 @@ mod tests {
             .collect::<Vec<_>>();
         utxos.extend((0..5).map(|position| test_utxo(token, 3, 1, position)));
 
-        assert_eq!(max_unshield_spendable(&utxos, token), U256::from(35_u8));
+        assert_eq!(max_unshield_spendable(&utxos, token), uint!(35_U256));
     }
 
     #[test]
@@ -3255,9 +3373,9 @@ mod tests {
             .map(|position| test_utxo(token, 1, 0, position))
             .collect::<Vec<_>>();
 
-        let error = select_utxos(&utxos, token, U256::from(14_u8), false, 1).unwrap_err();
+        let error = select_utxos(&utxos, token, uint!(14_U256), false, 1).unwrap_err();
 
-        assert!(matches!(error, BuildError::InsufficientBalance(max) if max == U256::from(13_u8)));
+        assert!(matches!(error, BuildError::InsufficientBalance(max) if max == uint!(13_U256)));
     }
 
     #[test]
@@ -3269,8 +3387,8 @@ mod tests {
 
         let outputs = build_send_outputs(
             token,
-            U256::from(7_u8),
-            U256::from(3_u8),
+            uint!(7_U256),
+            uint!(3_U256),
             &sender,
             &recipient,
             None,
@@ -3279,7 +3397,7 @@ mod tests {
         .expect("send outputs");
 
         assert_eq!(outputs.outputs.len(), 2);
-        assert_eq!(outputs.recipient_note.value, U256::from(7_u8));
+        assert_eq!(outputs.recipient_note.value, uint!(7_U256));
         assert_eq!(
             outputs.recipient_note.npk,
             crate::notes::note_public_key(
@@ -3288,7 +3406,7 @@ mod tests {
             )
         );
         let change_note = outputs.change_note.expect("change note");
-        assert_eq!(change_note.value, U256::from(3_u8));
+        assert_eq!(change_note.value, uint!(3_U256));
         assert_eq!(
             change_note.npk,
             crate::notes::note_public_key(sender.master_public_key, change_note.random)
@@ -3304,7 +3422,7 @@ mod tests {
 
         let outputs = build_send_outputs(
             token,
-            U256::from(7_u8),
+            uint!(7_U256),
             U256::ZERO,
             &sender,
             &recipient,
@@ -3327,13 +3445,13 @@ mod tests {
 
         let outputs = build_send_outputs(
             token,
-            U256::from(7_u8),
-            U256::from(3_u8),
+            uint!(7_U256),
+            uint!(3_U256),
             &sender,
             &recipient,
             Some(BroadcasterFeeOutput {
                 recipient: broadcaster,
-                amount: U256::from(2_u8),
+                amount: uint!(2_U256),
             }),
             &sender_viewing.viewing_private_key,
         )
@@ -3341,14 +3459,14 @@ mod tests {
 
         assert_eq!(outputs.outputs.len(), 3);
         let fee_note = outputs.broadcaster_fee_note.expect("fee note");
-        assert_eq!(outputs.outputs[0].value, U256::from(2_u8));
-        assert_eq!(fee_note.value, U256::from(2_u8));
+        assert_eq!(outputs.outputs[0].value, uint!(2_U256));
+        assert_eq!(fee_note.value, uint!(2_U256));
         assert_eq!(
             outputs.outputs[0].npk,
             crate::notes::note_public_key(broadcaster.master_public_key, outputs.outputs[0].random)
         );
-        assert_eq!(outputs.outputs[1].value, U256::from(7_u8));
-        assert_eq!(outputs.outputs[2].value, U256::from(3_u8));
+        assert_eq!(outputs.outputs[1].value, uint!(7_U256));
+        assert_eq!(outputs.outputs[2].value, uint!(3_U256));
     }
 
     #[test]
@@ -3361,13 +3479,13 @@ mod tests {
 
         let outputs = build_unshield_outputs(
             token,
-            U256::from(7_u8),
+            uint!(7_U256),
             unshield_to,
-            U256::from(3_u8),
+            uint!(3_U256),
             &receiver,
             Some(BroadcasterFeeOutput {
                 recipient: broadcaster,
-                amount: U256::from(2_u8),
+                amount: uint!(2_U256),
             }),
             &receiver_viewing.viewing_private_key,
         )
@@ -3376,10 +3494,10 @@ mod tests {
         assert_eq!(outputs.outputs.len(), 3);
         assert_eq!(outputs.commitment_ciphertext.len(), 2);
         let fee_note = outputs.broadcaster_fee_note.expect("fee note");
-        assert_eq!(outputs.outputs[0].value, U256::from(2_u8));
-        assert_eq!(fee_note.value, U256::from(2_u8));
-        assert_eq!(outputs.outputs[1].value, U256::from(3_u8));
-        assert_eq!(outputs.outputs[2].value, U256::from(7_u8));
+        assert_eq!(outputs.outputs[0].value, uint!(2_U256));
+        assert_eq!(fee_note.value, uint!(2_U256));
+        assert_eq!(outputs.outputs[1].value, uint!(3_U256));
+        assert_eq!(outputs.outputs[2].value, uint!(7_U256));
         assert_eq!(
             outputs.unshield_note.npk,
             U256::from_be_slice(unshield_to.as_slice())
@@ -3395,9 +3513,9 @@ mod tests {
             test_utxo(token, 5, 0, 3),
         ];
 
-        let (selected, total) = select_utxos(&utxos, token, U256::from(35_u8), false, 1).unwrap();
+        let (selected, total) = select_utxos(&utxos, token, uint!(35_U256), false, 1).unwrap();
 
-        assert_eq!(total, U256::from(40_u8));
+        assert_eq!(total, uint!(40_U256));
         assert_eq!(selected_positions(&selected), vec![1]);
     }
 
@@ -3408,10 +3526,10 @@ mod tests {
             .map(|position| test_utxo(token, 2, 0, position))
             .collect::<Vec<_>>();
 
-        let info = send_selection_info(&utxos, token, U256::from(23_u8), false).unwrap();
+        let info = send_selection_info(&utxos, token, uint!(23_U256), false).unwrap();
 
         assert_eq!(info.input_count, 12);
-        assert_eq!(info.total, U256::from(24_u8));
+        assert_eq!(info.total, uint!(24_U256));
     }
 
     #[test]
@@ -3421,10 +3539,10 @@ mod tests {
             .map(|position| test_utxo(token, 2, 0, position))
             .collect::<Vec<_>>();
 
-        let info = send_selection_info(&utxos, token, U256::from(26_u8), false).unwrap();
+        let info = send_selection_info(&utxos, token, uint!(26_U256), false).unwrap();
 
         assert_eq!(info.input_count, 13);
-        assert_eq!(info.total, U256::from(26_u8));
+        assert_eq!(info.total, uint!(26_U256));
     }
 
     #[test]
@@ -3437,18 +3555,18 @@ mod tests {
         let info = send_selection_info_with_broadcaster_fee(
             &utxos,
             token,
-            U256::from(23_u8),
-            U256::from(3_u8),
+            uint!(23_U256),
+            uint!(3_U256),
             false,
         )
         .unwrap();
 
-        assert_eq!(info.total, U256::from(26_u8));
+        assert_eq!(info.total, uint!(26_U256));
         assert_eq!(info.input_count, 13);
         assert_eq!(info.transaction_count, 2);
         assert_eq!(info.private_output_count, 3);
         assert_eq!(info.public_output_count, 0);
-        assert_eq!(info.max_spendable, U256::from(23_u8));
+        assert_eq!(info.max_spendable, uint!(23_U256));
     }
 
     #[test]
@@ -3459,9 +3577,9 @@ mod tests {
             .collect::<Vec<_>>();
         utxos.push(test_utxo(token, 1, 1, 0));
 
-        let info = send_selection_info(&utxos, token, U256::from(25_u8), false).unwrap();
+        let info = send_selection_info(&utxos, token, uint!(25_U256), false).unwrap();
 
-        assert_eq!(info.total, U256::from(25_u8));
+        assert_eq!(info.total, uint!(25_U256));
         assert_eq!(info.input_count, 13);
         assert_eq!(info.transaction_count, 2);
         assert_eq!(info.private_output_count, 2);
@@ -3476,7 +3594,7 @@ mod tests {
             .collect::<Vec<_>>();
         utxos.extend((0..5).map(|position| test_utxo(token, 3, 1, position)));
 
-        assert_eq!(max_send_spendable(&utxos, token), U256::from(35_u8));
+        assert_eq!(max_send_spendable(&utxos, token), uint!(35_U256));
     }
 
     #[test]
@@ -3486,8 +3604,8 @@ mod tests {
             .flat_map(|tree| (0..13).map(move |position| test_utxo(token, 1, tree, position)))
             .collect::<Vec<_>>();
 
-        let error = send_selection_info(&utxos, token, U256::from(105_u8), false).unwrap_err();
+        let error = send_selection_info(&utxos, token, uint!(105_U256), false).unwrap_err();
 
-        assert!(matches!(error, BuildError::InsufficientBalance(max) if max == U256::from(104_u8)));
+        assert!(matches!(error, BuildError::InsufficientBalance(max) if max == uint!(104_U256)));
     }
 }

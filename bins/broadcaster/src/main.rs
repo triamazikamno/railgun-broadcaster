@@ -125,7 +125,11 @@ async fn main() -> Result<()> {
     if let Some(path) = cfg.artifacts_cache_dir.clone() {
         artifact_source = artifact_source.with_cache_dir(path);
     }
-    let prover = Arc::new(ProverService::new_with_db(artifact_source, db.clone()));
+    let prover = Arc::new(ProverService::new_with_db(
+        artifact_source.clone(),
+        db.clone(),
+    ));
+    let poi_recovery_prover = Arc::new(ProverService::new_with_db(artifact_source, db.clone()));
 
     let waku_client = Arc::new(Client::new(&cfg.waku).wrap_err("create waku relay client")?);
     let snark_prover = Arc::new(Prover::new().await.wrap_err("create snark prover")?);
@@ -149,6 +153,7 @@ async fn main() -> Result<()> {
             cfg.required_poi_list.clone(),
             sync_manager.clone(),
             prover.clone(),
+            poi_recovery_prover.clone(),
             cfg.query_rpc_cooldown.into_inner(),
         )
         .instrument(tracing::info_span!("service", chain_id))

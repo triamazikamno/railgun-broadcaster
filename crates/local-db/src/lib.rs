@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use alloy::hex;
 use alloy::primitives::{FixedBytes, U256};
 use broadcaster_core::transact::{FeeNoteAssuranceContext, PreTxPoi};
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, Table, TableDefinition};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -23,6 +23,8 @@ const TERMINAL_FEE_NOTE_ASSURANCE_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("fee_note_assurance_terminal");
 const PENDING_OUTPUT_POI_CONTEXT_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("pending_output_poi_context");
+const OUTPUT_POI_RECOVERY_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("output_poi_recovery");
 const DESKTOP_WALLET_VAULT_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("desktop_wallet_vault_v1");
 
@@ -30,7 +32,7 @@ const META_KEY: &str = "meta";
 const RAILGUN_DIR: &str = "railgun";
 const BLOBS_DIR: &str = "blobs";
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 6;
+pub const CURRENT_SCHEMA_VERSION: u32 = 7;
 
 #[derive(Debug, Clone)]
 pub struct DbConfig {
@@ -175,6 +177,7 @@ pub struct PendingOutputPoiContextRecord {
     pub output_npk: FixedBytes<32>,
     pub utxo_tree_in: u64,
     pub railgun_txid: U256,
+    pub txid_merkleroot_index: Option<u64>,
     pub pre_transaction_pois_per_txid_leaf_per_list:
         BTreeMap<FixedBytes<32>, BTreeMap<FixedBytes<32>, PreTxPoi>>,
     pub required_poi_list_keys: Vec<FixedBytes<32>>,
@@ -184,6 +187,40 @@ pub struct PendingOutputPoiContextRecord {
     pub observation: Option<PendingOutputPoiObservation>,
     pub submitted_poi_list_keys: Vec<FixedBytes<32>>,
     pub terminal_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OutputPoiRecoveryStatus {
+    Recoverable,
+    Submitted,
+    Valid,
+    NotSelfOriginated,
+    UnsupportedShape,
+    MissingWalletInputs,
+    MissingWalletOutputs,
+    InputPoiNotValid,
+    MissingMerkleProof,
+    TxFetchFailed,
+    DecodeFailed,
+    ProofGenerationFailed,
+    SubmitFailed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutputPoiRecoveryRecord {
+    pub chain_id: u64,
+    pub wallet_id: String,
+    pub output_commitment: FixedBytes<32>,
+    pub source_tx_hash: FixedBytes<32>,
+    pub tx_input: Option<Vec<u8>>,
+    pub status: OutputPoiRecoveryStatus,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub last_detection_at: Option<u64>,
+    pub last_submission_at: Option<u64>,
+    pub next_retry_at: Option<u64>,
+    pub attempt_count: u32,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -295,6 +332,25 @@ impl DbStore {
         format!("{BLOBS_DIR}/{kind}/{name}")
     }
 
+    fn list_decoded_by_prefix<T>(
+        &self,
+        table_def: TableDefinition<'static, &str, &[u8]>,
+        prefix: &str,
+    ) -> Result<Vec<T>, DbError>
+    where
+        T: DeserializeOwned,
+    {
+        let range_end = format!("{prefix}~");
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(table_def)?;
+        let mut out = Vec::new();
+        for entry in table.range(prefix..range_end.as_str())? {
+            let (_, value) = entry?;
+            out.push(decode(value.value())?);
+        }
+        Ok(out)
+    }
+
     pub fn get_blob_meta(&self, kind: &str, id: &str) -> Result<Option<BlobMeta>, DbError> {
         let key = blob_index_key(kind, id);
         let txn = self.db.begin_read()?;
@@ -397,17 +453,10 @@ impl DbStore {
 
     pub fn clear_wallet_utxos(&self, wallet_id: &str) -> Result<(), DbError> {
         let prefix = wallet_utxo_prefix(wallet_id);
-        let range_end = format!("{prefix}~");
         let txn = self.db.begin_write()?;
         {
             let mut table = txn.open_table(WALLET_UTXO_TABLE)?;
-            let keys: Vec<String> = table
-                .range(prefix.as_str()..range_end.as_str())?
-                .map(|entry| entry.map(|(key, _)| key.value().to_string()))
-                .collect::<Result<_, _>>()?;
-            for key in keys {
-                table.remove(key.as_str())?;
-            }
+            remove_table_prefix(&mut table, &prefix)?;
         }
         txn.commit()?;
         Ok(())
@@ -423,17 +472,10 @@ impl DbStore {
         meta: Option<&WalletMeta>,
     ) -> Result<(), DbError> {
         let prefix = wallet_utxo_prefix(wallet_id);
-        let range_end = format!("{prefix}~");
         let txn = self.db.begin_write()?;
         {
             let mut utxo_table = txn.open_table(WALLET_UTXO_TABLE)?;
-            let keys: Vec<String> = utxo_table
-                .range(prefix.as_str()..range_end.as_str())?
-                .map(|entry| entry.map(|(key, _)| key.value().to_string()))
-                .collect::<Result<_, _>>()?;
-            for key in keys {
-                utxo_table.remove(key.as_str())?;
-            }
+            remove_table_prefix(&mut utxo_table, &prefix)?;
             for (utxo_id, payload) in utxos {
                 let key = wallet_utxo_key(wallet_id, utxo_id);
                 utxo_table.insert(key.as_str(), payload.as_slice())?;
@@ -535,15 +577,7 @@ impl DbStore {
         chain_id: u64,
     ) -> Result<Vec<PendingFeeNoteAssuranceRecord>, DbError> {
         let prefix = fee_note_assurance_prefix(chain_id);
-        let range_end = format!("{prefix}~");
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(PENDING_FEE_NOTE_ASSURANCE_TABLE)?;
-        let mut out = Vec::new();
-        for entry in table.range(prefix.as_str()..range_end.as_str())? {
-            let (_, value) = entry?;
-            out.push(decode(value.value())?);
-        }
-        Ok(out)
+        self.list_decoded_by_prefix(PENDING_FEE_NOTE_ASSURANCE_TABLE, &prefix)
     }
 
     pub fn get_terminal_fee_note_assurance(
@@ -565,15 +599,7 @@ impl DbStore {
         chain_id: u64,
     ) -> Result<Vec<TerminalFeeNoteAssuranceRecord>, DbError> {
         let prefix = fee_note_assurance_prefix(chain_id);
-        let range_end = format!("{prefix}~");
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(TERMINAL_FEE_NOTE_ASSURANCE_TABLE)?;
-        let mut out = Vec::new();
-        for entry in table.range(prefix.as_str()..range_end.as_str())? {
-            let (_, value) = entry?;
-            out.push(decode(value.value())?);
-        }
-        Ok(out)
+        self.list_decoded_by_prefix(TERMINAL_FEE_NOTE_ASSURANCE_TABLE, &prefix)
     }
 
     pub fn mark_fee_note_assurance_terminal(
@@ -630,20 +656,67 @@ impl DbStore {
         Ok(())
     }
 
+    pub fn delete_pending_output_poi_context(
+        &self,
+        chain_id: u64,
+        output_commitment: &FixedBytes<32>,
+    ) -> Result<(), DbError> {
+        let key = pending_output_poi_context_key(chain_id, output_commitment);
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(PENDING_OUTPUT_POI_CONTEXT_TABLE)?;
+            table.remove(key.as_str())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     pub fn list_pending_output_poi_contexts(
         &self,
         chain_id: u64,
     ) -> Result<Vec<PendingOutputPoiContextRecord>, DbError> {
         let prefix = pending_output_poi_context_prefix(chain_id);
-        let range_end = format!("{prefix}~");
+        self.list_decoded_by_prefix(PENDING_OUTPUT_POI_CONTEXT_TABLE, &prefix)
+    }
+
+    pub fn get_output_poi_recovery(
+        &self,
+        chain_id: u64,
+        wallet_id: &str,
+        output_commitment: &FixedBytes<32>,
+    ) -> Result<Option<OutputPoiRecoveryRecord>, DbError> {
+        let key = output_poi_recovery_key(chain_id, wallet_id, output_commitment);
         let txn = self.db.begin_read()?;
-        let table = txn.open_table(PENDING_OUTPUT_POI_CONTEXT_TABLE)?;
-        let mut out = Vec::new();
-        for entry in table.range(prefix.as_str()..range_end.as_str())? {
-            let (_, value) = entry?;
-            out.push(decode(value.value())?);
+        let table = txn.open_table(OUTPUT_POI_RECOVERY_TABLE)?;
+        match table.get(key.as_str())? {
+            Some(value) => Ok(Some(decode(value.value())?)),
+            None => Ok(None),
         }
-        Ok(out)
+    }
+
+    pub fn put_output_poi_recovery(&self, record: &OutputPoiRecoveryRecord) -> Result<(), DbError> {
+        let key = output_poi_recovery_key(
+            record.chain_id,
+            &record.wallet_id,
+            &record.output_commitment,
+        );
+        let data = encode(record)?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(OUTPUT_POI_RECOVERY_TABLE)?;
+            table.insert(key.as_str(), data.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn list_output_poi_recoveries(
+        &self,
+        chain_id: u64,
+        wallet_id: &str,
+    ) -> Result<Vec<OutputPoiRecoveryRecord>, DbError> {
+        let prefix = output_poi_recovery_prefix(chain_id, wallet_id);
+        self.list_decoded_by_prefix(OUTPUT_POI_RECOVERY_TABLE, &prefix)
     }
 
     pub fn get_desktop_wallet_vault_record(&self, key: &str) -> Result<Option<Vec<u8>>, DbError> {
@@ -718,17 +791,10 @@ impl DbStore {
         prefix: &str,
         records: &[(String, Vec<u8>)],
     ) -> Result<(), DbError> {
-        let range_end = format!("{prefix}~");
         let txn = self.db.begin_write()?;
         {
             let mut table = txn.open_table(DESKTOP_WALLET_VAULT_TABLE)?;
-            let keys: Vec<String> = table
-                .range(prefix..range_end.as_str())?
-                .map(|entry| entry.map(|(key, _)| key.value().to_string()))
-                .collect::<Result<_, _>>()?;
-            for key in keys {
-                table.remove(key.as_str())?;
-            }
+            remove_table_prefix(&mut table, prefix)?;
             for (key, payload) in records {
                 table.insert(key.as_str(), payload.as_slice())?;
             }
@@ -766,6 +832,7 @@ impl DbStore {
         txn.open_table(PENDING_FEE_NOTE_ASSURANCE_TABLE)?;
         txn.open_table(TERMINAL_FEE_NOTE_ASSURANCE_TABLE)?;
         txn.open_table(PENDING_OUTPUT_POI_CONTEXT_TABLE)?;
+        txn.open_table(OUTPUT_POI_RECOVERY_TABLE)?;
         txn.open_table(DESKTOP_WALLET_VAULT_TABLE)?;
         txn.commit()?;
         Ok(())
@@ -855,6 +922,12 @@ fn decode<T: DeserializeOwned>(data: &[u8]) -> Result<T, DbError> {
     Ok(rmp_serde::from_slice(data)?)
 }
 
+fn remove_table_prefix(table: &mut Table<'_, &str, &[u8]>, prefix: &str) -> Result<(), DbError> {
+    let range_end = format!("{prefix}~");
+    table.retain_in(prefix..range_end.as_str(), |_, _| false)?;
+    Ok(())
+}
+
 fn blob_index_key(kind: &str, id: &str) -> String {
     format!("{kind}|{id}")
 }
@@ -887,13 +960,27 @@ fn pending_output_poi_context_prefix(chain_id: u64) -> String {
     format!("{chain_id}|")
 }
 
+fn output_poi_recovery_key(
+    chain_id: u64,
+    wallet_id: &str,
+    output_commitment: &FixedBytes<32>,
+) -> String {
+    format!("{chain_id}|{wallet_id}|{}", hex::encode(output_commitment))
+}
+
+fn output_poi_recovery_prefix(chain_id: u64, wallet_id: &str) -> String {
+    format!("{chain_id}|{wallet_id}|")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CURRENT_SCHEMA_VERSION, DbConfig, DbStore, Meta, PendingFeeNoteAssuranceRecord,
-        PendingOutputPoiContextRecord, PendingOutputPoiRole, WalletMeta, fee_note_assurance_key,
+        CURRENT_SCHEMA_VERSION, DbConfig, DbStore, Meta, OutputPoiRecoveryRecord,
+        OutputPoiRecoveryStatus, PendingFeeNoteAssuranceRecord, PendingOutputPoiContextRecord,
+        PendingOutputPoiRole, WalletMeta, fee_note_assurance_key,
     };
     use alloy::primitives::{Bytes, FixedBytes, U256};
+    use alloy::uint;
     use broadcaster_core::transact::{FeeNoteAssuranceContext, PreTxPoi, SnarkJsProof};
     use std::collections::BTreeMap;
     use std::fs;
@@ -924,7 +1011,7 @@ mod tests {
             context: FeeNoteAssuranceContext {
                 chain_type: 0,
                 txid_version: "V3_PoseidonMerkle".to_string(),
-                railgun_txid: U256::from(5_u8),
+                railgun_txid: uint!(5_U256),
                 utxo_tree_in: 9,
                 fee_commitment: FixedBytes::from([1u8; 32]),
                 fee_note_npk: FixedBytes::from([2u8; 32]),
@@ -964,7 +1051,8 @@ mod tests {
             output_commitment,
             output_npk: FixedBytes::from([0x66; 32]),
             utxo_tree_in: 9,
-            railgun_txid: U256::from(7_u8),
+            railgun_txid: uint!(7_U256),
+            txid_merkleroot_index: None,
             pre_transaction_pois_per_txid_leaf_per_list: BTreeMap::from([(list_key, {
                 BTreeMap::from([(txid_leaf, sample_pre_tx_poi(0x10))])
             })]),
@@ -1138,6 +1226,74 @@ mod tests {
                 .expect("list other chain pending output POI contexts")
                 .is_empty()
         );
+        store
+            .delete_pending_output_poi_context(record.chain_id, &record.output_commitment)
+            .expect("delete pending output POI context");
+        assert!(
+            store
+                .get_pending_output_poi_context(record.chain_id, &record.output_commitment)
+                .expect("load deleted pending output POI context")
+                .is_none()
+        );
+
+        drop(store);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn output_poi_recovery_roundtrip_and_wallet_listing() {
+        let root_dir = temp_db_root();
+        let store = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db");
+
+        let record = OutputPoiRecoveryRecord {
+            chain_id: 1,
+            wallet_id: "wallet-a".to_string(),
+            output_commitment: FixedBytes::from([0x44; 32]),
+            source_tx_hash: FixedBytes::from([0x55; 32]),
+            tx_input: Some(vec![1, 2, 3]),
+            status: OutputPoiRecoveryStatus::NotSelfOriginated,
+            created_at: 10,
+            updated_at: 20,
+            last_detection_at: Some(20),
+            last_submission_at: None,
+            next_retry_at: None,
+            attempt_count: 1,
+            last_error: Some("external sender".to_string()),
+        };
+        let other_wallet = OutputPoiRecoveryRecord {
+            wallet_id: "wallet-b".to_string(),
+            output_commitment: FixedBytes::from([0x66; 32]),
+            ..record.clone()
+        };
+
+        store
+            .put_output_poi_recovery(&record)
+            .expect("store recovery record");
+        store
+            .put_output_poi_recovery(&other_wallet)
+            .expect("store other wallet recovery record");
+
+        let loaded = store
+            .get_output_poi_recovery(
+                record.chain_id,
+                &record.wallet_id,
+                &record.output_commitment,
+            )
+            .expect("load recovery record")
+            .expect("record present");
+        assert_eq!(loaded.status, OutputPoiRecoveryStatus::NotSelfOriginated);
+        assert_eq!(loaded.source_tx_hash, record.source_tx_hash);
+        assert_eq!(loaded.tx_input, record.tx_input);
+        assert_eq!(loaded.last_error, record.last_error);
+
+        let records = store
+            .list_output_poi_recoveries(record.chain_id, &record.wallet_id)
+            .expect("list wallet recovery records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].output_commitment, record.output_commitment);
 
         drop(store);
         fs::remove_dir_all(root_dir).expect("remove temp db dir");

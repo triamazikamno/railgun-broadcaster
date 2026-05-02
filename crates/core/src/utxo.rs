@@ -1,4 +1,5 @@
-use alloy::primitives::{FixedBytes, U256};
+use alloy::primitives::{Address, FixedBytes, U256};
+use alloy::uint;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -6,6 +7,7 @@ use crate::crypto::poseidon::poseidon;
 use crate::notes::Note;
 
 pub const TREE_LEAF_COUNT: u64 = 65_536;
+const TREE_LEAF_COUNT_U256: U256 = uint!(65_536_U256);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UtxoSource {
@@ -45,6 +47,12 @@ impl Utxo {
     #[must_use]
     pub fn nullifier(&self, nullifying_key: U256) -> U256 {
         poseidon(vec![nullifying_key, U256::from(self.position)])
+    }
+
+    #[must_use]
+    pub fn token_address(&self) -> Address {
+        let token_bytes = self.note.token_hash.to_be_bytes::<32>();
+        Address::from_slice(&token_bytes[12..32])
     }
 }
 
@@ -111,8 +119,7 @@ pub fn derive_blinded_commitment(
     tree: u32,
     position: u64,
 ) -> FixedBytes<32> {
-    let global_tree_position =
-        U256::from(tree) * U256::from(TREE_LEAF_COUNT) + U256::from(position);
+    let global_tree_position = U256::from(tree) * TREE_LEAF_COUNT_U256 + U256::from(position);
     poseidon(vec![commitment.into(), npk.into(), global_tree_position]).into()
 }
 
@@ -136,7 +143,7 @@ impl WalletUtxo {
 
 #[cfg(test)]
 mod tests {
-    use super::{TREE_LEAF_COUNT, derive_blinded_commitment};
+    use super::{TREE_LEAF_COUNT_U256, derive_blinded_commitment};
     use crate::crypto::poseidon::poseidon;
     use alloy::primitives::{FixedBytes, U256};
 
@@ -148,7 +155,7 @@ mod tests {
         let position = 7;
 
         let expected_global_position =
-            U256::from(tree) * U256::from(TREE_LEAF_COUNT) + U256::from(position);
+            U256::from(tree) * TREE_LEAF_COUNT_U256 + U256::from(position);
         let expected: FixedBytes<32> = poseidon(vec![
             commitment.into(),
             npk.into(),

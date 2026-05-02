@@ -12,6 +12,7 @@ use std::sync::LazyLock;
 
 use alloy::primitives::{Address, address};
 use ruint::aliases::U256;
+use ruint::uint;
 
 static TOKEN_ICON_DIR: LazyLock<PathBuf> =
     LazyLock::new(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/tokens"));
@@ -101,7 +102,7 @@ pub fn token_icon_path(chain_id: u64, addr: &Address) -> Option<PathBuf> {
 }
 
 fn pow10(exp: u8) -> U256 {
-    U256::from(10u8).pow(U256::from(exp))
+    uint!(10_U256).pow(U256::from(exp))
 }
 
 fn format_scaled_amount(amount: U256, decimals: u8) -> String {
@@ -127,13 +128,13 @@ fn display_precision(amount: U256, decimals: u8) -> u8 {
     }
 
     let scale = pow10(decimals);
-    let precision = if amount >= scale * U256::from(100u8) {
+    let precision = if amount >= scale * uint!(100_U256) {
         0
     } else if amount >= scale {
         2
     } else {
         let tenth = pow10(decimals - 1);
-        if amount >= U256::from(5u8) * tenth {
+        if amount >= uint!(5_U256) * tenth {
             4
         } else if amount >= tenth {
             5
@@ -155,8 +156,8 @@ fn format_token_amount_with_precision(amount: U256, decimals: u8, precision: u8)
     let rounding_divisor = pow10(decimals - precision);
     let mut rounded = amount / rounding_divisor;
     let remainder = amount % rounding_divisor;
-    if remainder >= rounding_divisor / U256::from(2u8) {
-        rounded += U256::from(1u8);
+    if remainder >= rounding_divisor / uint!(2_U256) {
+        rounded += uint!(1_U256);
     }
 
     format_scaled_amount(rounded, precision)
@@ -197,60 +198,57 @@ mod tests {
 
     #[test]
     fn format_handles_zero_decimals() {
-        assert_eq!(format_token_amount(U256::from(123u64), 0), "123");
+        assert_eq!(format_token_amount(uint!(123_U256), 0), "123");
     }
 
     #[test]
     fn format_inclusive_thresholds_pick_expected_precision() {
-        assert_eq!(display_precision(U256::from(100_000_000u64), 6), 0);
-        assert_eq!(display_precision(U256::from(1_000_000u64), 6), 2);
-        assert_eq!(display_precision(U256::from(500_000u64), 6), 4);
-        assert_eq!(display_precision(U256::from(100_000u64), 6), 5);
-        assert_eq!(display_precision(U256::from(99_999u64), 6), 6);
-        assert_eq!(display_precision(U256::from(99_999_999u64), 6), 2);
+        assert_eq!(display_precision(uint!(100_000_000_U256), 6), 0);
+        assert_eq!(display_precision(uint!(1_000_000_U256), 6), 2);
+        assert_eq!(display_precision(uint!(500_000_U256), 6), 4);
+        assert_eq!(display_precision(uint!(100_000_U256), 6), 5);
+        assert_eq!(display_precision(uint!(99_999_U256), 6), 6);
+        assert_eq!(display_precision(uint!(99_999_999_U256), 6), 2);
     }
 
     #[test]
     fn format_trims_trailing_zeros_after_rounding() {
-        assert_eq!(format_token_amount(U256::from(1_000_000u64), 6), "1");
-        assert_eq!(format_token_amount(U256::from(1_500_000u64), 6), "1.5");
+        assert_eq!(format_token_amount(uint!(1_000_000_U256), 6), "1");
+        assert_eq!(format_token_amount(uint!(1_500_000_U256), 6), "1.5");
     }
 
     #[test]
     fn format_rounds_large_values_to_whole_numbers() {
         assert_eq!(
-            format_token_amount(U256::from(19_232_527_572_893u64), 9),
+            format_token_amount(uint!(19_232_527_572_893_U256), 9),
             "19233"
         );
     }
 
     #[test]
     fn format_uses_two_decimals_between_one_and_hundred() {
-        assert_eq!(format_token_amount(U256::from(12_345_600u64), 6), "12.35");
+        assert_eq!(format_token_amount(uint!(12_345_600_U256), 6), "12.35");
     }
 
     #[test]
     fn format_uses_four_decimals_between_half_and_one() {
-        assert_eq!(format_token_amount(U256::from(543_250u64), 6), "0.5433");
+        assert_eq!(format_token_amount(uint!(543_250_U256), 6), "0.5433");
     }
 
     #[test]
     fn format_uses_five_decimals_between_tenth_and_half() {
-        assert_eq!(
-            format_token_amount(U256::from(123_456_789u64), 9),
-            "0.12346"
-        );
+        assert_eq!(format_token_amount(uint!(123_456_789_U256), 9), "0.12346");
     }
 
     #[test]
     fn format_uses_six_decimals_below_tenth() {
-        assert_eq!(format_token_amount(U256::from(12_345u64), 6), "0.012345");
+        assert_eq!(format_token_amount(uint!(12_345_U256), 6), "0.012345");
     }
 
     #[test]
     fn precision_caps_to_available_token_decimals() {
-        assert_eq!(display_precision(U256::from(54u64), 2), 2);
-        assert_eq!(format_token_amount(U256::from(54u64), 2), "0.54");
+        assert_eq!(display_precision(uint!(54_U256), 2), 2);
+        assert_eq!(format_token_amount(uint!(54_U256), 2), "0.54");
     }
 
     #[test]

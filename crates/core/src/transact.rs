@@ -149,6 +149,17 @@ pub struct SnarkJsProof {
     pub pi_c: [U256; 2],
 }
 
+impl SnarkJsProof {
+    #[must_use]
+    pub const fn zero() -> Self {
+        Self {
+            pi_a: [U256::ZERO; 2],
+            pi_b: [[U256::ZERO; 2]; 2],
+            pi_c: [U256::ZERO; 2],
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct DecryptedTransact {
     pub shared_key: [u8; 32],
@@ -254,6 +265,7 @@ pub const MERKLE_ZERO_VALUE: U256 =
     uint!(2051258411002736885948763699317990061539314419500486054347250703186609807356_U256);
 
 pub const DEFAULT_TXID_VERSION: &str = "V2_PoseidonMerkle";
+pub const TXID_TREE_DEPTH: usize = 16;
 
 #[must_use]
 pub fn pad_with_merkle_zero(mut v: Vec<U256>, target: usize) -> Vec<U256> {
@@ -313,13 +325,21 @@ pub fn compute_railgun_txid(
 
 #[must_use]
 pub fn railgun_txid_leaf_hash(railgun_txid: U256, utxo_tree_in: u64) -> U256 {
-    const GLOBAL_TREE_POSITION_TREE: u64 = 199_999;
-    const GLOBAL_TREE_POSITION_POS: u64 = 199_999;
-    const TREE_MAX_ITEMS: u64 = 65_536;
+    const GLOBAL_TREE_POSITION_TREE: U256 = uint!(199_999_U256);
+    const GLOBAL_TREE_POSITION_POS: U256 = uint!(199_999_U256);
+    const TREE_MAX_ITEMS: U256 = uint!(65_536_U256);
 
-    let gpos = U256::from(GLOBAL_TREE_POSITION_TREE) * U256::from(TREE_MAX_ITEMS)
-        + U256::from(GLOBAL_TREE_POSITION_POS);
+    let gpos = GLOBAL_TREE_POSITION_TREE * TREE_MAX_ITEMS + GLOBAL_TREE_POSITION_POS;
     poseidon(vec![railgun_txid, U256::from(utxo_tree_in), gpos])
+}
+
+#[must_use]
+pub fn dummy_txid_root(leaf: U256) -> U256 {
+    let mut acc = leaf;
+    for _ in 0..TXID_TREE_DEPTH {
+        acc = poseidon(vec![acc, U256::ZERO]);
+    }
+    acc
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -523,10 +543,11 @@ mod tests {
     use crate::notes::{Note, note_public_key};
     use alloy::primitives::{Address, Bytes, FixedBytes, U256};
     use alloy::sol_types::SolCall;
+    use ruint::uint;
     use std::collections::BTreeMap;
 
     fn sample_viewing_key_data() -> ViewingKeyData {
-        ViewingKeyData::from_spending_public_key([7u8; 32], [U256::from(3_u8), U256::from(9_u8)])
+        ViewingKeyData::from_spending_public_key([7u8; 32], [uint!(3_U256), uint!(9_U256)])
     }
 
     fn sample_ciphertext(
@@ -577,7 +598,7 @@ mod tests {
     ) {
         let viewing_key_data = sample_viewing_key_data();
         let fee_token = Address::from([0x22; 20]);
-        let fee_value = U256::from(42_u8);
+        let fee_value = uint!(42_U256);
         let random = [0x55; 16];
         let npk = note_public_key(viewing_key_data.master_public_key, random);
         let fee_commitment = Note {
@@ -621,11 +642,7 @@ mod tests {
         let leaf: FixedBytes<32> = railgun_txid_leaf_hash(railgun_txid, 9).into();
         let required_list_key = FixedBytes::from([0x88; 32]);
         let pre_tx_poi = PreTxPoi {
-            snark_proof: SnarkJsProof {
-                pi_a: [U256::ZERO, U256::ZERO],
-                pi_b: [[U256::ZERO, U256::ZERO], [U256::ZERO, U256::ZERO]],
-                pi_c: [U256::ZERO, U256::ZERO],
-            },
+            snark_proof: SnarkJsProof::zero(),
             txid_merkleroot: FixedBytes::ZERO,
             poi_merkleroots: vec![FixedBytes::ZERO],
             blinded_commitments_out: vec![FixedBytes::from([0x77; 32])],
@@ -733,7 +750,7 @@ mod tests {
     #[test]
     fn parse_transact_uses_receiver_master_public_key_for_visible_sender_note() {
         let viewing_key_data = sample_viewing_key_data();
-        let sender_master_public_key = U256::from(0x1234_u64);
+        let sender_master_public_key = uint!(0x1234_U256);
         let encoded_mpk = viewing_key_data.master_public_key ^ sender_master_public_key;
         let (calldata, _, _, fee_commitment, _) =
             sample_transaction_and_params_with_encoded_mpk(None, encoded_mpk);

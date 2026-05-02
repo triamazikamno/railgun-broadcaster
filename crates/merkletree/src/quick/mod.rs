@@ -203,7 +203,8 @@ mod tests {
     use std::sync::mpsc::{self, Receiver};
     use std::time::Duration;
 
-    use alloy::primitives::{FixedBytes, U256};
+    use alloy::primitives::FixedBytes;
+    use alloy::uint;
     use url::Url;
 
     use super::{QuickSyncClient, QuickSyncConfig, run_quick_sync, run_quick_sync_into};
@@ -494,7 +495,7 @@ mod tests {
             .insert_leaf(MerkleTreeUpdate {
                 tree_number: 0,
                 tree_position: 1,
-                hash: U256::from(4_u8),
+                hash: uint!(4_U256),
             })
             .expect("insert existing leaf");
 
@@ -512,7 +513,7 @@ mod tests {
         .expect("quick sync into forest");
 
         assert_eq!(progress.latest_commitment_block, 20);
-        assert_eq!(forest.leaf_at(0, 1), Some(U256::from(4_u8)));
-        assert_eq!(forest.leaf_at(0, 2), Some(U256::from(5_u8)));
+        assert_eq!(forest.leaf_at(0, 1), Some(uint!(4_U256)));
+        assert_eq!(forest.leaf_at(0, 2), Some(uint!(5_U256)));
     }
 }

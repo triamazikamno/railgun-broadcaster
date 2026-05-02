@@ -2,13 +2,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy::primitives::{Address, address};
+use alloy::primitives::{Address, U256, address};
 use alloy_rpc_types_eth::Log;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use local_db::{DbStore, WalletMeta};
-use merkletree::wallet::WalletScanKeys;
-use railgun_wallet::WalletUtxo;
+use merkletree::wallet::{WalletLogDelta, WalletScanKeys};
 use railgun_wallet::wallet_cache::{WalletCacheDbExt, WalletCacheError};
+use railgun_wallet::{ProverService, WalletUtxo};
 use tokio::sync::{mpsc, watch};
 use url::Url;
 
@@ -301,9 +301,12 @@ pub struct WalletConfig {
     pub cache_key: String,
     pub start_block: Option<u64>,
     pub sync_to_block: Option<u64>,
+    pub quick_sync_endpoint: Option<Url>,
     pub scan_keys: WalletScanKeys,
+    pub spending_public_key: Option<[U256; 2]>,
     pub progress_tx: Option<SyncProgressSender>,
     pub cache_store: Option<Arc<dyn WalletCacheStore>>,
+    pub poi_recovery_prover: Option<ProverService>,
     pub use_indexed_wallet_catch_up: bool,
 }
 
@@ -371,8 +374,17 @@ pub type SharedLogBatch = Arc<LogBatch>;
 #[derive(Debug, Clone)]
 pub enum BackfillEvent {
     Logs(SharedLogBatch),
-    Done { last_block: u64 },
-    Reset { from_block: u64 },
+    IndexedDelta {
+        from_block: u64,
+        to_block: u64,
+        delta: Box<WalletLogDelta>,
+    },
+    Done {
+        last_block: u64,
+    },
+    Reset {
+        from_block: u64,
+    },
 }
 
 #[derive(Debug)]

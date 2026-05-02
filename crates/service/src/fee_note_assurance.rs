@@ -1,5 +1,6 @@
 use alloy::primitives::{Address, FixedBytes, U256};
 use alloy::providers::Provider;
+use alloy::uint;
 use alloy_rpc_types_eth::Log;
 use broadcaster_core::contracts::railgun::Transact;
 use broadcaster_core::crypto::poseidon::poseidon;
@@ -351,10 +352,10 @@ fn derive_fee_note_blinded_commitment(
     utxo_tree_out: u64,
     utxo_position_out: u64,
 ) -> FixedBytes<32> {
-    const TREE_MAX_ITEMS: u64 = 65_536;
+    const TREE_MAX_ITEMS: U256 = uint!(65_536_U256);
 
     let global_tree_position =
-        U256::from(utxo_tree_out) * U256::from(TREE_MAX_ITEMS) + U256::from(utxo_position_out);
+        U256::from(utxo_tree_out) * TREE_MAX_ITEMS + U256::from(utxo_position_out);
 
     poseidon(vec![
         fee_commitment.into(),
@@ -393,6 +394,7 @@ mod tests {
     use alloy::hex;
     use alloy::primitives::{Address, Bytes, FixedBytes, Log as PrimitiveLog, U256};
     use alloy::sol_types::SolEvent;
+    use alloy::uint;
     use alloy_rpc_types_eth::Log;
     use broadcaster_core::contracts::railgun::{CommitmentCiphertext, Transact};
     use local_db::FeeNoteAssuranceTerminalOutcome;
@@ -425,7 +427,7 @@ mod tests {
 
     fn transact_log(fee_commitment: FixedBytes<32>, start_position: u64) -> Log {
         let event = Transact {
-            treeNumber: U256::from(7_u8),
+            treeNumber: uint!(7_U256),
             startPosition: U256::from(start_position),
             hash: vec![fee_commitment],
             ciphertext: vec![CommitmentCiphertext {

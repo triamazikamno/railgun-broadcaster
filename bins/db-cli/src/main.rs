@@ -1,3 +1,4 @@
+use alloy::hex;
 use eyre::{Result, WrapErr, bail, eyre};
 use local_db::{
     BlobMeta, MerkleForestMeta, Meta, PendingFeeNoteAssuranceRecord,
@@ -227,7 +228,7 @@ fn print_value(table: TableKind, key: &str, value: &[u8], raw: bool) -> Result<(
     if raw {
         let entry = RawEntry {
             key: key.to_string(),
-            value_hex: format!("0x{}", hex::encode(value)),
+            value_hex: hex::encode_prefixed(value),
         };
         return print_json(&entry);
     }
@@ -267,7 +268,7 @@ fn print_wallet_utxo(key: &str, value: &[u8]) -> Result<()> {
         value: WalletUtxoValue {
             wallet_id,
             utxo_id,
-            payload_hex: format!("0x{}", hex::encode(value)),
+            payload_hex: hex::encode_prefixed(value),
         },
     };
     print_json(&entry)

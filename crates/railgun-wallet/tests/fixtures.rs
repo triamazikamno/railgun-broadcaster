@@ -5,11 +5,12 @@ use std::str::FromStr;
 use std::sync::OnceLock;
 
 use alloy::primitives::{Address, Bytes, FixedBytes, U256, Uint};
+use alloy::uint;
 use merkletree::tree::{MerkleForest, MerkleTreeUpdate};
 use railgun_wallet::artifacts::ArtifactSource;
 use railgun_wallet::keys::EddsaSignature;
 use railgun_wallet::notes::{Note, note_public_key};
-use railgun_wallet::prover::{ProverError, ProverService, WitnessInputs};
+use railgun_wallet::prover::{ProverError, ProverService, RailgunWitnessInputs};
 use railgun_wallet::public_spending_key;
 use railgun_wallet::tx::{
     PrivateInputs, PublicInputs, TransactionBuilder, UnshieldMode, UnshieldPlan, UnshieldRequest,
@@ -141,7 +142,7 @@ fn build_valid_unshield_plan() -> UnshieldPlan {
             let note_random = [7u8; 16];
             let note = Note {
                 token_hash: U256::from_be_slice(token_address.as_slice()),
-                value: U256::from(10),
+                value: uint!(10_U256),
                 random: note_random,
                 npk: note_public_key(wallet.viewing.master_public_key, note_random),
             };
@@ -174,7 +175,7 @@ fn build_valid_unshield_plan() -> UnshieldPlan {
             };
             let request = UnshieldRequest {
                 token_address,
-                amount: U256::from(5),
+                amount: uint!(5_U256),
                 recipient: Address::ZERO,
                 mode: UnshieldMode::Token,
                 verify_proof: true,
@@ -258,7 +259,7 @@ fn witness_inputs_matches_js() {
         u256_from_hex(&fixture.signature[1]),
         u256_from_hex(&fixture.signature[2]),
     ];
-    let formatted = WitnessInputs::new(&public_inputs, &private_inputs, &signature);
+    let formatted = RailgunWitnessInputs::new(&public_inputs, &private_inputs, &signature);
     assert_eq!(formatted.to_hex_map(), fixture.formatted_inputs);
 }
 

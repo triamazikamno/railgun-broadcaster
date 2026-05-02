@@ -228,7 +228,8 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    use alloy::primitives::{U256, address};
+    use alloy::primitives::address;
+    use alloy::uint;
     use broadcaster_monitor::{event_channel, shared};
 
     #[test]
@@ -329,7 +330,7 @@ mod tests {
         let relay_adapt = address!("0000000000000000000000000000000000000002");
         let relay_adapt_7702 = address!("0000000000000000000000000000000000000003");
         let body = fees::Body {
-            fees: HashMap::from([(token, U256::from(42u64))]),
+            fees: HashMap::from([(token, uint!(42_U256))]),
             fee_expiration: 1_900_000_000_000,
             fees_id: "fees-id".to_string(),
             railgun_address: RAILGUN_ADDRESS.into(),

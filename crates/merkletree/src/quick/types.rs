@@ -479,7 +479,7 @@ pub struct IndexedNullifier {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::U256;
+    use alloy::uint;
     use serde_json::json;
 
     use super::IndexedNullifier;
@@ -496,7 +496,7 @@ mod tests {
         }))
         .expect("deserialize indexed nullifier");
 
-        assert_eq!(item.block_number, U256::from(123_u64));
-        assert_eq!(item.block_timestamp, U256::from(1_700_000_123_u64));
+        assert_eq!(item.block_number, uint!(123_U256));
+        assert_eq!(item.block_timestamp, uint!(1_700_000_123_U256));
     }
 }

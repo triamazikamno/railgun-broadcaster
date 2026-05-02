@@ -202,6 +202,7 @@ impl BroadcasterService {
         required_poi_list: Vec<FixedBytes<32>>,
         sync_manager: Arc<SyncManager>,
         prover: Arc<ProverService>,
+        poi_recovery_prover: Arc<ProverService>,
         query_rpc_cooldown: Duration,
     ) -> Result<Self, BroadcasterServiceError> {
         let (tx, rx) = kanal::bounded_async::<(DecryptedTransact, ParsedTransactCalldata)>(20);
@@ -395,7 +396,7 @@ impl BroadcasterService {
                     indexed_wallet_block_range,
                     poll_interval: receipt_poll_interval,
                     finality_depth,
-                    quick_sync_endpoint,
+                    quick_sync_endpoint: quick_sync_endpoint.clone(),
                     anchor_interval,
                     anchor_retention,
                     http_client: None,
@@ -414,9 +415,12 @@ impl BroadcasterService {
                     cache_key: cache_key.clone(),
                     start_block: Some(*init_block_number),
                     sync_to_block: None,
+                    quick_sync_endpoint,
                     scan_keys,
+                    spending_public_key: Some(wallet.spending_public_key),
                     progress_tx: None,
                     cache_store: None,
+                    poi_recovery_prover: Some((*poi_recovery_prover).clone()),
                     use_indexed_wallet_catch_up: true,
                 };
                 let handle = sync_manager.add_wallet(wallet_cfg).await?;
@@ -1035,7 +1039,8 @@ mod tests {
         should_remove_fee_note_assurance_fallback, snapshot_fee_note_assurance_fallback,
     };
     use crate::fee_note_assurance::FeeNoteAssuranceRecordOutcome;
-    use alloy::primitives::{FixedBytes, U256};
+    use alloy::primitives::FixedBytes;
+    use alloy::uint;
     use broadcaster_core::transact::FeeNoteAssuranceContext;
     use local_db::PendingFeeNoteAssuranceRecord;
     use std::collections::{BTreeMap, HashMap};
@@ -1076,7 +1081,7 @@ mod tests {
             context: FeeNoteAssuranceContext {
                 chain_type: 0,
                 txid_version: "V2_PoseidonMerkle".to_string(),
-                railgun_txid: U256::from(5_u8),
+                railgun_txid: uint!(5_U256),
                 utxo_tree_in: 9,
                 fee_commitment: FixedBytes::from([1u8; 32]),
                 fee_note_npk: FixedBytes::from([2u8; 32]),
@@ -1109,7 +1114,7 @@ mod tests {
     fn collect_pending_fee_note_assurance_records_prefers_db_record() {
         let fallback_record = sample_record(1, [0x22; 32]);
         let mut db_record = fallback_record.clone();
-        db_record.context.railgun_txid = U256::from(9_u8);
+        db_record.context.railgun_txid = uint!(9_U256);
 
         let records = collect_pending_fee_note_assurance_records(
             vec![db_record.clone()],
@@ -1183,14 +1188,14 @@ async fn submit_tx(
 }
 
 fn pretty_number(num: &U256, decimals: usize) -> String {
-    let div = U256::from(10).pow(U256::from(decimals));
+    let div = uint!(10_U256).pow(U256::from(decimals));
     let q = num / div;
     let mut r = num % div;
 
     let mut frac = Vec::with_capacity(decimals);
     for _ in 0..decimals {
-        let digit = (r * U256::from(10)) / div;
-        r = (r * U256::from(10)) % div;
+        let digit = (r * uint!(10_U256)) / div;
+        r = (r * uint!(10_U256)) % div;
         frac.push((digit.to::<u8>() + b'0') as char);
     }
 

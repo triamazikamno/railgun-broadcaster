@@ -1,5 +1,6 @@
 use alloy::primitives::{Address, FixedBytes, U256, Uint};
 use alloy::sol_types::SolCall;
+use alloy::uint;
 use broadcaster_core::contracts::railgun::{LegacyCommitmentPreimage, TokenData, shieldCall};
 use broadcaster_core::contracts::shield::build_shield_calldata;
 use broadcaster_core::crypto::aes_gcm::encrypt_in_place_16b_iv;
@@ -53,7 +54,7 @@ fn indexed_transact_commitment_decrypts_wallet_utxo() {
     let note = Note::new_change(
         keys.master_public_key,
         Address::ZERO,
-        U256::from(42_u8),
+        uint!(42_U256),
         [9u8; 16],
     );
     let ciphertext =
@@ -93,7 +94,7 @@ fn indexed_transact_commitment_ignores_undecryptable_utxo() {
     let note = Note::new_change(
         keys.master_public_key,
         Address::ZERO,
-        U256::from(42_u8),
+        uint!(42_U256),
         [9u8; 16],
     );
     let ciphertext =
@@ -124,7 +125,7 @@ fn indexed_transact_commitment_ignores_undecryptable_utxo() {
 #[test]
 fn indexed_shield_commitment_decrypts_wallet_utxo() {
     let keys = scan_keys(7);
-    let amount = U256::from(55_u8);
+    let amount = uint!(55_U256);
     let calldata = build_shield_calldata(
         keys.master_public_key,
         &keys.viewing_public_key,
@@ -162,7 +163,7 @@ fn indexed_nullifier_converts_to_spent_marker() {
     let keys = scan_keys(7);
     let input = IndexedNullifierInput {
         tree_number: 3,
-        nullifier: U256::from(99_u8),
+        nullifier: uint!(99_U256),
         source: source(2),
     };
 
@@ -171,7 +172,7 @@ fn indexed_nullifier_converts_to_spent_marker() {
     assert!(delta.utxos.is_empty());
     assert_eq!(delta.nullifiers.len(), 1);
     assert_eq!(delta.nullifiers[0].tree, 3);
-    assert_eq!(delta.nullifiers[0].nullifier, U256::from(99_u8));
+    assert_eq!(delta.nullifiers[0].nullifier, uint!(99_U256));
     assert_eq!(delta.nullifiers[0].source, source(2));
 }
 
@@ -181,7 +182,7 @@ fn indexed_legacy_encrypted_commitment_decrypts_wallet_utxo() {
     let note = Note::new_change(
         keys.master_public_key,
         Address::ZERO,
-        U256::from(42_u8),
+        uint!(42_U256),
         [9u8; 16],
     );
     let shared_key =
@@ -253,6 +254,6 @@ fn indexed_legacy_generated_commitment_decrypts_wallet_utxo() {
     assert_eq!(delta.utxos[0].position, 12);
     assert_eq!(delta.utxos[0].note.random, random);
     assert_eq!(delta.utxos[0].note.npk, npk);
-    assert_eq!(delta.utxos[0].note.value, U256::from(77_u8));
+    assert_eq!(delta.utxos[0].note.value, uint!(77_U256));
     assert_eq!(delta.utxos[0].source, source(5));
 }

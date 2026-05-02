@@ -32,7 +32,7 @@ pub enum WalletScanError {
 
 pub type WalletScanKeys = ViewingKeyData;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WalletLogDelta {
     pub utxos: Vec<Utxo>,
     pub nullifiers: Vec<SpentNullifier>,
@@ -232,13 +232,17 @@ pub fn parse_wallet_delta_from_logs(
                     tree_number,
                     tree_position: position,
                     hash: expected_hash,
-                    ciphertext: ciphertext.ciphertext.map(u256_to_fixed_bytes),
-                    ephemeral_keys: ciphertext.ephemeralKeys.map(u256_to_fixed_bytes),
+                    ciphertext: ciphertext
+                        .ciphertext
+                        .map(|value| FixedBytes::from(value.to_be_bytes::<32>())),
+                    ephemeral_keys: ciphertext
+                        .ephemeralKeys
+                        .map(|value| FixedBytes::from(value.to_be_bytes::<32>())),
                     memo: ciphertext
                         .memo
                         .iter()
                         .copied()
-                        .map(u256_to_fixed_bytes)
+                        .map(|value| FixedBytes::from(value.to_be_bytes::<32>()))
                         .collect(),
                     source: source.clone(),
                 };
@@ -499,15 +503,14 @@ fn scan_transact_commitment(
     ))
 }
 
-fn u256_to_fixed_bytes(value: U256) -> FixedBytes<32> {
-    FixedBytes::from(value.to_be_bytes::<32>())
-}
-
 fn encrypted_random_from_u256(value: [U256; 2]) -> (FixedBytes<32>, FixedBytes<16>) {
     let data = value[1].to_be_bytes::<32>();
     let mut data16 = [0u8; 16];
     data16.copy_from_slice(&data[16..]);
-    (u256_to_fixed_bytes(value[0]), FixedBytes::from(data16))
+    (
+        FixedBytes::from(value[0].to_be_bytes::<32>()),
+        FixedBytes::from(data16),
+    )
 }
 
 fn scan_shield_commitment(

@@ -742,7 +742,7 @@ fn render_fee_header(
 mod tests {
     use super::*;
     use alloy::primitives::address;
-    use ruint::aliases::U256;
+    use alloy::uint;
     use std::time::SystemTime;
 
     fn row(chain_id: u64, broadcaster: &str, token: Address, identifier: Option<&str>) -> FeeRow {
@@ -750,7 +750,7 @@ mod tests {
             chain_id,
             railgun_address: Arc::from(broadcaster),
             token_address: token,
-            fee: U256::from(0u64),
+            fee: uint!(0_U256),
             signature_valid: true,
             fees_id: Arc::from("fid"),
             fee_expiration: SystemTime::now(),

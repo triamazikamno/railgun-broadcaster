@@ -16,6 +16,8 @@ merkletree = { path = "../merkletree" }
 poi = { path = "../poi" }
 railgun-wallet = { path = "../railgun-wallet" }
 reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 tokio-util = "0.7"
 tracing = { workspace = true }
