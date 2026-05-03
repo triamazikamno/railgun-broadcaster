@@ -1,0 +1,56 @@
+use super::*;
+
+pub(crate) trait EvmTransactionSigner {
+    fn address(&self) -> Address;
+
+    fn ethereum_wallet(&self) -> EthereumWallet;
+}
+
+pub(crate) trait EvmMessageSigner {
+    fn derive_shield_private_key(&self) -> Result<[u8; 32]>;
+}
+
+pub(crate) struct SoftwareEvmSigner {
+    private_key: [u8; 32],
+    signer: PrivateKeySigner,
+}
+
+impl SoftwareEvmSigner {
+    pub(crate) fn from_private_key_hex(private_key: &str) -> Result<Self> {
+        let private_key = parse_private_key(private_key)?;
+        let signer = PrivateKeySigner::from(
+            SigningKey::from_bytes((&private_key).into()).wrap_err("invalid signing key")?,
+        );
+        Ok(Self {
+            private_key,
+            signer,
+        })
+    }
+}
+
+impl EvmTransactionSigner for SoftwareEvmSigner {
+    fn address(&self) -> Address {
+        self.signer.address()
+    }
+
+    fn ethereum_wallet(&self) -> EthereumWallet {
+        EthereumWallet::from(self.signer.clone())
+    }
+}
+
+impl EvmMessageSigner for SoftwareEvmSigner {
+    fn derive_shield_private_key(&self) -> Result<[u8; 32]> {
+        derive_shield_private_key(&self.private_key).wrap_err("derive shield private key")
+    }
+}
+
+impl Drop for SoftwareEvmSigner {
+    fn drop(&mut self) {
+        self.private_key.zeroize();
+    }
+}
+
+fn parse_private_key(private_key: &str) -> Result<[u8; 32]> {
+    let pk_hex = private_key.strip_prefix("0x").unwrap_or(private_key);
+    hex::decode_to_array(pk_hex).wrap_err("invalid private key hex")
+}

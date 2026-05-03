@@ -68,6 +68,13 @@ pub enum PoiStatus {
     Unknown,
 }
 
+impl PoiStatus {
+    #[must_use]
+    pub const fn is_recoverable(self) -> bool {
+        matches!(self, Self::Missing | Self::ProofSubmitted | Self::Unknown)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UtxoPoiMetadata {
     pub commitment_kind: UtxoCommitmentKind,
@@ -107,6 +114,53 @@ impl UtxoPoiMetadata {
                 .is_some_and(|status| *status == PoiStatus::Valid)
         })
     }
+
+    #[must_use]
+    pub fn has_recoverable_status_for_lists(&self, list_keys: &[FixedBytes<32>]) -> bool {
+        list_keys.iter().any(|list_key| {
+            self.statuses
+                .get(list_key)
+                .is_none_or(|status| status.is_recoverable())
+        })
+    }
+
+    #[must_use]
+    pub fn apply_status_refresh(
+        &mut self,
+        list_keys: &[FixedBytes<32>],
+        statuses: Option<&BTreeMap<FixedBytes<32>, PoiStatus>>,
+        refreshed_at: u64,
+    ) -> usize {
+        let mut status_changes = 0usize;
+        let old_refreshed_at = self.refreshed_at;
+        for list_key in list_keys {
+            let status = statuses
+                .and_then(|per_list| per_list.get(list_key))
+                .copied()
+                .unwrap_or(PoiStatus::Missing);
+            let old_status = self.statuses.insert(*list_key, status);
+            if old_status != Some(status) {
+                status_changes += 1;
+            }
+        }
+        self.refreshed_at = Some(refreshed_at);
+        if old_refreshed_at != Some(refreshed_at) {
+            status_changes += 1;
+        }
+        status_changes
+    }
+
+    #[must_use]
+    pub fn mark_statuses_unknown_for_lists(&mut self, list_keys: &[FixedBytes<32>]) -> usize {
+        let mut status_changes = 0usize;
+        for list_key in list_keys {
+            let old_status = self.statuses.insert(*list_key, PoiStatus::Unknown);
+            if old_status != Some(PoiStatus::Unknown) {
+                status_changes += 1;
+            }
+        }
+        status_changes
+    }
 }
 
 #[must_use]
@@ -140,10 +194,14 @@ impl WalletUtxo {
 
 #[cfg(test)]
 mod tests {
-    use super::derive_blinded_commitment;
+    use std::collections::BTreeMap;
+
+    use alloy::primitives::{FixedBytes, U256};
+
     use crate::crypto::poseidon::poseidon;
     use crate::tree::TREE_LEAF_COUNT_U256;
-    use alloy::primitives::{FixedBytes, U256};
+
+    use super::{PoiStatus, UtxoCommitmentKind, UtxoPoiMetadata, derive_blinded_commitment};
 
     #[test]
     fn blinded_commitment_uses_global_tree_position() {
@@ -168,6 +226,140 @@ mod tests {
         assert_ne!(
             derive_blinded_commitment(commitment, npk, tree, position),
             derive_blinded_commitment(commitment, npk, tree, position + 1)
+        );
+    }
+
+    #[test]
+    fn poi_status_recoverable_matches_retryable_statuses() {
+        assert!(!PoiStatus::Valid.is_recoverable());
+        assert!(!PoiStatus::ShieldBlocked.is_recoverable());
+        assert!(PoiStatus::ProofSubmitted.is_recoverable());
+        assert!(PoiStatus::Missing.is_recoverable());
+        assert!(PoiStatus::Unknown.is_recoverable());
+    }
+
+    #[test]
+    fn poi_metadata_has_recoverable_status_for_lists() {
+        let recoverable_list = FixedBytes::from([0x11; 32]);
+        let valid_list = FixedBytes::from([0x22; 32]);
+        let shield_blocked_list = FixedBytes::from([0x33; 32]);
+        let missing_list = FixedBytes::from([0x44; 32]);
+        let metadata = UtxoPoiMetadata {
+            commitment_kind: UtxoCommitmentKind::Transact,
+            commitment: FixedBytes::from([0xaa; 32]),
+            npk: FixedBytes::from([0xbb; 32]),
+            blinded_commitment: FixedBytes::from([0xcc; 32]),
+            statuses: BTreeMap::from([
+                (recoverable_list, PoiStatus::Missing),
+                (valid_list, PoiStatus::Valid),
+                (shield_blocked_list, PoiStatus::ShieldBlocked),
+            ]),
+            refreshed_at: None,
+        };
+
+        assert!(metadata.has_recoverable_status_for_lists(&[recoverable_list]));
+        assert!(metadata.has_recoverable_status_for_lists(&[missing_list]));
+        assert!(!metadata.has_recoverable_status_for_lists(&[valid_list, shield_blocked_list]));
+        assert!(!metadata.has_recoverable_status_for_lists(&[]));
+    }
+
+    #[test]
+    fn poi_metadata_apply_status_refresh_updates_statuses_and_refresh_time() {
+        let updated_list = FixedBytes::from([0x11; 32]);
+        let unchanged_list = FixedBytes::from([0x22; 32]);
+        let missing_list = FixedBytes::from([0x33; 32]);
+        let mut metadata = UtxoPoiMetadata {
+            commitment_kind: UtxoCommitmentKind::Transact,
+            commitment: FixedBytes::from([0xaa; 32]),
+            npk: FixedBytes::from([0xbb; 32]),
+            blinded_commitment: FixedBytes::from([0xcc; 32]),
+            statuses: BTreeMap::from([
+                (updated_list, PoiStatus::Unknown),
+                (unchanged_list, PoiStatus::Valid),
+            ]),
+            refreshed_at: Some(10),
+        };
+        let refreshed_statuses = BTreeMap::from([
+            (updated_list, PoiStatus::Valid),
+            (unchanged_list, PoiStatus::Valid),
+        ]);
+
+        let changes = metadata.apply_status_refresh(
+            &[updated_list, unchanged_list, missing_list],
+            Some(&refreshed_statuses),
+            20,
+        );
+
+        assert_eq!(changes, 3);
+        assert_eq!(
+            metadata.statuses.get(&updated_list),
+            Some(&PoiStatus::Valid)
+        );
+        assert_eq!(
+            metadata.statuses.get(&unchanged_list),
+            Some(&PoiStatus::Valid)
+        );
+        assert_eq!(
+            metadata.statuses.get(&missing_list),
+            Some(&PoiStatus::Missing)
+        );
+        assert_eq!(metadata.refreshed_at, Some(20));
+
+        assert_eq!(
+            metadata.apply_status_refresh(
+                &[updated_list, unchanged_list, missing_list],
+                Some(&refreshed_statuses),
+                20,
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn poi_metadata_mark_statuses_unknown_for_lists_does_not_refresh() {
+        let updated_list = FixedBytes::from([0x11; 32]);
+        let unchanged_list = FixedBytes::from([0x22; 32]);
+        let inserted_list = FixedBytes::from([0x33; 32]);
+        let mut metadata = UtxoPoiMetadata {
+            commitment_kind: UtxoCommitmentKind::Transact,
+            commitment: FixedBytes::from([0xaa; 32]),
+            npk: FixedBytes::from([0xbb; 32]),
+            blinded_commitment: FixedBytes::from([0xcc; 32]),
+            statuses: BTreeMap::from([
+                (updated_list, PoiStatus::Valid),
+                (unchanged_list, PoiStatus::Unknown),
+            ]),
+            refreshed_at: Some(20),
+        };
+
+        let changes = metadata.mark_statuses_unknown_for_lists(&[
+            updated_list,
+            unchanged_list,
+            inserted_list,
+        ]);
+
+        assert_eq!(changes, 2);
+        assert_eq!(
+            metadata.statuses.get(&updated_list),
+            Some(&PoiStatus::Unknown)
+        );
+        assert_eq!(
+            metadata.statuses.get(&unchanged_list),
+            Some(&PoiStatus::Unknown)
+        );
+        assert_eq!(
+            metadata.statuses.get(&inserted_list),
+            Some(&PoiStatus::Unknown)
+        );
+        assert_eq!(metadata.refreshed_at, Some(20));
+
+        assert_eq!(
+            metadata.mark_statuses_unknown_for_lists(&[
+                updated_list,
+                unchanged_list,
+                inserted_list,
+            ]),
+            0
         );
     }
 }

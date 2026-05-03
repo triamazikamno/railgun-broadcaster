@@ -610,27 +610,27 @@ async fn submit_observed_pending_output_pois(
                 }
                 db.put_pending_output_poi_context(&record)?;
                 if let Some(mut recovery) = recovery.clone() {
-                    recovery.status = OutputPoiRecoveryStatus::Submitted;
-                    recovery.updated_at = now;
-                    recovery.last_submission_at = Some(now);
-                    recovery.next_retry_at = Some(
-                        now.saturating_add(OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER.as_secs()),
+                    apply_output_poi_recovery_action(
+                        &mut recovery,
+                        OutputPoiRecoveryAction::Submitted {
+                            retry_after: OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER,
+                        },
+                        now,
                     );
-                    recovery.last_error = None;
-                    recovery.attempt_count = recovery.attempt_count.saturating_add(1);
                     db.put_output_poi_recovery(&recovery)?;
                 }
                 submitted_contexts += 1;
             }
             Err(err) => {
                 if let Some(mut recovery) = recovery.clone() {
-                    recovery.status = OutputPoiRecoveryStatus::SubmitFailed;
-                    recovery.updated_at = now;
-                    recovery.next_retry_at = Some(
-                        now.saturating_add(OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER.as_secs()),
+                    apply_output_poi_recovery_action(
+                        &mut recovery,
+                        OutputPoiRecoveryAction::SubmitFailed {
+                            error: err.to_string(),
+                            retry_after: OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
+                        },
+                        now,
                     );
-                    recovery.last_error = Some(err.to_string());
-                    recovery.attempt_count = recovery.attempt_count.saturating_add(1);
                     db.put_output_poi_recovery(&recovery)?;
                 }
                 warn!(
@@ -1043,7 +1043,7 @@ async fn recover_missing_output_pois(request: OutputPoiRecoveryRequest<'_>) -> u
                     request.cfg,
                     candidate,
                     now,
-                    OutputPoiRecoveryRecordUpdate {
+                    OutputPoiRecoveryAction::Detected {
                         status: OutputPoiRecoveryStatus::Recoverable,
                         retry_after: None,
                         last_error: None,
@@ -1514,7 +1514,10 @@ fn output_poi_recovery_candidates<'a>(
         .filter(|wallet_utxo| {
             !wallet_utxo.is_spent()
                 && wallet_utxo.utxo.poi.commitment_kind == UtxoCommitmentKind::Transact
-                && recoverable_status_for_active_lists(wallet_utxo, active_list_keys)
+                && wallet_utxo
+                    .utxo
+                    .poi
+                    .has_recoverable_status_for_lists(active_list_keys)
         })
         .collect()
 }
@@ -1983,6 +1986,100 @@ fn log_forced_output_poi_recovery_regeneration(
     );
 }
 
+enum OutputPoiRecoveryAction {
+    CacheTxInput {
+        tx_input: Vec<u8>,
+    },
+    Detected {
+        status: OutputPoiRecoveryStatus,
+        retry_after: Option<Duration>,
+        last_error: Option<String>,
+        increment_attempts: bool,
+    },
+    Submitted {
+        retry_after: Duration,
+    },
+    SubmitFailed {
+        error: String,
+        retry_after: Duration,
+    },
+    Valid,
+}
+
+fn apply_output_poi_recovery_action(
+    record: &mut OutputPoiRecoveryRecord,
+    action: OutputPoiRecoveryAction,
+    now: u64,
+) {
+    match action {
+        OutputPoiRecoveryAction::CacheTxInput { tx_input } => {
+            record.tx_input = Some(tx_input);
+            record.updated_at = now;
+            record.last_detection_at = Some(now);
+        }
+        OutputPoiRecoveryAction::Detected {
+            status,
+            retry_after,
+            last_error,
+            increment_attempts,
+        } => {
+            record.status = status;
+            record.updated_at = now;
+            record.last_detection_at = Some(now);
+            record.next_retry_at =
+                retry_after.map(|duration| now.saturating_add(duration.as_secs()));
+            record.last_error = last_error;
+            if increment_attempts {
+                record.attempt_count = record.attempt_count.saturating_add(1);
+            }
+        }
+        OutputPoiRecoveryAction::Submitted { retry_after } => {
+            record.status = OutputPoiRecoveryStatus::Submitted;
+            record.updated_at = now;
+            record.last_submission_at = Some(now);
+            record.next_retry_at = Some(now.saturating_add(retry_after.as_secs()));
+            record.last_error = None;
+            record.attempt_count = record.attempt_count.saturating_add(1);
+        }
+        OutputPoiRecoveryAction::SubmitFailed { error, retry_after } => {
+            record.status = OutputPoiRecoveryStatus::SubmitFailed;
+            record.updated_at = now;
+            record.next_retry_at = Some(now.saturating_add(retry_after.as_secs()));
+            record.last_error = Some(error);
+            record.attempt_count = record.attempt_count.saturating_add(1);
+        }
+        OutputPoiRecoveryAction::Valid => {
+            record.status = OutputPoiRecoveryStatus::Valid;
+            record.updated_at = now;
+            record.next_retry_at = None;
+            record.last_error = None;
+        }
+    }
+}
+
+fn new_output_poi_recovery_record(
+    cfg: &WalletConfig,
+    candidate: &WalletUtxo,
+    status: OutputPoiRecoveryStatus,
+    now: u64,
+) -> OutputPoiRecoveryRecord {
+    OutputPoiRecoveryRecord {
+        chain_id: cfg.chain.chain_id,
+        wallet_id: cfg.cache_key.clone(),
+        output_commitment: candidate.utxo.poi.commitment,
+        source_tx_hash: candidate.utxo.source.tx_hash,
+        tx_input: None,
+        status,
+        created_at: now,
+        updated_at: now,
+        last_detection_at: None,
+        last_submission_at: None,
+        next_retry_at: None,
+        attempt_count: 0,
+        last_error: None,
+    }
+}
+
 fn record_output_poi_recovery_failure(
     db: &DbStore,
     cfg: &WalletConfig,
@@ -1997,7 +2094,7 @@ fn record_output_poi_recovery_failure(
         cfg,
         candidate,
         now,
-        OutputPoiRecoveryRecordUpdate {
+        OutputPoiRecoveryAction::Detected {
             status,
             retry_after: failure.retry_after,
             last_error: Some(message.clone()),
@@ -2029,24 +2126,16 @@ fn put_output_poi_recovery_tx_input(
         )
         .ok()
         .flatten();
-    let mut record = existing.unwrap_or_else(|| OutputPoiRecoveryRecord {
-        chain_id: cfg.chain.chain_id,
-        wallet_id: cfg.cache_key.clone(),
-        output_commitment: candidate.utxo.poi.commitment,
-        source_tx_hash: candidate.utxo.source.tx_hash,
-        tx_input: None,
-        status: OutputPoiRecoveryStatus::Recoverable,
-        created_at: now,
-        updated_at: now,
-        last_detection_at: None,
-        last_submission_at: None,
-        next_retry_at: None,
-        attempt_count: 0,
-        last_error: None,
+    let mut record = existing.unwrap_or_else(|| {
+        new_output_poi_recovery_record(cfg, candidate, OutputPoiRecoveryStatus::Recoverable, now)
     });
-    record.tx_input = Some(tx_input.to_vec());
-    record.updated_at = now;
-    record.last_detection_at = Some(now);
+    apply_output_poi_recovery_action(
+        &mut record,
+        OutputPoiRecoveryAction::CacheTxInput {
+            tx_input: tx_input.to_vec(),
+        },
+        now,
+    );
     if let Err(err) = db.put_output_poi_recovery(&record) {
         warn!(
             ?err,
@@ -2057,19 +2146,12 @@ fn put_output_poi_recovery_tx_input(
     }
 }
 
-struct OutputPoiRecoveryRecordUpdate {
-    status: OutputPoiRecoveryStatus,
-    retry_after: Option<Duration>,
-    last_error: Option<String>,
-    increment_attempts: bool,
-}
-
 fn put_output_poi_recovery_record(
     db: &DbStore,
     cfg: &WalletConfig,
     candidate: &WalletUtxo,
     now: u64,
-    update: OutputPoiRecoveryRecordUpdate,
+    action: OutputPoiRecoveryAction,
 ) {
     let existing = db
         .get_output_poi_recovery(
@@ -2079,31 +2161,16 @@ fn put_output_poi_recovery_record(
         )
         .ok()
         .flatten();
-    let mut record = existing.unwrap_or_else(|| OutputPoiRecoveryRecord {
-        chain_id: cfg.chain.chain_id,
-        wallet_id: cfg.cache_key.clone(),
-        output_commitment: candidate.utxo.poi.commitment,
-        source_tx_hash: candidate.utxo.source.tx_hash,
-        tx_input: None,
-        status: update.status,
-        created_at: now,
-        updated_at: now,
-        last_detection_at: None,
-        last_submission_at: None,
-        next_retry_at: None,
-        attempt_count: 0,
-        last_error: None,
-    });
-    record.status = update.status;
-    record.updated_at = now;
-    record.last_detection_at = Some(now);
-    record.next_retry_at = update
-        .retry_after
-        .map(|duration| now.saturating_add(duration.as_secs()));
-    record.last_error = update.last_error;
-    if update.increment_attempts {
-        record.attempt_count = record.attempt_count.saturating_add(1);
-    }
+    let default_status = match &action {
+        OutputPoiRecoveryAction::Detected { status, .. } => *status,
+        OutputPoiRecoveryAction::CacheTxInput { .. } => OutputPoiRecoveryStatus::Recoverable,
+        OutputPoiRecoveryAction::Submitted { .. } => OutputPoiRecoveryStatus::Submitted,
+        OutputPoiRecoveryAction::SubmitFailed { .. } => OutputPoiRecoveryStatus::SubmitFailed,
+        OutputPoiRecoveryAction::Valid => OutputPoiRecoveryStatus::Valid,
+    };
+    let mut record = existing
+        .unwrap_or_else(|| new_output_poi_recovery_record(cfg, candidate, default_status, now));
+    apply_output_poi_recovery_action(&mut record, action, now);
     if let Err(err) = db.put_output_poi_recovery(&record) {
         warn!(
             ?err,
@@ -2139,10 +2206,7 @@ fn mark_valid_output_poi_recoveries(
         if record.status == OutputPoiRecoveryStatus::Valid {
             continue;
         }
-        record.status = OutputPoiRecoveryStatus::Valid;
-        record.updated_at = now;
-        record.next_retry_at = None;
-        record.last_error = None;
+        apply_output_poi_recovery_action(&mut record, OutputPoiRecoveryAction::Valid, now);
         if let Err(err) = db.put_output_poi_recovery(&record) {
             warn!(?err, cache_key = %cfg.cache_key, "failed to mark output POI recovery valid");
         }
@@ -2213,13 +2277,10 @@ async fn refresh_wallet_poi_statuses_selected(
                     let Some(wallet_utxo) = wallet_utxos.get_mut(*index) else {
                         continue;
                     };
-                    status_changes += apply_poi_statuses(
-                        wallet_utxo,
+                    status_changes += wallet_utxo.utxo.poi.apply_status_refresh(
                         active_list_keys,
                         statuses_by_blinded_commitment.get(&data.blinded_commitment),
                         refreshed_at,
-                        chain_id,
-                        selection_label,
                     );
                 }
                 debug!(
@@ -2246,12 +2307,10 @@ async fn refresh_wallet_poi_statuses_selected(
                     let Some(wallet_utxo) = wallet_utxos.get_mut(*index) else {
                         continue;
                     };
-                    status_changes += apply_unknown_poi_statuses(
-                        wallet_utxo,
-                        active_list_keys,
-                        chain_id,
-                        selection_label,
-                    );
+                    status_changes += wallet_utxo
+                        .utxo
+                        .poi
+                        .mark_statuses_unknown_for_lists(active_list_keys);
                 }
             }
         }
@@ -2313,13 +2372,20 @@ fn wallet_utxo_matches_poi_refresh_selection(
                 wallet_utxo,
                 active_list_keys,
                 WalletPoiRefreshSelection::Required,
-            ) || recoverable_status_for_active_lists(wallet_utxo, active_list_keys)
+            ) || wallet_utxo
+                .utxo
+                .poi
+                .has_recoverable_status_for_lists(active_list_keys)
         }
-        WalletPoiRefreshSelection::Recoverable => {
-            recoverable_status_for_active_lists(wallet_utxo, active_list_keys)
-        }
+        WalletPoiRefreshSelection::Recoverable => wallet_utxo
+            .utxo
+            .poi
+            .has_recoverable_status_for_lists(active_list_keys),
         WalletPoiRefreshSelection::RecoverableStale { now } => {
-            recoverable_status_for_active_lists(wallet_utxo, active_list_keys)
+            wallet_utxo
+                .utxo
+                .poi
+                .has_recoverable_status_for_lists(active_list_keys)
                 && wallet_utxo
                     .utxo
                     .poi
@@ -2330,74 +2396,6 @@ fn wallet_utxo_matches_poi_refresh_selection(
                     })
         }
     }
-}
-
-fn recoverable_status_for_active_lists(
-    wallet_utxo: &WalletUtxo,
-    active_list_keys: &[FixedBytes<32>],
-) -> bool {
-    active_list_keys.iter().any(|list_key| {
-        wallet_utxo
-            .utxo
-            .poi
-            .statuses
-            .get(list_key)
-            .is_none_or(|status| status_is_recoverable(*status))
-    })
-}
-
-const fn status_is_recoverable(status: PoiStatus) -> bool {
-    matches!(
-        status,
-        PoiStatus::Missing | PoiStatus::ProofSubmitted | PoiStatus::Unknown
-    )
-}
-
-fn apply_poi_statuses(
-    wallet_utxo: &mut WalletUtxo,
-    active_list_keys: &[FixedBytes<32>],
-    statuses: Option<&BTreeMap<FixedBytes<32>, PoiStatus>>,
-    refreshed_at: u64,
-    _chain_id: u64,
-    _selection_label: &str,
-) -> usize {
-    let mut status_changes = 0usize;
-    let old_refreshed_at = wallet_utxo.utxo.poi.refreshed_at;
-    for list_key in active_list_keys {
-        let status = statuses
-            .and_then(|per_list| per_list.get(list_key))
-            .copied()
-            .unwrap_or(PoiStatus::Missing);
-        let old_status = wallet_utxo.utxo.poi.statuses.insert(*list_key, status);
-        if old_status != Some(status) {
-            status_changes += 1;
-        }
-    }
-    wallet_utxo.utxo.poi.refreshed_at = Some(refreshed_at);
-    if old_refreshed_at != Some(refreshed_at) {
-        status_changes += 1;
-    }
-    status_changes
-}
-
-fn apply_unknown_poi_statuses(
-    wallet_utxo: &mut WalletUtxo,
-    active_list_keys: &[FixedBytes<32>],
-    _chain_id: u64,
-    _selection_label: &str,
-) -> usize {
-    let mut status_changes = 0usize;
-    for list_key in active_list_keys {
-        let old_status = wallet_utxo
-            .utxo
-            .poi
-            .statuses
-            .insert(*list_key, PoiStatus::Unknown);
-        if old_status != Some(PoiStatus::Unknown) {
-            status_changes += 1;
-        }
-    }
-    status_changes
 }
 
 fn blinded_commitment_type(kind: UtxoCommitmentKind) -> BlindedCommitmentType {
@@ -2435,14 +2433,16 @@ impl WalletHandle {
     }
 
     pub(crate) fn notify_changed(&self) {
-        notify_wallet_rev(self);
+        let rev = self.rev_rx.borrow().wrapping_add(1);
+        if let Err(err) = self.rev_tx.send(rev) {
+            debug!(?err, cache_key = %self.cache_key, "failed to send wallet revision");
+        }
     }
-}
 
-fn notify_wallet_rev(handle: &WalletHandle) {
-    let rev = handle.rev_rx.borrow().wrapping_add(1);
-    if let Err(err) = handle.rev_tx.send(rev) {
-        debug!(?err, cache_key = %handle.cache_key, "failed to send wallet revision");
+    fn notify_if_changed(&self, changed: bool) {
+        if changed {
+            self.notify_changed();
+        }
     }
 }
 
@@ -2482,6 +2482,24 @@ struct WalletProgressPersist<'a> {
     last_scanned: u64,
     last_scanned_block_hash: Option<[u8; 32]>,
     changed: bool,
+}
+
+#[derive(Default)]
+struct WalletProgressPersistOutcome {
+    persisted_full_snapshot: bool,
+    persisted_progress: bool,
+}
+
+struct WalletSnapshotPersist<'a> {
+    cache_store: &'a dyn WalletCacheStore,
+    cfg: &'a WalletConfig,
+    snapshot: &'a [WalletUtxo],
+    last_scanned: u64,
+    last_scanned_block_hash: Option<[u8; 32]>,
+    changed: bool,
+    persist_state: &'a mut WalletPersistState,
+    live_metadata_flush: Option<&'a mut WalletLiveMetadataFlush>,
+    error_message: &'static str,
 }
 
 struct WalletPoiStatusRefreshPersist<'a> {
@@ -2561,6 +2579,46 @@ fn persist_wallet_progress(
         "persisted wallet metadata progress"
     );
     Ok(false)
+}
+
+fn persist_wallet_snapshot(request: WalletSnapshotPersist<'_>) -> WalletProgressPersistOutcome {
+    let WalletSnapshotPersist {
+        cache_store,
+        cfg,
+        snapshot,
+        last_scanned,
+        last_scanned_block_hash,
+        changed,
+        persist_state,
+        live_metadata_flush,
+        error_message,
+    } = request;
+
+    match persist_wallet_progress(
+        cache_store,
+        WalletProgressPersist {
+            cache_key: &cfg.cache_key,
+            snapshot,
+            last_scanned,
+            last_scanned_block_hash,
+            changed,
+        },
+        persist_state,
+    ) {
+        Ok(persisted_full_snapshot) => {
+            if let Some(live_metadata_flush) = live_metadata_flush {
+                live_metadata_flush.mark_persisted(last_scanned, Instant::now());
+            }
+            WalletProgressPersistOutcome {
+                persisted_full_snapshot,
+                persisted_progress: true,
+            }
+        }
+        Err(err) => {
+            warn!(?err, cache_key = %cfg.cache_key, "{error_message}");
+            WalletProgressPersistOutcome::default()
+        }
+    }
 }
 
 async fn refresh_wallet_poi_statuses_and_persist(
@@ -2774,9 +2832,7 @@ pub(crate) fn spawn_wallet_worker(
                         force_submission_retry,
                     ).await;
                     set_poi_refreshing(&poi_refreshing_tx, false, &cfg.cache_key);
-                    if changed {
-                        worker_handle.notify_changed();
-                    }
+                    worker_handle.notify_if_changed(changed);
                 }
                 _ = tokio::time::sleep(WALLET_POI_REFRESH_INTERVAL), if poi_status_client.is_some() && backfill_complete_block.is_some() => {
                     let Some(client) = poi_status_client.as_ref() else {
@@ -2836,9 +2892,7 @@ pub(crate) fn spawn_wallet_worker(
                         false,
                     ).await;
                     set_poi_refreshing(&poi_refreshing_tx, false, &cfg.cache_key);
-                    if changed {
-                        worker_handle.notify_changed();
-                    }
+                    worker_handle.notify_if_changed(changed);
                 }
                 Some(event) = backfill_rx.recv() => {
                     match event {
@@ -2879,26 +2933,17 @@ pub(crate) fn spawn_wallet_worker(
                             last_scanned = to_block;
                             let snapshot = utxos.read().await;
                             let (unspent, spent) = wallet_utxo_counts(&snapshot);
-                            let (persisted_full_snapshot, persisted_progress) = match persist_wallet_progress(
-                                cache_store.as_ref(),
-                                WalletProgressPersist {
-                                    cache_key: &cfg.cache_key,
-                                    snapshot: &snapshot,
-                                    last_scanned,
-                                    last_scanned_block_hash: None,
-                                    changed,
-                                },
-                                &mut persist_state,
-                            ) {
-                                Ok(persisted_full_snapshot) => (persisted_full_snapshot, true),
-                                Err(err) => {
-                                    warn!(?err, cache_key = %cfg.cache_key, "failed to persist indexed wallet cache");
-                                    (false, false)
-                                }
-                            };
-                            if persisted_progress {
-                                live_metadata_flush.mark_persisted(last_scanned, Instant::now());
-                            }
+                            let persist_outcome = persist_wallet_snapshot(WalletSnapshotPersist {
+                                cache_store: cache_store.as_ref(),
+                                cfg: &cfg,
+                                snapshot: &snapshot,
+                                last_scanned,
+                                last_scanned_block_hash: None,
+                                changed,
+                                persist_state: &mut persist_state,
+                                live_metadata_flush: Some(&mut live_metadata_flush),
+                                error_message: "failed to persist indexed wallet cache",
+                            });
                             debug!(
                                 cache_key = %cfg.cache_key,
                                 last_scanned,
@@ -2907,15 +2952,13 @@ pub(crate) fn spawn_wallet_worker(
                                 spent,
                                 changed,
                                 poi_status_deferred = poi_status_client.is_some(),
-                                persisted_full_snapshot,
+                                persisted_full_snapshot = persist_outcome.persisted_full_snapshot,
                                 needs_full_persist = persist_state.needs_full_persist,
                                 poi_observation_elapsed_ms = poi_observation_started.elapsed().as_millis(),
                                 elapsed_ms = apply_started.elapsed().as_millis(),
                                 "indexed wallet delta complete"
                             );
-                            if changed {
-                                worker_handle.notify_changed();
-                            }
+                            worker_handle.notify_if_changed(changed);
                         }
                         BackfillEvent::Logs(batch) => {
                             if batch.to_block <= last_scanned {
@@ -2934,26 +2977,17 @@ pub(crate) fn spawn_wallet_worker(
                                     last_scanned = updated_last_scanned;
                                     let snapshot = utxos.read().await;
                                     let (unspent, spent) = wallet_utxo_counts(&snapshot);
-                                    let (persisted_full_snapshot, persisted_progress) = match persist_wallet_progress(
-                                        cache_store.as_ref(),
-                                        WalletProgressPersist {
-                                            cache_key: &cfg.cache_key,
-                                            snapshot: &snapshot,
-                                            last_scanned,
-                                            last_scanned_block_hash: batch.to_block_hash,
-                                            changed,
-                                        },
-                                        &mut persist_state,
-                                    ) {
-                                        Ok(persisted_full_snapshot) => (persisted_full_snapshot, true),
-                                        Err(err) => {
-                                            warn!(?err, cache_key = %cfg.cache_key, "failed to persist wallet cache");
-                                            (false, false)
-                                        }
-                                    };
-                                    if persisted_progress {
-                                        live_metadata_flush.mark_persisted(last_scanned, Instant::now());
-                                    }
+                                    let persist_outcome = persist_wallet_snapshot(WalletSnapshotPersist {
+                                        cache_store: cache_store.as_ref(),
+                                        cfg: &cfg,
+                                        snapshot: &snapshot,
+                                        last_scanned,
+                                        last_scanned_block_hash: batch.to_block_hash,
+                                        changed,
+                                        persist_state: &mut persist_state,
+                                        live_metadata_flush: Some(&mut live_metadata_flush),
+                                        error_message: "failed to persist wallet cache",
+                                    });
                                     debug!(
                                         cache_key = %cfg.cache_key,
                                         last_scanned,
@@ -2962,13 +2996,11 @@ pub(crate) fn spawn_wallet_worker(
                                         spent,
                                         changed,
                                         poi_status_deferred = poi_status_client.is_some(),
-                                        persisted_full_snapshot,
+                                        persisted_full_snapshot = persist_outcome.persisted_full_snapshot,
                                         needs_full_persist = persist_state.needs_full_persist,
                                         "wallet backfill batch complete"
                                     );
-                                    if changed {
-                                        worker_handle.notify_changed();
-                                    }
+                                    worker_handle.notify_if_changed(changed);
                                 }
                                 Err(err) => {
                                     warn!(?err, cache_key = %cfg.cache_key, "failed to apply backfill logs");
@@ -3062,9 +3094,7 @@ pub(crate) fn spawn_wallet_worker(
                                         force_retry: false,
                                     }).await;
                                     set_poi_refreshing(&poi_refreshing_tx, false, &cfg.cache_key);
-                                    if changed {
-                                        worker_handle.notify_changed();
-                                    }
+                                    worker_handle.notify_if_changed(changed);
                                     info!(
                                         cache_key = %cfg.cache_key,
                                         changed,
@@ -3123,37 +3153,26 @@ pub(crate) fn spawn_wallet_worker(
                                     || persist_state.pending_cache_reset.is_some()
                                     || live_metadata_flush
                                         .should_flush(last_scanned, Instant::now());
-                                let mut persisted_full_snapshot = false;
-                                let mut persisted_progress = false;
+                                let mut persist_outcome = WalletProgressPersistOutcome::default();
                                 if should_persist {
                                     let snapshot = utxos.read().await;
-                                    match persist_wallet_progress(
-                                        cache_store.as_ref(),
-                                        WalletProgressPersist {
-                                            cache_key: &cfg.cache_key,
-                                            snapshot: &snapshot,
-                                            last_scanned,
-                                            last_scanned_block_hash: batch.to_block_hash,
-                                            changed: false,
-                                        },
-                                        &mut persist_state,
-                                    ) {
-                                        Ok(persisted) => {
-                                            persisted_full_snapshot = persisted;
-                                            persisted_progress = true;
-                                            live_metadata_flush
-                                                .mark_persisted(last_scanned, Instant::now());
-                                        }
-                                        Err(err) => {
-                                            warn!(?err, cache_key = %cfg.cache_key, "failed to persist empty wallet live batch progress");
-                                        }
-                                    }
+                                    persist_outcome = persist_wallet_snapshot(WalletSnapshotPersist {
+                                        cache_store: cache_store.as_ref(),
+                                        cfg: &cfg,
+                                        snapshot: &snapshot,
+                                        last_scanned,
+                                        last_scanned_block_hash: batch.to_block_hash,
+                                        changed: false,
+                                        persist_state: &mut persist_state,
+                                        live_metadata_flush: Some(&mut live_metadata_flush),
+                                        error_message: "failed to persist empty wallet live batch progress",
+                                    });
                                 }
                                 debug!(
                                     cache_key = %cfg.cache_key,
                                     last_scanned,
-                                    metadata_persisted = persisted_progress,
-                                    persisted_full_snapshot,
+                                    metadata_persisted = persist_outcome.persisted_progress,
+                                    persisted_full_snapshot = persist_outcome.persisted_full_snapshot,
                                     needs_full_persist = persist_state.needs_full_persist,
                                     "wallet empty live batch complete"
                                 );
@@ -3199,30 +3218,19 @@ pub(crate) fn spawn_wallet_worker(
                                         || persist_state.pending_cache_reset.is_some()
                                         || live_metadata_flush
                                             .should_flush(last_scanned, Instant::now());
-                                    let mut persisted_full_snapshot = false;
-                                    let mut persisted_progress = false;
+                                    let mut persist_outcome = WalletProgressPersistOutcome::default();
                                     if should_persist {
-                                        match persist_wallet_progress(
-                                            cache_store.as_ref(),
-                                            WalletProgressPersist {
-                                                cache_key: &cfg.cache_key,
-                                                snapshot: &snapshot,
-                                                last_scanned,
-                                                last_scanned_block_hash: batch.to_block_hash,
-                                                changed,
-                                            },
-                                            &mut persist_state,
-                                        ) {
-                                            Ok(persisted) => {
-                                                persisted_full_snapshot = persisted;
-                                                persisted_progress = true;
-                                                live_metadata_flush
-                                                    .mark_persisted(last_scanned, Instant::now());
-                                            }
-                                            Err(err) => {
-                                                warn!(?err, cache_key = %cfg.cache_key, "failed to persist wallet cache");
-                                            }
-                                        }
+                                        persist_outcome = persist_wallet_snapshot(WalletSnapshotPersist {
+                                            cache_store: cache_store.as_ref(),
+                                            cfg: &cfg,
+                                            snapshot: &snapshot,
+                                            last_scanned,
+                                            last_scanned_block_hash: batch.to_block_hash,
+                                            changed,
+                                            persist_state: &mut persist_state,
+                                            live_metadata_flush: Some(&mut live_metadata_flush),
+                                            error_message: "failed to persist wallet cache",
+                                        });
                                     }
                                     debug!(
                                         cache_key = %cfg.cache_key,
@@ -3231,14 +3239,12 @@ pub(crate) fn spawn_wallet_worker(
                                         unspent,
                                         spent,
                                         changed,
-                                        metadata_persisted = persisted_progress,
-                                        persisted_full_snapshot,
+                                        metadata_persisted = persist_outcome.persisted_progress,
+                                        persisted_full_snapshot = persist_outcome.persisted_full_snapshot,
                                         needs_full_persist = persist_state.needs_full_persist,
                                         "wallet live batch complete"
                                     );
-                                    if changed {
-                                        worker_handle.notify_changed();
-                                    }
+                                    worker_handle.notify_if_changed(changed);
                                 }
                                 Err(err) => {
                                     warn!(?err, cache_key = %cfg.cache_key, "failed to apply live logs");
@@ -3281,14 +3287,15 @@ fn wallet_utxo_counts(utxos: &[WalletUtxo]) -> (usize, usize) {
 mod tests {
     use super::{
         DEFAULT_TXID_VERSION, OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER,
-        OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER, PendingOutputPoiSubmitter, PoiStatusReader,
-        RecoveryGraphRailgunTransaction, WALLET_METADATA_LIVE_FLUSH_BLOCKS,
-        WALLET_METADATA_LIVE_FLUSH_INTERVAL, WALLET_POI_RECOVERABLE_REFRESH_AFTER,
-        WALLET_POI_STATUS_BATCH_SIZE, WalletHandle, WalletLiveMetadataFlush, WalletPersistState,
-        WalletPoiRefreshRequest, WalletPoiRefreshSelection, WalletProgressPersist,
+        OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER, OutputPoiRecoveryAction,
+        PendingOutputPoiSubmitter, PoiStatusReader, RecoveryGraphRailgunTransaction,
+        WALLET_METADATA_LIVE_FLUSH_BLOCKS, WALLET_METADATA_LIVE_FLUSH_INTERVAL,
+        WALLET_POI_RECOVERABLE_REFRESH_AFTER, WALLET_POI_STATUS_BATCH_SIZE, WalletHandle,
+        WalletLiveMetadataFlush, WalletPersistState, WalletPoiRefreshRequest,
+        WalletPoiRefreshSelection, WalletProgressPersist, apply_output_poi_recovery_action,
         apply_wallet_delta_to_vec, apply_wallet_delta_to_vec_with_outcome,
         discard_pending_output_poi_contexts_for_spent_outputs, graph_output_start_global,
-        notify_wallet_rev, output_poi_recovery_candidates, output_poi_recovery_proof_retry_after,
+        output_poi_recovery_candidates, output_poi_recovery_proof_retry_after,
         output_poi_recovery_retry_allowed, output_start_global_position,
         pending_output_poi_submit_identity, persist_wallet_progress,
         process_pending_output_poi_observations, process_pending_output_poi_observations_inner,
@@ -3321,7 +3328,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
     use tokio::sync::{RwLock, mpsc, watch};
 
     static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -3582,6 +3589,177 @@ mod tests {
             attempt_count: 0,
             last_error: None,
         }
+    }
+
+    #[test]
+    fn output_poi_recovery_action_caches_tx_input_without_resetting_state() {
+        let mut record = output_poi_recovery_record(
+            1,
+            "wallet",
+            FixedBytes::from([0x44; 32]),
+            OutputPoiRecoveryStatus::ProofGenerationFailed,
+            Some(20),
+        );
+        record.attempt_count = 3;
+        record.last_error = Some("previous".to_string());
+
+        apply_output_poi_recovery_action(
+            &mut record,
+            OutputPoiRecoveryAction::CacheTxInput {
+                tx_input: vec![0xde, 0xad],
+            },
+            10,
+        );
+
+        assert_eq!(record.tx_input, Some(vec![0xde, 0xad]));
+        assert_eq!(
+            record.status,
+            OutputPoiRecoveryStatus::ProofGenerationFailed
+        );
+        assert_eq!(record.updated_at, 10);
+        assert_eq!(record.last_detection_at, Some(10));
+        assert_eq!(record.next_retry_at, Some(20));
+        assert_eq!(record.attempt_count, 3);
+        assert_eq!(record.last_error.as_deref(), Some("previous"));
+    }
+
+    #[test]
+    fn output_poi_recovery_action_records_detected_failure() {
+        let mut record = output_poi_recovery_record(
+            1,
+            "wallet",
+            FixedBytes::from([0x44; 32]),
+            OutputPoiRecoveryStatus::Recoverable,
+            None,
+        );
+
+        apply_output_poi_recovery_action(
+            &mut record,
+            OutputPoiRecoveryAction::Detected {
+                status: OutputPoiRecoveryStatus::DecodeFailed,
+                retry_after: Some(Duration::from_secs(30)),
+                last_error: Some("decode failed".to_string()),
+                increment_attempts: true,
+            },
+            10,
+        );
+
+        assert_eq!(record.status, OutputPoiRecoveryStatus::DecodeFailed);
+        assert_eq!(record.updated_at, 10);
+        assert_eq!(record.last_detection_at, Some(10));
+        assert_eq!(record.next_retry_at, Some(40));
+        assert_eq!(record.attempt_count, 1);
+        assert_eq!(record.last_error.as_deref(), Some("decode failed"));
+    }
+
+    #[test]
+    fn output_poi_recovery_action_records_recovered_context() {
+        let mut record = output_poi_recovery_record(
+            1,
+            "wallet",
+            FixedBytes::from([0x44; 32]),
+            OutputPoiRecoveryStatus::ProofGenerationFailed,
+            Some(20),
+        );
+        record.attempt_count = 2;
+        record.last_error = Some("old".to_string());
+
+        apply_output_poi_recovery_action(
+            &mut record,
+            OutputPoiRecoveryAction::Detected {
+                status: OutputPoiRecoveryStatus::Recoverable,
+                retry_after: None,
+                last_error: None,
+                increment_attempts: false,
+            },
+            10,
+        );
+
+        assert_eq!(record.status, OutputPoiRecoveryStatus::Recoverable);
+        assert_eq!(record.updated_at, 10);
+        assert_eq!(record.last_detection_at, Some(10));
+        assert_eq!(record.next_retry_at, None);
+        assert_eq!(record.attempt_count, 2);
+        assert_eq!(record.last_error, None);
+    }
+
+    #[test]
+    fn output_poi_recovery_action_records_submit_success() {
+        let mut record = output_poi_recovery_record(
+            1,
+            "wallet",
+            FixedBytes::from([0x44; 32]),
+            OutputPoiRecoveryStatus::Recoverable,
+            None,
+        );
+        record.last_error = Some("old".to_string());
+
+        apply_output_poi_recovery_action(
+            &mut record,
+            OutputPoiRecoveryAction::Submitted {
+                retry_after: Duration::from_secs(60),
+            },
+            10,
+        );
+
+        assert_eq!(record.status, OutputPoiRecoveryStatus::Submitted);
+        assert_eq!(record.updated_at, 10);
+        assert_eq!(record.last_submission_at, Some(10));
+        assert_eq!(record.next_retry_at, Some(70));
+        assert_eq!(record.attempt_count, 1);
+        assert_eq!(record.last_error, None);
+    }
+
+    #[test]
+    fn output_poi_recovery_action_records_submit_failure() {
+        let mut record = output_poi_recovery_record(
+            1,
+            "wallet",
+            FixedBytes::from([0x44; 32]),
+            OutputPoiRecoveryStatus::Recoverable,
+            None,
+        );
+
+        apply_output_poi_recovery_action(
+            &mut record,
+            OutputPoiRecoveryAction::SubmitFailed {
+                error: "submit failed".to_string(),
+                retry_after: Duration::from_secs(60),
+            },
+            10,
+        );
+
+        assert_eq!(record.status, OutputPoiRecoveryStatus::SubmitFailed);
+        assert_eq!(record.updated_at, 10);
+        assert_eq!(record.last_submission_at, None);
+        assert_eq!(record.next_retry_at, Some(70));
+        assert_eq!(record.attempt_count, 1);
+        assert_eq!(record.last_error.as_deref(), Some("submit failed"));
+    }
+
+    #[test]
+    fn output_poi_recovery_action_marks_valid_without_touching_history() {
+        let mut record = output_poi_recovery_record(
+            1,
+            "wallet",
+            FixedBytes::from([0x44; 32]),
+            OutputPoiRecoveryStatus::Submitted,
+            Some(20),
+        );
+        record.last_detection_at = Some(4);
+        record.last_submission_at = Some(5);
+        record.attempt_count = 2;
+        record.last_error = Some("old".to_string());
+
+        apply_output_poi_recovery_action(&mut record, OutputPoiRecoveryAction::Valid, 10);
+
+        assert_eq!(record.status, OutputPoiRecoveryStatus::Valid);
+        assert_eq!(record.updated_at, 10);
+        assert_eq!(record.last_detection_at, Some(4));
+        assert_eq!(record.last_submission_at, Some(5));
+        assert_eq!(record.next_retry_at, None);
+        assert_eq!(record.attempt_count, 2);
+        assert_eq!(record.last_error, None);
     }
 
     #[test]
@@ -4666,7 +4844,7 @@ mod tests {
     }
 
     #[test]
-    fn notify_wallet_rev_increments_revision() {
+    fn notify_changed_increments_revision() {
         let (ready_tx, ready_rx) = watch::channel(false);
         drop(ready_tx);
         let (rev_tx, rev_rx) = watch::channel(0_u64);
@@ -4682,10 +4860,10 @@ mod tests {
             rev_tx,
         };
 
-        notify_wallet_rev(&handle);
+        handle.notify_changed();
         assert_eq!(*handle.rev_rx.borrow(), 1);
 
-        notify_wallet_rev(&handle);
+        handle.notify_changed();
         assert_eq!(*handle.rev_rx.borrow(), 2);
     }
 

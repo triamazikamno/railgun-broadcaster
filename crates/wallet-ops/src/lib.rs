@@ -58,7 +58,37 @@ use zeroize::{Zeroize, Zeroizing};
 
 pub use waku_relay::client::Client as PublicBroadcasterWakuClient;
 
+mod amounts;
+mod http;
+mod poi_contexts;
+mod signer;
+mod utxos;
+
 pub mod vault;
+
+pub use amounts::{
+    is_wrapped_native_token, parse_railgun_recipient, parse_send_amount, parse_unshield_amount,
+};
+pub use http::{HttpContext, build_http_client};
+pub use utxos::{
+    ListUtxosOutput, TokenTotal, UtxoOutput, max_send_amount_from_outputs,
+    max_unshield_amount_from_outputs,
+};
+
+pub(crate) use poi_contexts::{
+    active_list_pre_transaction_pois, persist_pending_send_output_poi_contexts,
+    persist_pending_unshield_output_poi_contexts, public_broadcaster_pre_transaction_pois,
+};
+pub(crate) use signer::{EvmMessageSigner, EvmTransactionSigner, SoftwareEvmSigner};
+pub(crate) use utxos::utxo_outputs_from_utxos;
+
+#[cfg(test)]
+pub(crate) use amounts::wrapped_native_token_for_chain;
+#[cfg(test)]
+pub(crate) use poi_contexts::{
+    build_pending_output_poi_context_records, pending_send_output_role_plans,
+    pending_unshield_output_role_plans,
+};
 
 const DEFAULT_QUERY_RPC_COOLDOWN: Duration = Duration::from_secs(5);
 const DEFAULT_BLOCK_RANGE: u64 = 500;
@@ -83,32 +113,6 @@ pub const RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS: U256 = uint!(25_U256);
 /// WETH `deposit()` function selector - no arguments, ETH value is the deposit
 /// amount.
 const WETH_DEPOSIT_SELECTOR: [u8; 4] = [0xd0, 0xe3, 0x0d, 0xb0];
-
-/// Shared HTTP context built once from an optional proxy and passed into wallet
-/// operations that issue network requests.
-#[derive(Clone)]
-pub struct HttpContext {
-    /// Async HTTP client for reqwest and alloy usage.
-    pub client: reqwest::Client,
-    /// Proxy URL for components that build their own client, such as the
-    /// blocking artifact downloader.
-    pub proxy_url: Option<Url>,
-}
-
-pub fn build_http_client(proxy: Option<&Url>) -> Result<HttpContext> {
-    let mut builder = reqwest::Client::builder();
-    if let Some(proxy_url) = proxy {
-        tracing::info!(%proxy_url, "routing all HTTP traffic through proxy");
-        let p = reqwest::Proxy::all(proxy_url.as_str())
-            .wrap_err_with(|| format!("invalid proxy URL {proxy_url}"))?;
-        builder = builder.proxy(p);
-    }
-    let client = builder.build().wrap_err("build HTTP client")?;
-    Ok(HttpContext {
-        client,
-        proxy_url: proxy.cloned(),
-    })
-}
 
 pub struct ListUtxosRequest {
     pub mnemonic: String,
@@ -432,135 +436,6 @@ struct PreparedPublicBroadcasterPlan<P> {
     min_gas_price: u128,
 }
 
-pub trait EvmTransactionSigner {
-    fn address(&self) -> Address;
-
-    fn ethereum_wallet(&self) -> EthereumWallet;
-}
-
-pub trait EvmMessageSigner {
-    fn derive_shield_private_key(&self) -> Result<[u8; 32]>;
-}
-
-pub struct SoftwareEvmSigner {
-    private_key: [u8; 32],
-    signer: PrivateKeySigner,
-}
-
-impl SoftwareEvmSigner {
-    pub fn from_private_key_hex(private_key: &str) -> Result<Self> {
-        let private_key = parse_private_key(private_key)?;
-        let signer = PrivateKeySigner::from(
-            SigningKey::from_bytes((&private_key).into()).wrap_err("invalid signing key")?,
-        );
-        Ok(Self {
-            private_key,
-            signer,
-        })
-    }
-}
-
-impl EvmTransactionSigner for SoftwareEvmSigner {
-    fn address(&self) -> Address {
-        self.signer.address()
-    }
-
-    fn ethereum_wallet(&self) -> EthereumWallet {
-        EthereumWallet::from(self.signer.clone())
-    }
-}
-
-impl EvmMessageSigner for SoftwareEvmSigner {
-    fn derive_shield_private_key(&self) -> Result<[u8; 32]> {
-        derive_shield_private_key(&self.private_key).wrap_err("derive shield private key")
-    }
-}
-
-impl Drop for SoftwareEvmSigner {
-    fn drop(&mut self) {
-        self.private_key.zeroize();
-    }
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct UtxoOutput {
-    pub tree: u32,
-    pub position: u64,
-    pub token: String,
-    pub value: String,
-    pub commitment_kind: String,
-    pub commitment: String,
-    pub npk: String,
-    pub blinded_commitment: String,
-    pub poi_statuses: BTreeMap<String, String>,
-    pub poi_spendable: bool,
-    pub source_tx_hash: String,
-    pub source_block_number: u64,
-    pub source_block_timestamp: u64,
-    pub is_spent: bool,
-    pub spent_tx_hash: Option<String>,
-    pub spent_block_number: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct TokenTotal {
-    pub token: String,
-    pub total: String,
-    pub poi_verified_total: String,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct ListUtxosOutput {
-    pub chain_id: u64,
-    pub cache_key: String,
-    pub utxo_count: usize,
-    pub unspent_count: usize,
-    pub spent_count: usize,
-    pub utxos: Vec<UtxoOutput>,
-    pub totals: Vec<TokenTotal>,
-}
-
-#[must_use]
-pub fn max_unshield_amount_from_outputs(utxos: &[UtxoOutput], token: Address) -> U256 {
-    let planner_utxos = planner_utxos_from_outputs(utxos, token);
-    max_unshield_spendable(&planner_utxos, token)
-}
-
-#[must_use]
-pub fn max_send_amount_from_outputs(utxos: &[UtxoOutput], token: Address) -> U256 {
-    let planner_utxos = planner_utxos_from_outputs(utxos, token);
-    max_send_spendable(&planner_utxos, token)
-}
-
-fn planner_utxos_from_outputs(utxos: &[UtxoOutput], token: Address) -> Vec<Utxo> {
-    utxos
-        .iter()
-        .filter(|row| !row.is_spent)
-        .filter(|row| row.poi_spendable)
-        .filter_map(|row| {
-            let row_token = row.token.parse::<Address>().ok()?;
-            if row_token != token {
-                return None;
-            }
-            let value = U256::from_str_radix(&row.value, 10).ok()?;
-            if value.is_zero() {
-                return None;
-            }
-            Some(Utxo::new(
-                Note::new_unshield(Address::ZERO, token, value),
-                row.tree,
-                row.position,
-                UtxoSource {
-                    tx_hash: FixedBytes::ZERO,
-                    block_number: row.source_block_number,
-                    block_timestamp: row.source_block_timestamp,
-                },
-                UtxoCommitmentKind::Transact,
-            ))
-        })
-        .collect()
-}
-
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct UnshieldOutput {
     pub to: Address,
@@ -691,35 +566,6 @@ fn poi_verified_unspent_utxos_from_records(utxos: &[WalletUtxo]) -> Vec<Utxo> {
         .filter(|entry| entry.utxo.poi.is_valid_for_lists(&active_poi_list_keys))
         .map(|entry| entry.utxo.clone())
         .collect()
-}
-
-pub fn parse_unshield_amount(input: &str, decimals: Option<u8>) -> Result<U256> {
-    let input = input.trim();
-    if input.is_empty() {
-        return Err(eyre!("amount is required"));
-    }
-
-    if let Some(decimals) = decimals {
-        parse_scaled_amount(input, decimals)
-    } else {
-        if !input.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(eyre!("unknown token amounts must be raw integer units"));
-        }
-        U256::from_str_radix(input, 10).wrap_err("invalid raw amount")
-    }
-}
-
-pub fn parse_send_amount(input: &str, decimals: Option<u8>) -> Result<U256> {
-    parse_unshield_amount(input, decimals)
-}
-
-pub fn parse_railgun_recipient(input: &str) -> Result<AddressData> {
-    let input = input.trim();
-    if input.is_empty() {
-        return Err(eyre!("recipient 0zk address is required"));
-    }
-    let railgun_addr = RailgunAddress::from(input);
-    AddressData::try_from(&railgun_addr).wrap_err("invalid recipient 0zk address")
 }
 
 pub fn eligible_public_broadcasters_for_asset(
@@ -927,12 +773,6 @@ fn parse_required_poi_list_keys(
         .collect()
 }
 
-struct PublicBroadcasterPreTransactionPois {
-    request_pois: PreTransactionPoiMap,
-    pending_poi_list_keys: Vec<FixedBytes<32>>,
-    pending_pois: PreTransactionPoiMap,
-}
-
 struct PublicBroadcasterSetup {
     chain_defaults: ChainConfigDefaults,
     broadcaster: PublicBroadcasterCandidate,
@@ -989,368 +829,6 @@ async fn public_broadcaster_setup(
         forest,
         utxos,
     })
-}
-
-async fn public_broadcaster_pre_transaction_pois(
-    chunks: &[TransactionPlanChunk],
-    broadcaster: &PublicBroadcasterCandidate,
-    chain_id: u64,
-    prover: &ProverService,
-    verify_proof: bool,
-    http: &HttpContext,
-) -> Result<PublicBroadcasterPreTransactionPois> {
-    let required_poi_list_keys = parse_required_poi_list_keys(broadcaster)?;
-    let pending_poi_list_keys: Vec<FixedBytes<32>> = default_active_poi_list_keys();
-    let all_poi_list_keys = combined_poi_list_keys(&required_poi_list_keys, &pending_poi_list_keys);
-    let poi_started = Instant::now();
-    let all_pois = generate_pre_transaction_pois_for_lists(
-        chunks,
-        chain_id,
-        prover,
-        verify_proof,
-        http,
-        &all_poi_list_keys,
-        "generate public broadcaster pre-transaction POI",
-    )
-    .await?;
-    tracing::info!(
-        chain_id,
-        chunks = chunks.len(),
-        required_list_keys = required_poi_list_keys.len(),
-        pending_list_keys = pending_poi_list_keys.len(),
-        total_list_keys = all_poi_list_keys.len(),
-        elapsed_ms = poi_started.elapsed().as_millis(),
-        "generated public broadcaster pre-transaction POIs"
-    );
-    let pending_pois = retain_pre_transaction_poi_lists(&all_pois, &pending_poi_list_keys);
-    Ok(PublicBroadcasterPreTransactionPois {
-        request_pois: retain_pre_transaction_poi_lists(&all_pois, &required_poi_list_keys),
-        pending_poi_list_keys,
-        pending_pois,
-    })
-}
-
-async fn active_list_pre_transaction_pois(
-    chunks: &[TransactionPlanChunk],
-    chain_id: u64,
-    prover: &ProverService,
-    verify_proof: bool,
-    http: &HttpContext,
-    context: &'static str,
-) -> Result<(Vec<FixedBytes<32>>, PreTransactionPoiMap)> {
-    let poi_list_keys = default_active_poi_list_keys();
-    let pois = generate_pre_transaction_pois_for_lists(
-        chunks,
-        chain_id,
-        prover,
-        verify_proof,
-        http,
-        &poi_list_keys,
-        context,
-    )
-    .await?;
-    Ok((poi_list_keys, pois))
-}
-
-async fn generate_pre_transaction_pois_for_lists(
-    chunks: &[TransactionPlanChunk],
-    chain_id: u64,
-    prover: &ProverService,
-    verify_proof: bool,
-    http: &HttpContext,
-    poi_list_keys: &[FixedBytes<32>],
-    context: &'static str,
-) -> Result<PreTransactionPoiMap> {
-    if poi_list_keys.is_empty() {
-        return Ok(BTreeMap::new());
-    }
-    let poi_rpc_url =
-        Url::parse(DEFAULT_WALLET_POI_RPC_URL).wrap_err("parse default POI RPC URL")?;
-    let poi_client = PoiRpcClient::with_http_client(poi_rpc_url, http.client.clone());
-    generate_pre_transaction_pois(PreTransactionPoiGenerationRequest {
-        chunks,
-        chain_type: 0,
-        chain_id,
-        txid_version: Some(DEFAULT_TXID_VERSION),
-        required_poi_list_keys: poi_list_keys,
-        poi_client: &poi_client,
-        prover,
-        verify_proof,
-    })
-    .await
-    .wrap_err(context)
-}
-
-fn combined_poi_list_keys(
-    first: &[FixedBytes<32>],
-    second: &[FixedBytes<32>],
-) -> Vec<FixedBytes<32>> {
-    let mut out = Vec::with_capacity(first.len() + second.len());
-    for key in first.iter().chain(second.iter()) {
-        if !out.contains(key) {
-            out.push(*key);
-        }
-    }
-    out
-}
-
-fn retain_pre_transaction_poi_lists(
-    pois: &PreTransactionPoiMap,
-    list_keys: &[FixedBytes<32>],
-) -> PreTransactionPoiMap {
-    list_keys
-        .iter()
-        .filter_map(|list_key| {
-            pois.get(list_key)
-                .cloned()
-                .map(|per_leaf| (*list_key, per_leaf))
-        })
-        .collect()
-}
-
-#[derive(Clone, Copy)]
-struct PendingOutputPoiRolePlan {
-    role: PendingOutputPoiRole,
-    first_chunk_only: bool,
-    required: bool,
-    missing_output: &'static str,
-}
-
-fn pending_send_output_role_plans(include_broadcaster_fee: bool) -> Vec<PendingOutputPoiRolePlan> {
-    let mut plans = Vec::with_capacity(3);
-    if include_broadcaster_fee {
-        plans.push(PendingOutputPoiRolePlan {
-            role: PendingOutputPoiRole::BroadcasterFee,
-            first_chunk_only: true,
-            required: true,
-            missing_output: "missing public broadcaster send fee output for pending POI",
-        });
-    }
-    plans.push(PendingOutputPoiRolePlan {
-        role: PendingOutputPoiRole::Recipient,
-        first_chunk_only: false,
-        required: true,
-        missing_output: "missing send recipient output for pending POI",
-    });
-    plans.push(PendingOutputPoiRolePlan {
-        role: PendingOutputPoiRole::Change,
-        first_chunk_only: false,
-        required: false,
-        missing_output: "missing send change output for pending POI",
-    });
-    plans
-}
-
-fn pending_unshield_output_role_plans(
-    include_broadcaster_fee: bool,
-) -> Vec<PendingOutputPoiRolePlan> {
-    let mut plans = Vec::with_capacity(2);
-    if include_broadcaster_fee {
-        plans.push(PendingOutputPoiRolePlan {
-            role: PendingOutputPoiRole::BroadcasterFee,
-            first_chunk_only: true,
-            required: true,
-            missing_output: "missing public broadcaster unshield fee output for pending POI",
-        });
-    }
-    plans.push(PendingOutputPoiRolePlan {
-        role: PendingOutputPoiRole::Change,
-        first_chunk_only: false,
-        required: false,
-        missing_output: "missing unshield change output for pending POI",
-    });
-    plans
-}
-
-fn persist_pending_send_output_poi_contexts(
-    db: &DbStore,
-    chain_id: u64,
-    wallet_id: &str,
-    chunks: &[TransactionPlanChunk],
-    pre_transaction_pois: &PreTransactionPoiMap,
-    poi_list_keys: &[FixedBytes<32>],
-    include_broadcaster_fee: bool,
-) -> Result<usize> {
-    let created_at = now_epoch_secs()?;
-    let records = build_pending_output_poi_context_records(
-        chain_id,
-        wallet_id,
-        created_at,
-        chunks,
-        pre_transaction_pois,
-        poi_list_keys,
-        &pending_send_output_role_plans(include_broadcaster_fee),
-    )?;
-    persist_pending_output_poi_context_records(db, &records)
-}
-
-fn persist_pending_unshield_output_poi_contexts(
-    db: &DbStore,
-    chain_id: u64,
-    wallet_id: &str,
-    chunks: &[TransactionPlanChunk],
-    pre_transaction_pois: &PreTransactionPoiMap,
-    poi_list_keys: &[FixedBytes<32>],
-    include_broadcaster_fee: bool,
-) -> Result<usize> {
-    let created_at = now_epoch_secs()?;
-    let records = build_pending_output_poi_context_records(
-        chain_id,
-        wallet_id,
-        created_at,
-        chunks,
-        pre_transaction_pois,
-        poi_list_keys,
-        &pending_unshield_output_role_plans(include_broadcaster_fee),
-    )?;
-    persist_pending_output_poi_context_records(db, &records)
-}
-
-fn build_pending_output_poi_context_records(
-    chain_id: u64,
-    wallet_id: &str,
-    created_at: u64,
-    chunks: &[TransactionPlanChunk],
-    pre_transaction_pois: &PreTransactionPoiMap,
-    poi_list_keys: &[FixedBytes<32>],
-    role_plans: &[PendingOutputPoiRolePlan],
-) -> Result<Vec<PendingOutputPoiContextRecord>> {
-    let mut records = Vec::new();
-    for (chunk_index, chunk) in chunks.iter().enumerate() {
-        let chunk_context = pending_chunk_context(chunk, pre_transaction_pois, poi_list_keys)?;
-        let private_output_count = pending_private_output_count(chunk)?;
-        let mut output_index = 0;
-
-        for role_plan in role_plans {
-            if role_plan.first_chunk_only && chunk_index != 0 {
-                continue;
-            }
-            if output_index >= private_output_count {
-                if role_plan.required {
-                    return Err(eyre!(role_plan.missing_output));
-                }
-                continue;
-            }
-            let note = chunk
-                .outputs
-                .get(output_index)
-                .ok_or_else(|| eyre!(role_plan.missing_output))?;
-            records.push(pending_output_poi_context_record(
-                chain_id,
-                wallet_id,
-                created_at,
-                &chunk_context,
-                note,
-                role_plan.role,
-            ));
-            output_index += 1;
-        }
-    }
-    Ok(records)
-}
-
-struct PendingOutputPoiChunkContext {
-    utxo_tree_in: u64,
-    railgun_txid: U256,
-    pre_transaction_pois: PreTransactionPoiMap,
-    poi_list_keys: Vec<FixedBytes<32>>,
-}
-
-fn pending_chunk_context(
-    chunk: &TransactionPlanChunk,
-    pre_transaction_pois: &PreTransactionPoiMap,
-    poi_list_keys: &[FixedBytes<32>],
-) -> Result<PendingOutputPoiChunkContext> {
-    let railgun_txid = chunk.railgun_txid();
-    let utxo_tree_in = u64::from(chunk.tree_number);
-    let txid_leaf_hash =
-        FixedBytes::from(railgun_txid_leaf_hash(railgun_txid, utxo_tree_in).to_be_bytes::<32>());
-    let pre_transaction_pois = pre_transaction_pois
-        .iter()
-        .filter_map(|(list_key, per_leaf)| {
-            per_leaf
-                .get(&txid_leaf_hash)
-                .cloned()
-                .map(|poi| (*list_key, BTreeMap::from([(txid_leaf_hash, poi)])))
-        })
-        .collect::<PreTransactionPoiMap>();
-
-    for list_key in poi_list_keys {
-        let has_poi = pre_transaction_pois
-            .get(list_key)
-            .is_some_and(|per_leaf| per_leaf.contains_key(&txid_leaf_hash));
-        if !has_poi {
-            return Err(eyre!(
-                "missing pending output pre-transaction POI for list key {}",
-                hex::encode(list_key)
-            ));
-        }
-    }
-
-    Ok(PendingOutputPoiChunkContext {
-        utxo_tree_in,
-        railgun_txid,
-        pre_transaction_pois,
-        poi_list_keys: poi_list_keys.to_vec(),
-    })
-}
-
-fn pending_private_output_count(chunk: &TransactionPlanChunk) -> Result<usize> {
-    if chunk.has_unshield {
-        chunk
-            .outputs
-            .len()
-            .checked_sub(1)
-            .ok_or_else(|| eyre!("unshield chunk is missing public output"))
-    } else {
-        Ok(chunk.outputs.len())
-    }
-}
-
-fn pending_output_poi_context_record(
-    chain_id: u64,
-    wallet_id: &str,
-    created_at: u64,
-    chunk_context: &PendingOutputPoiChunkContext,
-    note: &Note,
-    output_role: PendingOutputPoiRole,
-) -> PendingOutputPoiContextRecord {
-    PendingOutputPoiContextRecord {
-        chain_id,
-        wallet_id: wallet_id.to_string(),
-        txid_version: DEFAULT_TXID_VERSION.to_string(),
-        output_commitment: FixedBytes::from(note.commitment().to_be_bytes::<32>()),
-        output_npk: FixedBytes::from(note.npk.to_be_bytes::<32>()),
-        utxo_tree_in: chunk_context.utxo_tree_in,
-        railgun_txid: chunk_context.railgun_txid,
-        txid_merkleroot_index: None,
-        pre_transaction_pois_per_txid_leaf_per_list: chunk_context.pre_transaction_pois.clone(),
-        required_poi_list_keys: chunk_context.poi_list_keys.clone(),
-        output_role,
-        created_at,
-        source_operation_id: None,
-        observation: None,
-        submitted_poi_list_keys: Vec::new(),
-        terminal_error: None,
-    }
-}
-
-fn persist_pending_output_poi_context_records(
-    db: &DbStore,
-    records: &[PendingOutputPoiContextRecord],
-) -> Result<usize> {
-    for record in records {
-        db.put_pending_output_poi_context(record)
-            .wrap_err("persist pending output POI context")?;
-    }
-    Ok(records.len())
-}
-
-fn now_epoch_secs() -> Result<u64> {
-    Ok(SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .wrap_err("system clock is before unix epoch")?
-        .as_secs())
 }
 
 const fn approximate_public_broadcaster_gas(shape: ApproximateTransactionShape) -> u64 {
@@ -1546,58 +1024,6 @@ fn candidate_from_fee_row(row: &FeeRow) -> Option<PublicBroadcasterCandidate> {
         viewing_public_key: address_data.viewing_public_key,
         address_data,
     })
-}
-
-#[must_use]
-pub const fn wrapped_native_token_for_chain(chain_id: u64) -> Option<Address> {
-    match chain_id {
-        1 => Some(address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2")),
-        56 => Some(address!("0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c")),
-        137 => Some(address!("0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270")),
-        42161 => Some(address!("0x82aF49447D8a07e3bd95BD0d56f35241523fBab1")),
-        _ => None,
-    }
-}
-
-#[must_use]
-pub fn is_wrapped_native_token(chain_id: u64, token: Address) -> bool {
-    wrapped_native_token_for_chain(chain_id).is_some_and(|wrapped| wrapped == token)
-}
-
-fn parse_scaled_amount(input: &str, decimals: u8) -> Result<U256> {
-    let (whole, fractional) = input
-        .split_once('.')
-        .map_or((input, ""), |(whole, fractional)| (whole, fractional));
-    if whole.is_empty() && fractional.is_empty() {
-        return Err(eyre!("amount is required"));
-    }
-    if !whole.bytes().all(|byte| byte.is_ascii_digit())
-        || !fractional.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return Err(eyre!("amount must contain only decimal digits"));
-    }
-    if fractional.len() > usize::from(decimals) {
-        return Err(eyre!("amount has too many decimal places"));
-    }
-
-    let whole_value = if whole.is_empty() {
-        U256::ZERO
-    } else {
-        U256::from_str_radix(whole, 10).wrap_err("invalid whole amount")?
-    };
-    let scale = uint!(10_U256).pow(U256::from(decimals));
-    let fractional_value = if decimals == 0 || fractional.is_empty() {
-        U256::ZERO
-    } else {
-        let mut padded = fractional.to_owned();
-        padded.extend(std::iter::repeat_n(
-            '0',
-            usize::from(decimals) - fractional.len(),
-        ));
-        U256::from_str_radix(&padded, 10).wrap_err("invalid fractional amount")?
-    };
-
-    Ok(whole_value * scale + fractional_value)
 }
 
 pub struct WalletSessionStore {
@@ -3116,69 +2542,6 @@ async fn submit_public_broadcaster_plan(
     })
 }
 
-#[must_use]
-pub fn utxo_outputs_from_utxos(mut utxos: Vec<WalletUtxo>) -> (Vec<UtxoOutput>, Vec<TokenTotal>) {
-    utxos.sort_by(|a, b| match a.utxo.tree.cmp(&b.utxo.tree) {
-        std::cmp::Ordering::Equal => a.utxo.position.cmp(&b.utxo.position),
-        other => other,
-    });
-
-    let active_poi_list_keys = default_active_poi_list_keys();
-    let mut totals_map: BTreeMap<Address, U256> = BTreeMap::new();
-    let mut poi_verified_totals_map: BTreeMap<Address, U256> = BTreeMap::new();
-    let utxo_outputs = utxos
-        .into_iter()
-        .map(|wallet_utxo| {
-            let utxo = wallet_utxo.utxo;
-            let token_addr = utxo.token_address();
-            let poi_spendable =
-                wallet_utxo.spent.is_none() && utxo.poi.is_valid_for_lists(&active_poi_list_keys);
-            if wallet_utxo.spent.is_none() {
-                *totals_map.entry(token_addr).or_default() += utxo.note.value;
-            }
-            if poi_spendable {
-                *poi_verified_totals_map.entry(token_addr).or_default() += utxo.note.value;
-            }
-            let source = &utxo.source;
-            let spent = wallet_utxo.spent.as_ref();
-            let poi_statuses = poi_statuses_for_output(&utxo, &active_poi_list_keys);
-
-            UtxoOutput {
-                tree: utxo.tree,
-                position: utxo.position,
-                token: token_addr.to_checksum(None),
-                value: utxo.note.value.to_string(),
-                commitment_kind: commitment_kind_label(utxo.poi.commitment_kind).to_string(),
-                commitment: hex::encode_prefixed(utxo.poi.commitment),
-                npk: hex::encode_prefixed(utxo.poi.npk),
-                blinded_commitment: hex::encode_prefixed(utxo.poi.blinded_commitment),
-                poi_statuses,
-                poi_spendable,
-                source_tx_hash: hex::encode_prefixed(source.tx_hash),
-                source_block_number: source.block_number,
-                source_block_timestamp: source.block_timestamp,
-                is_spent: wallet_utxo.spent.is_some(),
-                spent_tx_hash: spent.map(|source| hex::encode_prefixed(source.tx_hash)),
-                spent_block_number: spent.map(|source| source.block_number),
-            }
-        })
-        .collect();
-
-    let totals = totals_map
-        .into_iter()
-        .map(|(addr, total)| TokenTotal {
-            token: addr.to_checksum(None),
-            total: total.to_string(),
-            poi_verified_total: poi_verified_totals_map
-                .remove(&addr)
-                .unwrap_or_default()
-                .to_string(),
-        })
-        .collect();
-
-    (utxo_outputs, totals)
-}
-
 async fn snapshot_from_handle(chain_id: u64, handle: &WalletHandle) -> ListUtxosOutput {
     let utxos = handle.utxos.read().await.clone();
     let (utxo_outputs, totals) = utxo_outputs_from_utxos(utxos);
@@ -3194,37 +2557,6 @@ async fn snapshot_from_handle(chain_id: u64, handle: &WalletHandle) -> ListUtxos
         utxos: utxo_outputs,
         totals,
     }
-}
-
-const fn commitment_kind_label(kind: UtxoCommitmentKind) -> &'static str {
-    match kind {
-        UtxoCommitmentKind::Shield => "Shield",
-        UtxoCommitmentKind::Transact => "Transact",
-    }
-}
-
-const fn poi_status_label(status: PoiStatus) -> &'static str {
-    match status {
-        PoiStatus::Valid => "Valid",
-        PoiStatus::ShieldBlocked => "ShieldBlocked",
-        PoiStatus::ProofSubmitted => "ProofSubmitted",
-        PoiStatus::Missing => "Missing",
-        PoiStatus::Unknown => "Unknown",
-    }
-}
-
-fn poi_statuses_for_output(
-    utxo: &Utxo,
-    active_poi_list_keys: &[FixedBytes<32>],
-) -> BTreeMap<String, String> {
-    let mut statuses = utxo.poi.statuses.clone();
-    for list_key in active_poi_list_keys {
-        statuses.entry(*list_key).or_insert(PoiStatus::Unknown);
-    }
-    statuses
-        .into_iter()
-        .map(|(list_key, status)| (hex::encode(list_key), poi_status_label(status).to_string()))
-        .collect()
 }
 
 struct SyncedWallet {
@@ -3503,11 +2835,6 @@ fn artifact_source(http: &HttpContext) -> ArtifactSource {
         Some(url) => ArtifactSource::default().with_proxy(url.clone()),
         None => ArtifactSource::default(),
     }
-}
-
-fn parse_private_key(private_key: &str) -> Result<[u8; 32]> {
-    let pk_hex = private_key.strip_prefix("0x").unwrap_or(private_key);
-    hex::decode_to_array(pk_hex).wrap_err("invalid private key hex")
 }
 
 async fn buffered_gas_price(provider: &(impl Provider + Clone)) -> Result<u128> {

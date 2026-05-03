@@ -11,5 +11,8 @@ serde = { workspace = true }
 humantime-serde = { workspace = true }
 url = { workspace = true, features = ["serde"] }
 
+[dev-dependencies]
+serde_json = { workspace = true }
+
 [lints]
 workspace = true

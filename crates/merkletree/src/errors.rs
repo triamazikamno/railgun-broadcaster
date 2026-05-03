@@ -8,4 +8,9 @@ pub enum SyncError {
     MissingData,
     #[error("unexpected response format: {0}")]
     UnexpectedFormat(String),
+    #[error("invalid merkle tree position {tree_position}; expected less than {max_position}")]
+    InvalidTreePosition {
+        tree_position: u64,
+        max_position: u64,
+    },
 }

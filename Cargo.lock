@@ -3017,6 +3017,7 @@ dependencies = [
  "alloy-dyn-abi",
  "humantime-serde",
  "serde",
+ "serde_json",
  "url",
 ]
 

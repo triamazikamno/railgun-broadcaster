@@ -39,8 +39,8 @@ pub struct MerkleProof {
 
 impl MerkleTree {
     pub fn insert(&mut self, position: u64, leaf: U256) -> Result<(), SyncError> {
-        let local_position = position % TREE_LEAF_COUNT;
-        self.leaves.insert(local_position, leaf);
+        validate_tree_position(position)?;
+        self.leaves.insert(position, leaf);
         self.root = None;
         Ok(())
     }
@@ -154,6 +154,7 @@ impl MerkleForest {
     }
 
     pub fn insert_leaf(&mut self, update: MerkleTreeUpdate) -> Result<(), SyncError> {
+        validate_tree_position(update.tree_position)?;
         let tree = self.trees.entry(update.tree_number).or_default();
         tree.insert(update.tree_position, update.hash)?;
         Ok(())
@@ -222,6 +223,16 @@ impl MerkleForest {
             .get(&tree_number)
             .map(|tree| tree.prove_with_leaf_count(tree_position, leaf_count))
     }
+}
+
+const fn validate_tree_position(tree_position: u64) -> Result<(), SyncError> {
+    if tree_position >= TREE_LEAF_COUNT {
+        return Err(SyncError::InvalidTreePosition {
+            tree_position,
+            max_position: TREE_LEAF_COUNT,
+        });
+    }
+    Ok(())
 }
 
 fn compute_zero_hashes() -> [U256; TREE_DEPTH + 1] {
@@ -332,5 +343,45 @@ mod tests {
 
         assert_eq!(proof.root, forest.roots()[&0]);
         assert_eq!(proof.leaf, uint!(4_U256));
+    }
+
+    #[test]
+    fn tree_insert_rejects_out_of_range_position_without_wrapping() {
+        let mut tree = MerkleTree::default();
+        tree.insert(0, uint!(11_U256)).unwrap();
+
+        let error = tree.insert(TREE_LEAF_COUNT, uint!(12_U256)).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SyncError::InvalidTreePosition {
+                tree_position: TREE_LEAF_COUNT,
+                max_position: TREE_LEAF_COUNT,
+            }
+        ));
+        assert_eq!(tree.leaves.get(&0), Some(&uint!(11_U256)));
+        assert_eq!(tree.leaf_count(), 1);
+    }
+
+    #[test]
+    fn forest_insert_rejects_out_of_range_local_position() {
+        let mut forest = MerkleForest::new();
+
+        let error = forest
+            .insert_leaf(MerkleTreeUpdate {
+                tree_number: 7,
+                tree_position: TREE_LEAF_COUNT,
+                hash: uint!(12_U256),
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SyncError::InvalidTreePosition {
+                tree_position: TREE_LEAF_COUNT,
+                max_position: TREE_LEAF_COUNT,
+            }
+        ));
+        assert_eq!(forest.tree_count(), 0);
     }
 }

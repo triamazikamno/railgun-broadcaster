@@ -1,6 +1,8 @@
 use alloy::primitives::{Address, Bytes, ChainId, FixedBytes, U256};
-use serde::Deserialize;
+use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 use url::Url;
@@ -55,7 +57,7 @@ pub struct AdditionalWakuPeer {
 pub struct Chain {
     pub key: Key,
     pub chain_id: ChainId,
-    pub fee_bonus: f32,
+    pub fee_bonus: FeeBonusBps,
     pub fees_ttl: humantime_serde::Serde<Duration>,
     pub fees_refresh_interval: humantime_serde::Serde<Duration>,
     pub fees: HashMap<Address, FeeRate>,
@@ -68,6 +70,82 @@ pub struct Chain {
     pub evm_wallets: Vec<Bytes>,
     pub identifier: Option<String>,
     pub sync: Option<SyncChainConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeeBonusBps(u32);
+
+impl FeeBonusBps {
+    #[must_use]
+    pub const fn bps(self) -> u32 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for FeeBonusBps {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(FeeBonusBpsVisitor)
+    }
+}
+
+struct FeeBonusBpsVisitor;
+
+impl Visitor<'_> for FeeBonusBpsVisitor {
+    type Value = FeeBonusBps;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a non-negative fee bonus percent")
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        if value < 0 {
+            return Err(E::custom("fee_bonus must be non-negative"));
+        }
+        let value = u64::try_from(value).map_err(|_| E::custom("fee_bonus out of range"))?;
+        self.visit_u64(value)
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        let bps = value
+            .checked_mul(100)
+            .and_then(|bps| u32::try_from(bps).ok())
+            .ok_or_else(|| E::custom("fee_bonus out of range"))?;
+        Ok(FeeBonusBps(bps))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        if !value.is_finite() {
+            return Err(E::custom("fee_bonus must be finite"));
+        }
+        if value < 0.0 {
+            return Err(E::custom("fee_bonus must be non-negative"));
+        }
+        let scaled = value * 100.0;
+        if scaled > f64::from(u32::MAX) {
+            return Err(E::custom("fee_bonus out of range"));
+        }
+
+        let nearest_bps = scaled.round();
+        let bps = if (scaled - nearest_bps).abs() <= f64::EPSILON * scaled.abs().max(1.0) * 4.0 {
+            nearest_bps
+        } else {
+            scaled.trunc()
+        };
+        #[allow(clippy::cast_sign_loss)]
+        Ok(FeeBonusBps(bps as u32))
+    }
 }
 
 #[derive(Deserialize, Clone)]
@@ -154,4 +232,52 @@ pub enum Rpc {
     Normal(Url),
     Private { url: Url, has_mev: bool },
     BloxrouteBackrunme { url: Url, api_key: String },
+}
+
+#[cfg(test)]
+mod tests {
+    use serde::Deserialize;
+
+    use super::FeeBonusBps;
+
+    #[derive(Debug, Deserialize)]
+    struct FeeBonusFixture {
+        fee_bonus: FeeBonusBps,
+    }
+
+    fn parse_fee_bonus(value: &serde_json::Value) -> FeeBonusBps {
+        serde_json::from_value::<FeeBonusFixture>(serde_json::json!({ "fee_bonus": value }))
+            .expect("fee bonus should parse")
+            .fee_bonus
+    }
+
+    #[test]
+    fn fee_bonus_whole_percent_deserializes_to_basis_points() {
+        assert_eq!(parse_fee_bonus(&serde_json::json!(5)).bps(), 500);
+    }
+
+    #[test]
+    fn fee_bonus_two_decimal_percent_deserializes_to_basis_points() {
+        assert_eq!(parse_fee_bonus(&serde_json::json!(2.34)).bps(), 234);
+    }
+
+    #[test]
+    fn fee_bonus_two_decimal_underflow_does_not_round_down() {
+        assert_eq!(parse_fee_bonus(&serde_json::json!(0.29)).bps(), 29);
+    }
+
+    #[test]
+    fn fee_bonus_extra_decimal_precision_is_truncated() {
+        assert_eq!(parse_fee_bonus(&serde_json::json!(2.349)).bps(), 234);
+    }
+
+    #[test]
+    fn fee_bonus_rejects_negative_percent() {
+        let error = serde_json::from_value::<FeeBonusFixture>(serde_json::json!({
+            "fee_bonus": -1,
+        }))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("non-negative"));
+    }
 }

@@ -74,6 +74,9 @@ sol! {
 
 pub const API_VERSION: &str = "8.2.3";
 
+const WAD: U256 = uint!(1_000_000_000_000_000_000_U256);
+const FEE_BONUS_BPS_DENOMINATOR: U256 = uint!(10_000_U256);
+
 #[derive(Debug, Error)]
 pub enum HandleTransactError {
     #[error("failed to decrypt transact request: {0}")]
@@ -369,8 +372,8 @@ impl BroadcasterService {
         let multicall_contract = chain_cfg
             .multicall_contract
             .ok_or(BroadcasterServiceError::MissingMulticallContract)?;
-        let fee_bonus = uint!(1000000000000000000_U256)
-            + U256::from(chain_cfg.fee_bonus * 1000.0) * uint!(10000000000000_U256);
+        let fee_bonus =
+            WAD + U256::from(chain_cfg.fee_bonus.bps()) * WAD / FEE_BONUS_BPS_DENOMINATOR;
         let fees_ttl = chain_cfg.fees_ttl.into_inner();
         let fees_manager = Arc::new(FeesManager::new(
             &chain_cfg.fees,
