@@ -112,6 +112,12 @@ pub struct EncryptedRecord {
     pub ciphertext: Vec<u8>,
 }
 
+impl EncryptedRecord {
+    pub fn to_record_entry(&self, key: String) -> Result<(String, Vec<u8>), VaultError> {
+        Ok((key, rmp_serde::to_vec_named(self)?))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VaultMetadata {
     pub version: u32,
@@ -144,6 +150,18 @@ impl RecordKind {
             Self::WalletChainMetadata => "wallet-chain-metadata",
             Self::WalletCacheRow => "wallet-cache-row",
         }
+    }
+
+    #[must_use]
+    pub fn aad(self, record_id: &str) -> Vec<u8> {
+        let mut aad =
+            Vec::with_capacity(VAULT_AAD_PREFIX.len() + self.as_str().len() + record_id.len() + 16);
+        aad.extend_from_slice(VAULT_AAD_PREFIX);
+        aad.extend_from_slice(b":v1:");
+        aad.extend_from_slice(self.as_str().as_bytes());
+        aad.extend_from_slice(b":");
+        aad.extend_from_slice(record_id.as_bytes());
+        aad
     }
 }
 
@@ -708,7 +726,7 @@ impl DesktopVaultStore {
     }
 
     fn put_encrypted_record(&self, key: &str, record: &EncryptedRecord) -> Result<(), VaultError> {
-        let (_, data) = encrypted_record_entry(key.to_string(), record)?;
+        let (_, data) = record.to_record_entry(key.to_string())?;
         self.db.put_desktop_wallet_vault_record(key, &data)?;
         Ok(())
     }
@@ -738,21 +756,13 @@ impl DesktopVaultStore {
         let view_record_key = wallet_view_record_key(wallet_id);
         let spend_record_key = wallet_spend_record_key(wallet_id);
         let mut records = Vec::with_capacity(2 + usize::from(metadata.is_some()));
-        records.push(encrypted_record_entry(
-            view_record_key.clone(),
-            &view_record,
-        )?);
-        records.push(encrypted_record_entry(
-            spend_record_key.clone(),
-            &spend_record,
-        )?);
+        records.push(view_record.to_record_entry(view_record_key.clone())?);
+        records.push(spend_record.to_record_entry(spend_record_key.clone())?);
 
         if let Some(metadata) = metadata {
             let record = view.encrypt_wallet_metadata(&metadata.wallet_uuid, metadata)?;
-            records.push(encrypted_record_entry(
-                wallet_metadata_record_key(&metadata.wallet_uuid),
-                &record,
-            )?);
+            records
+                .push(record.to_record_entry(wallet_metadata_record_key(&metadata.wallet_uuid))?);
         }
 
         Ok((
@@ -765,13 +775,6 @@ impl DesktopVaultStore {
             records,
         ))
     }
-}
-
-fn encrypted_record_entry(
-    key: String,
-    record: &EncryptedRecord,
-) -> Result<(String, Vec<u8>), VaultError> {
-    Ok((key, rmp_serde::to_vec_named(record)?))
 }
 
 impl DesktopViewSession {
@@ -1589,7 +1592,7 @@ pub fn encrypt_payload(
     fill(&mut nonce).map_err(|_| VaultError::Random)?;
     let cipher =
         XChaCha20Poly1305::new_from_slice(key.expose_secret()).map_err(|_| VaultError::Encrypt)?;
-    let aad = record_aad(kind, record_id);
+    let aad = kind.aad(record_id);
     let ciphertext = cipher
         .encrypt(
             XNonce::from_slice(&nonce),
@@ -1610,7 +1613,7 @@ pub fn decrypt_payload(
 ) -> Result<Zeroizing<Vec<u8>>, VaultError> {
     let cipher =
         XChaCha20Poly1305::new_from_slice(key.expose_secret()).map_err(|_| VaultError::Decrypt)?;
-    let aad = record_aad(kind, record_id);
+    let aad = kind.aad(record_id);
     let plaintext = cipher
         .decrypt(
             XNonce::from_slice(&record.nonce),
@@ -1643,17 +1646,6 @@ pub fn decrypt_serialized<T: DeserializeOwned>(
 ) -> Result<T, VaultError> {
     let plaintext = decrypt_payload(key, kind, record_id, record)?;
     Ok(rmp_serde::from_slice(&plaintext)?)
-}
-
-fn record_aad(kind: RecordKind, record_id: &str) -> Vec<u8> {
-    let mut aad =
-        Vec::with_capacity(VAULT_AAD_PREFIX.len() + kind.as_str().len() + record_id.len() + 16);
-    aad.extend_from_slice(VAULT_AAD_PREFIX);
-    aad.extend_from_slice(b":v1:");
-    aad.extend_from_slice(kind.as_str().as_bytes());
-    aad.extend_from_slice(b":");
-    aad.extend_from_slice(record_id.as_bytes());
-    aad
 }
 
 fn wallet_view_record_key(wallet_id: &str) -> String {

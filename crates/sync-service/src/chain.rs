@@ -17,19 +17,17 @@ use broadcaster_core::provider::build_provider;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use local_db::DbStore;
 use merkletree::errors::SyncError;
-use merkletree::persist::{
-    PersistError, SNAPSHOT_VERSION, load_forest_snapshot, write_forest_snapshot,
-};
+use merkletree::persist::{MerkleForestSnapshot, PersistError, SNAPSHOT_VERSION};
 use merkletree::quick::{
     DEFAULT_PAGE_SIZE, IndexedLegacyEncryptedCommitment, IndexedLegacyGeneratedCommitment,
     IndexedNullifier, IndexedShieldCommitment, IndexedTransactCommitment, QuickSyncClient,
     QuickSyncConfig, run_quick_sync_into_with_progress,
 };
+use merkletree::slow::CommitmentUpdateError;
 use merkletree::slow::types::{
     CommitmentBatch, GeneratedCommitmentBatch, Nullified, Nullifiers, Shield, ShieldLegacyPreMar23,
     Transact,
 };
-use merkletree::slow::{CommitmentUpdateError, apply_commitment_updates_from_logs};
 use merkletree::tree::MerkleForest;
 use railgun_wallet::UtxoSource;
 use railgun_wallet::scan::{
@@ -1568,7 +1566,7 @@ impl MerkleForestDbExt for DbStore {
             self.get_merkle_forest_meta(chain.chain_id, &chain.contract.to_string())
         {
             let path = self.resolve_path(&meta.relative_path);
-            match load_forest_snapshot(&path, chain.chain_id, chain.contract) {
+            match MerkleForestSnapshot::load(&path, chain.chain_id, chain.contract) {
                 Ok(Some(snapshot)) => {
                     forest = snapshot.forest;
                     last_processed = snapshot.last_processed_block;
@@ -1584,7 +1582,7 @@ impl MerkleForestDbExt for DbStore {
         if let Ok(Some((anchor_path, anchor_block))) = self.find_latest_anchor(chain) {
             last_anchor = anchor_block;
             if last_processed < anchor_block {
-                match load_forest_snapshot(&anchor_path, chain.chain_id, chain.contract) {
+                match MerkleForestSnapshot::load(&anchor_path, chain.chain_id, chain.contract) {
                     Ok(Some(snapshot)) => {
                         forest = snapshot.forest;
                         last_processed = snapshot.last_processed_block;
@@ -1774,7 +1772,7 @@ fn persist_indexed_forest_snapshot(
     block_hash: Option<[u8; 32]>,
     forest: &MerkleForest,
 ) -> Result<(), ChainError> {
-    write_forest_snapshot(
+    MerkleForestSnapshot::write(
         snapshot_path,
         chain.chain_id,
         chain.contract,
@@ -2189,7 +2187,7 @@ struct WalletBackfill {
 impl ChainService {
     async fn apply_forest_updates(&self, batch: &SharedLogBatch) -> Result<(), ChainError> {
         let mut forest = self.forest.write().await;
-        apply_commitment_updates_from_logs(&mut forest, &batch.logs)?;
+        forest.apply_commitment_updates_from_logs(&batch.logs)?;
         forest.compute_roots();
         Ok(())
     }
@@ -2202,11 +2200,12 @@ impl ChainService {
         let mut reset_block = self.chain.deployment_block.saturating_sub(1);
 
         if let Ok(Some((anchor_path, anchor_block))) = self.db.find_latest_anchor(&self.chain) {
-            match load_forest_snapshot(&anchor_path, self.chain.chain_id, self.chain.contract) {
+            match MerkleForestSnapshot::load(&anchor_path, self.chain.chain_id, self.chain.contract)
+            {
                 Ok(Some(snapshot)) => {
                     *forest = snapshot.forest;
                     reset_block = snapshot.last_processed_block;
-                    write_forest_snapshot(
+                    MerkleForestSnapshot::write(
                         snapshot_path,
                         self.chain.chain_id,
                         self.chain.contract,
@@ -2236,7 +2235,7 @@ impl ChainService {
             self.anchor_last.store(0, Ordering::Relaxed);
         }
 
-        write_forest_snapshot(
+        MerkleForestSnapshot::write(
             snapshot_path,
             self.chain.chain_id,
             self.chain.contract,
@@ -2341,7 +2340,7 @@ impl ChainService {
         block_hash: Option<[u8; 32]>,
     ) -> Result<(), ChainError> {
         let forest = self.forest.read().await;
-        write_forest_snapshot(
+        MerkleForestSnapshot::write(
             snapshot_path,
             self.chain.chain_id,
             self.chain.contract,
@@ -2382,7 +2381,7 @@ impl ChainService {
         let file_name = anchor_file_name(self.chain.chain_id, self.chain.contract, last_block);
         let relative = DbStore::relative_blob_path("merkle_forest/anchors", &file_name);
         let path = self.db.resolve_path(&relative);
-        write_forest_snapshot(
+        MerkleForestSnapshot::write(
             &path,
             self.chain.chain_id,
             self.chain.contract,

@@ -15,7 +15,7 @@ use crate::crypto::aes_gcm::{
 };
 use crate::crypto::poseidon::poseidon;
 use crate::crypto::shared_key::{ed25519_private_scalar_bytes, shared_symmetric_key};
-use crate::notes::note_public_key;
+use crate::notes::Note;
 use crate::tree::{TREE_DEPTH, TREE_LEAF_COUNT_U256};
 
 #[derive(Debug, Error)]
@@ -120,6 +120,47 @@ pub struct EncryptedTransactRequest {
     pub shared_key: [u8; 32],
 }
 
+impl EncryptedTransactRequest {
+    pub fn encrypt(
+        broadcaster_viewing_pubkey: [u8; 32],
+        params: &BroadcasterRawParamsTransact,
+    ) -> Result<Self, TransactError> {
+        let mut client_seed = [0u8; 32];
+        getrandom::fill(&mut client_seed).map_err(|_| TransactError::Random)?;
+        Self::encrypt_with_seed(broadcaster_viewing_pubkey, params, client_seed)
+    }
+
+    pub fn encrypt_with_seed(
+        broadcaster_viewing_pubkey: [u8; 32],
+        params: &BroadcasterRawParamsTransact,
+        client_seed: [u8; 32],
+    ) -> Result<Self, TransactError> {
+        let pubkey = SigningKey::from_bytes(&client_seed)
+            .verifying_key()
+            .to_bytes();
+        let shared_key = shared_key_for_broadcaster(&client_seed, &broadcaster_viewing_pubkey)
+            .map_err(|_| TransactError::SharedKey)?;
+        let mut plaintext = serde_json::to_vec(params)?;
+        let iv_tag = encrypt_in_place_16b_iv(&shared_key, &mut plaintext)?;
+        Ok(Self {
+            pubkey,
+            encrypted_data: [Bytes::copy_from_slice(&iv_tag), Bytes::from(plaintext)],
+            shared_key,
+        })
+    }
+
+    pub fn to_transact_payload(&self) -> Result<Vec<u8>, serde_json::Error> {
+        let envelope = TransactEnvelope {
+            method: "transact",
+            params: TransactEnvelopeParams {
+                pubkey: FixedBytes::from(self.pubkey),
+                encrypted_data: &self.encrypted_data,
+            },
+        };
+        serde_json::to_vec(&envelope)
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct TransactEnvelope<'a> {
     method: &'static str,
@@ -191,47 +232,6 @@ pub fn try_decrypt_transact_request(
     } else {
         Ok(None)
     }
-}
-
-pub fn encrypt_transact_request(
-    broadcaster_viewing_pubkey: [u8; 32],
-    params: &BroadcasterRawParamsTransact,
-) -> Result<EncryptedTransactRequest, TransactError> {
-    let mut client_seed = [0u8; 32];
-    getrandom::fill(&mut client_seed).map_err(|_| TransactError::Random)?;
-    encrypt_transact_request_with_seed(broadcaster_viewing_pubkey, params, client_seed)
-}
-
-pub fn encrypt_transact_request_with_seed(
-    broadcaster_viewing_pubkey: [u8; 32],
-    params: &BroadcasterRawParamsTransact,
-    client_seed: [u8; 32],
-) -> Result<EncryptedTransactRequest, TransactError> {
-    let pubkey = SigningKey::from_bytes(&client_seed)
-        .verifying_key()
-        .to_bytes();
-    let shared_key = shared_key_for_broadcaster(&client_seed, &broadcaster_viewing_pubkey)
-        .map_err(|_| TransactError::SharedKey)?;
-    let mut plaintext = serde_json::to_vec(params)?;
-    let iv_tag = encrypt_in_place_16b_iv(&shared_key, &mut plaintext)?;
-    Ok(EncryptedTransactRequest {
-        pubkey,
-        encrypted_data: [Bytes::copy_from_slice(&iv_tag), Bytes::from(plaintext)],
-        shared_key,
-    })
-}
-
-pub fn build_transact_request_payload(
-    request: &EncryptedTransactRequest,
-) -> Result<Vec<u8>, serde_json::Error> {
-    let envelope = TransactEnvelope {
-        method: "transact",
-        params: TransactEnvelopeParams {
-            pubkey: FixedBytes::from(request.pubkey),
-            encrypted_data: &request.encrypted_data,
-        },
-    };
-    serde_json::to_vec(&envelope)
 }
 
 fn decrypt<T: serde::de::DeserializeOwned>(
@@ -410,58 +410,62 @@ pub struct ParsedTransactCalldata {
     pub fee_note_assurance: Option<FeeNoteAssuranceContext>,
 }
 
-pub fn attach_fee_note_assurance_context(
-    parsed_transact: &mut ParsedTransactCalldata,
-    params: &BroadcasterRawParamsTransact,
-    required_poi_list_keys: &[FixedBytes<32>],
-) -> Result<(), TransactError> {
-    if required_poi_list_keys.is_empty() {
-        parsed_transact.fee_note_assurance = None;
-        return Ok(());
+impl ParsedTransactCalldata {
+    pub fn attach_fee_note_assurance_context(
+        &mut self,
+        params: &BroadcasterRawParamsTransact,
+        required_poi_list_keys: &[FixedBytes<32>],
+    ) -> Result<(), TransactError> {
+        if required_poi_list_keys.is_empty() {
+            self.fee_note_assurance = None;
+            return Ok(());
+        }
+
+        let txid_version = supported_txid_version(params.txid_version.as_deref())?;
+
+        let leaf = railgun_txid_leaf_hash(self.railgun_txid, self.utxo_tree_in);
+        let leaf_hex: FixedBytes<32> = leaf.into();
+
+        if !required_poi_list_keys.iter().all(|list_key| {
+            params
+                .pre_transaction_pois_per_txid_leaf_per_list
+                .get(list_key)
+                .is_some_and(|per_list| per_list.contains_key(&leaf_hex))
+        }) {
+            return Err(TransactError::MissingPreTransactionPoiForAssurance);
+        }
+
+        self.fee_note_assurance = Some(FeeNoteAssuranceContext {
+            chain_type: params.chain_type as u8,
+            txid_version: txid_version.to_string(),
+            railgun_txid: self.railgun_txid,
+            utxo_tree_in: self.utxo_tree_in,
+            fee_commitment: self.fee_commitment,
+            fee_note_npk: self.fee_note_npk,
+            pre_transaction_pois_per_txid_leaf_per_list: params
+                .pre_transaction_pois_per_txid_leaf_per_list
+                .clone(),
+            required_poi_list_keys: required_poi_list_keys.to_vec(),
+        });
+
+        Ok(())
     }
-
-    let txid_version = supported_txid_version(params.txid_version.as_deref())?;
-
-    let leaf = railgun_txid_leaf_hash(parsed_transact.railgun_txid, parsed_transact.utxo_tree_in);
-    let leaf_hex: FixedBytes<32> = leaf.into();
-
-    if !required_poi_list_keys.iter().all(|list_key| {
-        params
-            .pre_transaction_pois_per_txid_leaf_per_list
-            .get(list_key)
-            .is_some_and(|per_list| per_list.contains_key(&leaf_hex))
-    }) {
-        return Err(TransactError::MissingPreTransactionPoiForAssurance);
-    }
-
-    parsed_transact.fee_note_assurance = Some(FeeNoteAssuranceContext {
-        chain_type: params.chain_type as u8,
-        txid_version: txid_version.to_string(),
-        railgun_txid: parsed_transact.railgun_txid,
-        utxo_tree_in: parsed_transact.utxo_tree_in,
-        fee_commitment: parsed_transact.fee_commitment,
-        fee_note_npk: parsed_transact.fee_note_npk,
-        pre_transaction_pois_per_txid_leaf_per_list: params
-            .pre_transaction_pois_per_txid_leaf_per_list
-            .clone(),
-        required_poi_list_keys: required_poi_list_keys.to_vec(),
-    });
-
-    Ok(())
 }
 
-fn parsed_transaction_metadata(
-    transaction: &Transaction,
-    txid_version: Option<&str>,
-) -> Result<ParsedTransactTransaction, TransactError> {
-    let railgun_txid = compute_railgun_txid(transaction, txid_version)?;
-    Ok(ParsedTransactTransaction {
-        railgun_txid,
-        utxo_tree_in: transaction.boundParams.treeNumber.into(),
-        tx_nullifiers_len: transaction.nullifiers.len(),
-        tx_commitments_out_len: transaction.commitments.len(),
-        has_unshield: transaction.boundParams.unshield != 0,
-    })
+impl ParsedTransactTransaction {
+    fn from_transaction(
+        transaction: &Transaction,
+        txid_version: Option<&str>,
+    ) -> Result<Self, TransactError> {
+        let railgun_txid = compute_railgun_txid(transaction, txid_version)?;
+        Ok(Self {
+            railgun_txid,
+            utxo_tree_in: transaction.boundParams.treeNumber.into(),
+            tx_nullifiers_len: transaction.nullifiers.len(),
+            tx_commitments_out_len: transaction.commitments.len(),
+            has_unshield: transaction.boundParams.unshield != 0,
+        })
+    }
 }
 
 pub fn parse_transact_calldata(
@@ -490,7 +494,7 @@ pub fn parse_transact_calldata(
         .ok_or(TransactError::MissingTransactions)?;
     let parsed_transactions = transactions
         .iter()
-        .map(|transaction| parsed_transaction_metadata(transaction, txid_version))
+        .map(|transaction| ParsedTransactTransaction::from_transaction(transaction, txid_version))
         .collect::<Result<Vec<_>, _>>()?;
 
     let Some(tx0_metadata) = parsed_transactions.first() else {
@@ -540,7 +544,7 @@ pub fn parse_transact_calldata(
     }
     let fee_token = Address::from_slice(&token_hash[12..32]);
     let fee_amount = U256::from_be_slice(&value_bytes);
-    let fee_note_npk: FixedBytes<32> = note_public_key(receiver_master_public_key, random).into();
+    let fee_note_npk: FixedBytes<32> = Note::npk_for(receiver_master_public_key, random).into();
 
     Ok(ParsedTransactCalldata {
         fee_token,
@@ -561,8 +565,7 @@ pub fn parse_transact_calldata(
 mod tests {
     use super::{
         BroadcasterRawParamsTransact, DEFAULT_TXID_VERSION, PreTxPoi, SnarkJsProof, TransactError,
-        attach_fee_note_assurance_context, compute_railgun_txid, parse_transact_calldata,
-        railgun_txid_leaf_hash,
+        compute_railgun_txid, parse_transact_calldata, railgun_txid_leaf_hash,
     };
     use crate::contracts::railgun::{
         BoundParams, CommitmentCiphertext, CommitmentPreimage, SnarkProof, TokenData, Transaction,
@@ -571,7 +574,7 @@ mod tests {
     use crate::crypto::aes_gcm::encrypt_in_place_16b_iv;
     use crate::crypto::railgun::{ViewingKeyData, derive_viewing_public_key};
     use crate::crypto::shared_key::shared_symmetric_key;
-    use crate::notes::{Note, note_public_key};
+    use crate::notes::Note;
     use alloy::primitives::{Address, Bytes, FixedBytes, U256};
     use alloy::sol_types::SolCall;
     use ruint::uint;
@@ -631,7 +634,7 @@ mod tests {
         let fee_token = Address::from([0x22; 20]);
         let fee_value = uint!(42_U256);
         let random = [0x55; 16];
-        let npk = note_public_key(viewing_key_data.master_public_key, random);
+        let npk = Note::npk_for(viewing_key_data.master_public_key, random);
         let fee_commitment = Note {
             token_hash: U256::from_be_slice(fee_token.as_slice()),
             value: fee_value,
@@ -796,7 +799,7 @@ mod tests {
 
         assert_eq!(parsed.fee_commitment, fee_commitment);
         let expected_npk: FixedBytes<32> =
-            note_public_key(viewing_key_data.master_public_key, [0x55; 16]).into();
+            Note::npk_for(viewing_key_data.master_public_key, [0x55; 16]).into();
         assert_eq!(parsed.fee_note_npk, expected_npk);
     }
 
@@ -833,12 +836,9 @@ mod tests {
         )
         .expect("parse calldata");
 
-        let error = attach_fee_note_assurance_context(
-            &mut parsed,
-            &params,
-            &[FixedBytes::from([0x88; 32])],
-        )
-        .expect_err("unsupported txid version should fail");
+        let error = parsed
+            .attach_fee_note_assurance_context(&params, &[FixedBytes::from([0x88; 32])])
+            .expect_err("unsupported txid version should fail");
 
         assert!(matches!(
             error,

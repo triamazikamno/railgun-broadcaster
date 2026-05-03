@@ -20,6 +20,33 @@ pub struct UtxoOutput {
     pub spent_block_number: Option<u64>,
 }
 
+impl UtxoOutput {
+    fn planner_utxo_for_token(&self, token: Address) -> Option<Utxo> {
+        if self.is_spent || !self.poi_spendable {
+            return None;
+        }
+        let row_token = self.token.parse::<Address>().ok()?;
+        if row_token != token {
+            return None;
+        }
+        let value = U256::from_str_radix(&self.value, 10).ok()?;
+        if value.is_zero() {
+            return None;
+        }
+        Some(Utxo::new(
+            Note::new_unshield(Address::ZERO, token, value),
+            self.tree,
+            self.position,
+            UtxoSource {
+                tx_hash: FixedBytes::ZERO,
+                block_number: self.source_block_number,
+                block_timestamp: self.source_block_timestamp,
+            },
+            UtxoCommitmentKind::Transact,
+        ))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct TokenTotal {
     pub token: String,
@@ -53,29 +80,7 @@ pub fn max_send_amount_from_outputs(utxos: &[UtxoOutput], token: Address) -> U25
 fn planner_utxos_from_outputs(utxos: &[UtxoOutput], token: Address) -> Vec<Utxo> {
     utxos
         .iter()
-        .filter(|row| !row.is_spent)
-        .filter(|row| row.poi_spendable)
-        .filter_map(|row| {
-            let row_token = row.token.parse::<Address>().ok()?;
-            if row_token != token {
-                return None;
-            }
-            let value = U256::from_str_radix(&row.value, 10).ok()?;
-            if value.is_zero() {
-                return None;
-            }
-            Some(Utxo::new(
-                Note::new_unshield(Address::ZERO, token, value),
-                row.tree,
-                row.position,
-                UtxoSource {
-                    tx_hash: FixedBytes::ZERO,
-                    block_number: row.source_block_number,
-                    block_timestamp: row.source_block_timestamp,
-                },
-                UtxoCommitmentKind::Transact,
-            ))
-        })
+        .filter_map(|row| row.planner_utxo_for_token(token))
         .collect()
 }
 

@@ -14,7 +14,7 @@ pub(crate) async fn public_broadcaster_pre_transaction_pois(
     verify_proof: bool,
     http: &HttpContext,
 ) -> Result<PublicBroadcasterPreTransactionPois> {
-    let required_poi_list_keys = parse_required_poi_list_keys(broadcaster)?;
+    let required_poi_list_keys = broadcaster.parsed_required_poi_list_keys()?;
     let pending_poi_list_keys: Vec<FixedBytes<32>> = default_active_poi_list_keys();
     let all_poi_list_keys = combined_poi_list_keys(&required_poi_list_keys, &pending_poi_list_keys);
     let poi_started = Instant::now();
@@ -235,7 +235,9 @@ pub(crate) fn build_pending_output_poi_context_records(
     let mut records = Vec::new();
     for (chunk_index, chunk) in chunks.iter().enumerate() {
         let chunk_context = pending_chunk_context(chunk, pre_transaction_pois, poi_list_keys)?;
-        let private_output_count = pending_private_output_count(chunk)?;
+        let private_output_count = chunk
+            .private_output_count()
+            .ok_or_else(|| eyre!("unshield chunk is missing public output"))?;
         let mut output_index = 0;
 
         for role_plan in role_plans {
@@ -310,18 +312,6 @@ fn pending_chunk_context(
         pre_transaction_pois,
         poi_list_keys: poi_list_keys.to_vec(),
     })
-}
-
-fn pending_private_output_count(chunk: &TransactionPlanChunk) -> Result<usize> {
-    if chunk.has_unshield {
-        chunk
-            .outputs
-            .len()
-            .checked_sub(1)
-            .ok_or_else(|| eyre!("unshield chunk is missing public output"))
-    } else {
-        Ok(chunk.outputs.len())
-    }
 }
 
 fn pending_output_poi_context_record(

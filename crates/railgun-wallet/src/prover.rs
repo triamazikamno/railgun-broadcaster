@@ -18,10 +18,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 use wasmer::{Module, Store};
 
-use crate::artifacts::{
-    ArtifactError, ArtifactSource, artifact_paths, ensure_artifacts_with_source,
-    ensure_poi_artifacts_with_source, expected_zkey_hash, poi_variant_name, variant_name,
-};
+use crate::artifacts::{ArtifactError, ArtifactSource, poi_variant_name, variant_name};
 use crate::tx::{PoiProofInputs, PrivateInputs, PublicInputs};
 use crate::zkey_cache::load_or_parse_zkey;
 use broadcaster_core::contracts::railgun::{G1Point, G2Point, SnarkProof};
@@ -573,22 +570,21 @@ fn prove_unshield_blocking(
         ?source,
         "ensuring artifacts"
     );
-    ensure_artifacts_with_source(
+    source.ensure_artifacts(
         public_inputs.nullifiers.len(),
         public_inputs.commitments_out.len(),
-        source,
     )?;
     debug!("loading artifacts");
     let variant = variant_name(
         public_inputs.nullifiers.len(),
         public_inputs.commitments_out.len(),
     );
-    let paths = artifact_paths(&variant, source);
+    let paths = source.artifact_paths(&variant);
     let wasm = fs::read(&paths.wasm).map_err(|source| ArtifactError::ArtifactFile {
         path: paths.wasm.clone(),
         source,
     })?;
-    let expected_hash = expected_zkey_hash(&variant, source)?;
+    let expected_hash = source.expected_zkey_hash(&variant)?;
     let mut expected_hash_bytes = [0u8; 32];
     expected_hash_bytes.copy_from_slice(expected_hash.as_slice());
     let (proving_key, matrices) =
@@ -650,15 +646,15 @@ fn prove_poi_blocking(
         ?source,
         "ensuring POI artifacts"
     );
-    ensure_poi_artifacts_with_source(max_inputs, max_outputs, source)?;
+    source.ensure_poi_artifacts(max_inputs, max_outputs)?;
     debug!("loading POI artifacts");
     let variant = poi_variant_name(max_inputs, max_outputs);
-    let paths = artifact_paths(&variant, source);
+    let paths = source.artifact_paths(&variant);
     let wasm = fs::read(&paths.wasm).map_err(|source| ArtifactError::ArtifactFile {
         path: paths.wasm.clone(),
         source,
     })?;
-    let expected_hash = expected_zkey_hash(&variant, source)?;
+    let expected_hash = source.expected_zkey_hash(&variant)?;
     let mut expected_hash_bytes = [0u8; 32];
     expected_hash_bytes.copy_from_slice(expected_hash.as_slice());
     let (proving_key, matrices) =

@@ -20,5 +20,5 @@ pub use tx::{
     BroadcasterFeeOutput, PoiCircuitVariant, PoiProofInputs, PreTransactionPoiChunkInputs,
     PreTransactionPoiGenerationRequest, PreTransactionPoiMap, PrivateInputs, PublicInputs,
     SendPlan, TransactPlan, TransactionBuilder, TransactionCall, UnshieldPlan,
-    generate_pre_transaction_pois, poi_circuit_variant, pre_transaction_poi_inputs_from_chunk,
+    generate_pre_transaction_pois, poi_circuit_variant,
 };

@@ -51,32 +51,32 @@ impl Default for DiscoveryConfig {
     }
 }
 
-/// Discover peers from DNS ENR trees.
-pub(crate) async fn discover_all(
-    config: &DiscoveryConfig,
-) -> Result<Vec<DiscoveredPeer>, DiscoveryError> {
-    let resolver = txt::TxtResolver::new(config.doh_endpoint.clone())?;
-    let mut peers = HashMap::<PeerId, Vec<Multiaddr>>::new();
+impl DiscoveryConfig {
+    /// Discover peers from DNS ENR trees.
+    pub(crate) async fn discover_all(&self) -> Result<Vec<DiscoveredPeer>, DiscoveryError> {
+        let resolver = txt::TxtResolver::new(self.doh_endpoint.clone())?;
+        let mut peers = HashMap::<PeerId, Vec<Multiaddr>>::new();
 
-    for tree in &config.enr_trees {
-        for peer in enr_tree::discover_from_tree(
-            &resolver,
-            tree,
-            config.max_txt_queries_per_tree,
-            config.max_enrs_per_tree,
-        )
-        .await?
-        {
-            peers.entry(peer.peer_id).or_default().extend(peer.addrs);
+        for tree in &self.enr_trees {
+            for peer in enr_tree::discover_from_tree(
+                &resolver,
+                tree,
+                self.max_txt_queries_per_tree,
+                self.max_enrs_per_tree,
+            )
+            .await?
+            {
+                peers.entry(peer.peer_id).or_default().extend(peer.addrs);
+            }
         }
-    }
 
-    Ok(peers
-        .into_iter()
-        .map(|(peer_id, mut addrs)| {
-            addrs.sort();
-            addrs.dedup();
-            DiscoveredPeer { peer_id, addrs }
-        })
-        .collect())
+        Ok(peers
+            .into_iter()
+            .map(|(peer_id, mut addrs)| {
+                addrs.sort();
+                addrs.dedup();
+                DiscoveredPeer { peer_id, addrs }
+            })
+            .collect())
+    }
 }

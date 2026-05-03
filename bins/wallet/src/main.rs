@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use broadcaster_monitor::{DEFAULT_EVENT_CAPACITY, event_channel, shared};
 use broadcaster_monitor_waku::{
-    DEFAULT_CLUSTER_ID, DEFAULT_SHARD_ID, WakuViewerConfig, build_waku_client, spawn_workers,
+    DEFAULT_CLUSTER_ID, DEFAULT_SHARD_ID, WakuViewerConfig, spawn_workers,
 };
 use eyre::{Result, WrapErr};
 use gpui::{App, Application};
@@ -63,7 +63,7 @@ fn main() -> Result<()> {
     );
 
     let runtime_guard = runtime.enter();
-    let waku = build_waku_client(&waku_config)?;
+    let waku = waku_config.build_client()?;
     let wallet_waku = Arc::clone(&waku);
     let worker_monitor = monitor.clone();
     runtime.spawn(async move {

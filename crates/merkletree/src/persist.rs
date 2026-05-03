@@ -32,73 +32,75 @@ pub enum PersistError {
     MetadataMismatch { reason: String },
 }
 
-pub fn load_forest_snapshot(
-    path: &Path,
-    chain_id: u64,
-    contract_address: Address,
-) -> Result<Option<MerkleForestSnapshot>, PersistError> {
-    let data = match fs::read(path) {
-        Ok(data) => data,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err.into()),
-    };
-    let mut snapshot: MerkleForestSnapshot = rmp_serde::from_slice(&data)?;
-    if snapshot.version != SNAPSHOT_VERSION {
-        return Err(PersistError::UnsupportedVersion {
-            version: snapshot.version,
-        });
+impl MerkleForestSnapshot {
+    pub fn load(
+        path: &Path,
+        chain_id: u64,
+        contract_address: Address,
+    ) -> Result<Option<Self>, PersistError> {
+        let data = match fs::read(path) {
+            Ok(data) => data,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        let mut snapshot: Self = rmp_serde::from_slice(&data)?;
+        if snapshot.version != SNAPSHOT_VERSION {
+            return Err(PersistError::UnsupportedVersion {
+                version: snapshot.version,
+            });
+        }
+        if snapshot.chain_id != chain_id {
+            return Err(PersistError::MetadataMismatch {
+                reason: format!(
+                    "chain id mismatch: expected {chain_id}, got {}",
+                    snapshot.chain_id
+                ),
+            });
+        }
+        if snapshot.contract_address != contract_address {
+            return Err(PersistError::MetadataMismatch {
+                reason: format!(
+                    "contract address mismatch: expected {contract_address}, got {}",
+                    snapshot.contract_address
+                ),
+            });
+        }
+        snapshot.forest.compute_roots();
+        Ok(Some(snapshot))
     }
-    if snapshot.chain_id != chain_id {
-        return Err(PersistError::MetadataMismatch {
-            reason: format!(
-                "chain id mismatch: expected {chain_id}, got {}",
-                snapshot.chain_id
-            ),
-        });
-    }
-    if snapshot.contract_address != contract_address {
-        return Err(PersistError::MetadataMismatch {
-            reason: format!(
-                "contract address mismatch: expected {contract_address}, got {}",
-                snapshot.contract_address
-            ),
-        });
-    }
-    snapshot.forest.compute_roots();
-    Ok(Some(snapshot))
-}
 
-pub fn write_forest_snapshot(
-    path: &Path,
-    chain_id: u64,
-    contract_address: Address,
-    last_processed_block: u64,
-    forest: &MerkleForest,
-) -> Result<(), PersistError> {
-    #[derive(serde::Serialize)]
-    struct MerkleForestSnapshotRef<'a> {
-        version: u32,
+    pub fn write(
+        path: &Path,
         chain_id: u64,
         contract_address: Address,
         last_processed_block: u64,
-        forest: &'a MerkleForest,
-    }
+        forest: &MerkleForest,
+    ) -> Result<(), PersistError> {
+        #[derive(serde::Serialize)]
+        struct MerkleForestSnapshotRef<'a> {
+            version: u32,
+            chain_id: u64,
+            contract_address: Address,
+            last_processed_block: u64,
+            forest: &'a MerkleForest,
+        }
 
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let snapshot = MerkleForestSnapshotRef {
+            version: SNAPSHOT_VERSION,
+            chain_id,
+            contract_address,
+            last_processed_block,
+            forest,
+        };
+        let data = rmp_serde::to_vec(&snapshot)?;
+        let temp_path = temp_path(path);
+        fs::write(&temp_path, data)?;
+        fs::rename(temp_path, path)?;
+        Ok(())
     }
-    let snapshot = MerkleForestSnapshotRef {
-        version: SNAPSHOT_VERSION,
-        chain_id,
-        contract_address,
-        last_processed_block,
-        forest,
-    };
-    let data = rmp_serde::to_vec(&snapshot)?;
-    let temp_path = temp_path(path);
-    fs::write(&temp_path, data)?;
-    fs::rename(temp_path, path)?;
-    Ok(())
 }
 
 fn temp_path(path: &Path) -> PathBuf {
@@ -118,7 +120,7 @@ fn temp_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{PersistError, load_forest_snapshot, write_forest_snapshot};
+    use super::{MerkleForestSnapshot, PersistError};
     use crate::tree::{MerkleForest, MerkleTreeUpdate};
     use alloy::primitives::Address;
     use alloy::uint;
@@ -159,10 +161,10 @@ mod tests {
             .expect("insert leaf");
         forest.compute_roots();
 
-        write_forest_snapshot(&path, chain_id, contract_address, last_block, &forest)
+        MerkleForestSnapshot::write(&path, chain_id, contract_address, last_block, &forest)
             .expect("write snapshot");
 
-        let snapshot = load_forest_snapshot(&path, chain_id, contract_address)
+        let snapshot = MerkleForestSnapshot::load(&path, chain_id, contract_address)
             .expect("load snapshot")
             .expect("snapshot missing");
 
@@ -190,10 +192,10 @@ mod tests {
             .expect("insert leaf");
         forest.compute_roots();
 
-        write_forest_snapshot(&path, chain_id, contract_address, 5, &forest)
+        MerkleForestSnapshot::write(&path, chain_id, contract_address, 5, &forest)
             .expect("write snapshot");
 
-        let err = load_forest_snapshot(&path, chain_id + 1, contract_address)
+        let err = MerkleForestSnapshot::load(&path, chain_id + 1, contract_address)
             .expect_err("expected metadata mismatch");
         assert!(matches!(err, PersistError::MetadataMismatch { .. }));
 

@@ -3,7 +3,7 @@ mod pprof_server;
 
 use broadcaster_monitor::{DEFAULT_EVENT_CAPACITY, event_channel, shared};
 use broadcaster_monitor_waku::{
-    DEFAULT_CLUSTER_ID, DEFAULT_SHARD_ID, WakuViewerConfig, build_waku_client, spawn_workers,
+    DEFAULT_CLUSTER_ID, DEFAULT_SHARD_ID, WakuViewerConfig, spawn_workers,
 };
 use eyre::{Result, WrapErr};
 use gpui::{App, Application};
@@ -71,7 +71,7 @@ fn main() -> Result<()> {
 
     // Build the Waku client from CLI inputs (no broadcaster config file is
     // loaded) and spawn the background subscription workers.
-    let waku = build_waku_client(&waku_config)?;
+    let waku = waku_config.build_client()?;
     let worker_monitor = monitor.clone();
     runtime.spawn(async move {
         if let Err(error) = spawn_workers(waku_config, waku, worker_monitor, event_tx).await {

@@ -6,7 +6,6 @@ use broadcaster_core::contracts::shield::build_shield_calldata;
 use broadcaster_core::crypto::aes_gcm::encrypt_in_place_16b_iv;
 use broadcaster_core::crypto::shared_key::shared_symmetric_key_legacy;
 use broadcaster_core::notes::Note;
-use broadcaster_core::notes::note_public_key;
 use railgun_wallet::scan::{
     IndexedLegacyEncryptedCommitmentInput, IndexedLegacyGeneratedCommitmentInput,
     IndexedNullifierInput, IndexedShieldCommitmentInput, IndexedTransactCommitmentInput,
@@ -223,7 +222,7 @@ fn indexed_legacy_encrypted_commitment_decrypts_wallet_utxo() {
 fn indexed_legacy_generated_commitment_decrypts_wallet_utxo() {
     let keys = scan_keys(7);
     let random = [8u8; 16];
-    let npk = note_public_key(keys.master_public_key, random);
+    let npk = Note::npk_for(keys.master_public_key, random);
     let mut encrypted_random = random.to_vec();
     let iv_tag = encrypt_in_place_16b_iv(&keys.viewing_private_key, &mut encrypted_random)
         .expect("encrypt legacy random");

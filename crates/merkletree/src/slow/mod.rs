@@ -19,28 +19,30 @@ pub enum CommitmentUpdateError {
     Update(#[from] SyncError),
 }
 
-pub fn apply_commitment_updates_from_logs(
-    forest: &mut MerkleForest,
-    logs: &[Log],
-) -> Result<(), CommitmentUpdateError> {
-    for raw_log in logs {
-        let topic0 = raw_log.inner.topics().first().copied().unwrap_or_default();
-        if topic0 == Transact::SIGNATURE_HASH {
-            let event = Transact::decode_log(&raw_log.inner)?.data;
-            forest.insert_updates(event.commitment_updates())?;
-        } else if topic0 == Shield::SIGNATURE_HASH {
-            let event = Shield::decode_log(&raw_log.inner)?.data;
-            forest.insert_updates(event.commitment_updates())?;
-        } else if topic0 == ShieldLegacyPreMar23::SIGNATURE_HASH {
-            let event = ShieldLegacyPreMar23::decode_log(&raw_log.inner)?.data;
-            forest.insert_updates(event.commitment_updates())?;
-        } else if topic0 == CommitmentBatch::SIGNATURE_HASH {
-            let event = CommitmentBatch::decode_log(&raw_log.inner)?.data;
-            forest.insert_updates(event.commitment_updates())?;
-        } else if topic0 == GeneratedCommitmentBatch::SIGNATURE_HASH {
-            let event = GeneratedCommitmentBatch::decode_log(&raw_log.inner)?.data;
-            forest.insert_updates(event.commitment_updates())?;
+impl MerkleForest {
+    pub fn apply_commitment_updates_from_logs(
+        &mut self,
+        logs: &[Log],
+    ) -> Result<(), CommitmentUpdateError> {
+        for raw_log in logs {
+            let topic0 = raw_log.inner.topics().first().copied().unwrap_or_default();
+            if topic0 == Transact::SIGNATURE_HASH {
+                let event = Transact::decode_log(&raw_log.inner)?.data;
+                self.insert_updates(event.commitment_updates())?;
+            } else if topic0 == Shield::SIGNATURE_HASH {
+                let event = Shield::decode_log(&raw_log.inner)?.data;
+                self.insert_updates(event.commitment_updates())?;
+            } else if topic0 == ShieldLegacyPreMar23::SIGNATURE_HASH {
+                let event = ShieldLegacyPreMar23::decode_log(&raw_log.inner)?.data;
+                self.insert_updates(event.commitment_updates())?;
+            } else if topic0 == CommitmentBatch::SIGNATURE_HASH {
+                let event = CommitmentBatch::decode_log(&raw_log.inner)?.data;
+                self.insert_updates(event.commitment_updates())?;
+            } else if topic0 == GeneratedCommitmentBatch::SIGNATURE_HASH {
+                let event = GeneratedCommitmentBatch::decode_log(&raw_log.inner)?.data;
+                self.insert_updates(event.commitment_updates())?;
+            }
         }
+        Ok(())
     }
-    Ok(())
 }

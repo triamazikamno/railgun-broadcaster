@@ -40,7 +40,7 @@ impl Client {
     pub fn new(cfg: &config::Waku) -> Result<Self, ClientError> {
         let cluster_id = configured_cluster_id(cfg);
         let shard_id = configured_shard_id(cfg);
-        let config = waku_config_from_config(cfg);
+        let config = Self::build_waku_config(cfg);
         let waku = Arc::new(WakuNode::spawn(config).map_err(ClientError::SpawnNode)?);
         waku.add_additional_peers(
             cfg.direct_peers
@@ -66,6 +66,25 @@ impl Client {
             pubsub_path: relay_shard_pubsub_path(cluster_id, shard_id),
             waku_fleet: waku,
         })
+    }
+
+    fn build_waku_config(cfg: &config::Waku) -> WakuConfig {
+        let mut config = WakuConfig::default();
+        if let Some(dns_enr_trees) = &cfg.dns_enr_trees {
+            config.discovery.enr_trees.clone_from(dns_enr_trees);
+        }
+        if let Some(doh_endpoint) = &cfg.doh_endpoint {
+            config.discovery.doh_endpoint.clone_from(doh_endpoint);
+        }
+        config.cluster_id = configured_cluster_id(cfg);
+        config.shard_id = configured_shard_id(cfg);
+        if let Some(max_peers) = cfg.max_peers {
+            config.node.connection_cap = max_peers;
+        }
+        if let Some(request_timeout) = cfg.peer_connection_timeout {
+            config.node.request_timeout = request_timeout.into_inner();
+        }
+        config
     }
 
     #[must_use]
@@ -438,30 +457,10 @@ fn configured_shard_id(cfg: &config::Waku) -> u32 {
     cfg.shard_id.unwrap_or(DEFAULT_SHARD_ID)
 }
 
-fn waku_config_from_config(cfg: &config::Waku) -> WakuConfig {
-    let mut config = WakuConfig::default();
-    if let Some(dns_enr_trees) = &cfg.dns_enr_trees {
-        config.discovery.enr_trees.clone_from(dns_enr_trees);
-    }
-    if let Some(doh_endpoint) = &cfg.doh_endpoint {
-        config.discovery.doh_endpoint.clone_from(doh_endpoint);
-    }
-    config.cluster_id = configured_cluster_id(cfg);
-    config.shard_id = configured_shard_id(cfg);
-    if let Some(max_peers) = cfg.max_peers {
-        config.node.connection_cap = max_peers;
-    }
-    if let Some(request_timeout) = cfg.peer_connection_timeout {
-        config.node.request_timeout = request_timeout.into_inner();
-    }
-    config
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         DEFAULT_CLUSTER_ID, DEFAULT_SHARD_ID, is_fee_content_topic, relay_shard_pubsub_path,
-        waku_config_from_config,
     };
 
     #[test]
@@ -494,7 +493,7 @@ mod tests {
             peer_connection_timeout: None,
         };
 
-        let waku = waku_config_from_config(&cfg);
+        let waku = super::Client::build_waku_config(&cfg);
 
         assert_eq!(waku.cluster_id, 7);
         assert_eq!(waku.shard_id, 3);
@@ -519,7 +518,7 @@ mod tests {
             peer_connection_timeout: None,
         };
 
-        let waku = waku_config_from_config(&cfg);
+        let waku = super::Client::build_waku_config(&cfg);
 
         assert_eq!(waku.cluster_id, DEFAULT_CLUSTER_ID);
         assert_eq!(waku.shard_id, DEFAULT_SHARD_ID);

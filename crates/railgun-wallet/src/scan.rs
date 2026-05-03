@@ -11,9 +11,7 @@ use broadcaster_core::contracts::railgun::{
 };
 use broadcaster_core::crypto::railgun::ViewingKeyData;
 use broadcaster_core::crypto::shared_key::{shared_symmetric_key, shared_symmetric_key_legacy};
-use broadcaster_core::notes::{
-    Note, decrypt_legacy_random, decrypt_shield_random, note_public_key,
-};
+use broadcaster_core::notes::{Note, decrypt_legacy_random, decrypt_shield_random};
 use broadcaster_core::tree::normalize_tree_position;
 use broadcaster_core::utxo::{Utxo, UtxoCommitmentKind, UtxoSource};
 
@@ -60,6 +58,34 @@ pub struct IndexedTransactCommitmentInput {
     pub source: UtxoSource,
 }
 
+impl IndexedTransactCommitmentInput {
+    fn scan(&self, keys: &WalletScanKeys) -> Option<Utxo> {
+        let (tree, position) = normalize_tree_position(self.tree_number, self.tree_position);
+        let shared_key = shared_symmetric_key(
+            &keys.viewing_private_key,
+            &self.blinded_sender_viewing_key.0,
+        )
+        .ok()?;
+        let note = Note::decrypt_v2(
+            &self.ciphertext,
+            self.memo.as_ref(),
+            &shared_key,
+            keys.master_public_key,
+        )
+        .ok()?;
+        if note.commitment() != self.hash {
+            return None;
+        }
+        Some(Utxo::new(
+            note,
+            tree,
+            position,
+            self.source.clone(),
+            UtxoCommitmentKind::Transact,
+        ))
+    }
+}
+
 #[derive(Clone)]
 pub struct IndexedShieldCommitmentInput {
     pub tree_number: u32,
@@ -87,6 +113,33 @@ pub struct IndexedLegacyEncryptedCommitmentInput {
     pub source: UtxoSource,
 }
 
+impl IndexedLegacyEncryptedCommitmentInput {
+    fn scan(&self, keys: &WalletScanKeys) -> Option<Utxo> {
+        let memo = self
+            .memo
+            .iter()
+            .skip(2)
+            .flat_map(|chunk| chunk.0)
+            .collect::<Vec<_>>();
+        let shared_key =
+            shared_symmetric_key_legacy(&keys.viewing_private_key, &self.ephemeral_keys[0].0)
+                .ok()?;
+        let (tree, position) = normalize_tree_position(self.tree_number, self.tree_position);
+        let note =
+            Note::decrypt_v2(&self.ciphertext, &memo, &shared_key, keys.master_public_key).ok()?;
+        if note.commitment() != self.hash {
+            return None;
+        }
+        Some(Utxo::new(
+            note,
+            tree,
+            position,
+            self.source.clone(),
+            UtxoCommitmentKind::Transact,
+        ))
+    }
+}
+
 #[derive(Clone)]
 pub struct IndexedLegacyGeneratedCommitmentInput {
     pub tree_number: u32,
@@ -94,6 +147,35 @@ pub struct IndexedLegacyGeneratedCommitmentInput {
     pub preimage: LegacyCommitmentPreimage,
     pub encrypted_random: (FixedBytes<32>, FixedBytes<16>),
     pub source: UtxoSource,
+}
+
+impl IndexedLegacyGeneratedCommitmentInput {
+    fn scan(&self, keys: &WalletScanKeys) -> Option<Utxo> {
+        let random = decrypt_legacy_random(
+            self.encrypted_random.0,
+            self.encrypted_random.1,
+            &keys.viewing_private_key,
+        )
+        .ok()?;
+        let npk = Note::npk_for(keys.master_public_key, random);
+        if npk != self.preimage.npk {
+            return None;
+        }
+        let (tree, position) = normalize_tree_position(self.tree_number, self.tree_position);
+        let note = Note {
+            token_hash: self.preimage.token.id(),
+            value: U256::from(self.preimage.value.to::<u128>()),
+            random,
+            npk: self.preimage.npk,
+        };
+        Some(Utxo::new(
+            note,
+            tree,
+            position,
+            self.source.clone(),
+            UtxoCommitmentKind::Shield,
+        ))
+    }
 }
 
 pub fn parse_wallet_delta_from_logs(
@@ -135,7 +217,7 @@ pub fn parse_wallet_delta_from_logs(
                         expected_hash,
                         source.clone(),
                     ));
-                    if let Some(utxo) = scan_transact_commitment(&input, keys) {
+                    if let Some(utxo) = input.scan(keys) {
                         utxos.push(utxo);
                     }
                 }
@@ -231,7 +313,7 @@ pub fn parse_wallet_delta_from_logs(
                     expected_hash,
                     source.clone(),
                 ));
-                if let Some(utxo) = scan_legacy_encrypted_commitment(&input, keys) {
+                if let Some(utxo) = input.scan(keys) {
                     utxos.push(utxo);
                 }
             }
@@ -259,7 +341,7 @@ pub fn parse_wallet_delta_from_logs(
                     preimage.hash(),
                     source.clone(),
                 ));
-                if let Some(utxo) = scan_legacy_generated_commitment(&input, keys) {
+                if let Some(utxo) = input.scan(keys) {
                     utxos.push(utxo);
                 }
             }
@@ -299,7 +381,7 @@ pub fn parse_indexed_wallet_delta(
             commitment.hash,
             commitment.source.clone(),
         ));
-        if let Some(utxo) = scan_transact_commitment(commitment, keys) {
+        if let Some(utxo) = commitment.scan(keys) {
             utxos.push(utxo);
         }
     }
@@ -330,7 +412,7 @@ pub fn parse_indexed_wallet_delta(
             commitment.hash,
             commitment.source.clone(),
         ));
-        if let Some(utxo) = scan_legacy_encrypted_commitment(commitment, keys) {
+        if let Some(utxo) = commitment.scan(keys) {
             utxos.push(utxo);
         }
     }
@@ -342,7 +424,7 @@ pub fn parse_indexed_wallet_delta(
             commitment.preimage.hash(),
             commitment.source.clone(),
         ));
-        if let Some(utxo) = scan_legacy_generated_commitment(commitment, keys) {
+        if let Some(utxo) = commitment.scan(keys) {
             utxos.push(utxo);
         }
     }
@@ -417,101 +499,6 @@ fn scan_shield_event_commitments(
             output.utxos.push(utxo);
         }
     }
-}
-
-fn scan_legacy_encrypted_commitment(
-    commitment: &IndexedLegacyEncryptedCommitmentInput,
-    keys: &WalletScanKeys,
-) -> Option<Utxo> {
-    let memo = commitment
-        .memo
-        .iter()
-        .skip(2)
-        .flat_map(|chunk| chunk.0)
-        .collect::<Vec<_>>();
-    let shared_key =
-        shared_symmetric_key_legacy(&keys.viewing_private_key, &commitment.ephemeral_keys[0].0)
-            .ok()?;
-    let (tree, position) =
-        normalize_tree_position(commitment.tree_number, commitment.tree_position);
-    let note = Note::decrypt_v2(
-        &commitment.ciphertext,
-        &memo,
-        &shared_key,
-        keys.master_public_key,
-    )
-    .ok()?;
-    if note.commitment() != commitment.hash {
-        return None;
-    }
-    Some(Utxo::new(
-        note,
-        tree,
-        position,
-        commitment.source.clone(),
-        UtxoCommitmentKind::Transact,
-    ))
-}
-
-fn scan_legacy_generated_commitment(
-    commitment: &IndexedLegacyGeneratedCommitmentInput,
-    keys: &WalletScanKeys,
-) -> Option<Utxo> {
-    let random = decrypt_legacy_random(
-        commitment.encrypted_random.0,
-        commitment.encrypted_random.1,
-        &keys.viewing_private_key,
-    )
-    .ok()?;
-    let npk = note_public_key(keys.master_public_key, random);
-    if npk != commitment.preimage.npk {
-        return None;
-    }
-    let (tree, position) =
-        normalize_tree_position(commitment.tree_number, commitment.tree_position);
-    let note = Note {
-        token_hash: commitment.preimage.token.id(),
-        value: U256::from(commitment.preimage.value.to::<u128>()),
-        random,
-        npk: commitment.preimage.npk,
-    };
-    Some(Utxo::new(
-        note,
-        tree,
-        position,
-        commitment.source.clone(),
-        UtxoCommitmentKind::Shield,
-    ))
-}
-
-fn scan_transact_commitment(
-    commitment: &IndexedTransactCommitmentInput,
-    keys: &WalletScanKeys,
-) -> Option<Utxo> {
-    let (tree, position) =
-        normalize_tree_position(commitment.tree_number, commitment.tree_position);
-    let shared_key = shared_symmetric_key(
-        &keys.viewing_private_key,
-        &commitment.blinded_sender_viewing_key.0,
-    )
-    .ok()?;
-    let note = Note::decrypt_v2(
-        &commitment.ciphertext,
-        commitment.memo.as_ref(),
-        &shared_key,
-        keys.master_public_key,
-    )
-    .ok()?;
-    if note.commitment() != commitment.hash {
-        return None;
-    }
-    Some(Utxo::new(
-        note,
-        tree,
-        position,
-        commitment.source.clone(),
-        UtxoCommitmentKind::Transact,
-    ))
 }
 
 fn encrypted_random_from_u256(value: [U256; 2]) -> (FixedBytes<32>, FixedBytes<16>) {

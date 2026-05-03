@@ -3,7 +3,7 @@ use eyre::{Result, WrapErr, bail, eyre};
 use local_db::{
     BlobMeta, LOCAL_DB_TABLES, LocalDbTableDecodeKind, LocalDbTableInfo, MerkleForestMeta, Meta,
     OutputPoiRecoveryRecord, PendingFeeNoteAssuranceRecord, PendingOutputPoiContextRecord,
-    TerminalFeeNoteAssuranceRecord, WalletMeta, ZkeyMeta, local_db_table_by_name,
+    TerminalFeeNoteAssuranceRecord, WalletMeta, ZkeyMeta,
 };
 use redb::{Builder, ReadOnlyDatabase, ReadableDatabase, TableDefinition};
 use serde::Serialize;
@@ -105,7 +105,7 @@ fn main() -> Result<()> {
         return Ok(());
     };
 
-    let table_info = local_db_table_by_name(table_name);
+    let table_info = LocalDbTableInfo::by_name(table_name);
     if table_info.is_none() && !opt.raw {
         bail!("unknown table: {table_name}; use --raw to inspect unknown tables");
     }

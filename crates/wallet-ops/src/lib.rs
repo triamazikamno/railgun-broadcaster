@@ -19,12 +19,10 @@ use broadcaster_core::contracts::shield::{
 use broadcaster_core::crypto::railgun::{Address as RailgunAddress, AddressData};
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use broadcaster_core::transact::{
-    BroadcasterRawParamsTransact, DEFAULT_TXID_VERSION, build_transact_request_payload,
-    encrypt_transact_request, railgun_txid_leaf_hash,
+    BroadcasterRawParamsTransact, DEFAULT_TXID_VERSION, EncryptedTransactRequest,
+    railgun_txid_leaf_hash,
 };
-use broadcaster_core::transact_response::{
-    DecryptedTransactResponse, try_decrypt_transact_response_message,
-};
+use broadcaster_core::transact_response::DecryptedTransactResponse;
 use broadcaster_monitor::FeeRow;
 use eyre::{Report, Result, WrapErr, eyre};
 use local_db::{DbConfig, DbStore, PendingOutputPoiContextRecord, PendingOutputPoiRole};
@@ -245,6 +243,51 @@ pub struct PublicBroadcasterCandidate {
     pub required_poi_list_keys: Vec<String>,
     pub viewing_public_key: [u8; 32],
     pub address_data: AddressData,
+}
+
+impl PublicBroadcasterCandidate {
+    pub fn parsed_required_poi_list_keys(&self) -> Result<Vec<FixedBytes<32>>> {
+        self.required_poi_list_keys
+            .iter()
+            .map(|list_key| {
+                let bare = list_key.strip_prefix("0x").unwrap_or(list_key);
+                if bare.len() != 64 {
+                    return Err(eyre!(
+                        "invalid required POI list key {list_key}: expected 32-byte hex"
+                    ));
+                }
+                let bytes = hex::decode_to_array(bare)
+                    .wrap_err_with(|| format!("invalid required POI list key {list_key}"))?;
+                Ok(FixedBytes::from(bytes))
+            })
+            .collect()
+    }
+
+    fn from_fee_row(row: &FeeRow) -> Option<Self> {
+        let railgun_address = RailgunAddress::from(row.railgun_address.as_ref());
+        let address_data = AddressData::try_from(&railgun_address).ok()?;
+        Some(Self {
+            chain_id: row.chain_id,
+            railgun_address: row.railgun_address.to_string(),
+            identifier: row.identifier.as_ref().map(ToString::to_string),
+            token: row.token_address,
+            fee: row.fee,
+            fees_id: row.fees_id.to_string(),
+            fee_expiration: row.fee_expiration,
+            reliability: row.reliability,
+            available_wallets: row.available_wallets,
+            version: row.version.to_string(),
+            relay_adapt: row.relay_adapt,
+            relay_adapt_7702: row.relay_adapt_7702,
+            required_poi_list_keys: row
+                .required_poi_list_keys
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            viewing_public_key: address_data.viewing_public_key,
+            address_data,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -606,7 +649,7 @@ pub fn eligible_public_broadcasters(
         // Temporarily include POI-required broadcasters so the desktop picker can
         // be assessed against long live broadcaster lists.
         .filter(|row| required_relay_adapt.is_none_or(|relay| row.relay_adapt == relay))
-        .filter_map(candidate_from_fee_row)
+        .filter_map(PublicBroadcasterCandidate::from_fee_row)
         .collect()
 }
 
@@ -751,26 +794,6 @@ fn public_broadcaster_build_error(
         ),
         other => Report::new(other),
     }
-}
-
-fn parse_required_poi_list_keys(
-    broadcaster: &PublicBroadcasterCandidate,
-) -> Result<Vec<FixedBytes<32>>> {
-    broadcaster
-        .required_poi_list_keys
-        .iter()
-        .map(|list_key| {
-            let bare = list_key.strip_prefix("0x").unwrap_or(list_key);
-            if bare.len() != 64 {
-                return Err(eyre!(
-                    "invalid required POI list key {list_key}: expected 32-byte hex"
-                ));
-            }
-            let bytes = hex::decode_to_array(bare)
-                .wrap_err_with(|| format!("invalid required POI list key {list_key}"))?;
-            Ok(FixedBytes::from(bytes))
-        })
-        .collect()
 }
 
 struct PublicBroadcasterSetup {
@@ -980,7 +1003,7 @@ pub fn decode_public_broadcaster_response(
     payload: &[u8],
 ) -> Result<Option<PublicBroadcasterResultKind>> {
     Ok(
-        match try_decrypt_transact_response_message(shared_key, payload)? {
+        match DecryptedTransactResponse::try_decrypt_message(shared_key, payload)? {
             Some(DecryptedTransactResponse::TxHash(tx_hash)) => {
                 Some(PublicBroadcasterResultKind::Submitted { tx_hash })
             }
@@ -998,32 +1021,6 @@ fn supported_broadcaster_version(version: &str) -> bool {
         .next()
         .and_then(|major| major.parse::<u64>().ok())
         == Some(8)
-}
-
-fn candidate_from_fee_row(row: &FeeRow) -> Option<PublicBroadcasterCandidate> {
-    let railgun_address = RailgunAddress::from(row.railgun_address.as_ref());
-    let address_data = AddressData::try_from(&railgun_address).ok()?;
-    Some(PublicBroadcasterCandidate {
-        chain_id: row.chain_id,
-        railgun_address: row.railgun_address.to_string(),
-        identifier: row.identifier.as_ref().map(ToString::to_string),
-        token: row.token_address,
-        fee: row.fee,
-        fees_id: row.fees_id.to_string(),
-        fee_expiration: row.fee_expiration,
-        reliability: row.reliability,
-        available_wallets: row.available_wallets,
-        version: row.version.to_string(),
-        relay_adapt: row.relay_adapt,
-        relay_adapt_7702: row.relay_adapt_7702,
-        required_poi_list_keys: row
-            .required_poi_list_keys
-            .iter()
-            .map(ToString::to_string)
-            .collect(),
-        viewing_public_key: address_data.viewing_public_key,
-        address_data,
-    })
 }
 
 pub struct WalletSessionStore {
@@ -2440,9 +2437,10 @@ async fn submit_public_broadcaster_plan(
         pre_transaction_pois_per_txid_leaf_per_list,
     );
     let encrypt_started = Instant::now();
-    let encrypted = encrypt_transact_request(broadcaster.viewing_public_key, &params)
+    let encrypted = EncryptedTransactRequest::encrypt(broadcaster.viewing_public_key, &params)
         .wrap_err("encrypt public broadcaster transact request")?;
-    let payload = build_transact_request_payload(&encrypted)
+    let payload = encrypted
+        .to_transact_payload()
         .wrap_err("serialize public broadcaster transact request")?;
     tracing::info!(
         chain_id = broadcaster.chain_id,
@@ -2924,10 +2922,10 @@ mod tests {
     };
     use broadcaster_core::notes::Note;
     use broadcaster_core::transact::{
-        PreTxPoi, SnarkJsProof, build_transact_request_payload, encrypt_transact_request_with_seed,
-        railgun_txid_leaf_hash, try_decrypt_transact_request,
+        EncryptedTransactRequest, PreTxPoi, SnarkJsProof, railgun_txid_leaf_hash,
+        try_decrypt_transact_request,
     };
-    use broadcaster_core::transact_response::build_transact_response_txhash;
+    use broadcaster_core::transact_response::DecryptedTransactResponse;
     use broadcaster_monitor::FeeRow;
     use local_db::{DbConfig, DbStore, PendingOutputPoiRole};
     use poi::poi::default_active_poi_list_keys;
@@ -2945,8 +2943,8 @@ mod tests {
         approximate_public_broadcaster_gas, broadcaster_fee_amount, broadcaster_fee_covers,
         buffered_public_broadcaster_fee, decode_public_broadcaster_response,
         eligible_public_broadcasters, is_wrapped_native_token, max_send_amount_from_outputs,
-        max_unshield_amount_from_outputs, parse_railgun_recipient, parse_required_poi_list_keys,
-        parse_send_amount, parse_unshield_amount, public_broadcaster_amount_split,
+        max_unshield_amount_from_outputs, parse_railgun_recipient, parse_send_amount,
+        parse_unshield_amount, public_broadcaster_amount_split,
         public_broadcaster_max_entered_amount, public_broadcaster_transact_params,
         select_public_broadcaster, send_approximate_shape, sort_specific_public_broadcasters,
         transact_topic, unshield_approximate_shape, utxo_outputs_from_utxos,
@@ -4174,10 +4172,13 @@ mod tests {
             BTreeMap::new(),
         );
 
-        let encrypted =
-            encrypt_transact_request_with_seed(candidate.viewing_public_key, &params, [8u8; 32])
-                .expect("encrypt request");
-        let payload = build_transact_request_payload(&encrypted).expect("serialize envelope");
+        let encrypted = EncryptedTransactRequest::encrypt_with_seed(
+            candidate.viewing_public_key,
+            &params,
+            [8u8; 32],
+        )
+        .expect("encrypt request");
+        let payload = encrypted.to_transact_payload().expect("serialize envelope");
         let value: serde_json::Value = serde_json::from_slice(&payload).expect("json envelope");
         assert_eq!(value["method"], "transact");
         assert!(value["params"]["encryptedData"].is_array());
@@ -4209,7 +4210,9 @@ mod tests {
         let list_key = FixedBytes::from([0x88; 32]);
         let txid_leaf = FixedBytes::from([0x99; 32]);
         candidate.required_poi_list_keys = vec![hex::encode(list_key)];
-        let required_keys = parse_required_poi_list_keys(&candidate).expect("required list keys");
+        let required_keys = candidate
+            .parsed_required_poi_list_keys()
+            .expect("required list keys");
         let params = public_broadcaster_transact_params(
             &candidate,
             address(0x33),
@@ -4218,9 +4221,12 @@ mod tests {
             sample_poi_map(&required_keys, &[txid_leaf]),
         );
 
-        let encrypted =
-            encrypt_transact_request_with_seed(candidate.viewing_public_key, &params, [8u8; 32])
-                .expect("encrypt request");
+        let encrypted = EncryptedTransactRequest::encrypt_with_seed(
+            candidate.viewing_public_key,
+            &params,
+            [8u8; 32],
+        )
+        .expect("encrypt request");
         let decrypted = try_decrypt_transact_request(
             &broadcaster.viewing_private_key,
             encrypted.pubkey,
@@ -4244,7 +4250,9 @@ mod tests {
         let list_keys = [FixedBytes::from([0x81; 32]), FixedBytes::from([0x82; 32])];
         let leaves = [FixedBytes::from([0x91; 32]), FixedBytes::from([0x92; 32])];
         candidate.required_poi_list_keys = list_keys.iter().map(hex::encode).collect();
-        let required_keys = parse_required_poi_list_keys(&candidate).expect("required list keys");
+        let required_keys = candidate
+            .parsed_required_poi_list_keys()
+            .expect("required list keys");
         let params = public_broadcaster_transact_params(
             &candidate,
             address(0x33),
@@ -4253,9 +4261,12 @@ mod tests {
             sample_poi_map(&required_keys, &leaves),
         );
 
-        let encrypted =
-            encrypt_transact_request_with_seed(candidate.viewing_public_key, &params, [8u8; 32])
-                .expect("encrypt request");
+        let encrypted = EncryptedTransactRequest::encrypt_with_seed(
+            candidate.viewing_public_key,
+            &params,
+            [8u8; 32],
+        )
+        .expect("encrypt request");
         let decrypted = try_decrypt_transact_request(
             &broadcaster.viewing_private_key,
             encrypted.pubkey,
@@ -4280,8 +4291,9 @@ mod tests {
         let (mut candidate, _) = sample_public_broadcaster_candidate(12);
         candidate.required_poi_list_keys = vec!["poi-list".to_string()];
 
-        let error =
-            parse_required_poi_list_keys(&candidate).expect_err("invalid POI list key should fail");
+        let error = candidate
+            .parsed_required_poi_list_keys()
+            .expect_err("invalid POI list key should fail");
 
         assert!(error.to_string().contains("invalid required POI list key"));
     }
@@ -4291,7 +4303,8 @@ mod tests {
         let shared_key = [7u8; 32];
         let tx_hash = TxHash::from([3u8; 32]);
         let response =
-            build_transact_response_txhash(None, &shared_key, tx_hash).expect("response payload");
+            DecryptedTransactResponse::encrypted_tx_hash_message(None, &shared_key, tx_hash)
+                .expect("response payload");
 
         let decoded = decode_public_broadcaster_response(&shared_key, &response)
             .expect("decode response")

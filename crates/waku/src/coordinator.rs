@@ -69,6 +69,37 @@ pub struct StoreQueryOptions {
     pub pagination_limit: Option<u64>,
 }
 
+impl StoreQueryOptions {
+    pub fn validate(&self) -> Result<(), WakuError> {
+        if self.pubsub_topic.is_empty() {
+            return Err(WakuError::InvalidArgument(
+                "pubsub_topic cannot be empty".to_string(),
+            ));
+        }
+        if self.content_topics.is_empty() {
+            return Err(WakuError::InvalidArgument(
+                "content_topics cannot be empty".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn to_request(&self, pagination_cursor: Option<Vec<u8>>) -> proto::store::StoreQueryRequest {
+        proto::store::StoreQueryRequest {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            include_data: true,
+            pubsub_topic: Some(self.pubsub_topic.clone()),
+            content_topics: self.content_topics.clone(),
+            time_start: self.time_start,
+            time_end: self.time_end,
+            message_hashes: Vec::new(),
+            pagination_cursor,
+            pagination_forward: true,
+            pagination_limit: self.pagination_limit,
+        }
+    }
+}
+
 static LIGHTPUSH_UNIMPLEMENTED: OnceLock<proto::light_push::LightPushResponseV3> = OnceLock::new();
 static PEER_EXCHANGE_EMPTY_RESPONSE: OnceLock<proto::peer_exchange::PeerExchangeRpc> =
     OnceLock::new();
@@ -307,42 +338,10 @@ fn build_filter_request(
     }
 }
 
-fn build_store_query_request(
-    options: &StoreQueryOptions,
-    pagination_cursor: Option<Vec<u8>>,
-) -> proto::store::StoreQueryRequest {
-    proto::store::StoreQueryRequest {
-        request_id: uuid::Uuid::new_v4().to_string(),
-        include_data: true,
-        pubsub_topic: Some(options.pubsub_topic.clone()),
-        content_topics: options.content_topics.clone(),
-        time_start: options.time_start,
-        time_end: options.time_end,
-        message_hashes: Vec::new(),
-        pagination_cursor,
-        pagination_forward: true,
-        pagination_limit: options.pagination_limit,
-    }
-}
-
 fn store_status_ok(response: &proto::store::StoreQueryResponse) -> bool {
     response
         .status_code
         .is_none_or(|status_code| (200..300).contains(&status_code))
-}
-
-fn validate_store_query_options(options: &StoreQueryOptions) -> Result<(), WakuError> {
-    if options.pubsub_topic.is_empty() {
-        return Err(WakuError::InvalidArgument(
-            "pubsub_topic cannot be empty".to_string(),
-        ));
-    }
-    if options.content_topics.is_empty() {
-        return Err(WakuError::InvalidArgument(
-            "content_topics cannot be empty".to_string(),
-        ));
-    }
-    Ok(())
 }
 
 struct NodeInner {
@@ -394,7 +393,7 @@ impl NodeInner {
     }
 
     async fn discover(&self) -> Result<usize, discovery::DiscoveryError> {
-        let peers = discovery::discover_all(&self.discovery_config).await?;
+        let peers = self.discovery_config.discover_all().await?;
         Ok(self.apply_discovered_peers(peers))
     }
 
@@ -1420,7 +1419,7 @@ impl WakuNode {
         &self,
         options: StoreQueryOptions,
     ) -> Result<Vec<proto::WakuMessage>, WakuError> {
-        validate_store_query_options(&options)?;
+        options.validate()?;
 
         let peers = self.store_peers();
         if peers.is_empty() {
@@ -1460,7 +1459,7 @@ impl WakuNode {
         peer_id: PeerId,
         options: StoreQueryOptions,
     ) -> Result<Vec<proto::WakuMessage>, WakuError> {
-        validate_store_query_options(&options)?;
+        options.validate()?;
         self.store_query_peer_pages(peer_id, &options).await
     }
 
@@ -1474,7 +1473,7 @@ impl WakuNode {
         let mut messages = Vec::new();
 
         loop {
-            let request = build_store_query_request(options, cursor.clone());
+            let request = options.to_request(cursor.clone());
             let response = self.store_query_peer_page(peer_id, request).await?;
 
             if !store_status_ok(&response) {

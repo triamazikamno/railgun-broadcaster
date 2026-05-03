@@ -9,7 +9,7 @@ use alloy::uint;
 use merkletree::tree::{MerkleForest, MerkleTreeUpdate};
 use railgun_wallet::artifacts::ArtifactSource;
 use railgun_wallet::keys::EddsaSignature;
-use railgun_wallet::notes::{Note, note_public_key};
+use railgun_wallet::notes::Note;
 use railgun_wallet::prover::{ProverError, ProverService, RailgunWitnessInputs};
 use railgun_wallet::public_spending_key;
 use railgun_wallet::tx::{
@@ -144,7 +144,7 @@ fn build_valid_unshield_plan() -> UnshieldPlan {
                 token_hash: U256::from_be_slice(token_address.as_slice()),
                 value: uint!(10_U256),
                 random: note_random,
-                npk: note_public_key(wallet.viewing.master_public_key, note_random),
+                npk: Note::npk_for(wallet.viewing.master_public_key, note_random),
             };
             let utxo = Utxo::new(
                 note.clone(),

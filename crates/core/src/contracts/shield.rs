@@ -6,7 +6,7 @@ use crate::contracts::railgun::{
 };
 use crate::crypto::aes_gcm::{AesGcmError, encrypt_in_place_16b_iv};
 use crate::crypto::shared_key::{SharedKeyError, shared_symmetric_key};
-use crate::notes::note_public_key;
+use crate::notes::Note;
 
 use ed25519_dalek::SigningKey;
 use getrandom::fill;
@@ -39,7 +39,7 @@ pub fn build_shield_calldata(
     let mut random = [0u8; 16];
     fill(&mut random).map_err(|_| ShieldError::RandomFailed)?;
 
-    let npk = note_public_key(master_public_key, random);
+    let npk = Note::npk_for(master_public_key, random);
 
     let preimage = CommitmentPreimage {
         npk: FixedBytes::from(npk.to_be_bytes::<32>()),

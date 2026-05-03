@@ -26,39 +26,41 @@ pub struct WakuViewerConfig {
     pub nwaku_url: Option<String>,
 }
 
-/// Interval for refreshing peer snapshots from the Waku node.
-const PEER_POLL_INTERVAL: Duration = Duration::from_secs(2);
+impl WakuViewerConfig {
+    /// Build a `config::Waku` from explicit monitor settings. The standalone
+    /// viewer fills these from CLI flags; wallet apps can pass their own values.
+    #[must_use]
+    pub fn to_waku_config(&self) -> config::Waku {
+        let doh = self
+            .doh_endpoint
+            .clone()
+            .unwrap_or_else(|| DEFAULT_DOH_ENDPOINT.to_string());
+        let timeout = self
+            .peer_connection_timeout
+            .unwrap_or_else(|| Duration::from_secs(DEFAULT_PEER_CONNECTION_TIMEOUT_SECS));
 
-/// Build a `config::Waku` from explicit monitor settings. The standalone
-/// viewer fills these from CLI flags; wallet apps can pass their own values.
-#[must_use]
-pub fn waku_config(opts: &WakuViewerConfig) -> config::Waku {
-    let doh = opts
-        .doh_endpoint
-        .clone()
-        .unwrap_or_else(|| DEFAULT_DOH_ENDPOINT.to_string());
-    let timeout = opts
-        .peer_connection_timeout
-        .unwrap_or_else(|| Duration::from_secs(DEFAULT_PEER_CONNECTION_TIMEOUT_SECS));
+        config::Waku {
+            nwaku_url: self.nwaku_url.clone(),
+            direct_peers: Vec::new(),
+            dns_enr_trees: None,
+            doh_endpoint: Some(doh),
+            cluster_id: Some(self.cluster_id.unwrap_or(DEFAULT_CLUSTER_ID)),
+            shard_id: Some(self.shard_id.unwrap_or(DEFAULT_SHARD_ID)),
+            max_peers: Some(self.max_peers.unwrap_or(DEFAULT_MAX_PEERS)),
+            peer_connection_timeout: Some(humantime_serde::Serde::from(timeout)),
+        }
+    }
 
-    config::Waku {
-        nwaku_url: opts.nwaku_url.clone(),
-        direct_peers: Vec::new(),
-        dns_enr_trees: None,
-        doh_endpoint: Some(doh),
-        cluster_id: Some(opts.cluster_id.unwrap_or(DEFAULT_CLUSTER_ID)),
-        shard_id: Some(opts.shard_id.unwrap_or(DEFAULT_SHARD_ID)),
-        max_peers: Some(opts.max_peers.unwrap_or(DEFAULT_MAX_PEERS)),
-        peer_connection_timeout: Some(humantime_serde::Serde::from(timeout)),
+    /// Construct and start a Waku client from monitor settings.
+    pub fn build_client(&self) -> Result<Arc<Client>> {
+        let cfg = self.to_waku_config();
+        let client = Client::new(&cfg).wrap_err("construct waku relay client")?;
+        Ok(Arc::new(client))
     }
 }
 
-/// Construct and start a Waku client from monitor settings.
-pub fn build_waku_client(opts: &WakuViewerConfig) -> Result<Arc<Client>> {
-    let cfg = waku_config(opts);
-    let client = Client::new(&cfg).wrap_err("construct waku relay client")?;
-    Ok(Arc::new(client))
-}
+/// Interval for refreshing peer snapshots from the Waku node.
+const PEER_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Spawn the viewer's background Waku + fees workers on the current runtime.
 pub async fn spawn_workers(
@@ -280,7 +282,7 @@ mod tests {
     #[test]
     fn waku_config_defaults_apply_when_flags_are_absent() {
         let opts = WakuViewerConfig::default();
-        let cfg = waku_config(&opts);
+        let cfg = opts.to_waku_config();
         assert_eq!(cfg.cluster_id, Some(DEFAULT_CLUSTER_ID));
         assert_eq!(cfg.shard_id, Some(DEFAULT_SHARD_ID));
         assert_eq!(cfg.max_peers, Some(DEFAULT_MAX_PEERS));
@@ -305,7 +307,7 @@ mod tests {
             peer_connection_timeout: Some(Duration::from_secs(3)),
             nwaku_url: Some("http://127.0.0.1:8645".to_string()),
         };
-        let cfg = waku_config(&opts);
+        let cfg = opts.to_waku_config();
         assert_eq!(cfg.cluster_id, Some(7));
         assert_eq!(cfg.shard_id, Some(3));
         assert_eq!(cfg.max_peers, Some(42));

@@ -149,6 +149,244 @@ impl ArtifactSource {
         self.metadata_dir = Some(path);
         Ok(self)
     }
+
+    pub fn list_variants(&self) -> Result<Vec<String>, ArtifactError> {
+        let specs = self.artifact_specs()?;
+        let mut variants: Vec<String> = specs
+            .iter()
+            .map(|spec| variant_name(spec.nullifiers, spec.commitments))
+            .collect();
+        variants.sort();
+        Ok(variants)
+    }
+
+    #[must_use]
+    pub fn artifact_paths(&self, variant: &str) -> ArtifactPaths {
+        let base = if is_poi_variant(variant) {
+            self.out_dir.join(POI_ARTIFACT_CACHE_DIR).join(variant)
+        } else {
+            self.out_dir.join(variant)
+        };
+        ArtifactPaths {
+            zkey: base.join("zkey"),
+            wasm: base.join("wasm"),
+        }
+    }
+
+    pub fn ensure_artifacts(
+        &self,
+        nullifiers: usize,
+        commitments: usize,
+    ) -> Result<ArtifactPaths, ArtifactError> {
+        self.assert_variant_exists(nullifiers, commitments)?;
+        let variant = variant_name(nullifiers, commitments);
+        let paths = self.artifact_paths(&variant);
+        if paths.zkey.exists() && paths.wasm.exists() {
+            return Ok(paths);
+        }
+        self.download_variant(&variant, false)?;
+        Ok(paths)
+    }
+
+    pub fn ensure_poi_artifacts(
+        &self,
+        max_inputs: usize,
+        max_outputs: usize,
+    ) -> Result<ArtifactPaths, ArtifactError> {
+        let variant = poi_variant_name(max_inputs, max_outputs);
+        assert_supported_poi_variant(&variant)?;
+        let paths = self.artifact_paths(&variant);
+        if paths.zkey.exists() && paths.wasm.exists() {
+            return Ok(paths);
+        }
+        self.download_variant(&variant, false)?;
+        Ok(paths)
+    }
+
+    pub fn download_variants(
+        &self,
+        variants: &[String],
+        force: bool,
+    ) -> Result<Vec<ArtifactPaths>, ArtifactError> {
+        let mut out = Vec::with_capacity(variants.len());
+        for variant in variants {
+            out.push(self.download_variant(variant, force)?);
+        }
+        Ok(out)
+    }
+
+    pub fn download_variant(
+        &self,
+        variant: &str,
+        force: bool,
+    ) -> Result<ArtifactPaths, ArtifactError> {
+        let hashes = self.load_hashes()?;
+        let expected = hashes
+            .get(variant)
+            .ok_or_else(|| ArtifactError::MissingHash {
+                variant: variant.to_string(),
+            })?;
+        let paths = self.artifact_paths(variant);
+
+        if !force && paths.zkey.exists() && paths.wasm.exists() {
+            return Ok(paths);
+        }
+
+        let zkey_parent = paths
+            .zkey
+            .parent()
+            .ok_or_else(|| ArtifactError::ArtifactFile {
+                path: paths.zkey.clone(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "zkey path missing parent",
+                ),
+            })?;
+        fs::create_dir_all(zkey_parent).map_err(|source| ArtifactError::ArtifactFile {
+            path: paths.zkey.clone(),
+            source,
+        })?;
+
+        let urls = self.artifact_urls(variant)?;
+        let client = {
+            let mut builder = Client::builder();
+            if let Some(proxy_url) = &self.proxy {
+                let proxy = reqwest::Proxy::all(proxy_url.as_str()).map_err(|source| {
+                    ArtifactError::Download {
+                        source,
+                        url: proxy_url.clone(),
+                    }
+                })?;
+                builder = builder.proxy(proxy);
+            }
+            builder.build().map_err(|source| ArtifactError::Download {
+                source,
+                url: urls.zkey.clone(),
+            })?
+        };
+
+        let zkey_br = fetch_bytes(&client, &urls.zkey)?;
+        let wasm_br = fetch_bytes(&client, &urls.wasm)?;
+
+        let zkey = brotli_decompress(&zkey_br)?;
+        let wasm = brotli_decompress(&wasm_br)?;
+
+        validate_hash("zkey", &zkey, expected.zkey.as_slice())?;
+        validate_hash("wasm", &wasm, expected.wasm.as_slice())?;
+
+        write_if_needed(&paths.zkey, &zkey, force)?;
+        write_if_needed(&paths.wasm, &wasm, force)?;
+
+        Ok(paths)
+    }
+
+    pub fn load_artifacts(
+        &self,
+        nullifiers: usize,
+        commitments: usize,
+    ) -> Result<Artifacts, ArtifactError> {
+        self.assert_variant_exists(nullifiers, commitments)?;
+        let variant = variant_name(nullifiers, commitments);
+        let paths = self.artifact_paths(&variant);
+
+        let zkey = fs::read(&paths.zkey).map_err(|source| ArtifactError::ArtifactFile {
+            path: paths.zkey.clone(),
+            source,
+        })?;
+        let wasm = fs::read(&paths.wasm).map_err(|source| ArtifactError::ArtifactFile {
+            path: paths.wasm.clone(),
+            source,
+        })?;
+
+        Ok(Artifacts { zkey, wasm })
+    }
+
+    pub fn expected_zkey_hash(&self, variant: &str) -> Result<FixedBytes<32>, ArtifactError> {
+        let hashes = self.load_hashes()?;
+        let expected = hashes
+            .get(variant)
+            .ok_or_else(|| ArtifactError::MissingHash {
+                variant: variant.to_string(),
+            })?;
+        Ok(expected.zkey)
+    }
+
+    fn assert_variant_exists(
+        &self,
+        nullifiers: usize,
+        commitments: usize,
+    ) -> Result<(), ArtifactError> {
+        let specs = self.artifact_specs()?;
+        let exists = specs
+            .iter()
+            .any(|spec| spec.nullifiers == nullifiers && spec.commitments == commitments);
+        if exists {
+            Ok(())
+        } else {
+            Err(ArtifactError::UnsupportedVariant {
+                nullifiers,
+                commitments,
+            })
+        }
+    }
+
+    fn artifact_specs(&self) -> Result<Vec<ArtifactSpec>, ArtifactError> {
+        if let Some(dir) = self.metadata_dir.as_ref() {
+            let path = dir.join(ARTIFACTS_LIST_FILE);
+            let data =
+                fs::read(&path).map_err(|source| ArtifactError::ArtifactFile { path, source })?;
+            serde_json::from_slice(&data).map_err(ArtifactError::ArtifactList)
+        } else {
+            serde_json::from_slice(ARTIFACTS_LIST_EMBED).map_err(ArtifactError::ArtifactList)
+        }
+    }
+
+    fn load_hashes(&self) -> Result<HashMap<String, ArtifactHashes>, ArtifactError> {
+        if let Some(dir) = self.metadata_dir.as_ref() {
+            let path = dir.join(ARTIFACTS_HASHES_FILE);
+            let data = fs::read(&path).map_err(ArtifactError::ArtifactHashes)?;
+            serde_json::from_slice(&data).map_err(ArtifactError::HashesParse)
+        } else {
+            serde_json::from_slice(ARTIFACTS_HASHES_EMBED).map_err(ArtifactError::HashesParse)
+        }
+    }
+
+    fn artifact_urls(&self, variant: &str) -> Result<ArtifactUrls, ArtifactError> {
+        let base_suffix = if is_poi_variant(variant) {
+            assert_supported_poi_variant(variant)?;
+            format!("ipfs/{}/", self.poi_ipfs_hash)
+        } else {
+            format!("ipfs/{}/", self.ipfs_hash)
+        };
+        let base = self
+            .gateway
+            .join(&base_suffix)
+            .map_err(|source| ArtifactError::InvalidUrl {
+                url: base_suffix,
+                source,
+            })?;
+        let (zkey_path, wasm_path) = if is_poi_variant(variant) {
+            (format!("{variant}/zkey.br"), format!("{variant}/wasm.br"))
+        } else {
+            (
+                format!("circuits/{variant}/zkey.br"),
+                format!("prover/snarkjs/{variant}.wasm.br"),
+            )
+        };
+        let zkey = base
+            .join(&zkey_path)
+            .map_err(|source| ArtifactError::InvalidUrl {
+                url: zkey_path,
+                source,
+            })?;
+        let wasm = base
+            .join(&wasm_path)
+            .map_err(|source| ArtifactError::InvalidUrl {
+                url: wasm_path,
+                source,
+            })?;
+        Ok(ArtifactUrls { zkey, wasm })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -167,29 +405,6 @@ pub fn poi_variant_name(max_inputs: usize, max_outputs: usize) -> String {
     format!("{POI_ARTIFACT_PREFIX}{max_inputs}x{max_outputs}")
 }
 
-pub fn list_variants(source: &ArtifactSource) -> Result<Vec<String>, ArtifactError> {
-    let specs = artifact_specs(source)?;
-    let mut variants: Vec<String> = specs
-        .iter()
-        .map(|spec| variant_name(spec.nullifiers, spec.commitments))
-        .collect();
-    variants.sort();
-    Ok(variants)
-}
-
-#[must_use]
-pub fn artifact_paths(variant: &str, source: &ArtifactSource) -> ArtifactPaths {
-    let base = if is_poi_variant(variant) {
-        source.out_dir.join(POI_ARTIFACT_CACHE_DIR).join(variant)
-    } else {
-        source.out_dir.join(variant)
-    };
-    ArtifactPaths {
-        zkey: base.join("zkey"),
-        wasm: base.join("wasm"),
-    }
-}
-
 fn validate_metadata_dir(path: &Path) -> Result<(), ArtifactError> {
     let list_path = path.join(ARTIFACTS_LIST_FILE);
     let hashes_path = path.join(ARTIFACTS_HASHES_FILE);
@@ -201,232 +416,14 @@ fn validate_metadata_dir(path: &Path) -> Result<(), ArtifactError> {
     Ok(())
 }
 
-pub fn ensure_artifacts_with_source(
-    nullifiers: usize,
-    commitments: usize,
-    source: &ArtifactSource,
-) -> Result<ArtifactPaths, ArtifactError> {
-    assert_variant_exists(source, nullifiers, commitments)?;
-    let variant = variant_name(nullifiers, commitments);
-    let paths = artifact_paths(&variant, source);
-    if paths.zkey.exists() && paths.wasm.exists() {
-        return Ok(paths);
-    }
-    download_variant(&variant, source, false)?;
-    Ok(paths)
-}
-
-pub fn ensure_poi_artifacts_with_source(
-    max_inputs: usize,
-    max_outputs: usize,
-    source: &ArtifactSource,
-) -> Result<ArtifactPaths, ArtifactError> {
-    let variant = poi_variant_name(max_inputs, max_outputs);
-    assert_supported_poi_variant(&variant)?;
-    let paths = artifact_paths(&variant, source);
-    if paths.zkey.exists() && paths.wasm.exists() {
-        return Ok(paths);
-    }
-    download_variant(&variant, source, false)?;
-    Ok(paths)
-}
-
-pub fn download_variants(
-    variants: &[String],
-    source: &ArtifactSource,
-    force: bool,
-) -> Result<Vec<ArtifactPaths>, ArtifactError> {
-    let mut out = Vec::with_capacity(variants.len());
-    for variant in variants {
-        out.push(download_variant(variant, source, force)?);
-    }
-    Ok(out)
-}
-
-pub fn download_variant(
-    variant: &str,
-    source: &ArtifactSource,
-    force: bool,
-) -> Result<ArtifactPaths, ArtifactError> {
-    let hashes = load_hashes(source)?;
-    let expected = hashes
-        .get(variant)
-        .ok_or_else(|| ArtifactError::MissingHash {
-            variant: variant.to_string(),
-        })?;
-    let paths = artifact_paths(variant, source);
-
-    if !force && paths.zkey.exists() && paths.wasm.exists() {
-        return Ok(paths);
-    }
-
-    let zkey_parent = paths
-        .zkey
-        .parent()
-        .ok_or_else(|| ArtifactError::ArtifactFile {
-            path: paths.zkey.clone(),
-            source: std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "zkey path missing parent",
-            ),
-        })?;
-    fs::create_dir_all(zkey_parent).map_err(|source| ArtifactError::ArtifactFile {
-        path: paths.zkey.clone(),
-        source,
-    })?;
-
-    let urls = artifact_urls(source, variant)?;
-    let client = {
-        let mut builder = Client::builder();
-        if let Some(proxy_url) = &source.proxy {
-            let proxy = reqwest::Proxy::all(proxy_url.as_str()).map_err(|source| {
-                ArtifactError::Download {
-                    source,
-                    url: proxy_url.clone(),
-                }
-            })?;
-            builder = builder.proxy(proxy);
-        }
-        builder.build().map_err(|source| ArtifactError::Download {
-            source,
-            url: urls.zkey.clone(),
-        })?
-    };
-
-    let zkey_br = fetch_bytes(&client, &urls.zkey)?;
-    let wasm_br = fetch_bytes(&client, &urls.wasm)?;
-
-    let zkey = brotli_decompress(&zkey_br)?;
-    let wasm = brotli_decompress(&wasm_br)?;
-
-    validate_hash("zkey", &zkey, expected.zkey.as_slice())?;
-    validate_hash("wasm", &wasm, expected.wasm.as_slice())?;
-
-    write_if_needed(&paths.zkey, &zkey, force)?;
-    write_if_needed(&paths.wasm, &wasm, force)?;
-
-    Ok(paths)
-}
-
 pub fn load_artifacts(nullifiers: usize, commitments: usize) -> Result<Artifacts, ArtifactError> {
     let source = ArtifactSource::default();
-    load_artifacts_with_source(nullifiers, commitments, &source)
-}
-
-pub fn load_artifacts_with_source(
-    nullifiers: usize,
-    commitments: usize,
-    source: &ArtifactSource,
-) -> Result<Artifacts, ArtifactError> {
-    assert_variant_exists(source, nullifiers, commitments)?;
-    let variant = variant_name(nullifiers, commitments);
-    let paths = artifact_paths(&variant, source);
-
-    let zkey = fs::read(&paths.zkey).map_err(|source| ArtifactError::ArtifactFile {
-        path: paths.zkey.clone(),
-        source,
-    })?;
-    let wasm = fs::read(&paths.wasm).map_err(|source| ArtifactError::ArtifactFile {
-        path: paths.wasm.clone(),
-        source,
-    })?;
-
-    Ok(Artifacts { zkey, wasm })
-}
-
-pub fn expected_zkey_hash(
-    variant: &str,
-    source: &ArtifactSource,
-) -> Result<FixedBytes<32>, ArtifactError> {
-    let hashes = load_hashes(source)?;
-    let expected = hashes
-        .get(variant)
-        .ok_or_else(|| ArtifactError::MissingHash {
-            variant: variant.to_string(),
-        })?;
-    Ok(expected.zkey)
-}
-
-fn assert_variant_exists(
-    source: &ArtifactSource,
-    nullifiers: usize,
-    commitments: usize,
-) -> Result<(), ArtifactError> {
-    let specs = artifact_specs(source)?;
-    let exists = specs
-        .iter()
-        .any(|spec| spec.nullifiers == nullifiers && spec.commitments == commitments);
-    if exists {
-        Ok(())
-    } else {
-        Err(ArtifactError::UnsupportedVariant {
-            nullifiers,
-            commitments,
-        })
-    }
-}
-
-fn artifact_specs(source: &ArtifactSource) -> Result<Vec<ArtifactSpec>, ArtifactError> {
-    if let Some(dir) = source.metadata_dir.as_ref() {
-        let path = dir.join(ARTIFACTS_LIST_FILE);
-        let data =
-            fs::read(&path).map_err(|source| ArtifactError::ArtifactFile { path, source })?;
-        serde_json::from_slice(&data).map_err(ArtifactError::ArtifactList)
-    } else {
-        serde_json::from_slice(ARTIFACTS_LIST_EMBED).map_err(ArtifactError::ArtifactList)
-    }
-}
-
-fn load_hashes(source: &ArtifactSource) -> Result<HashMap<String, ArtifactHashes>, ArtifactError> {
-    if let Some(dir) = source.metadata_dir.as_ref() {
-        let path = dir.join(ARTIFACTS_HASHES_FILE);
-        let data = fs::read(&path).map_err(ArtifactError::ArtifactHashes)?;
-        serde_json::from_slice(&data).map_err(ArtifactError::HashesParse)
-    } else {
-        serde_json::from_slice(ARTIFACTS_HASHES_EMBED).map_err(ArtifactError::HashesParse)
-    }
+    source.load_artifacts(nullifiers, commitments)
 }
 
 struct ArtifactUrls {
     zkey: Url,
     wasm: Url,
-}
-
-fn artifact_urls(source: &ArtifactSource, variant: &str) -> Result<ArtifactUrls, ArtifactError> {
-    let base_suffix = if is_poi_variant(variant) {
-        assert_supported_poi_variant(variant)?;
-        format!("ipfs/{}/", source.poi_ipfs_hash)
-    } else {
-        format!("ipfs/{}/", source.ipfs_hash)
-    };
-    let base = source
-        .gateway
-        .join(&base_suffix)
-        .map_err(|source| ArtifactError::InvalidUrl {
-            url: base_suffix,
-            source,
-        })?;
-    let (zkey_path, wasm_path) = if is_poi_variant(variant) {
-        (format!("{variant}/zkey.br"), format!("{variant}/wasm.br"))
-    } else {
-        (
-            format!("circuits/{variant}/zkey.br"),
-            format!("prover/snarkjs/{variant}.wasm.br"),
-        )
-    };
-    let zkey = base
-        .join(&zkey_path)
-        .map_err(|source| ArtifactError::InvalidUrl {
-            url: format!("{base}{zkey_path}"),
-            source,
-        })?;
-    let wasm = base
-        .join(&wasm_path)
-        .map_err(|source| ArtifactError::InvalidUrl {
-            url: format!("{base}{wasm_path}"),
-            source,
-        })?;
-    Ok(ArtifactUrls { zkey, wasm })
 }
 
 fn is_poi_variant(variant: &str) -> bool {
@@ -496,10 +493,7 @@ fn write_if_needed(path: &Path, data: &[u8], force: bool) -> Result<(), Artifact
 mod tests {
     use std::path::PathBuf;
 
-    use super::{
-        ArtifactSource, artifact_paths, artifact_urls, ensure_poi_artifacts_with_source,
-        poi_variant_name,
-    };
+    use super::{ArtifactSource, poi_variant_name};
 
     #[test]
     fn poi_variant_name_matches_expected_shape() {
@@ -511,7 +505,7 @@ mod tests {
     fn poi_artifact_paths_use_poi_cache_dir() {
         let source = ArtifactSource::default().with_cache_dir(PathBuf::from("cache"));
 
-        let paths = artifact_paths("POI_3x3", &source);
+        let paths = source.artifact_paths("POI_3x3");
 
         assert_eq!(
             paths.zkey,
@@ -527,7 +521,7 @@ mod tests {
     fn poi_artifact_urls_use_poi_ipfs_hash_and_flat_paths() {
         let source = ArtifactSource::default().with_poi_ipfs_hash("poi-hash".to_string());
 
-        let urls = artifact_urls(&source, "POI_13x13").expect("poi urls");
+        let urls = source.artifact_urls("POI_13x13").expect("poi urls");
 
         assert_eq!(
             urls.zkey.as_str(),
@@ -543,7 +537,8 @@ mod tests {
     fn unsupported_poi_variant_is_rejected_before_download() {
         let source = ArtifactSource::default();
 
-        let error = ensure_poi_artifacts_with_source(4, 4, &source)
+        let error = source
+            .ensure_poi_artifacts(4, 4)
             .expect_err("unsupported poi variant should fail");
 
         assert!(error.to_string().contains("POI_4x4"));

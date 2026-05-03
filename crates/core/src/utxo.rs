@@ -95,7 +95,7 @@ impl UtxoPoiMetadata {
     ) -> Self {
         let commitment = FixedBytes::from(note.commitment().to_be_bytes::<32>());
         let npk = FixedBytes::from(note.npk.to_be_bytes::<32>());
-        let blinded_commitment = derive_blinded_commitment(commitment, npk, tree, position);
+        let blinded_commitment = Self::blinded_commitment_for(commitment, npk, tree, position);
         Self {
             commitment_kind,
             commitment,
@@ -161,17 +161,17 @@ impl UtxoPoiMetadata {
         }
         status_changes
     }
-}
 
-#[must_use]
-pub fn derive_blinded_commitment(
-    commitment: FixedBytes<32>,
-    npk: FixedBytes<32>,
-    tree: u32,
-    position: u64,
-) -> FixedBytes<32> {
-    let global_tree_position = U256::from(tree) * TREE_LEAF_COUNT_U256 + U256::from(position);
-    poseidon(vec![commitment.into(), npk.into(), global_tree_position]).into()
+    #[must_use]
+    pub fn blinded_commitment_for(
+        commitment: FixedBytes<32>,
+        npk: FixedBytes<32>,
+        tree: u32,
+        position: u64,
+    ) -> FixedBytes<32> {
+        let global_tree_position = U256::from(tree) * TREE_LEAF_COUNT_U256 + U256::from(position);
+        poseidon(vec![commitment.into(), npk.into(), global_tree_position]).into()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -201,7 +201,7 @@ mod tests {
     use crate::crypto::poseidon::poseidon;
     use crate::tree::TREE_LEAF_COUNT_U256;
 
-    use super::{PoiStatus, UtxoCommitmentKind, UtxoPoiMetadata, derive_blinded_commitment};
+    use super::{PoiStatus, UtxoCommitmentKind, UtxoPoiMetadata};
 
     #[test]
     fn blinded_commitment_uses_global_tree_position() {
@@ -220,12 +220,12 @@ mod tests {
         .into();
 
         assert_eq!(
-            derive_blinded_commitment(commitment, npk, tree, position),
+            UtxoPoiMetadata::blinded_commitment_for(commitment, npk, tree, position),
             expected
         );
         assert_ne!(
-            derive_blinded_commitment(commitment, npk, tree, position),
-            derive_blinded_commitment(commitment, npk, tree, position + 1)
+            UtxoPoiMetadata::blinded_commitment_for(commitment, npk, tree, position),
+            UtxoPoiMetadata::blinded_commitment_for(commitment, npk, tree, position + 1)
         );
     }
 

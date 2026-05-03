@@ -19,6 +19,20 @@ struct AdminState {
     sync_manager: Arc<SyncManager>,
 }
 
+impl AdminState {
+    fn is_authorized(&self, headers: &HeaderMap) -> bool {
+        let Some(value) = headers.get(header::AUTHORIZATION) else {
+            return false;
+        };
+        let Ok(value) = value.to_str() else {
+            return false;
+        };
+        value
+            .strip_prefix("Bearer ")
+            .is_some_and(|provided| provided == self.token)
+    }
+}
+
 #[derive(Deserialize)]
 struct ResetWalletRequest {
     cache_key: String,
@@ -60,7 +74,7 @@ async fn reset_wallet(
     headers: HeaderMap,
     Json(payload): Json<ResetWalletRequest>,
 ) -> HandlerResult<Json<ResetWalletResponse>> {
-    if !is_authorized(&headers, &state.token) {
+    if !state.is_authorized(&headers) {
         return Err((
             StatusCode::UNAUTHORIZED,
             Json(ErrorResponse {
@@ -97,16 +111,4 @@ async fn reset_wallet(
             }),
         )),
     }
-}
-
-fn is_authorized(headers: &HeaderMap, token: &str) -> bool {
-    let Some(value) = headers.get(header::AUTHORIZATION) else {
-        return false;
-    };
-    let Ok(value) = value.to_str() else {
-        return false;
-    };
-    value
-        .strip_prefix("Bearer ")
-        .is_some_and(|provided| provided == token)
 }

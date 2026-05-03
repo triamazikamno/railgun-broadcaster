@@ -51,7 +51,7 @@ impl Note {
         random: [u8; 16],
     ) -> Self {
         let token_hash = U256::from_be_slice(token_address.as_slice());
-        let npk = note_public_key(master_public_key, random);
+        let npk = Self::npk_for(master_public_key, random);
         Self {
             token_hash,
             value,
@@ -95,7 +95,7 @@ impl Note {
 
         let token_hash = U256::from_be_bytes(token_hash);
         let value = U256::from_be_slice(&value_bytes);
-        let npk = note_public_key(receiver_mpk, random);
+        let npk = Self::npk_for(receiver_mpk, random);
         Ok(Self {
             token_hash,
             value,
@@ -103,12 +103,12 @@ impl Note {
             npk,
         })
     }
-}
 
-#[must_use]
-pub fn note_public_key(master_public_key: U256, random: [u8; 16]) -> U256 {
-    let random_value = U256::from_be_slice(&random);
-    poseidon(vec![master_public_key, random_value])
+    #[must_use]
+    pub fn npk_for(master_public_key: U256, random: [u8; 16]) -> U256 {
+        let random_value = U256::from_be_slice(&random);
+        poseidon(vec![master_public_key, random_value])
+    }
 }
 
 pub fn decrypt_shield_random(

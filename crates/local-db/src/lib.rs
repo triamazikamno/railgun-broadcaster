@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::hex;
 use alloy::primitives::{FixedBytes, U256};
-use broadcaster_core::transact::{FeeNoteAssuranceContext, PreTxPoi};
+use broadcaster_core::transact::{FeeNoteAssuranceContext, PreTxPoi, railgun_txid_leaf_hash};
 use redb::{Database, ReadableDatabase, ReadableTable, Table, TableDefinition};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -142,12 +142,14 @@ impl LocalDbTable {
     }
 }
 
-#[must_use]
-pub fn local_db_table_by_name(name: &str) -> Option<LocalDbTableInfo> {
-    LOCAL_DB_TABLES
-        .iter()
-        .copied()
-        .find(|table| table.name == name)
+impl LocalDbTableInfo {
+    #[must_use]
+    pub fn by_name(name: &str) -> Option<Self> {
+        LOCAL_DB_TABLES
+            .iter()
+            .copied()
+            .find(|table| table.name == name)
+    }
 }
 
 const META_KEY: &str = "meta";
@@ -266,12 +268,36 @@ pub struct PendingFeeNoteAssuranceRecord {
     pub context: FeeNoteAssuranceContext,
 }
 
+impl PendingFeeNoteAssuranceRecord {
+    #[must_use]
+    pub fn key(&self) -> String {
+        Self::key_for(self.chain_id, &self.public_tx_hash)
+    }
+
+    #[must_use]
+    pub fn key_for(chain_id: u64, public_tx_hash: &FixedBytes<32>) -> String {
+        format!("{chain_id}|{}", hex::encode(public_tx_hash))
+    }
+
+    #[must_use]
+    pub fn prefix_for_chain(chain_id: u64) -> String {
+        format!("{chain_id}|")
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TerminalFeeNoteAssuranceRecord {
     pub chain_id: u64,
     pub public_tx_hash: FixedBytes<32>,
     pub context: FeeNoteAssuranceContext,
     pub outcome: FeeNoteAssuranceTerminalOutcome,
+}
+
+impl TerminalFeeNoteAssuranceRecord {
+    #[must_use]
+    pub fn key(&self) -> String {
+        PendingFeeNoteAssuranceRecord::key_for(self.chain_id, &self.public_tx_hash)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -311,6 +337,87 @@ pub struct PendingOutputPoiContextRecord {
     pub terminal_error: Option<String>,
 }
 
+impl PendingOutputPoiContextRecord {
+    #[must_use]
+    pub fn key(&self) -> String {
+        Self::key_for(self.chain_id, &self.output_commitment)
+    }
+
+    #[must_use]
+    pub fn key_for(chain_id: u64, output_commitment: &FixedBytes<32>) -> String {
+        format!("{chain_id}|{}", hex::encode(output_commitment))
+    }
+
+    #[must_use]
+    pub fn prefix_for_chain(chain_id: u64) -> String {
+        format!("{chain_id}|")
+    }
+
+    #[must_use]
+    pub fn txid_leaf_hash(&self) -> Option<FixedBytes<32>> {
+        if self.txid_merkleroot_index.is_none() {
+            return Some(FixedBytes::from(
+                railgun_txid_leaf_hash(self.railgun_txid, self.utxo_tree_in).to_be_bytes::<32>(),
+            ));
+        }
+
+        let mut txid_leaf_hash = None;
+        for per_leaf in self.pre_transaction_pois_per_txid_leaf_per_list.values() {
+            for key in per_leaf.keys() {
+                if txid_leaf_hash.is_some_and(|existing| existing != *key) {
+                    return None;
+                }
+                txid_leaf_hash = Some(*key);
+            }
+        }
+        txid_leaf_hash
+    }
+
+    #[must_use]
+    pub fn list_keys(&self) -> Vec<FixedBytes<32>> {
+        if self.required_poi_list_keys.is_empty() {
+            self.pre_transaction_pois_per_txid_leaf_per_list
+                .keys()
+                .copied()
+                .collect()
+        } else {
+            self.required_poi_list_keys.clone()
+        }
+    }
+
+    #[must_use]
+    pub fn missing_list_keys(&self) -> Vec<FixedBytes<32>> {
+        self.list_keys()
+            .into_iter()
+            .filter(|list_key| !self.submitted_poi_list_keys.contains(list_key))
+            .collect()
+    }
+
+    #[must_use]
+    pub fn retain_poi_lists(
+        &self,
+        list_keys: &[FixedBytes<32>],
+    ) -> BTreeMap<FixedBytes<32>, BTreeMap<FixedBytes<32>, PreTxPoi>> {
+        list_keys
+            .iter()
+            .filter_map(|list_key| {
+                self.pre_transaction_pois_per_txid_leaf_per_list
+                    .get(list_key)
+                    .cloned()
+                    .map(|per_leaf| (*list_key, per_leaf))
+            })
+            .collect()
+    }
+
+    pub fn observe(&mut self, observation: PendingOutputPoiObservation) -> bool {
+        if self.observation.as_ref() == Some(&observation) {
+            return false;
+        }
+        self.observation = Some(observation);
+        true
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum OutputPoiRecoveryStatus {
     Recoverable,
@@ -328,6 +435,42 @@ pub enum OutputPoiRecoveryStatus {
     SubmitFailed,
 }
 
+impl OutputPoiRecoveryStatus {
+    #[must_use]
+    pub const fn is_permanent_skip(self) -> bool {
+        matches!(
+            self,
+            Self::Valid
+                | Self::NotSelfOriginated
+                | Self::UnsupportedShape
+                | Self::MissingWalletInputs
+                | Self::MissingWalletOutputs
+                | Self::DecodeFailed
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum OutputPoiRecoveryAction {
+    CacheTxInput {
+        tx_input: Vec<u8>,
+    },
+    Detected {
+        status: OutputPoiRecoveryStatus,
+        retry_after: Option<Duration>,
+        last_error: Option<String>,
+        increment_attempts: bool,
+    },
+    Submitted {
+        retry_after: Duration,
+    },
+    SubmitFailed {
+        error: String,
+        retry_after: Duration,
+    },
+    Valid,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutputPoiRecoveryRecord {
     pub chain_id: u64,
@@ -343,6 +486,92 @@ pub struct OutputPoiRecoveryRecord {
     pub next_retry_at: Option<u64>,
     pub attempt_count: u32,
     pub last_error: Option<String>,
+}
+
+impl OutputPoiRecoveryRecord {
+    #[must_use]
+    pub fn key(&self) -> String {
+        Self::key_for(self.chain_id, &self.wallet_id, &self.output_commitment)
+    }
+
+    #[must_use]
+    pub fn key_for(chain_id: u64, wallet_id: &str, output_commitment: &FixedBytes<32>) -> String {
+        format!("{chain_id}|{wallet_id}|{}", hex::encode(output_commitment))
+    }
+
+    #[must_use]
+    pub fn prefix_for_wallet(chain_id: u64, wallet_id: &str) -> String {
+        format!("{chain_id}|{wallet_id}|")
+    }
+
+    #[must_use]
+    pub fn retry_allowed(&self, now: u64, force_retry: bool) -> bool {
+        !self.status.is_permanent_skip()
+            && (force_retry
+                || self
+                    .next_retry_at
+                    .is_none_or(|next_retry_at| next_retry_at <= now))
+    }
+
+    #[must_use]
+    pub fn submission_retry_allowed(&self, now: u64, force_retry: bool) -> bool {
+        matches!(
+            self.status,
+            OutputPoiRecoveryStatus::Submitted
+                | OutputPoiRecoveryStatus::SubmitFailed
+                | OutputPoiRecoveryStatus::Recoverable
+        ) && (force_retry
+            || self
+                .next_retry_at
+                .is_some_and(|next_retry_at| next_retry_at <= now))
+    }
+
+    pub fn apply_action(&mut self, action: OutputPoiRecoveryAction, now: u64) {
+        match action {
+            OutputPoiRecoveryAction::CacheTxInput { tx_input } => {
+                self.tx_input = Some(tx_input);
+                self.updated_at = now;
+                self.last_detection_at = Some(now);
+            }
+            OutputPoiRecoveryAction::Detected {
+                status,
+                retry_after,
+                last_error,
+                increment_attempts,
+            } => {
+                self.status = status;
+                self.updated_at = now;
+                self.last_detection_at = Some(now);
+                self.next_retry_at =
+                    retry_after.map(|duration| now.saturating_add(duration.as_secs()));
+                self.last_error = last_error;
+                if increment_attempts {
+                    self.attempt_count = self.attempt_count.saturating_add(1);
+                }
+            }
+            OutputPoiRecoveryAction::Submitted { retry_after } => {
+                self.status = OutputPoiRecoveryStatus::Submitted;
+                self.updated_at = now;
+                self.last_submission_at = Some(now);
+                self.next_retry_at = Some(now.saturating_add(retry_after.as_secs()));
+                self.last_error = None;
+                self.attempt_count = self.attempt_count.saturating_add(1);
+            }
+            OutputPoiRecoveryAction::SubmitFailed { error, retry_after } => {
+                self.status = OutputPoiRecoveryStatus::SubmitFailed;
+                self.updated_at = now;
+                self.next_retry_at = Some(now.saturating_add(retry_after.as_secs()));
+                self.last_error = Some(error);
+                self.attempt_count = self.attempt_count.saturating_add(1);
+            }
+            OutputPoiRecoveryAction::Valid => {
+                self.status = OutputPoiRecoveryStatus::Valid;
+                self.updated_at = now;
+                self.next_retry_at = None;
+                self.last_error = None;
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -655,7 +884,7 @@ impl DbStore {
         chain_id: u64,
         public_tx_hash: &FixedBytes<32>,
     ) -> Result<Option<PendingFeeNoteAssuranceRecord>, DbError> {
-        let key = fee_note_assurance_key(chain_id, public_tx_hash);
+        let key = PendingFeeNoteAssuranceRecord::key_for(chain_id, public_tx_hash);
         let txn = self.db.begin_read()?;
         let table = txn.open_table(PENDING_FEE_NOTE_ASSURANCE_TABLE)?;
         match table.get(key.as_str())? {
@@ -668,7 +897,7 @@ impl DbStore {
         &self,
         record: &PendingFeeNoteAssuranceRecord,
     ) -> Result<(), DbError> {
-        let key = fee_note_assurance_key(record.chain_id, &record.public_tx_hash);
+        let key = record.key();
         let data = encode(record)?;
         let txn = self.db.begin_write()?;
         {
@@ -684,7 +913,7 @@ impl DbStore {
         chain_id: u64,
         public_tx_hash: &FixedBytes<32>,
     ) -> Result<(), DbError> {
-        let key = fee_note_assurance_key(chain_id, public_tx_hash);
+        let key = PendingFeeNoteAssuranceRecord::key_for(chain_id, public_tx_hash);
         let txn = self.db.begin_write()?;
         {
             let mut table = txn.open_table(PENDING_FEE_NOTE_ASSURANCE_TABLE)?;
@@ -698,7 +927,7 @@ impl DbStore {
         &self,
         chain_id: u64,
     ) -> Result<Vec<PendingFeeNoteAssuranceRecord>, DbError> {
-        let prefix = fee_note_assurance_prefix(chain_id);
+        let prefix = PendingFeeNoteAssuranceRecord::prefix_for_chain(chain_id);
         self.list_decoded_by_prefix(PENDING_FEE_NOTE_ASSURANCE_TABLE, &prefix)
     }
 
@@ -707,7 +936,7 @@ impl DbStore {
         chain_id: u64,
         public_tx_hash: &FixedBytes<32>,
     ) -> Result<Option<TerminalFeeNoteAssuranceRecord>, DbError> {
-        let key = fee_note_assurance_key(chain_id, public_tx_hash);
+        let key = PendingFeeNoteAssuranceRecord::key_for(chain_id, public_tx_hash);
         let txn = self.db.begin_read()?;
         let table = txn.open_table(TERMINAL_FEE_NOTE_ASSURANCE_TABLE)?;
         match table.get(key.as_str())? {
@@ -720,7 +949,7 @@ impl DbStore {
         &self,
         chain_id: u64,
     ) -> Result<Vec<TerminalFeeNoteAssuranceRecord>, DbError> {
-        let prefix = fee_note_assurance_prefix(chain_id);
+        let prefix = PendingFeeNoteAssuranceRecord::prefix_for_chain(chain_id);
         self.list_decoded_by_prefix(TERMINAL_FEE_NOTE_ASSURANCE_TABLE, &prefix)
     }
 
@@ -729,7 +958,7 @@ impl DbStore {
         record: &PendingFeeNoteAssuranceRecord,
         outcome: FeeNoteAssuranceTerminalOutcome,
     ) -> Result<(), DbError> {
-        let key = fee_note_assurance_key(record.chain_id, &record.public_tx_hash);
+        let key = record.key();
         let terminal = TerminalFeeNoteAssuranceRecord {
             chain_id: record.chain_id,
             public_tx_hash: record.public_tx_hash,
@@ -754,7 +983,7 @@ impl DbStore {
         chain_id: u64,
         output_commitment: &FixedBytes<32>,
     ) -> Result<Option<PendingOutputPoiContextRecord>, DbError> {
-        let key = pending_output_poi_context_key(chain_id, output_commitment);
+        let key = PendingOutputPoiContextRecord::key_for(chain_id, output_commitment);
         let txn = self.db.begin_read()?;
         let table = txn.open_table(PENDING_OUTPUT_POI_CONTEXT_TABLE)?;
         match table.get(key.as_str())? {
@@ -767,7 +996,7 @@ impl DbStore {
         &self,
         record: &PendingOutputPoiContextRecord,
     ) -> Result<(), DbError> {
-        let key = pending_output_poi_context_key(record.chain_id, &record.output_commitment);
+        let key = record.key();
         let data = encode(record)?;
         let txn = self.db.begin_write()?;
         {
@@ -783,7 +1012,7 @@ impl DbStore {
         chain_id: u64,
         output_commitment: &FixedBytes<32>,
     ) -> Result<(), DbError> {
-        let key = pending_output_poi_context_key(chain_id, output_commitment);
+        let key = PendingOutputPoiContextRecord::key_for(chain_id, output_commitment);
         let txn = self.db.begin_write()?;
         {
             let mut table = txn.open_table(PENDING_OUTPUT_POI_CONTEXT_TABLE)?;
@@ -797,7 +1026,7 @@ impl DbStore {
         &self,
         chain_id: u64,
     ) -> Result<Vec<PendingOutputPoiContextRecord>, DbError> {
-        let prefix = pending_output_poi_context_prefix(chain_id);
+        let prefix = PendingOutputPoiContextRecord::prefix_for_chain(chain_id);
         self.list_decoded_by_prefix(PENDING_OUTPUT_POI_CONTEXT_TABLE, &prefix)
     }
 
@@ -807,7 +1036,7 @@ impl DbStore {
         wallet_id: &str,
         output_commitment: &FixedBytes<32>,
     ) -> Result<Option<OutputPoiRecoveryRecord>, DbError> {
-        let key = output_poi_recovery_key(chain_id, wallet_id, output_commitment);
+        let key = OutputPoiRecoveryRecord::key_for(chain_id, wallet_id, output_commitment);
         let txn = self.db.begin_read()?;
         let table = txn.open_table(OUTPUT_POI_RECOVERY_TABLE)?;
         match table.get(key.as_str())? {
@@ -817,11 +1046,7 @@ impl DbStore {
     }
 
     pub fn put_output_poi_recovery(&self, record: &OutputPoiRecoveryRecord) -> Result<(), DbError> {
-        let key = output_poi_recovery_key(
-            record.chain_id,
-            &record.wallet_id,
-            &record.output_commitment,
-        );
+        let key = record.key();
         let data = encode(record)?;
         let txn = self.db.begin_write()?;
         {
@@ -837,7 +1062,7 @@ impl DbStore {
         chain_id: u64,
         wallet_id: &str,
     ) -> Result<Vec<OutputPoiRecoveryRecord>, DbError> {
-        let prefix = output_poi_recovery_prefix(chain_id, wallet_id);
+        let prefix = OutputPoiRecoveryRecord::prefix_for_wallet(chain_id, wallet_id);
         self.list_decoded_by_prefix(OUTPUT_POI_RECOVERY_TABLE, &prefix)
     }
 
@@ -1070,40 +1295,12 @@ fn wallet_utxo_prefix(wallet_id: &str) -> String {
     format!("{wallet_id}|")
 }
 
-fn fee_note_assurance_key(chain_id: u64, public_tx_hash: &FixedBytes<32>) -> String {
-    format!("{chain_id}|{}", hex::encode(public_tx_hash))
-}
-
-fn fee_note_assurance_prefix(chain_id: u64) -> String {
-    format!("{chain_id}|")
-}
-
-fn pending_output_poi_context_key(chain_id: u64, output_commitment: &FixedBytes<32>) -> String {
-    format!("{chain_id}|{}", hex::encode(output_commitment))
-}
-
-fn pending_output_poi_context_prefix(chain_id: u64) -> String {
-    format!("{chain_id}|")
-}
-
-fn output_poi_recovery_key(
-    chain_id: u64,
-    wallet_id: &str,
-    output_commitment: &FixedBytes<32>,
-) -> String {
-    format!("{chain_id}|{wallet_id}|{}", hex::encode(output_commitment))
-}
-
-fn output_poi_recovery_prefix(chain_id: u64, wallet_id: &str) -> String {
-    format!("{chain_id}|{wallet_id}|")
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         CURRENT_SCHEMA_VERSION, DbConfig, DbStore, Meta, OutputPoiRecoveryRecord,
         OutputPoiRecoveryStatus, PendingFeeNoteAssuranceRecord, PendingOutputPoiContextRecord,
-        PendingOutputPoiRole, WalletMeta, fee_note_assurance_key,
+        PendingOutputPoiRole, WalletMeta,
     };
     use alloy::primitives::{Bytes, FixedBytes, U256};
     use alloy::uint;
@@ -1242,7 +1439,7 @@ mod tests {
         .expect("open db");
 
         let record = sample_record(56, FixedBytes::from([0x22; 32]));
-        let key = fee_note_assurance_key(record.chain_id, &record.public_tx_hash);
+        let key = record.key();
         assert!(key.starts_with("56|"));
 
         store
