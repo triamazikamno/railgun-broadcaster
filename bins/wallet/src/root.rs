@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, U256};
-use alloy::uint;
 use broadcaster_monitor::{EventRx, Shared};
 use chrono::{DateTime, Local, Utc};
 use gpui::{
@@ -33,7 +32,7 @@ use gpui_component::{
 };
 use railgun_ui::{
     DEFAULT_CHAINS, chain_icon_path, chain_name, format_broadcaster_address_label,
-    format_token_amount, lookup_token, short_address, token_icon_path,
+    format_scaled_amount, format_token_amount, lookup_token, short_address, token_icon_path,
 };
 use reqwest::Url;
 use tokio::runtime::Handle;
@@ -6370,23 +6369,10 @@ fn max_send_amount_from_snapshot(snapshot: &ListUtxosOutput, token: Address) -> 
 }
 
 fn format_unshield_amount_input(amount: U256, decimals: Option<u8>) -> String {
-    let Some(decimals) = decimals else {
-        return amount.to_string();
-    };
-    if decimals == 0 {
-        return amount.to_string();
-    }
-
-    let divisor = uint!(10_U256).pow(U256::from(decimals));
-    let whole = amount / divisor;
-    let fractional = amount % divisor;
-    if fractional.is_zero() {
-        return whole.to_string();
-    }
-
-    let fractional = fractional.to_string();
-    let padded = format!("{fractional:0>width$}", width = decimals as usize);
-    format!("{whole}.{}", padded.trim_end_matches('0'))
+    decimals.map_or_else(
+        || amount.to_string(),
+        |decimals| format_scaled_amount(amount, decimals),
+    )
 }
 
 fn format_send_amount_input(amount: U256, decimals: Option<u8>) -> String {

@@ -89,11 +89,9 @@ pub mod hex_array32 {
             where
                 E: de::Error,
             {
-                let bytes = hex::decode(v).map_err(E::custom)?;
-                let len = bytes.len();
-                bytes
-                    .try_into()
-                    .map_err(|_| E::custom(format!("expected 32 bytes, got {len}")))
+                let mut bytes = [0_u8; 32];
+                hex::decode_to_slice(v, &mut bytes).map_err(E::custom)?;
+                Ok(bytes)
             }
         }
 

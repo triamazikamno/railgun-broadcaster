@@ -105,7 +105,8 @@ fn pow10(exp: u8) -> U256 {
     uint!(10_U256).pow(U256::from(exp))
 }
 
-fn format_scaled_amount(amount: U256, decimals: u8) -> String {
+#[must_use]
+pub fn format_scaled_amount(amount: U256, decimals: u8) -> String {
     if decimals == 0 {
         return amount.to_string();
     }

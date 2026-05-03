@@ -568,27 +568,7 @@ impl PoiRpcClient {
         P: Serialize,
         R: for<'de> Deserialize<'de>,
     {
-        let req = JsonRpcReq {
-            jsonrpc: "2.0",
-            id: self.next_id(),
-            method,
-            params,
-        };
-
-        let resp = self
-            .http
-            .post(self.base_url.clone())
-            .json(&req)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(PoiRpcError::HttpStatus { status, body });
-        }
-
-        let body = resp.text().await?;
+        let body = self.send_raw_json_rpc(method, params).await?;
         decode_json_rpc_response(&body)
     }
 
@@ -597,6 +577,18 @@ impl PoiRpcClient {
         method: &'static str,
         params: P,
     ) -> Result<(), PoiRpcError>
+    where
+        P: Serialize,
+    {
+        let body = self.send_raw_json_rpc(method, params).await?;
+        decode_json_rpc_ack_response(method, &body)
+    }
+
+    async fn send_raw_json_rpc<P>(
+        &self,
+        method: &'static str,
+        params: P,
+    ) -> Result<String, PoiRpcError>
     where
         P: Serialize,
     {
@@ -621,7 +613,7 @@ impl PoiRpcClient {
         }
 
         let body = resp.text().await?;
-        decode_json_rpc_ack_response(method, &body)
+        Ok(body)
     }
 
     fn submit_single_commitment_pois(

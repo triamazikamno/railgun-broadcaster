@@ -615,13 +615,52 @@ impl PreTransactionPoiChunkInputs {
 pub fn pre_transaction_poi_inputs_from_chunk(
     chunk: &TransactionPlanChunk,
 ) -> Result<PreTransactionPoiChunkInputs, PreTransactionPoiError> {
+    validate_poi_input_count(chunk)?;
+    let private_output_count = private_output_count_for_poi(chunk)?;
+
+    let railgun_txid = compute_railgun_txid_from_public_inputs(&chunk.public_inputs);
+    let txid_leaf = railgun_txid_leaf_hash(railgun_txid, u64::from(chunk.tree_number));
+    let txid_merkleroot = dummy_txid_root(txid_leaf);
+    let railgun_txid_if_has_unshield = railgun_txid_if_has_unshield_bytes(chunk, railgun_txid);
+    let railgun_txid_if_has_unshield_value =
+        railgun_txid_if_has_unshield_value(chunk, railgun_txid);
+
+    Ok(PreTransactionPoiChunkInputs {
+        txid_leaf_hash: FixedBytes::from(txid_leaf.to_be_bytes::<32>()),
+        txid_merkleroot: FixedBytes::from(txid_merkleroot.to_be_bytes::<32>()),
+        blinded_commitments_in: blinded_commitments_in(chunk),
+        blinded_commitments_out: pre_transaction_blinded_commitments_out(
+            chunk,
+            private_output_count,
+        ),
+        railgun_txid_if_has_unshield,
+        proof_base_inputs: poi_proof_base_inputs(
+            chunk,
+            private_output_count,
+            PoiProofBaseContext {
+                any_railgun_txid_merkleroot_after_transaction: txid_merkleroot,
+                utxo_batch_global_start_position_out: pre_transaction_output_global_position(),
+                railgun_txid_if_has_unshield: railgun_txid_if_has_unshield_value,
+                railgun_txid_merkle_proof_indices: U256::ZERO,
+                railgun_txid_merkle_proof_path_elements: vec![U256::ZERO; TREE_DEPTH],
+            },
+        ),
+    })
+}
+
+fn validate_poi_input_count(chunk: &TransactionPlanChunk) -> Result<(), PreTransactionPoiError> {
     if chunk.inputs.len() != chunk.public_inputs.nullifiers.len() {
         return Err(PreTransactionPoiError::InputCountMismatch {
             expected: chunk.public_inputs.nullifiers.len(),
             got: chunk.inputs.len(),
         });
     }
+    Ok(())
+}
 
+fn private_output_count_for_poi(
+    chunk: &TransactionPlanChunk,
+) -> Result<usize, PreTransactionPoiError> {
     let private_output_count = if chunk.has_unshield {
         chunk
             .public_inputs
@@ -644,27 +683,38 @@ pub fn pre_transaction_poi_inputs_from_chunk(
                 .min(chunk.private_inputs.value_out.len()),
         });
     }
+    Ok(private_output_count)
+}
 
-    let railgun_txid = compute_railgun_txid_from_public_inputs(&chunk.public_inputs);
-    let txid_leaf = railgun_txid_leaf_hash(railgun_txid, u64::from(chunk.tree_number));
-    let txid_merkleroot = dummy_txid_root(txid_leaf);
-    let railgun_txid_if_has_unshield = if chunk.has_unshield {
+fn railgun_txid_if_has_unshield_bytes(chunk: &TransactionPlanChunk, railgun_txid: U256) -> Bytes {
+    if chunk.has_unshield {
         Bytes::copy_from_slice(&railgun_txid.to_be_bytes::<32>())
     } else {
         Bytes::copy_from_slice(&[0_u8])
-    };
-    let railgun_txid_if_has_unshield_value = if chunk.has_unshield {
+    }
+}
+
+fn railgun_txid_if_has_unshield_value(chunk: &TransactionPlanChunk, railgun_txid: U256) -> U256 {
+    if chunk.has_unshield {
         railgun_txid
     } else {
         U256::ZERO
-    };
+    }
+}
 
-    let blinded_commitments_in = chunk
+fn blinded_commitments_in(chunk: &TransactionPlanChunk) -> Vec<FixedBytes<32>> {
+    chunk
         .inputs
         .iter()
         .map(|input| input.utxo.poi.blinded_commitment)
-        .collect::<Vec<_>>();
-    let blinded_commitments_out = chunk
+        .collect()
+}
+
+fn pre_transaction_blinded_commitments_out(
+    chunk: &TransactionPlanChunk,
+    private_output_count: usize,
+) -> Vec<FixedBytes<32>> {
+    chunk
         .public_inputs
         .commitments_out
         .iter()
@@ -681,119 +731,15 @@ pub fn pre_transaction_poi_inputs_from_chunk(
             let global_position = pre_transaction_output_global_position() + U256::from(index);
             poseidon(vec![*commitment, *npk, global_position]).into()
         })
-        .collect::<Vec<_>>();
-
-    Ok(PreTransactionPoiChunkInputs {
-        txid_leaf_hash: FixedBytes::from(txid_leaf.to_be_bytes::<32>()),
-        txid_merkleroot: FixedBytes::from(txid_merkleroot.to_be_bytes::<32>()),
-        blinded_commitments_in,
-        blinded_commitments_out,
-        railgun_txid_if_has_unshield,
-        proof_base_inputs: PoiProofBaseInputs {
-            any_railgun_txid_merkleroot_after_transaction: txid_merkleroot,
-            bound_params_hash: chunk.public_inputs.bound_params_hash,
-            nullifiers: chunk.public_inputs.nullifiers.clone(),
-            commitments_out: chunk.public_inputs.commitments_out.clone(),
-            spending_public_key: chunk.private_inputs.public_key,
-            nullifying_key: chunk.private_inputs.nullifying_key,
-            token: chunk.private_inputs.token_address,
-            randoms_in: chunk.private_inputs.random_in.clone(),
-            values_in: chunk.private_inputs.value_in.clone(),
-            utxo_positions_in: chunk.private_inputs.leaves_indices.clone(),
-            utxo_tree_in: U256::from(chunk.tree_number),
-            npks_out: chunk
-                .private_inputs
-                .npk_out
-                .iter()
-                .take(private_output_count)
-                .copied()
-                .collect(),
-            values_out: chunk
-                .private_inputs
-                .value_out
-                .iter()
-                .take(private_output_count)
-                .copied()
-                .collect(),
-            utxo_batch_global_start_position_out: pre_transaction_output_global_position(),
-            railgun_txid_if_has_unshield: railgun_txid_if_has_unshield_value,
-            railgun_txid_merkle_proof_indices: U256::ZERO,
-            railgun_txid_merkle_proof_path_elements: vec![U256::ZERO; TREE_DEPTH],
-        },
-    })
+        .collect()
 }
 
-pub fn post_transaction_poi_inputs_from_chunk(
+fn post_transaction_blinded_commitments_out(
     chunk: &TransactionPlanChunk,
-    txid_data: &PostTransactionPoiData,
-) -> Result<PreTransactionPoiChunkInputs, PreTransactionPoiError> {
-    if chunk.inputs.len() != chunk.public_inputs.nullifiers.len() {
-        return Err(PreTransactionPoiError::InputCountMismatch {
-            expected: chunk.public_inputs.nullifiers.len(),
-            got: chunk.inputs.len(),
-        });
-    }
-    if txid_data.txid_merkle_proof_path_elements.len() != TREE_DEPTH {
-        return Err(PreTransactionPoiError::TxidMerkleProofPathLengthMismatch {
-            expected: TREE_DEPTH,
-            got: txid_data.txid_merkle_proof_path_elements.len(),
-        });
-    }
-
-    let private_output_count = if chunk.has_unshield {
-        chunk
-            .public_inputs
-            .commitments_out
-            .len()
-            .checked_sub(1)
-            .ok_or(PreTransactionPoiError::MissingPrivateOutputBeforeUnshield)?
-    } else {
-        chunk.public_inputs.commitments_out.len()
-    };
-    if chunk.private_inputs.npk_out.len() < private_output_count
-        || chunk.private_inputs.value_out.len() < private_output_count
-    {
-        return Err(PreTransactionPoiError::OutputCountMismatch {
-            expected: private_output_count,
-            got: chunk
-                .private_inputs
-                .npk_out
-                .len()
-                .min(chunk.private_inputs.value_out.len()),
-        });
-    }
-
-    let railgun_txid = compute_railgun_txid_from_public_inputs(&chunk.public_inputs);
-    let expected_txid_leaf = railgun_txid_leaf_hash_with_output_start(
-        railgun_txid,
-        u64::from(chunk.tree_number),
-        txid_data.utxo_batch_global_start_position_out,
-    );
-    let expected_txid_leaf_hash = FixedBytes::from(expected_txid_leaf.to_be_bytes::<32>());
-    if expected_txid_leaf_hash != txid_data.txid_leaf_hash {
-        return Err(PreTransactionPoiError::TxidLeafHashMismatch {
-            expected: expected_txid_leaf_hash,
-            actual: txid_data.txid_leaf_hash,
-        });
-    }
-
-    let railgun_txid_if_has_unshield = if chunk.has_unshield {
-        Bytes::copy_from_slice(&railgun_txid.to_be_bytes::<32>())
-    } else {
-        Bytes::copy_from_slice(&[0_u8])
-    };
-    let railgun_txid_if_has_unshield_value = if chunk.has_unshield {
-        railgun_txid
-    } else {
-        U256::ZERO
-    };
-
-    let blinded_commitments_in = chunk
-        .inputs
-        .iter()
-        .map(|input| input.utxo.poi.blinded_commitment)
-        .collect::<Vec<_>>();
-    let blinded_commitments_out = chunk
+    private_output_count: usize,
+    utxo_batch_global_start_position_out: U256,
+) -> Vec<FixedBytes<32>> {
+    chunk
         .public_inputs
         .commitments_out
         .iter()
@@ -814,57 +760,122 @@ pub fn post_transaction_poi_inputs_from_chunk(
         )
         .enumerate()
         .map(|(index, ((commitment, npk), value))| {
+            // The post-transaction POI circuit emits zero for zero-value private
+            // outputs, not the Poseidon commitment preimage used by non-zero notes.
             if *value == U256::ZERO {
                 FixedBytes::ZERO
             } else {
-                let global_position =
-                    txid_data.utxo_batch_global_start_position_out + U256::from(index);
+                let global_position = utxo_batch_global_start_position_out + U256::from(index);
                 poseidon(vec![*commitment, *npk, global_position]).into()
             }
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+struct PoiProofBaseContext {
+    any_railgun_txid_merkleroot_after_transaction: U256,
+    utxo_batch_global_start_position_out: U256,
+    railgun_txid_if_has_unshield: U256,
+    railgun_txid_merkle_proof_indices: U256,
+    railgun_txid_merkle_proof_path_elements: Vec<U256>,
+}
+
+fn poi_proof_base_inputs(
+    chunk: &TransactionPlanChunk,
+    private_output_count: usize,
+    context: PoiProofBaseContext,
+) -> PoiProofBaseInputs {
+    PoiProofBaseInputs {
+        any_railgun_txid_merkleroot_after_transaction: context
+            .any_railgun_txid_merkleroot_after_transaction,
+        bound_params_hash: chunk.public_inputs.bound_params_hash,
+        nullifiers: chunk.public_inputs.nullifiers.clone(),
+        commitments_out: chunk.public_inputs.commitments_out.clone(),
+        spending_public_key: chunk.private_inputs.public_key,
+        nullifying_key: chunk.private_inputs.nullifying_key,
+        token: chunk.private_inputs.token_address,
+        randoms_in: chunk.private_inputs.random_in.clone(),
+        values_in: chunk.private_inputs.value_in.clone(),
+        utxo_positions_in: chunk.private_inputs.leaves_indices.clone(),
+        utxo_tree_in: U256::from(chunk.tree_number),
+        npks_out: chunk
+            .private_inputs
+            .npk_out
+            .iter()
+            .take(private_output_count)
+            .copied()
+            .collect(),
+        values_out: chunk
+            .private_inputs
+            .value_out
+            .iter()
+            .take(private_output_count)
+            .copied()
+            .collect(),
+        utxo_batch_global_start_position_out: context.utxo_batch_global_start_position_out,
+        railgun_txid_if_has_unshield: context.railgun_txid_if_has_unshield,
+        railgun_txid_merkle_proof_indices: context.railgun_txid_merkle_proof_indices,
+        railgun_txid_merkle_proof_path_elements: context.railgun_txid_merkle_proof_path_elements,
+    }
+}
+
+pub fn post_transaction_poi_inputs_from_chunk(
+    chunk: &TransactionPlanChunk,
+    txid_data: &PostTransactionPoiData,
+) -> Result<PreTransactionPoiChunkInputs, PreTransactionPoiError> {
+    validate_poi_input_count(chunk)?;
+    if txid_data.txid_merkle_proof_path_elements.len() != TREE_DEPTH {
+        return Err(PreTransactionPoiError::TxidMerkleProofPathLengthMismatch {
+            expected: TREE_DEPTH,
+            got: txid_data.txid_merkle_proof_path_elements.len(),
+        });
+    }
+    let private_output_count = private_output_count_for_poi(chunk)?;
+
+    let railgun_txid = compute_railgun_txid_from_public_inputs(&chunk.public_inputs);
+    let expected_txid_leaf = railgun_txid_leaf_hash_with_output_start(
+        railgun_txid,
+        u64::from(chunk.tree_number),
+        txid_data.utxo_batch_global_start_position_out,
+    );
+    let expected_txid_leaf_hash = FixedBytes::from(expected_txid_leaf.to_be_bytes::<32>());
+    if expected_txid_leaf_hash != txid_data.txid_leaf_hash {
+        return Err(PreTransactionPoiError::TxidLeafHashMismatch {
+            expected: expected_txid_leaf_hash,
+            actual: txid_data.txid_leaf_hash,
+        });
+    }
+
+    let railgun_txid_if_has_unshield = railgun_txid_if_has_unshield_bytes(chunk, railgun_txid);
+    let railgun_txid_if_has_unshield_value =
+        railgun_txid_if_has_unshield_value(chunk, railgun_txid);
 
     Ok(PreTransactionPoiChunkInputs {
         txid_leaf_hash: txid_data.txid_leaf_hash,
         txid_merkleroot: txid_data.txid_merkleroot,
-        blinded_commitments_in,
-        blinded_commitments_out,
+        blinded_commitments_in: blinded_commitments_in(chunk),
+        blinded_commitments_out: post_transaction_blinded_commitments_out(
+            chunk,
+            private_output_count,
+            txid_data.utxo_batch_global_start_position_out,
+        ),
         railgun_txid_if_has_unshield,
-        proof_base_inputs: PoiProofBaseInputs {
-            any_railgun_txid_merkleroot_after_transaction: U256::from_be_bytes(
-                txid_data.txid_merkleroot.0,
-            ),
-            bound_params_hash: chunk.public_inputs.bound_params_hash,
-            nullifiers: chunk.public_inputs.nullifiers.clone(),
-            commitments_out: chunk.public_inputs.commitments_out.clone(),
-            spending_public_key: chunk.private_inputs.public_key,
-            nullifying_key: chunk.private_inputs.nullifying_key,
-            token: chunk.private_inputs.token_address,
-            randoms_in: chunk.private_inputs.random_in.clone(),
-            values_in: chunk.private_inputs.value_in.clone(),
-            utxo_positions_in: chunk.private_inputs.leaves_indices.clone(),
-            utxo_tree_in: U256::from(chunk.tree_number),
-            npks_out: chunk
-                .private_inputs
-                .npk_out
-                .iter()
-                .take(private_output_count)
-                .copied()
-                .collect(),
-            values_out: chunk
-                .private_inputs
-                .value_out
-                .iter()
-                .take(private_output_count)
-                .copied()
-                .collect(),
-            utxo_batch_global_start_position_out: txid_data.utxo_batch_global_start_position_out,
-            railgun_txid_if_has_unshield: railgun_txid_if_has_unshield_value,
-            railgun_txid_merkle_proof_indices: txid_data.txid_merkle_proof_indices,
-            railgun_txid_merkle_proof_path_elements: txid_data
-                .txid_merkle_proof_path_elements
-                .clone(),
-        },
+        proof_base_inputs: poi_proof_base_inputs(
+            chunk,
+            private_output_count,
+            PoiProofBaseContext {
+                any_railgun_txid_merkleroot_after_transaction: U256::from_be_bytes(
+                    txid_data.txid_merkleroot.0,
+                ),
+                utxo_batch_global_start_position_out: txid_data
+                    .utxo_batch_global_start_position_out,
+                railgun_txid_if_has_unshield: railgun_txid_if_has_unshield_value,
+                railgun_txid_merkle_proof_indices: txid_data.txid_merkle_proof_indices,
+                railgun_txid_merkle_proof_path_elements: txid_data
+                    .txid_merkle_proof_path_elements
+                    .clone(),
+            },
+        ),
     })
 }
 
@@ -1051,12 +1062,13 @@ fn parse_u256_hex(value: &str, field: &'static str) -> Result<U256, PreTransacti
             value: value.to_string(),
         });
     }
-    let padded = format!("{value_without_prefix:0>64}");
-    let bytes = hex::decode(padded).map_err(|_| PreTransactionPoiError::InvalidHex {
+    if value_without_prefix.is_empty() {
+        return Ok(U256::ZERO);
+    }
+    U256::from_str_radix(value_without_prefix, 16).map_err(|_| PreTransactionPoiError::InvalidHex {
         field,
         value: value.to_string(),
-    })?;
-    Ok(U256::from_be_slice(&bytes))
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3245,6 +3257,21 @@ mod tests {
                 FixedBytes::from(expected.to_be_bytes::<32>())
             );
         }
+    }
+
+    #[test]
+    fn post_transaction_poi_zero_value_outputs_use_zero_blinded_commitment() {
+        let mut chunk = sample_chunk(63, 1, 2, false);
+        chunk.private_inputs.value_out[1] = U256::ZERO;
+        let txid_data = sample_post_txid_data(&chunk, uint!(987_654_U256));
+
+        let chunk_inputs =
+            post_transaction_poi_inputs_from_chunk(&chunk, &txid_data).expect("chunk inputs");
+
+        assert_ne!(chunk.public_inputs.commitments_out[1], U256::ZERO);
+        assert_ne!(chunk.private_inputs.npk_out[1], U256::ZERO);
+        assert_eq!(chunk_inputs.blinded_commitments_out[1], FixedBytes::ZERO);
+        assert_ne!(chunk_inputs.blinded_commitments_out[0], FixedBytes::ZERO);
     }
 
     #[test]

@@ -12576,6 +12576,7 @@ name = "wallet-ops"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "alloy-provider",
  "argon2",
  "broadcaster-core",
  "broadcaster-monitor",
@@ -12586,6 +12587,7 @@ dependencies = [
  "hmac 0.13.0",
  "libc",
  "local-db",
+ "merkletree",
  "poi",
  "railgun-wallet",
  "rand 0.10.1",

@@ -372,11 +372,10 @@ impl BroadcasterMonitorPane {
             loop {
                 let tick = cx.background_executor().timer(UI_REFRESH_INTERVAL);
                 tokio::select! {
-                    evt = event_rx.recv() => {
-                        if evt.is_none() {
+                    changed = event_rx.changed() => {
+                        if changed.is_err() {
                             break;
                         }
-                        while event_rx.try_recv().is_ok() {}
                     }
                     () = tick => {}
                 }

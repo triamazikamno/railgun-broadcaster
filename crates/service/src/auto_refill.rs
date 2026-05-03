@@ -1,8 +1,10 @@
-use crate::{pretty_number, submit_tx, unspent_utxos};
-use alloy::network::{EthereumWallet, TransactionBuilder};
+use crate::{
+    EvmGasPricePolicy, MAINTENANCE_GAS_PRICE_BUFFER_BPS, PrepareEvmTransactionError,
+    PreparedEvmTransaction, prepare_evm_transaction, pretty_number, submit_tx, unspent_utxos,
+};
+use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, ChainId, U256};
 use alloy::providers::Provider;
-use alloy::rpc::types::TransactionRequest;
 use alloy::signers::k256::ecdsa::SigningKey;
 use alloy::signers::local::LocalSigner;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
@@ -119,32 +121,6 @@ impl AutoRefillService {
                 continue;
             }
 
-            let gas_price = match rpc.get_gas_price().await {
-                Ok(gas_price) => gas_price * 105 / 100,
-                Err(error) => {
-                    warn!(
-                        %error,
-                        wallet = %wallet_address,
-                        rpc = %provider_handle.url,
-                        "fetch gas price failed",
-                    );
-                    self.query_rpc_pool.mark_bad_provider(&provider_handle);
-                    continue;
-                }
-            };
-            if let Some(max_gas_price) = self.max_gas_price {
-                let max_gas_price = max_gas_price.to::<u128>();
-                if gas_price > max_gas_price {
-                    info!(
-                        wallet = %wallet_address,
-                        gas_price,
-                        max_gas_price,
-                        "auto-refill skipped due to gas price",
-                    );
-                    continue;
-                }
-            }
-
             let utxos = unspent_utxos(&self.wallet_handle).await;
             if utxos.is_empty() {
                 warn!(wallet = %wallet_address, "no unspent utxos available for auto-refill");
@@ -230,40 +206,54 @@ impl AutoRefillService {
                 );
             }
 
-            let tx_req = TransactionRequest::default()
-                .with_chain_id(self.tx_builder.chain_id)
-                .with_from(wallet_address)
-                .with_to(plan.call.to)
-                .with_input(plan.call.data.clone())
-                .with_gas_price(gas_price)
-                .with_nonce(match rpc.get_transaction_count(wallet_address).await {
-                    Ok(nonce) => nonce,
-                    Err(error) => {
-                        warn!(
-                            %error,
-                            wallet = %wallet_address,
-                            rpc = %provider_handle.url,
-                            "fetch nonce failed",
-                        );
-                        self.query_rpc_pool.mark_bad_provider(&provider_handle);
-                        continue;
-                    }
-                });
-
-            let Ok(gas) = rpc.estimate_gas(tx_req.clone()).await.inspect_err(|error| {
-                warn!(
-                    %error,
-                    wallet = %wallet_address,
-                    rpc = %provider_handle.url,
-                    "estimate gas failed",
-                );
-            }) else {
-                continue;
+            let prepared_tx = match prepare_evm_transaction(
+                &rpc,
+                self.tx_builder.chain_id,
+                wallet_address,
+                plan.call.to,
+                plan.call.data.clone(),
+                EvmGasPricePolicy {
+                    gas_price_buffer_bps: MAINTENANCE_GAS_PRICE_BUFFER_BPS,
+                    min_gas_price: None,
+                    max_gas_price: self.max_gas_price.map(|value| value.to()),
+                },
+            )
+            .await
+            {
+                Ok(prepared_tx) => prepared_tx,
+                Err(PrepareEvmTransactionError::MaxGasPrice {
+                    gas_price,
+                    max_gas_price,
+                }) => {
+                    info!(
+                        wallet = %wallet_address,
+                        gas_price,
+                        max_gas_price,
+                        "auto-refill skipped due to gas price",
+                    );
+                    continue;
+                }
+                Err(error @ PrepareEvmTransactionError::FetchGasPrice(_)) => {
+                    warn!(%error, wallet = %wallet_address, rpc = %provider_handle.url, "fetch gas price failed");
+                    self.query_rpc_pool.mark_bad_provider(&provider_handle);
+                    continue;
+                }
+                Err(error @ PrepareEvmTransactionError::FetchNonce(_)) => {
+                    warn!(%error, wallet = %wallet_address, rpc = %provider_handle.url, "fetch nonce failed");
+                    self.query_rpc_pool.mark_bad_provider(&provider_handle);
+                    continue;
+                }
+                Err(error @ PrepareEvmTransactionError::EstimateGas(_)) => {
+                    warn!(%error, wallet = %wallet_address, rpc = %provider_handle.url, "estimate gas failed");
+                    continue;
+                }
             };
-
-            let gas = gas + 100_000;
-            let tx_req = tx_req.with_gas_limit(gas);
-            let cost = U256::from(gas) * U256::from(gas_price);
+            let PreparedEvmTransaction {
+                tx_req,
+                gas,
+                gas_price,
+                cost,
+            } = prepared_tx;
 
             info!(
                 wallet = %wallet_address,

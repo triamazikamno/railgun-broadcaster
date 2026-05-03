@@ -1,26 +1,15 @@
 use alloy::hex;
 use eyre::{Result, WrapErr, bail, eyre};
 use local_db::{
-    BlobMeta, MerkleForestMeta, Meta, PendingFeeNoteAssuranceRecord,
-    TerminalFeeNoteAssuranceRecord, WalletMeta, ZkeyMeta,
+    BlobMeta, LOCAL_DB_TABLES, LocalDbTableDecodeKind, LocalDbTableInfo, MerkleForestMeta, Meta,
+    OutputPoiRecoveryRecord, PendingFeeNoteAssuranceRecord, PendingOutputPoiContextRecord,
+    TerminalFeeNoteAssuranceRecord, WalletMeta, ZkeyMeta, local_db_table_by_name,
 };
 use redb::{Builder, ReadOnlyDatabase, ReadableDatabase, TableDefinition};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::path::{Path, PathBuf};
 use structopt::StructOpt;
-
-const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
-const BLOB_INDEX_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("blob_index");
-const MERKLE_FOREST_INDEX_TABLE: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("merkle_forest_index");
-const ZKEY_INDEX_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("zkey_index");
-const WALLET_UTXO_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("wallet_utxo");
-const WALLET_META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("wallet_meta");
-const PENDING_FEE_NOTE_ASSURANCE_TABLE: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("fee_note_assurance_pending");
-const TERMINAL_FEE_NOTE_ASSURANCE_TABLE: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("fee_note_assurance_terminal");
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "db-cli")]
@@ -41,47 +30,6 @@ struct Options {
     copy: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum TableKind {
-    Meta,
-    BlobIndex,
-    MerkleForestIndex,
-    ZkeyIndex,
-    WalletUtxo,
-    WalletMeta,
-    PendingFeeNoteAssurance,
-    TerminalFeeNoteAssurance,
-}
-
-impl TableKind {
-    fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "meta" => Some(Self::Meta),
-            "blob_index" => Some(Self::BlobIndex),
-            "merkle_forest_index" => Some(Self::MerkleForestIndex),
-            "zkey_index" => Some(Self::ZkeyIndex),
-            "wallet_utxo" => Some(Self::WalletUtxo),
-            "wallet_meta" => Some(Self::WalletMeta),
-            "fee_note_assurance_pending" => Some(Self::PendingFeeNoteAssurance),
-            "fee_note_assurance_terminal" => Some(Self::TerminalFeeNoteAssurance),
-            _ => None,
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::Meta => "meta",
-            Self::BlobIndex => "blob_index",
-            Self::MerkleForestIndex => "merkle_forest_index",
-            Self::ZkeyIndex => "zkey_index",
-            Self::WalletUtxo => "wallet_utxo",
-            Self::WalletMeta => "wallet_meta",
-            Self::PendingFeeNoteAssurance => "fee_note_assurance_pending",
-            Self::TerminalFeeNoteAssurance => "fee_note_assurance_terminal",
-        }
-    }
-}
-
 #[derive(Serialize)]
 struct Entry<T> {
     key: String,
@@ -99,6 +47,11 @@ struct WalletUtxoValue {
     wallet_id: String,
     utxo_id: String,
     payload_hex: String,
+}
+
+#[derive(Serialize)]
+struct DesktopWalletVaultValue {
+    payload_len: usize,
 }
 
 fn main() -> Result<()> {
@@ -152,23 +105,19 @@ fn main() -> Result<()> {
         return Ok(());
     };
 
-    let table_kind =
-        TableKind::from_name(table_name).ok_or_else(|| eyre!("unknown table: {table_name}"))?;
-
-    let table = match table_kind {
-        TableKind::Meta => txn.open_table(META_TABLE)?,
-        TableKind::BlobIndex => txn.open_table(BLOB_INDEX_TABLE)?,
-        TableKind::MerkleForestIndex => txn.open_table(MERKLE_FOREST_INDEX_TABLE)?,
-        TableKind::ZkeyIndex => txn.open_table(ZKEY_INDEX_TABLE)?,
-        TableKind::WalletUtxo => txn.open_table(WALLET_UTXO_TABLE)?,
-        TableKind::WalletMeta => txn.open_table(WALLET_META_TABLE)?,
-        TableKind::PendingFeeNoteAssurance => txn.open_table(PENDING_FEE_NOTE_ASSURANCE_TABLE)?,
-        TableKind::TerminalFeeNoteAssurance => txn.open_table(TERMINAL_FEE_NOTE_ASSURANCE_TABLE)?,
-    };
+    let table_info = local_db_table_by_name(table_name);
+    if table_info.is_none() && !opt.raw {
+        bail!("unknown table: {table_name}; use --raw to inspect unknown tables");
+    }
+    let table_def = table_info.map_or_else(
+        || TableDefinition::new(table_name),
+        |info| info.table.definition(),
+    );
+    let table = txn.open_table(table_def)?;
 
     if let Some(key) = opt.key.as_deref() {
         match table.get(key)? {
-            Some(value) => print_value(table_kind, key, value.value(), opt.raw)?,
+            Some(value) => print_value(table_info, key, value.value(), opt.raw)?,
             None => bail!("key not found: {key}"),
         }
         return Ok(());
@@ -186,7 +135,7 @@ fn main() -> Result<()> {
     for entry in range.take(limit) {
         let (key, value) = entry?;
         let key = key.value().to_string();
-        print_value(table_kind, &key, value.value(), opt.raw)?;
+        print_value(table_info, &key, value.value(), opt.raw)?;
     }
 
     Ok(())
@@ -210,21 +159,12 @@ fn copy_db_path(path: &Path) -> PathBuf {
 }
 
 fn list_tables() {
-    for table in [
-        TableKind::Meta,
-        TableKind::BlobIndex,
-        TableKind::MerkleForestIndex,
-        TableKind::ZkeyIndex,
-        TableKind::WalletUtxo,
-        TableKind::WalletMeta,
-        TableKind::PendingFeeNoteAssurance,
-        TableKind::TerminalFeeNoteAssurance,
-    ] {
-        println!("{}", table.name());
+    for table in LOCAL_DB_TABLES {
+        println!("{}", table.name);
     }
 }
 
-fn print_value(table: TableKind, key: &str, value: &[u8], raw: bool) -> Result<()> {
+fn print_value(table: Option<LocalDbTableInfo>, key: &str, value: &[u8], raw: bool) -> Result<()> {
     if raw {
         let entry = RawEntry {
             key: key.to_string(),
@@ -233,19 +173,29 @@ fn print_value(table: TableKind, key: &str, value: &[u8], raw: bool) -> Result<(
         return print_json(&entry);
     }
 
-    match table {
-        TableKind::Meta => print_decoded::<Meta>(key, value),
-        TableKind::BlobIndex => print_decoded::<BlobMeta>(key, value),
-        TableKind::MerkleForestIndex => print_decoded::<MerkleForestMeta>(key, value),
-        TableKind::ZkeyIndex => print_decoded::<ZkeyMeta>(key, value),
-        TableKind::WalletMeta => print_decoded::<WalletMeta>(key, value),
-        TableKind::PendingFeeNoteAssurance => {
+    let Some(table) = table else {
+        bail!("unknown table requires --raw");
+    };
+    match table.decode_kind {
+        LocalDbTableDecodeKind::Meta => print_decoded::<Meta>(key, value),
+        LocalDbTableDecodeKind::BlobMeta => print_decoded::<BlobMeta>(key, value),
+        LocalDbTableDecodeKind::MerkleForestMeta => print_decoded::<MerkleForestMeta>(key, value),
+        LocalDbTableDecodeKind::ZkeyMeta => print_decoded::<ZkeyMeta>(key, value),
+        LocalDbTableDecodeKind::WalletMeta => print_decoded::<WalletMeta>(key, value),
+        LocalDbTableDecodeKind::PendingFeeNoteAssurance => {
             print_decoded::<PendingFeeNoteAssuranceRecord>(key, value)
         }
-        TableKind::TerminalFeeNoteAssurance => {
+        LocalDbTableDecodeKind::TerminalFeeNoteAssurance => {
             print_decoded::<TerminalFeeNoteAssuranceRecord>(key, value)
         }
-        TableKind::WalletUtxo => print_wallet_utxo(key, value),
+        LocalDbTableDecodeKind::PendingOutputPoiContext => {
+            print_decoded::<PendingOutputPoiContextRecord>(key, value)
+        }
+        LocalDbTableDecodeKind::OutputPoiRecovery => {
+            print_decoded::<OutputPoiRecoveryRecord>(key, value)
+        }
+        LocalDbTableDecodeKind::WalletUtxo => print_wallet_utxo(key, value),
+        LocalDbTableDecodeKind::DesktopWalletVault => print_desktop_wallet_vault(key, value),
     }
 }
 
@@ -269,6 +219,16 @@ fn print_wallet_utxo(key: &str, value: &[u8]) -> Result<()> {
             wallet_id,
             utxo_id,
             payload_hex: hex::encode_prefixed(value),
+        },
+    };
+    print_json(&entry)
+}
+
+fn print_desktop_wallet_vault(key: &str, value: &[u8]) -> Result<()> {
+    let entry = Entry {
+        key: key.to_string(),
+        value: DesktopWalletVaultValue {
+            payload_len: value.len(),
         },
     };
     print_json(&entry)

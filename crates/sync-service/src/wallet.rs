@@ -14,6 +14,7 @@ use broadcaster_core::transact::{
 };
 use broadcaster_core::tree::TREE_LEAF_COUNT;
 use broadcaster_core::utxo::derive_blinded_commitment;
+use merkletree::quick::{GraphPostError, post_graphql_data};
 use merkletree::tree::{MerkleForest, MerkleTree};
 use railgun_wallet::prover::ProverError;
 use railgun_wallet::tx::{
@@ -21,8 +22,7 @@ use railgun_wallet::tx::{
     PreTransactionPoiError, PreTransactionPoiMap, PrivateInputs, PublicInputs,
     TransactionPlanChunk, generate_post_transaction_pois,
 };
-use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::{RwLock, broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -1415,61 +1415,29 @@ async fn post_recovery_graphql<T>(
     variables: serde_json::Value,
 ) -> Result<T, RecoveryFailure>
 where
-    T: DeserializeOwned,
+    T: for<'de> Deserialize<'de>,
 {
-    let response = client
-        .post(endpoint.clone())
-        .json(&RecoveryGraphRequest { query, variables })
-        .send()
+    post_graphql_data(client, endpoint, query, &variables)
         .await
-        .map_err(|err| {
-            RecoveryFailure::retryable(
-                OutputPoiRecoveryStatus::TxFetchFailed,
-                format!("TXID graph request failed: {err}"),
-                OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-            )
-        })?;
-    let status = response.status();
-    let body = response.text().await.map_err(|err| {
-        RecoveryFailure::retryable(
-            OutputPoiRecoveryStatus::TxFetchFailed,
-            format!("read TXID graph response failed: {err}"),
-            OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-        )
-    })?;
-    if !status.is_success() {
-        return Err(RecoveryFailure::retryable(
-            OutputPoiRecoveryStatus::TxFetchFailed,
-            format!("TXID graph request returned {status}: {body}"),
-            OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-        ));
-    }
-    let parsed: RecoveryGraphResponse<T> = serde_json::from_str(&body).map_err(|err| {
-        RecoveryFailure::retryable(
-            OutputPoiRecoveryStatus::TxFetchFailed,
-            format!("decode TXID graph response failed: {err}"),
-            OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-        )
-    })?;
-    if let Some(errors) = parsed.errors {
-        let message = errors
-            .iter()
-            .map(|error| error.message.as_str())
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(RecoveryFailure::retryable(
-            OutputPoiRecoveryStatus::TxFetchFailed,
-            format!("TXID graph returned errors: {message}"),
-            OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-        ));
-    }
-    parsed.data.ok_or_else(|| {
-        RecoveryFailure::retryable(
-            OutputPoiRecoveryStatus::TxFetchFailed,
-            "TXID graph response missing data",
-            OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-        )
-    })
+        .map_err(recovery_graph_failure)
+}
+
+fn recovery_graph_failure(error: GraphPostError) -> RecoveryFailure {
+    let message = match error {
+        GraphPostError::Request(error) => format!("TXID graph request failed: {error}"),
+        GraphPostError::ReadBody(error) => format!("read TXID graph response failed: {error}"),
+        GraphPostError::HttpStatus { status, body } => {
+            format!("TXID graph request returned {status}: {body}")
+        }
+        GraphPostError::Json(error) => format!("decode TXID graph response failed: {error}"),
+        GraphPostError::Graphql(message) => format!("TXID graph returned errors: {message}"),
+        GraphPostError::MissingData => "TXID graph response missing data".to_string(),
+    };
+    RecoveryFailure::retryable(
+        OutputPoiRecoveryStatus::TxFetchFailed,
+        message,
+        OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
+    )
 }
 
 fn graph_railgun_txid(transaction: &RecoveryGraphRailgunTransaction) -> U256 {
@@ -1494,23 +1462,6 @@ fn graph_output_start_global(transaction: &RecoveryGraphRailgunTransaction) -> u
     let output_tree = transaction.utxo_tree_out.to::<u128>();
     let output_position = transaction.utxo_batch_start_position_out.to::<u128>();
     output_tree * u128::from(TREE_LEAF_COUNT) + output_position
-}
-
-#[derive(Debug, Serialize)]
-struct RecoveryGraphRequest {
-    query: &'static str,
-    variables: serde_json::Value,
-}
-
-#[derive(Debug, Deserialize)]
-struct RecoveryGraphResponse<T> {
-    data: Option<T>,
-    errors: Option<Vec<RecoveryGraphError>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RecoveryGraphError {
-    message: String,
 }
 
 #[derive(Debug, Deserialize)]

@@ -12,6 +12,7 @@ use alloy::rpc::types::TransactionRequest;
 use alloy::signers::k256::ecdsa::SigningKey;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::uint;
+use alloy_provider::DynProvider;
 use broadcaster_core::contracts::shield::{
     build_approve_calldata, build_shield_calldata, derive_shield_private_key,
 };
@@ -27,6 +28,7 @@ use broadcaster_core::transact_response::{
 use broadcaster_monitor::FeeRow;
 use eyre::{Report, Result, WrapErr, eyre};
 use local_db::{DbConfig, DbStore, PendingOutputPoiContextRecord, PendingOutputPoiRole};
+use merkletree::tree::MerkleForest;
 use poi::poi::{DEFAULT_WALLET_POI_RPC_URL, PoiRpcClient, default_active_poi_list_keys};
 use railgun_wallet::artifacts::ArtifactSource;
 use railgun_wallet::tx::{
@@ -918,11 +920,8 @@ fn parse_required_poi_list_keys(
                     "invalid required POI list key {list_key}: expected 32-byte hex"
                 ));
             }
-            let bytes = hex::decode(bare)
+            let bytes = hex::decode_to_array(bare)
                 .wrap_err_with(|| format!("invalid required POI list key {list_key}"))?;
-            let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
-                eyre!("invalid required POI list key {list_key}: expected 32 bytes")
-            })?;
             Ok(FixedBytes::from(bytes))
         })
         .collect()
@@ -932,6 +931,64 @@ struct PublicBroadcasterPreTransactionPois {
     request_pois: PreTransactionPoiMap,
     pending_poi_list_keys: Vec<FixedBytes<32>>,
     pending_pois: PreTransactionPoiMap,
+}
+
+struct PublicBroadcasterSetup {
+    chain_defaults: ChainConfigDefaults,
+    broadcaster: PublicBroadcasterCandidate,
+    provider: DynProvider,
+    min_gas_price: u128,
+    prover: ProverService,
+    forest: MerkleForest,
+    utxos: Vec<Utxo>,
+}
+
+async fn public_broadcaster_setup(
+    session: &WalletSession,
+    chain_id: u64,
+    token: Address,
+    fee_rows: &[FeeRow],
+    selection: &PublicBroadcasterSelection,
+    require_relay_adapt: bool,
+    http: &HttpContext,
+) -> Result<PublicBroadcasterSetup> {
+    let chain_defaults = chain_defaults_for_chain(chain_id, UnsupportedChainMessage::Generic)?;
+    let candidates = eligible_public_broadcasters(
+        fee_rows,
+        chain_id,
+        token,
+        if require_relay_adapt {
+            Some(chain_defaults.relay_adapt_contract)
+        } else {
+            None
+        },
+        SystemTime::now(),
+    );
+    let broadcaster = select_public_broadcaster(&candidates, selection)?;
+    let provider = ProviderBuilder::new()
+        .connect_reqwest(http.client.clone(), chain_defaults.rpc_url.clone())
+        .erased();
+    let min_gas_price = buffered_gas_price(&provider).await?;
+    let artifact_source = artifact_source(http);
+    let prover = ProverService::new_with_db(artifact_source, Arc::clone(&session.db));
+    let chain_handle = session
+        .sync_manager
+        .chain_handle(&session.chain_key)
+        .await
+        .ok_or_else(|| eyre!("chain handle not found for chain {chain_id}"))?;
+    let mut forest = chain_handle.forest.read().await.clone();
+    forest.compute_roots();
+    let utxos = session.unspent_utxos().await;
+
+    Ok(PublicBroadcasterSetup {
+        chain_defaults,
+        broadcaster,
+        provider,
+        min_gas_price,
+        prover,
+        forest,
+        utxos,
+    })
 }
 
 async fn public_broadcaster_pre_transaction_pois(
@@ -1051,6 +1108,60 @@ fn retain_pre_transaction_poi_lists(
         .collect()
 }
 
+#[derive(Clone, Copy)]
+struct PendingOutputPoiRolePlan {
+    role: PendingOutputPoiRole,
+    first_chunk_only: bool,
+    required: bool,
+    missing_output: &'static str,
+}
+
+fn pending_send_output_role_plans(include_broadcaster_fee: bool) -> Vec<PendingOutputPoiRolePlan> {
+    let mut plans = Vec::with_capacity(3);
+    if include_broadcaster_fee {
+        plans.push(PendingOutputPoiRolePlan {
+            role: PendingOutputPoiRole::BroadcasterFee,
+            first_chunk_only: true,
+            required: true,
+            missing_output: "missing public broadcaster send fee output for pending POI",
+        });
+    }
+    plans.push(PendingOutputPoiRolePlan {
+        role: PendingOutputPoiRole::Recipient,
+        first_chunk_only: false,
+        required: true,
+        missing_output: "missing send recipient output for pending POI",
+    });
+    plans.push(PendingOutputPoiRolePlan {
+        role: PendingOutputPoiRole::Change,
+        first_chunk_only: false,
+        required: false,
+        missing_output: "missing send change output for pending POI",
+    });
+    plans
+}
+
+fn pending_unshield_output_role_plans(
+    include_broadcaster_fee: bool,
+) -> Vec<PendingOutputPoiRolePlan> {
+    let mut plans = Vec::with_capacity(2);
+    if include_broadcaster_fee {
+        plans.push(PendingOutputPoiRolePlan {
+            role: PendingOutputPoiRole::BroadcasterFee,
+            first_chunk_only: true,
+            required: true,
+            missing_output: "missing public broadcaster unshield fee output for pending POI",
+        });
+    }
+    plans.push(PendingOutputPoiRolePlan {
+        role: PendingOutputPoiRole::Change,
+        first_chunk_only: false,
+        required: false,
+        missing_output: "missing unshield change output for pending POI",
+    });
+    plans
+}
+
 fn persist_pending_send_output_poi_contexts(
     db: &DbStore,
     chain_id: u64,
@@ -1061,63 +1172,16 @@ fn persist_pending_send_output_poi_contexts(
     include_broadcaster_fee: bool,
 ) -> Result<usize> {
     let created_at = now_epoch_secs()?;
-    let mut count = 0;
-    for (chunk_index, chunk) in chunks.iter().enumerate() {
-        let chunk_context = pending_chunk_context(chunk, pre_transaction_pois, poi_list_keys)?;
-        let private_output_count = pending_private_output_count(chunk)?;
-        let mut output_index = 0;
-
-        if include_broadcaster_fee && chunk_index == 0 {
-            let note = chunk.outputs.get(output_index).ok_or_else(|| {
-                eyre!("missing public broadcaster send fee output for pending POI")
-            })?;
-            put_pending_output_poi_context(
-                db,
-                chain_id,
-                wallet_id,
-                created_at,
-                &chunk_context,
-                note,
-                PendingOutputPoiRole::BroadcasterFee,
-            )?;
-            count += 1;
-            output_index += 1;
-        }
-
-        let note = chunk
-            .outputs
-            .get(output_index)
-            .ok_or_else(|| eyre!("missing send recipient output for pending POI"))?;
-        put_pending_output_poi_context(
-            db,
-            chain_id,
-            wallet_id,
-            created_at,
-            &chunk_context,
-            note,
-            PendingOutputPoiRole::Recipient,
-        )?;
-        count += 1;
-        output_index += 1;
-
-        if output_index < private_output_count {
-            let note = chunk
-                .outputs
-                .get(output_index)
-                .ok_or_else(|| eyre!("missing send change output for pending POI"))?;
-            put_pending_output_poi_context(
-                db,
-                chain_id,
-                wallet_id,
-                created_at,
-                &chunk_context,
-                note,
-                PendingOutputPoiRole::Change,
-            )?;
-            count += 1;
-        }
-    }
-    Ok(count)
+    let records = build_pending_output_poi_context_records(
+        chain_id,
+        wallet_id,
+        created_at,
+        chunks,
+        pre_transaction_pois,
+        poi_list_keys,
+        &pending_send_output_role_plans(include_broadcaster_fee),
+    )?;
+    persist_pending_output_poi_context_records(db, &records)
 }
 
 fn persist_pending_unshield_output_poi_contexts(
@@ -1130,47 +1194,59 @@ fn persist_pending_unshield_output_poi_contexts(
     include_broadcaster_fee: bool,
 ) -> Result<usize> {
     let created_at = now_epoch_secs()?;
-    let mut count = 0;
+    let records = build_pending_output_poi_context_records(
+        chain_id,
+        wallet_id,
+        created_at,
+        chunks,
+        pre_transaction_pois,
+        poi_list_keys,
+        &pending_unshield_output_role_plans(include_broadcaster_fee),
+    )?;
+    persist_pending_output_poi_context_records(db, &records)
+}
+
+fn build_pending_output_poi_context_records(
+    chain_id: u64,
+    wallet_id: &str,
+    created_at: u64,
+    chunks: &[TransactionPlanChunk],
+    pre_transaction_pois: &PreTransactionPoiMap,
+    poi_list_keys: &[FixedBytes<32>],
+    role_plans: &[PendingOutputPoiRolePlan],
+) -> Result<Vec<PendingOutputPoiContextRecord>> {
+    let mut records = Vec::new();
     for (chunk_index, chunk) in chunks.iter().enumerate() {
         let chunk_context = pending_chunk_context(chunk, pre_transaction_pois, poi_list_keys)?;
         let private_output_count = pending_private_output_count(chunk)?;
         let mut output_index = 0;
 
-        if include_broadcaster_fee && chunk_index == 0 {
-            let note = chunk.outputs.get(output_index).ok_or_else(|| {
-                eyre!("missing public broadcaster unshield fee output for pending POI")
-            })?;
-            put_pending_output_poi_context(
-                db,
-                chain_id,
-                wallet_id,
-                created_at,
-                &chunk_context,
-                note,
-                PendingOutputPoiRole::BroadcasterFee,
-            )?;
-            count += 1;
-            output_index += 1;
-        }
-
-        if output_index < private_output_count {
+        for role_plan in role_plans {
+            if role_plan.first_chunk_only && chunk_index != 0 {
+                continue;
+            }
+            if output_index >= private_output_count {
+                if role_plan.required {
+                    return Err(eyre!(role_plan.missing_output));
+                }
+                continue;
+            }
             let note = chunk
                 .outputs
                 .get(output_index)
-                .ok_or_else(|| eyre!("missing unshield change output for pending POI"))?;
-            put_pending_output_poi_context(
-                db,
+                .ok_or_else(|| eyre!(role_plan.missing_output))?;
+            records.push(pending_output_poi_context_record(
                 chain_id,
                 wallet_id,
                 created_at,
                 &chunk_context,
                 note,
-                PendingOutputPoiRole::Change,
-            )?;
-            count += 1;
+                role_plan.role,
+            ));
+            output_index += 1;
         }
     }
-    Ok(count)
+    Ok(records)
 }
 
 struct PendingOutputPoiChunkContext {
@@ -1231,16 +1307,15 @@ fn pending_private_output_count(chunk: &TransactionPlanChunk) -> Result<usize> {
     }
 }
 
-fn put_pending_output_poi_context(
-    db: &DbStore,
+fn pending_output_poi_context_record(
     chain_id: u64,
     wallet_id: &str,
     created_at: u64,
     chunk_context: &PendingOutputPoiChunkContext,
     note: &Note,
     output_role: PendingOutputPoiRole,
-) -> Result<()> {
-    let record = PendingOutputPoiContextRecord {
+) -> PendingOutputPoiContextRecord {
+    PendingOutputPoiContextRecord {
         chain_id,
         wallet_id: wallet_id.to_string(),
         txid_version: DEFAULT_TXID_VERSION.to_string(),
@@ -1257,9 +1332,18 @@ fn put_pending_output_poi_context(
         observation: None,
         submitted_poi_list_keys: Vec::new(),
         terminal_error: None,
-    };
-    db.put_pending_output_poi_context(&record)
-        .wrap_err("persist pending output POI context")
+    }
+}
+
+fn persist_pending_output_poi_context_records(
+    db: &DbStore,
+    records: &[PendingOutputPoiContextRecord],
+) -> Result<usize> {
+    for record in records {
+        db.put_pending_output_poi_context(record)
+            .wrap_err("persist pending output POI context")?;
+    }
+    Ok(records.len())
 }
 
 fn now_epoch_secs() -> Result<u64> {
@@ -2353,36 +2437,24 @@ async fn prepare_desktop_unshield_public_broadcaster(
         return Err(eyre!("selected token does not support unwrap-to-native"));
     }
 
-    let chain_defaults =
-        chain_defaults_for_chain(request.chain_id, UnsupportedChainMessage::Generic)?;
-    let candidates = eligible_public_broadcasters(
-        &request.fee_rows,
+    let PublicBroadcasterSetup {
+        chain_defaults,
+        broadcaster,
+        provider,
+        min_gas_price,
+        prover,
+        forest,
+        utxos,
+    } = public_broadcaster_setup(
+        &request.session,
         request.chain_id,
         request.token,
-        if request.unwrap {
-            Some(chain_defaults.relay_adapt_contract)
-        } else {
-            None
-        },
-        SystemTime::now(),
-    );
-    let broadcaster = select_public_broadcaster(&candidates, &request.selection)?;
-
-    let provider = ProviderBuilder::new()
-        .connect_reqwest(http.client.clone(), chain_defaults.rpc_url.clone())
-        .erased();
-    let min_gas_price = buffered_gas_price(&provider).await?;
-    let artifact_source = artifact_source(http);
-    let prover = ProverService::new_with_db(artifact_source, Arc::clone(&request.session.db));
-    let chain_handle = request
-        .session
-        .sync_manager
-        .chain_handle(&request.session.chain_key)
-        .await
-        .ok_or_else(|| eyre!("chain handle not found for chain {}", request.chain_id))?;
-    let mut forest = chain_handle.forest.read().await.clone();
-    forest.compute_roots();
-    let utxos = request.session.unspent_utxos().await;
+        &request.fee_rows,
+        &request.selection,
+        request.unwrap,
+        http,
+    )
+    .await?;
     update_transaction_generation_stage(
         request.progress_tx.as_ref(),
         TransactionGenerationStage::SelectingPrivateNotes,
@@ -2620,32 +2692,24 @@ async fn prepare_desktop_send_public_broadcaster(
     }
 
     let recipient = parse_railgun_recipient(&request.recipient)?;
-    let chain_defaults =
-        chain_defaults_for_chain(request.chain_id, UnsupportedChainMessage::Generic)?;
-    let candidates = eligible_public_broadcasters(
-        &request.fee_rows,
+    let PublicBroadcasterSetup {
+        chain_defaults,
+        broadcaster,
+        provider,
+        min_gas_price,
+        prover,
+        forest,
+        utxos,
+    } = public_broadcaster_setup(
+        &request.session,
         request.chain_id,
         request.token,
-        None,
-        SystemTime::now(),
-    );
-    let broadcaster = select_public_broadcaster(&candidates, &request.selection)?;
-
-    let provider = ProviderBuilder::new()
-        .connect_reqwest(http.client.clone(), chain_defaults.rpc_url.clone())
-        .erased();
-    let min_gas_price = buffered_gas_price(&provider).await?;
-    let artifact_source = artifact_source(http);
-    let prover = ProverService::new_with_db(artifact_source, Arc::clone(&request.session.db));
-    let chain_handle = request
-        .session
-        .sync_manager
-        .chain_handle(&request.session.chain_key)
-        .await
-        .ok_or_else(|| eyre!("chain handle not found for chain {}", request.chain_id))?;
-    let mut forest = chain_handle.forest.read().await.clone();
-    forest.compute_roots();
-    let utxos = request.session.unspent_utxos().await;
+        &request.fee_rows,
+        &request.selection,
+        false,
+        http,
+    )
+    .await?;
     update_transaction_generation_stage(
         request.progress_tx.as_ref(),
         TransactionGenerationStage::SelectingPrivateNotes,
@@ -3443,10 +3507,7 @@ fn artifact_source(http: &HttpContext) -> ArtifactSource {
 
 fn parse_private_key(private_key: &str) -> Result<[u8; 32]> {
     let pk_hex = private_key.strip_prefix("0x").unwrap_or(private_key);
-    hex::decode(pk_hex)
-        .wrap_err("invalid private key hex")?
-        .try_into()
-        .map_err(|_| eyre!("private key must be 32 bytes"))
+    hex::decode_to_array(pk_hex).wrap_err("invalid private key hex")
 }
 
 async fn buffered_gas_price(provider: &(impl Provider + Clone)) -> Result<u128> {
@@ -4027,6 +4088,65 @@ mod tests {
 
         drop(store);
         fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn send_pending_output_role_plan_omits_absent_change() {
+        let token = address(0x37);
+        let recipient_note = sample_note(9, token, 11);
+        let chunk = sample_chunk(8, 0x60, vec![recipient_note.clone()], false);
+        let poi_list_keys = default_active_poi_list_keys();
+        let pre_transaction_pois = poi_map_for_chunks(&poi_list_keys, std::slice::from_ref(&chunk));
+
+        let records = super::build_pending_output_poi_context_records(
+            1,
+            "wallet-1",
+            123,
+            &[chunk],
+            &pre_transaction_pois,
+            &poi_list_keys,
+            &super::pending_send_output_role_plans(false),
+        )
+        .expect("build pending send records");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].output_role, PendingOutputPoiRole::Recipient);
+        assert_eq!(
+            records[0].output_commitment,
+            FixedBytes::from(recipient_note.commitment().to_be_bytes::<32>())
+        );
+    }
+
+    #[test]
+    fn unshield_pending_output_role_plan_skips_public_output_without_change() {
+        let token = address(0x38);
+        let fee_note = sample_note(10, token, 2);
+        let unshield_note = Note::new_unshield(address(0xcc), token, uint!(9_U256));
+        let chunk = sample_chunk(9, 0x70, vec![fee_note.clone(), unshield_note.clone()], true);
+        let poi_list_keys = default_active_poi_list_keys();
+        let pre_transaction_pois = poi_map_for_chunks(&poi_list_keys, std::slice::from_ref(&chunk));
+
+        let records = super::build_pending_output_poi_context_records(
+            1,
+            "wallet-1",
+            123,
+            &[chunk],
+            &pre_transaction_pois,
+            &poi_list_keys,
+            &super::pending_unshield_output_role_plans(true),
+        )
+        .expect("build pending unshield records");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].output_role, PendingOutputPoiRole::BroadcasterFee);
+        assert_eq!(
+            records[0].output_commitment,
+            FixedBytes::from(fee_note.commitment().to_be_bytes::<32>())
+        );
+        assert_ne!(
+            records[0].output_commitment,
+            FixedBytes::from(unshield_note.commitment().to_be_bytes::<32>())
+        );
     }
 
     #[test]

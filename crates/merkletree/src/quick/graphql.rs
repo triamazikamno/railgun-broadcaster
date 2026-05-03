@@ -1,8 +1,9 @@
 use std::num::NonZeroUsize;
 
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use url::Url;
 
 use crate::errors::SyncError;
@@ -381,18 +382,13 @@ impl QuickSyncClient {
             block_number: block_number.to_string(),
             limit: limit.min(i32::MAX as usize) as i32,
         };
-        let response: GraphResponse<D> = self.post_graph(query, &variables).await?;
-        validate_graph_response(&response)?;
-        let data = response.data.ok_or(SyncError::MissingData)?;
+        let data: D = self.post_graph(query, &variables).await?;
         Ok(data.items())
     }
 
     pub async fn fetch_squid_height(&self) -> Result<u64, SyncError> {
         let variables = EmptyVariables {};
-        let response: GraphResponse<SquidStatusData> =
-            self.post_graph(SQUID_STATUS_QUERY, &variables).await?;
-        validate_graph_response(&response)?;
-        let data = response.data.ok_or(SyncError::MissingData)?;
+        let data: SquidStatusData = self.post_graph(SQUID_STATUS_QUERY, &variables).await?;
         Ok(data.squid_status.height.to())
     }
 
@@ -402,10 +398,7 @@ impl QuickSyncClient {
             to_block: "0".to_string(),
             limit: 1,
         };
-        let response: GraphResponse<IndexedWalletProbeData> =
-            self.post_graph(WALLET_PROBE_QUERY, &variables).await?;
-        validate_graph_response(&response)?;
-        let data = response.data.ok_or(SyncError::MissingData)?;
+        let data: IndexedWalletProbeData = self.post_graph(WALLET_PROBE_QUERY, &variables).await?;
         Ok(IndexedWalletProbe {
             height: data.squid_status.height.to(),
         })
@@ -438,11 +431,7 @@ impl QuickSyncClient {
             to_block: to_block.to_string(),
             limit: limit.min(i32::MAX as usize) as i32,
         };
-        let response: GraphResponse<IndexedWalletPageData> = self
-            .post_graph(INDEXED_WALLET_PAGE_QUERY, &variables)
-            .await?;
-        validate_graph_response(&response)?;
-        response.data.ok_or(SyncError::MissingData)
+        self.post_graph(INDEXED_WALLET_PAGE_QUERY, &variables).await
     }
 
     pub async fn fetch_indexed_legacy_wallet_page(
@@ -457,11 +446,8 @@ impl QuickSyncClient {
             to_block: to_block.to_string(),
             limit: limit.min(i32::MAX as usize) as i32,
         };
-        let response: GraphResponse<IndexedLegacyWalletPageData> = self
-            .post_graph(INDEXED_LEGACY_WALLET_PAGE_QUERY, &variables)
-            .await?;
-        validate_graph_response(&response)?;
-        response.data.ok_or(SyncError::MissingData)
+        self.post_graph(INDEXED_LEGACY_WALLET_PAGE_QUERY, &variables)
+            .await
     }
 
     pub async fn fetch_shield_commitments(
@@ -510,40 +496,82 @@ impl QuickSyncClient {
             to_block: to_block.to_string(),
             limit: limit.min(i32::MAX as usize) as i32,
         };
-        let response: GraphResponse<D> = self.post_graph(query, &variables).await?;
-        validate_graph_response(&response)?;
-        let data = response.data.ok_or(SyncError::MissingData)?;
+        let data: D = self.post_graph(query, &variables).await?;
         Ok(data.items())
     }
 
-    async fn post_graph<T, V>(
-        &self,
-        query: &str,
-        variables: &V,
-    ) -> Result<GraphResponse<T>, SyncError>
+    async fn post_graph<T, V>(&self, query: &str, variables: &V) -> Result<T, SyncError>
     where
         T: DeserializeOwned,
         V: Serialize,
     {
-        let request = GraphRequest { query, variables };
+        post_graphql_data(&self.client, &self.endpoint, query, variables)
+            .await
+            .map_err(SyncError::from)
+    }
+}
 
-        let response = self
-            .client
-            .post(self.endpoint.clone())
-            .json(&request)
-            .send()
-            .await?;
+pub async fn post_graphql_data<T, V>(
+    client: &Client,
+    endpoint: &Url,
+    query: &str,
+    variables: &V,
+) -> Result<T, GraphPostError>
+where
+    T: DeserializeOwned,
+    V: Serialize,
+{
+    let request = GraphRequest { query, variables };
+    let response = client
+        .post(endpoint.clone())
+        .json(&request)
+        .send()
+        .await
+        .map_err(GraphPostError::Request)?;
+    let status = response.status();
+    let body = response.text().await.map_err(GraphPostError::ReadBody)?;
+    if !status.is_success() {
+        return Err(GraphPostError::HttpStatus { status, body });
+    }
+    let parsed: GraphResponse<T> = serde_json::from_str(&body).map_err(GraphPostError::Json)?;
+    if let Some(errors) = parsed.errors {
+        let message = errors
+            .iter()
+            .map(|error| error.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(GraphPostError::Graphql(message));
+    }
+    parsed.data.ok_or(GraphPostError::MissingData)
+}
 
-        let status = response.status();
-        let body = response.text().await?;
-        if !status.is_success() {
-            return Err(SyncError::UnexpectedFormat(format!(
-                "graphql request failed with status {status}: {body}"
-            )));
+#[derive(Debug, Error)]
+pub enum GraphPostError {
+    #[error("graphql request failed: {0}")]
+    Request(reqwest::Error),
+    #[error("read graphql response failed: {0}")]
+    ReadBody(reqwest::Error),
+    #[error("graphql request failed with status {status}: {body}")]
+    HttpStatus { status: StatusCode, body: String },
+    #[error("invalid graphql response: {0}")]
+    Json(serde_json::Error),
+    #[error("graphql errors: {0}")]
+    Graphql(String),
+    #[error("graphql response missing data field")]
+    MissingData,
+}
+
+impl From<GraphPostError> for SyncError {
+    fn from(error: GraphPostError) -> Self {
+        match error {
+            GraphPostError::Request(error) | GraphPostError::ReadBody(error) => {
+                Self::Request(error)
+            }
+            GraphPostError::MissingData => Self::MissingData,
+            GraphPostError::HttpStatus { .. }
+            | GraphPostError::Json(_)
+            | GraphPostError::Graphql(_) => Self::UnexpectedFormat(error.to_string()),
         }
-
-        serde_json::from_str::<GraphResponse<T>>(&body)
-            .map_err(|err| SyncError::UnexpectedFormat(format!("invalid graphql response: {err}")))
     }
 }
 
@@ -576,20 +604,6 @@ struct GraphRangeVariables {
 struct GraphResponse<T> {
     data: Option<T>,
     errors: Option<Vec<GraphError>>,
-}
-
-fn validate_graph_response<T>(response: &GraphResponse<T>) -> Result<(), SyncError> {
-    if let Some(errors) = &response.errors {
-        let message = errors
-            .iter()
-            .map(|error| error.message.as_str())
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(SyncError::UnexpectedFormat(format!(
-            "graphql errors: {message}"
-        )));
-    }
-    Ok(())
 }
 
 #[derive(Debug, Deserialize)]

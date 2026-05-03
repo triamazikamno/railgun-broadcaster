@@ -6,7 +6,7 @@ use std::time::SystemTime;
 use alloy::primitives::Address;
 use parking_lot::RwLock;
 use ruint::aliases::U256;
-use tokio::sync::mpsc;
+use tokio::sync::watch;
 
 pub const DEFAULT_EVENT_CAPACITY: usize = 1_024;
 
@@ -62,17 +62,6 @@ pub struct PeerRow {
     pub dial_failures: u32,
 }
 
-/// Events emitted by background workers into the monitor pipeline.
-#[derive(Debug)]
-#[allow(dead_code)]
-pub enum MonitorEvent {
-    FeeRow(FeeRow),
-    Peers {
-        summary: PeerSummary,
-        rows: Vec<PeerRow>,
-    },
-}
-
 /// Mutable broadcaster monitor state read by the UI and mutated by background events.
 pub struct MonitorState {
     fees: HashMap<FeeRowKey, FeeRow>,
@@ -98,27 +87,27 @@ impl MonitorState {
         self.rev.load(Ordering::Acquire)
     }
 
-    fn bump_rev(&self) {
-        self.rev.fetch_add(1, Ordering::Release);
+    fn bump_rev(&self) -> u64 {
+        self.rev.fetch_add(1, Ordering::Release) + 1
     }
 
-    pub fn upsert_fee(&mut self, row: FeeRow) {
+    pub fn upsert_fee(&mut self, row: FeeRow) -> u64 {
         let key = FeeRowKey {
             chain_id: row.chain_id,
             railgun_address: row.railgun_address.clone(),
             token_address: row.token_address,
         };
         self.fees.insert(key, row);
-        self.bump_rev();
+        self.bump_rev()
     }
 
-    pub fn set_peers(&mut self, summary: PeerSummary, rows: Vec<PeerRow>) {
+    pub fn set_peers(&mut self, summary: PeerSummary, rows: Vec<PeerRow>) -> Option<u64> {
         if self.peer_summary == summary && self.peer_rows == rows {
-            return;
+            return None;
         }
         self.peer_summary = summary;
         self.peer_rows = rows;
-        self.bump_rev();
+        Some(self.bump_rev())
     }
 
     #[must_use]
@@ -152,13 +141,13 @@ pub fn shared() -> Shared {
     Arc::new(RwLock::new(MonitorState::new()))
 }
 
-/// Event channel used between background tasks and the UI polling path.
-pub type EventTx = mpsc::Sender<MonitorEvent>;
-pub type EventRx = mpsc::Receiver<MonitorEvent>;
+/// Revision signal used between background tasks and the UI polling path.
+pub type EventTx = watch::Sender<u64>;
+pub type EventRx = watch::Receiver<u64>;
 
 #[must_use]
-pub fn event_channel(capacity: usize) -> (EventTx, EventRx) {
-    mpsc::channel(capacity)
+pub fn event_channel(_capacity: usize) -> (EventTx, EventRx) {
+    watch::channel(0)
 }
 
 #[cfg(test)]

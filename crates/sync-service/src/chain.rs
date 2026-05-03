@@ -1352,11 +1352,7 @@ where
         .saturating_sub(1)
 }
 
-fn indexed_source(
-    tx_hash: FixedBytes<32>,
-    block_number: u64,
-    block_timestamp: u64,
-) -> UtxoSource {
+fn indexed_source(tx_hash: FixedBytes<32>, block_number: u64, block_timestamp: u64) -> UtxoSource {
     UtxoSource {
         tx_hash,
         block_number,

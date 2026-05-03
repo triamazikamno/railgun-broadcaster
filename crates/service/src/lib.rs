@@ -138,6 +138,93 @@ pub enum SubmitTxError {
     MissingHash,
 }
 
+const GAS_PRICE_BPS_DENOMINATOR: u128 = 10_000;
+const USER_TRANSACT_GAS_PRICE_BUFFER_BPS: u128 = 10_100;
+const MAINTENANCE_GAS_PRICE_BUFFER_BPS: u128 = 10_500;
+const EVM_GAS_LIMIT_BUFFER: u64 = 100_000;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EvmGasPricePolicy {
+    pub gas_price_buffer_bps: u128,
+    pub min_gas_price: Option<u128>,
+    pub max_gas_price: Option<u128>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedEvmTransaction {
+    pub tx_req: TransactionRequest,
+    pub gas: u64,
+    pub gas_price: u128,
+    pub cost: U256,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum PrepareEvmTransactionError {
+    #[error("fetch gas price failed: {0}")]
+    FetchGasPrice(#[source] alloy::transports::RpcError<TransportErrorKind>),
+    #[error("gas price {gas_price} exceeds max {max_gas_price}")]
+    MaxGasPrice {
+        gas_price: u128,
+        max_gas_price: u128,
+    },
+    #[error("fetch nonce failed: {0}")]
+    FetchNonce(#[source] alloy::transports::RpcError<TransportErrorKind>),
+    #[error("estimate gas failed: {0}")]
+    EstimateGas(#[source] alloy::transports::RpcError<TransportErrorKind>),
+}
+
+pub(crate) async fn prepare_evm_transaction(
+    provider: &(impl Provider + Clone),
+    chain_id: ChainId,
+    from: Address,
+    to: Address,
+    input: Bytes,
+    policy: EvmGasPricePolicy,
+) -> Result<PreparedEvmTransaction, PrepareEvmTransactionError> {
+    let mut gas_price = provider
+        .get_gas_price()
+        .await
+        .map_err(PrepareEvmTransactionError::FetchGasPrice)?;
+    if let Some(min_gas_price) = policy.min_gas_price {
+        gas_price = gas_price.max(min_gas_price);
+    }
+    gas_price = gas_price * policy.gas_price_buffer_bps / GAS_PRICE_BPS_DENOMINATOR;
+    if let Some(max_gas_price) = policy.max_gas_price
+        && gas_price > max_gas_price
+    {
+        return Err(PrepareEvmTransactionError::MaxGasPrice {
+            gas_price,
+            max_gas_price,
+        });
+    }
+
+    let nonce = provider
+        .get_transaction_count(from)
+        .await
+        .map_err(PrepareEvmTransactionError::FetchNonce)?;
+    let tx_req = TransactionRequest::default()
+        .with_chain_id(chain_id)
+        .with_from(from)
+        .with_to(to)
+        .with_input(input)
+        .with_gas_price(gas_price)
+        .with_nonce(nonce);
+    let gas = provider
+        .estimate_gas(tx_req.clone())
+        .await
+        .map_err(PrepareEvmTransactionError::EstimateGas)?
+        + EVM_GAS_LIMIT_BUFFER;
+    let tx_req = tx_req.with_gas_limit(gas);
+    let cost = U256::from(gas) * U256::from(gas_price);
+
+    Ok(PreparedEvmTransaction {
+        tx_req,
+        gas,
+        gas_price,
+        cost,
+    })
+}
+
 #[derive(Debug, Error)]
 pub enum BroadcasterManagerError {
     #[error("waku subscribe failed: {0}")]
@@ -748,47 +835,48 @@ impl BroadcasterService {
                     let rpc = provider_handle.provider.clone();
 
                     let min_gas_price = decrypted_payload.params.min_gas_price.unwrap_or_default().to();
-                    let gas_price = match rpc.get_gas_price().await {
-                        Ok(gas_price) => gas_price.max(min_gas_price) * 101 / 100,
+                    let prepared_tx = match prepare_evm_transaction(
+                        &rpc,
+                        chain_id,
+                        signer.address(),
+                        decrypted_payload.params.to,
+                        decrypted_payload.params.data.clone(),
+                        EvmGasPricePolicy {
+                            gas_price_buffer_bps: USER_TRANSACT_GAS_PRICE_BUFFER_BPS,
+                            min_gas_price: Some(min_gas_price),
+                            max_gas_price: None,
+                        },
+                    )
+                    .await
+                    {
+                        Ok(prepared_tx) => prepared_tx,
                         Err(error) => {
-                            warn!(
-                                %error,
-                                rpc = %provider_handle.url,
-                                "fetch gas price failed",
-                            );
-                            query_rpc_pool.mark_bad_provider(&provider_handle);
+                            match &error {
+                                PrepareEvmTransactionError::FetchGasPrice(_) => {
+                                    warn!(%error, rpc = %provider_handle.url, "fetch gas price failed");
+                                    query_rpc_pool.mark_bad_provider(&provider_handle);
+                                }
+                                PrepareEvmTransactionError::FetchNonce(_) => {
+                                    warn!(%error, rpc = %provider_handle.url, "fetch nonce failed");
+                                    query_rpc_pool.mark_bad_provider(&provider_handle);
+                                }
+                                PrepareEvmTransactionError::EstimateGas(_) => {
+                                    warn!(%error, rpc = %provider_handle.url, "estimate gas failed");
+                                }
+                                PrepareEvmTransactionError::MaxGasPrice { .. } => {
+                                    warn!(%error, rpc = %provider_handle.url, "gas price rejected");
+                                }
+                            }
                             continue;
                         }
                     };
-
-                    let tx_req = TransactionRequest::default()
-                        .with_chain_id(chain_id)
-                        .with_from(signer.address())
-                        .with_to(decrypted_payload.params.to)
-                        .with_input(decrypted_payload.params.data)
-                        .with_gas_price(gas_price)
-                        .with_nonce(match rpc.get_transaction_count(signer.address()).await {
-                            Ok(nonce) => nonce,
-                            Err(error) => {
-                                warn!(
-                                    %error,
-                                    rpc = %provider_handle.url,
-                                    "fetch nonce failed",
-                                );
-                                query_rpc_pool.mark_bad_provider(&provider_handle);
-                                continue;
-                            }
-                        });
-                    if let Ok(gas) = rpc
-                        .estimate_gas(tx_req.clone())
-                        .await
-                        .inspect_err(|error| {
-                            warn!(%error, rpc = %provider_handle.url, "estimate gas failed");
-                        })
                     {
-                        let gas = gas + 100_000;
-                        let tx_req = tx_req.with_gas_limit(gas);
-                        let cost = U256::from(gas * gas_price as u64);
+                        let PreparedEvmTransaction {
+                            tx_req,
+                            gas,
+                            gas_price,
+                            cost,
+                        } = prepared_tx;
                         let refund = fees_manager.convert_to_eth(&calldata).await;
 
                         info!(

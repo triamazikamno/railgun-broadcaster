@@ -9,7 +9,7 @@ use waku_relay::client::Client;
 pub use waku_relay::client::{DEFAULT_CLUSTER_ID, DEFAULT_SHARD_ID};
 use waku_relay::msg::ContentTopic;
 
-use broadcaster_monitor::{EventTx, FeeRow, MonitorEvent, PeerRow, PeerSummary, Shared};
+use broadcaster_monitor::{EventTx, FeeRow, PeerRow, PeerSummary, Shared};
 
 pub const DEFAULT_DOH_ENDPOINT: &str = "https://cloudflare-dns.com/dns-query";
 pub const DEFAULT_MAX_PEERS: usize = 10;
@@ -172,8 +172,8 @@ pub fn handle_fees_message(
             last_seen: now,
             reliability: body.reliability,
         };
-        shared.write().upsert_fee(row.clone());
-        let _ = events.try_send(MonitorEvent::FeeRow(row));
+        let rev = shared.write().upsert_fee(row);
+        let _ = events.send(rev);
         produced += 1;
     }
     produced
@@ -204,8 +204,9 @@ async fn run_peer_poll_loop(waku: Arc<Client>, shared: Shared, events: EventTx) 
         };
         let rows: Vec<PeerRow> = snapshots.iter().map(peer_row_from_snapshot).collect();
 
-        shared.write().set_peers(summary.clone(), rows.clone());
-        let _ = events.try_send(MonitorEvent::Peers { summary, rows });
+        if let Some(rev) = shared.write().set_peers(summary, rows) {
+            let _ = events.send(rev);
+        }
     }
 }
 

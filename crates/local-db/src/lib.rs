@@ -28,6 +28,128 @@ const OUTPUT_POI_RECOVERY_TABLE: TableDefinition<&str, &[u8]> =
 const DESKTOP_WALLET_VAULT_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("desktop_wallet_vault_v1");
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalDbTable {
+    Meta,
+    BlobIndex,
+    MerkleForestIndex,
+    ZkeyIndex,
+    WalletUtxo,
+    WalletMeta,
+    PendingFeeNoteAssurance,
+    TerminalFeeNoteAssurance,
+    PendingOutputPoiContext,
+    OutputPoiRecovery,
+    DesktopWalletVault,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalDbTableDecodeKind {
+    Meta,
+    BlobMeta,
+    MerkleForestMeta,
+    ZkeyMeta,
+    WalletUtxo,
+    WalletMeta,
+    PendingFeeNoteAssurance,
+    TerminalFeeNoteAssurance,
+    PendingOutputPoiContext,
+    OutputPoiRecovery,
+    DesktopWalletVault,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalDbTableInfo {
+    pub table: LocalDbTable,
+    pub name: &'static str,
+    pub decode_kind: LocalDbTableDecodeKind,
+}
+
+pub const LOCAL_DB_TABLES: &[LocalDbTableInfo] = &[
+    LocalDbTableInfo {
+        table: LocalDbTable::Meta,
+        name: "meta",
+        decode_kind: LocalDbTableDecodeKind::Meta,
+    },
+    LocalDbTableInfo {
+        table: LocalDbTable::BlobIndex,
+        name: "blob_index",
+        decode_kind: LocalDbTableDecodeKind::BlobMeta,
+    },
+    LocalDbTableInfo {
+        table: LocalDbTable::MerkleForestIndex,
+        name: "merkle_forest_index",
+        decode_kind: LocalDbTableDecodeKind::MerkleForestMeta,
+    },
+    LocalDbTableInfo {
+        table: LocalDbTable::ZkeyIndex,
+        name: "zkey_index",
+        decode_kind: LocalDbTableDecodeKind::ZkeyMeta,
+    },
+    LocalDbTableInfo {
+        table: LocalDbTable::WalletUtxo,
+        name: "wallet_utxo",
+        decode_kind: LocalDbTableDecodeKind::WalletUtxo,
+    },
+    LocalDbTableInfo {
+        table: LocalDbTable::WalletMeta,
+        name: "wallet_meta",
+        decode_kind: LocalDbTableDecodeKind::WalletMeta,
+    },
+    LocalDbTableInfo {
+        table: LocalDbTable::PendingFeeNoteAssurance,
+        name: "fee_note_assurance_pending",
+        decode_kind: LocalDbTableDecodeKind::PendingFeeNoteAssurance,
+    },
+    LocalDbTableInfo {
+        table: LocalDbTable::TerminalFeeNoteAssurance,
+        name: "fee_note_assurance_terminal",
+        decode_kind: LocalDbTableDecodeKind::TerminalFeeNoteAssurance,
+    },
+    LocalDbTableInfo {
+        table: LocalDbTable::PendingOutputPoiContext,
+        name: "pending_output_poi_context",
+        decode_kind: LocalDbTableDecodeKind::PendingOutputPoiContext,
+    },
+    LocalDbTableInfo {
+        table: LocalDbTable::OutputPoiRecovery,
+        name: "output_poi_recovery",
+        decode_kind: LocalDbTableDecodeKind::OutputPoiRecovery,
+    },
+    LocalDbTableInfo {
+        table: LocalDbTable::DesktopWalletVault,
+        name: "desktop_wallet_vault_v1",
+        decode_kind: LocalDbTableDecodeKind::DesktopWalletVault,
+    },
+];
+
+impl LocalDbTable {
+    #[must_use]
+    pub const fn definition(self) -> TableDefinition<'static, &'static str, &'static [u8]> {
+        match self {
+            Self::Meta => META_TABLE,
+            Self::BlobIndex => BLOB_INDEX_TABLE,
+            Self::MerkleForestIndex => MERKLE_FOREST_INDEX_TABLE,
+            Self::ZkeyIndex => ZKEY_INDEX_TABLE,
+            Self::WalletUtxo => WALLET_UTXO_TABLE,
+            Self::WalletMeta => WALLET_META_TABLE,
+            Self::PendingFeeNoteAssurance => PENDING_FEE_NOTE_ASSURANCE_TABLE,
+            Self::TerminalFeeNoteAssurance => TERMINAL_FEE_NOTE_ASSURANCE_TABLE,
+            Self::PendingOutputPoiContext => PENDING_OUTPUT_POI_CONTEXT_TABLE,
+            Self::OutputPoiRecovery => OUTPUT_POI_RECOVERY_TABLE,
+            Self::DesktopWalletVault => DESKTOP_WALLET_VAULT_TABLE,
+        }
+    }
+}
+
+#[must_use]
+pub fn local_db_table_by_name(name: &str) -> Option<LocalDbTableInfo> {
+    LOCAL_DB_TABLES
+        .iter()
+        .copied()
+        .find(|table| table.name == name)
+}
+
 const META_KEY: &str = "meta";
 const RAILGUN_DIR: &str = "railgun";
 const BLOBS_DIR: &str = "blobs";
@@ -340,7 +462,7 @@ impl DbStore {
     where
         T: DeserializeOwned,
     {
-        let range_end = format!("{prefix}~");
+        let range_end = prefix_range_end(prefix);
         let txn = self.db.begin_read()?;
         let table = txn.open_table(table_def)?;
         let mut out = Vec::new();
@@ -492,7 +614,7 @@ impl DbStore {
 
     pub fn list_wallet_utxos(&self, wallet_id: &str) -> Result<Vec<WalletUtxoRecord>, DbError> {
         let prefix = wallet_utxo_prefix(wallet_id);
-        let range_end = format!("{prefix}~");
+        let range_end = prefix_range_end(&prefix);
         let txn = self.db.begin_read()?;
         let table = txn.open_table(WALLET_UTXO_TABLE)?;
         let mut out = Vec::new();
@@ -807,7 +929,7 @@ impl DbStore {
         &self,
         prefix: &str,
     ) -> Result<Vec<DesktopWalletVaultRecord>, DbError> {
-        let range_end = format!("{prefix}~");
+        let range_end = prefix_range_end(prefix);
         let txn = self.db.begin_read()?;
         let table = txn.open_table(DESKTOP_WALLET_VAULT_TABLE)?;
         let mut out = Vec::new();
@@ -923,9 +1045,13 @@ fn decode<T: DeserializeOwned>(data: &[u8]) -> Result<T, DbError> {
 }
 
 fn remove_table_prefix(table: &mut Table<'_, &str, &[u8]>, prefix: &str) -> Result<(), DbError> {
-    let range_end = format!("{prefix}~");
+    let range_end = prefix_range_end(prefix);
     table.retain_in(prefix..range_end.as_str(), |_, _| false)?;
     Ok(())
+}
+
+fn prefix_range_end(prefix: &str) -> String {
+    format!("{prefix}~")
 }
 
 fn blob_index_key(kind: &str, id: &str) -> String {

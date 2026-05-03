@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 alloy = { workspace = true, features = ["provider-http", "rpc-types", "network", "signers"] }
+alloy-provider = { workspace = true }
 argon2 = { workspace = true }
 chacha20poly1305 = { workspace = true }
 eyre = { workspace = true }
@@ -26,6 +27,7 @@ zeroize = { workspace = true }
 broadcaster-core = { path = "../core" }
 broadcaster-monitor = { path = "../broadcaster-monitor" }
 local-db = { path = "../local-db" }
+merkletree = { path = "../merkletree" }
 poi = { path = "../poi" }
 railgun-wallet = { path = "../railgun-wallet" }
 sync-service = { path = "../sync-service" }
