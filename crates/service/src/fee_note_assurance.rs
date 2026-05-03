@@ -1,10 +1,10 @@
 use alloy::primitives::{Address, FixedBytes, U256};
 use alloy::providers::Provider;
-use alloy::uint;
 use alloy_rpc_types_eth::Log;
 use broadcaster_core::contracts::railgun::Transact;
 use broadcaster_core::crypto::poseidon::poseidon;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
+use broadcaster_core::tree::TREE_LEAF_COUNT_U256;
 use local_db::{DbStore, FeeNoteAssuranceTerminalOutcome, PendingFeeNoteAssuranceRecord};
 use poi::poi::{Poi, PoiStatus};
 use std::collections::BTreeMap;
@@ -352,10 +352,8 @@ fn derive_fee_note_blinded_commitment(
     utxo_tree_out: u64,
     utxo_position_out: u64,
 ) -> FixedBytes<32> {
-    const TREE_MAX_ITEMS: U256 = uint!(65_536_U256);
-
     let global_tree_position =
-        U256::from(utxo_tree_out) * TREE_MAX_ITEMS + U256::from(utxo_position_out);
+        U256::from(utxo_tree_out) * TREE_LEAF_COUNT_U256 + U256::from(utxo_position_out);
 
     poseidon(vec![
         fee_commitment.into(),

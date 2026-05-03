@@ -7,13 +7,14 @@ use alloy::primitives::{Bytes, FixedBytes, U64, U256};
 use alloy::sol_types::SolCall;
 use async_trait::async_trait;
 use broadcaster_core::contracts::railgun::{Transaction, relayCall, transactCall};
-use broadcaster_core::crypto::poseidon::poseidon;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use broadcaster_core::transact::{
-    DEFAULT_TXID_VERSION, pad_with_merkle_zero, railgun_txid_leaf_hash,
+    DEFAULT_TXID_VERSION, compute_railgun_txid_parts, railgun_txid_leaf_hash,
+    railgun_txid_leaf_hash_with_output_start,
 };
+use broadcaster_core::tree::TREE_LEAF_COUNT;
 use broadcaster_core::utxo::derive_blinded_commitment;
-use merkletree::tree::{MerkleForest, MerkleTree, TREE_LEAF_COUNT};
+use merkletree::tree::{MerkleForest, MerkleTree};
 use railgun_wallet::prover::ProverError;
 use railgun_wallet::tx::{
     InputWitness, PostTransactionPoiData, PostTransactionPoiGenerationRequest,
@@ -31,13 +32,13 @@ use local_db::{
     DbStore, OutputPoiRecoveryRecord, OutputPoiRecoveryStatus, PendingOutputPoiContextRecord,
     PendingOutputPoiObservation, PendingOutputPoiRole,
 };
-use merkletree::wallet::{
-    CommitmentObservation, WalletLogDelta, WalletScanError, parse_wallet_delta_from_logs,
-};
 use poi::error::PoiError;
 use poi::poi::{
     BlindedCommitmentData, BlindedCommitmentType, DEFAULT_WALLET_POI_RPC_URL, PoiRpcClient,
     SingleCommitmentProofContext, ValidatedRailgunTxidStatus, default_active_poi_list_keys,
+};
+use railgun_wallet::scan::{
+    CommitmentObservation, WalletLogDelta, WalletScanError, parse_wallet_delta_from_logs,
 };
 use railgun_wallet::wallet_cache::WalletCacheError;
 use railgun_wallet::{
@@ -1472,25 +1473,21 @@ where
 }
 
 fn graph_railgun_txid(transaction: &RecoveryGraphRailgunTransaction) -> U256 {
-    let nullifiers = transaction.nullifiers.clone();
-    let commitments = transaction.commitments.clone();
-    let nullifiers_hash = poseidon(pad_with_merkle_zero(nullifiers, 13));
-    let commitments_hash = poseidon(pad_with_merkle_zero(commitments, 13));
-    poseidon(vec![
-        nullifiers_hash,
-        commitments_hash,
+    compute_railgun_txid_parts(
+        &transaction.nullifiers,
+        &transaction.commitments,
         transaction.bound_params_hash,
-    ])
+    )
 }
 
 fn graph_txid_leaf_hash(transaction: &RecoveryGraphRailgunTransaction) -> U256 {
     let railgun_txid = graph_railgun_txid(transaction);
     let output_start_global = graph_output_start_global(transaction);
-    poseidon(vec![
+    railgun_txid_leaf_hash_with_output_start(
         railgun_txid,
-        U256::from(transaction.utxo_tree_in.to::<u64>()),
+        transaction.utxo_tree_in.to(),
         U256::from(output_start_global),
-    ])
+    )
 }
 
 fn graph_output_start_global(transaction: &RecoveryGraphRailgunTransaction) -> u128 {
@@ -1727,7 +1724,7 @@ fn build_output_poi_recovery_chunk(
     forest: &MerkleForest,
     active_list_keys: &[FixedBytes<32>],
     spending_public_key: [U256; 2],
-    scan_keys: &merkletree::wallet::WalletScanKeys,
+    scan_keys: &railgun_wallet::scan::WalletScanKeys,
 ) -> Result<RecoveryChunk, RecoveryFailure> {
     if transactions.len() != 1 {
         return Err(RecoveryFailure::permanent(
@@ -1939,7 +1936,7 @@ fn wallet_inputs_for_transaction<'a>(
     candidate: &WalletUtxo,
     wallet_utxos: &'a [WalletUtxo],
     transaction: &Transaction,
-    scan_keys: &merkletree::wallet::WalletScanKeys,
+    scan_keys: &railgun_wallet::scan::WalletScanKeys,
 ) -> Result<Vec<&'a WalletUtxo>, RecoveryFailure> {
     let input_tree = u32::from(transaction.boundParams.treeNumber);
     let mut inputs = Vec::with_capacity(transaction.nullifiers.len());
@@ -3355,15 +3352,16 @@ mod tests {
     use broadcaster_core::crypto::railgun::ViewingKeyData;
     use broadcaster_core::notes::Note;
     use broadcaster_core::transact::{PreTxPoi, SnarkJsProof, railgun_txid_leaf_hash};
+    use broadcaster_core::tree::TREE_LEAF_COUNT;
     use broadcaster_core::utxo::derive_blinded_commitment;
     use local_db::{
         DbConfig, DbStore, OutputPoiRecoveryRecord, OutputPoiRecoveryStatus,
         PendingOutputPoiContextRecord, PendingOutputPoiRole, WalletMeta,
     };
-    use merkletree::tree::{MerkleForest, MerkleTreeUpdate, TREE_LEAF_COUNT};
-    use merkletree::wallet::{CommitmentObservation, SpentNullifier, WalletLogDelta};
+    use merkletree::tree::{MerkleForest, MerkleTreeUpdate};
     use poi::error::PoiError;
     use poi::poi::{BlindedCommitmentData, SingleCommitmentProofContext};
+    use railgun_wallet::scan::{CommitmentObservation, SpentNullifier, WalletLogDelta};
     use railgun_wallet::wallet_cache::WalletCacheError;
     use railgun_wallet::{PoiStatus, Utxo, UtxoCommitmentKind, UtxoSource, WalletUtxo};
     use railgun_wallet::{prover::ProverError, tx::PreTransactionPoiError};

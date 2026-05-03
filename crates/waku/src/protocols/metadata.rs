@@ -3,13 +3,13 @@ use crate::protocols::codec::ProstLengthDelimitedCodec;
 use async_trait::async_trait;
 use libp2p::request_response;
 
-pub const METADATA_CODEC: &str = "/vac/waku/metadata/1.0.0";
+pub(crate) const METADATA_CODEC: &str = "/vac/waku/metadata/1.0.0";
 
 #[derive(Clone, Default)]
-pub struct MetadataCodec;
+pub(crate) struct MetadataCodec;
 
 #[derive(Clone)]
-pub struct MetadataProtocol;
+pub(crate) struct MetadataProtocol;
 
 impl AsRef<str> for MetadataProtocol {
     fn as_ref(&self) -> &str {
@@ -71,7 +71,7 @@ impl request_response::Codec for MetadataCodec {
 }
 
 #[must_use]
-pub fn behaviour() -> request_response::Behaviour<MetadataCodec> {
+pub(crate) fn behaviour() -> request_response::Behaviour<MetadataCodec> {
     request_response::Behaviour::new(
         [(MetadataProtocol, request_response::ProtocolSupport::Full)],
         request_response::Config::default(),

@@ -6,7 +6,7 @@ use alloy::primitives::{Address, U256, address};
 use alloy_rpc_types_eth::Log;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use local_db::{DbStore, WalletMeta};
-use merkletree::wallet::{WalletLogDelta, WalletScanKeys};
+use railgun_wallet::scan::{WalletLogDelta, WalletScanKeys};
 use railgun_wallet::wallet_cache::{WalletCacheDbExt, WalletCacheError};
 use railgun_wallet::{ProverService, WalletUtxo};
 use tokio::sync::{mpsc, watch};

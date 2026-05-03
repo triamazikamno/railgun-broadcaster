@@ -4,16 +4,13 @@ use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
 use alloy::primitives::U256;
-use alloy::uint;
 use broadcaster_core::crypto::poseidon::poseidon;
 use broadcaster_core::transact::MERKLE_ZERO_VALUE;
+use broadcaster_core::tree::{TREE_DEPTH, TREE_LEAF_COUNT, normalize_tree_position};
 use rayon::iter::IntoParallelRefMutIterator;
 
 use crate::errors::SyncError;
 
-pub const TREE_DEPTH: usize = 16;
-pub const TREE_LEAF_COUNT: u64 = 1 << TREE_DEPTH;
-pub const TREE_LEAF_COUNT_U256: U256 = uint!(65_536_U256);
 const PARALLEL_HASH_LAYER_MIN_LEN: usize = 1024;
 
 static ZERO_HASHES: LazyLock<[U256; TREE_DEPTH + 1]> = LazyLock::new(compute_zero_hashes);
@@ -23,13 +20,6 @@ pub struct MerkleTreeUpdate {
     pub tree_number: u32,
     pub tree_position: u64,
     pub hash: U256,
-}
-
-#[must_use]
-pub const fn normalize_tree_position(tree_number: u32, tree_position: u64) -> (u32, u64) {
-    let normalized_index = tree_position % TREE_LEAF_COUNT;
-    let tree_increment = (tree_position / TREE_LEAF_COUNT) as u32;
-    (tree_number + tree_increment, normalized_index)
 }
 
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]

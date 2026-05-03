@@ -5,6 +5,7 @@ pub use broadcaster_core::contracts::railgun::{
     LegacyCommitmentCiphertext, LegacyCommitmentPreimage, Nullified, Nullifiers, Shield,
     ShieldCiphertext, ShieldLegacyPreMar23, TokenData, Transact, Unshield,
 };
+use broadcaster_core::tree::normalize_tree_position;
 
 use crate::tree::MerkleTreeUpdate;
 
@@ -36,7 +37,7 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         let hash = self.iter.next()?;
         let (tree_number, tree_position) =
-            crate::tree::normalize_tree_position(self.tree_number, self.next_index);
+            normalize_tree_position(self.tree_number, self.next_index);
         self.next_index += 1;
         Some(MerkleTreeUpdate {
             tree_number,

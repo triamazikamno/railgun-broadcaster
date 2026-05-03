@@ -691,7 +691,8 @@ impl NodeInner {
                     self.subscribe_on_peer(peer_id).await;
                 }
             }
-            TransportEvent::MetadataRequest { channel, .. } => {
+            TransportEvent::MetadataRequest { peer_id, channel } => {
+                debug!(%peer_id, "received metadata request");
                 let response = self.metadata_response.clone();
                 if let Err(error) = self
                     .transport_tx
@@ -700,7 +701,8 @@ impl NodeInner {
                     error!(%error, "failed to send metadata response command");
                 }
             }
-            TransportEvent::LightPushRequest { channel, .. } => {
+            TransportEvent::LightPushRequest { peer_id, channel } => {
+                debug!(%peer_id, "received inbound lightpush request");
                 let response = LIGHTPUSH_UNIMPLEMENTED
                     .get_or_init(|| proto::light_push::LightPushResponseV3 {
                         request_id: String::new(),
@@ -716,7 +718,8 @@ impl NodeInner {
                     error!(%error, "failed to send lightpush response command");
                 }
             }
-            TransportEvent::PeerExchangeRequest { channel, .. } => {
+            TransportEvent::PeerExchangeRequest { peer_id, channel } => {
+                debug!(%peer_id, "received peer exchange request");
                 let response = PEER_EXCHANGE_EMPTY_RESPONSE
                     .get_or_init(|| proto::peer_exchange::PeerExchangeRpc {
                         query: None,

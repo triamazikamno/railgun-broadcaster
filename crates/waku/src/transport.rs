@@ -24,12 +24,12 @@ use tokio::sync::mpsc;
 use tracing::{debug, error};
 
 /// Internal request ID used by the coordinator to correlate responses.
-pub type ReqId = u64;
+pub(crate) type ReqId = u64;
 
 /// Commands sent from coordinator to transport.
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
-pub enum TransportCmd {
+pub(crate) enum TransportCmd {
     Dial {
         peer_id: PeerId,
         addrs: Vec<Multiaddr>,
@@ -71,7 +71,7 @@ pub enum TransportCmd {
 
 /// Events emitted from transport to coordinator.
 #[derive(Debug)]
-pub enum TransportEvent {
+pub(crate) enum TransportEvent {
     ConnectionEstablished {
         peer_id: PeerId,
     },
@@ -137,7 +137,7 @@ pub(crate) struct Behaviour {
 
 /// Transport layer that owns the libp2p Swarm.
 /// Receives commands from coordinator, emits raw events back.
-pub struct Transport {
+pub(crate) struct Transport {
     swarm: Swarm<Behaviour>,
     pending_lightpush: HashMap<OutboundRequestId, (ReqId, PeerId)>,
     pending_px: HashMap<OutboundRequestId, ReqId>,
@@ -147,7 +147,7 @@ pub struct Transport {
 
 impl Transport {
     /// Create a new transport.
-    pub fn new(config: &NodeConfig) -> Result<Self, TransportInitError> {
+    pub(crate) fn new(config: &NodeConfig) -> Result<Self, TransportInitError> {
         let local_key = identity::Keypair::generate_ed25519();
         let local_peer_id = PeerId::from(local_key.public());
 
@@ -186,7 +186,7 @@ impl Transport {
 
     /// Run the transport loop.
     /// Polls swarm events and handles commands from the coordinator.
-    pub async fn run(
+    pub(crate) async fn run(
         mut self,
         mut cmd_rx: mpsc::Receiver<TransportCmd>,
         event_tx: mpsc::Sender<TransportEvent>,

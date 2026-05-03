@@ -6,4 +6,5 @@ pub mod query_rpc_pool;
 pub mod serde_helpers;
 pub mod transact;
 pub mod transact_response;
+pub mod tree;
 pub mod utxo;

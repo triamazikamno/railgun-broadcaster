@@ -1,15 +1,19 @@
-pub mod error;
+mod config;
+mod coordinator;
+mod discovery;
+mod error;
 pub mod proto;
+mod protocols;
+mod transport;
+mod types;
 
-pub mod config;
-pub mod coordinator;
-pub mod discovery;
-pub mod protocols;
-pub mod transport;
-pub mod types;
-
-pub use config::WakuConfig;
+pub use config::{NodeConfig, WakuConfig};
 pub use coordinator::{
     LightPushResult, PeerBook, PeerSnapshot, PeerStats, StoreQueryOptions, SubId, WakuNode,
 };
-pub use error::WakuError;
+pub use discovery::{
+    DiscoveredPeer, DiscoveryConfig, DiscoveryError, DnsResolveError, EnrDecodeError, EnrTreeError,
+    RAILGUN_TREE, SANDBOX_ENR_TREE, TEST_ENR_TREE,
+};
+pub use error::{TransportInitError, WakuError};
+pub use types::{parse_multiaddr, parse_peer_id};

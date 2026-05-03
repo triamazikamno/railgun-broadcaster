@@ -7,10 +7,10 @@ use broadcaster_core::crypto::aes_gcm::encrypt_in_place_16b_iv;
 use broadcaster_core::crypto::shared_key::shared_symmetric_key_legacy;
 use broadcaster_core::notes::Note;
 use broadcaster_core::notes::note_public_key;
-use merkletree::wallet::{
+use railgun_wallet::scan::{
     IndexedLegacyEncryptedCommitmentInput, IndexedLegacyGeneratedCommitmentInput,
     IndexedNullifierInput, IndexedShieldCommitmentInput, IndexedTransactCommitmentInput,
-    parse_indexed_wallet_delta,
+    WalletLogDelta, parse_indexed_wallet_delta,
 };
 use railgun_wallet::{NoteCiphertext, UtxoSource, ViewingKeyData};
 
@@ -28,7 +28,7 @@ fn parse_delta(
     legacy_generated: &[IndexedLegacyGeneratedCommitmentInput],
     nullifiers: &[IndexedNullifierInput],
     keys: &ViewingKeyData,
-) -> merkletree::wallet::WalletLogDelta {
+) -> WalletLogDelta {
     parse_indexed_wallet_delta(
         transact,
         shield,

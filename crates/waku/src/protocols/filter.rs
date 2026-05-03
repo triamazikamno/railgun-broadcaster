@@ -3,18 +3,18 @@ use crate::protocols::codec::ProstLengthDelimitedCodec;
 use async_trait::async_trait;
 use libp2p::request_response;
 
-pub const FILTER_SUBSCRIBE_CODEC: &str = "/vac/waku/filter-subscribe/2.0.0-beta1";
-pub const FILTER_PUSH_CODEC: &str = "/vac/waku/filter-push/2.0.0-beta1";
+pub(crate) const FILTER_SUBSCRIBE_CODEC: &str = "/vac/waku/filter-subscribe/2.0.0-beta1";
+pub(crate) const FILTER_PUSH_CODEC: &str = "/vac/waku/filter-push/2.0.0-beta1";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Filter Subscribe Protocol (client → server, request/response)
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Default)]
-pub struct FilterSubscribeCodec;
+pub(crate) struct FilterSubscribeCodec;
 
 #[derive(Clone)]
-pub struct FilterSubscribeProtocol;
+pub(crate) struct FilterSubscribeProtocol;
 
 impl AsRef<str> for FilterSubscribeProtocol {
     fn as_ref(&self) -> &str {
@@ -76,7 +76,7 @@ impl request_response::Codec for FilterSubscribeCodec {
 }
 
 #[must_use]
-pub fn filter_subscribe_behaviour() -> request_response::Behaviour<FilterSubscribeCodec> {
+pub(crate) fn filter_subscribe_behaviour() -> request_response::Behaviour<FilterSubscribeCodec> {
     request_response::Behaviour::new(
         [(
             FilterSubscribeProtocol,

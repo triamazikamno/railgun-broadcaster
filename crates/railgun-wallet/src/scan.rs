@@ -5,27 +5,22 @@ use alloy::sol_types::{Error as SolError, SolEvent};
 use alloy_rpc_types_eth::Log;
 use thiserror::Error;
 
+use broadcaster_core::contracts::railgun::{
+    CommitmentBatch, CommitmentPreimage, GeneratedCommitmentBatch, LegacyCommitmentPreimage,
+    Nullified, Nullifiers, Shield, ShieldCiphertext, ShieldLegacyPreMar23, Transact,
+};
 use broadcaster_core::crypto::railgun::ViewingKeyData;
 use broadcaster_core::crypto::shared_key::{shared_symmetric_key, shared_symmetric_key_legacy};
 use broadcaster_core::notes::{
     Note, decrypt_legacy_random, decrypt_shield_random, note_public_key,
 };
+use broadcaster_core::tree::normalize_tree_position;
 use broadcaster_core::utxo::{Utxo, UtxoCommitmentKind, UtxoSource};
-
-use crate::errors::SyncError;
-use crate::slow::types::{
-    CommitmentBatch, CommitmentPreimage, GeneratedCommitmentBatch, IntoCommitmentUpdates,
-    LegacyCommitmentPreimage, Nullified, Nullifiers, Shield, ShieldCiphertext,
-    ShieldLegacyPreMar23, Transact,
-};
-use crate::tree::{MerkleForest, normalize_tree_position};
 
 #[derive(Debug, Error)]
 pub enum WalletScanError {
     #[error("decode log: {0}")]
     Decode(#[from] SolError),
-    #[error("apply commitment updates: {0}")]
-    Update(#[from] SyncError),
     #[error("log missing required metadata: {0}")]
     MissingLogMetadata(&'static str),
 }
@@ -125,22 +120,22 @@ pub fn parse_wallet_delta_from_logs(
                     .get(index)
                     .map(|hash| U256::from_be_bytes(hash.0))
                 {
+                    let input = IndexedTransactCommitmentInput {
+                        tree_number,
+                        tree_position: position,
+                        hash: expected_hash,
+                        ciphertext: ciphertext.ciphertext,
+                        blinded_sender_viewing_key: ciphertext.blindedSenderViewingKey,
+                        memo: ciphertext.memo.clone(),
+                        source: source.clone(),
+                    };
                     commitment_observations.push(commitment_observation(
                         tree_number,
                         position,
                         expected_hash,
                         source.clone(),
                     ));
-                    if let Some(utxo) = scan_transact_commitment(
-                        tree_number,
-                        position,
-                        expected_hash,
-                        &ciphertext.ciphertext,
-                        &ciphertext.blindedSenderViewingKey,
-                        ciphertext.memo.as_ref(),
-                        source.clone(),
-                        keys,
-                    ) {
+                    if let Some(utxo) = scan_transact_commitment(&input, keys) {
                         utxos.push(utxo);
                     }
                 }
@@ -151,6 +146,10 @@ pub fn parse_wallet_delta_from_logs(
             let tree_number: u32 = event.treeNumber.to();
             let start_pos: u64 = event.startPosition.to();
             let source = source_from_log(raw_log, block_timestamps)?;
+            let mut output = WalletScanOutput {
+                utxos: &mut utxos,
+                commitment_observations: &mut commitment_observations,
+            };
             scan_shield_event_commitments(
                 tree_number,
                 start_pos,
@@ -158,8 +157,7 @@ pub fn parse_wallet_delta_from_logs(
                 &event.shieldCiphertext,
                 &source,
                 keys,
-                &mut utxos,
-                &mut commitment_observations,
+                &mut output,
             );
         } else if topic0 == ShieldLegacyPreMar23::SIGNATURE_HASH {
             let event = ShieldLegacyPreMar23::decode_log(&raw_log.inner)?.data;
@@ -167,6 +165,10 @@ pub fn parse_wallet_delta_from_logs(
             let tree_number: u32 = event.treeNumber.to();
             let start_pos: u64 = event.startPosition.to();
             let source = source_from_log(raw_log, block_timestamps)?;
+            let mut output = WalletScanOutput {
+                utxos: &mut utxos,
+                commitment_observations: &mut commitment_observations,
+            };
             scan_shield_event_commitments(
                 tree_number,
                 start_pos,
@@ -174,8 +176,7 @@ pub fn parse_wallet_delta_from_logs(
                 &event.shieldCiphertext,
                 &source,
                 keys,
-                &mut utxos,
-                &mut commitment_observations,
+                &mut output,
             );
         } else if topic0 == Nullifiers::SIGNATURE_HASH {
             let event = Nullifiers::decode_log(&raw_log.inner)?.data;
@@ -298,16 +299,7 @@ pub fn parse_indexed_wallet_delta(
             commitment.hash,
             commitment.source.clone(),
         ));
-        if let Some(utxo) = scan_transact_commitment(
-            commitment.tree_number,
-            commitment.tree_position,
-            commitment.hash,
-            &commitment.ciphertext,
-            &commitment.blinded_sender_viewing_key,
-            commitment.memo.as_ref(),
-            commitment.source.clone(),
-            keys,
-        ) {
+        if let Some(utxo) = scan_transact_commitment(commitment, keys) {
             utxos.push(utxo);
         }
     }
@@ -390,6 +382,11 @@ const fn commitment_observation(
     }
 }
 
+struct WalletScanOutput<'a> {
+    utxos: &'a mut Vec<Utxo>,
+    commitment_observations: &'a mut Vec<CommitmentObservation>,
+}
+
 fn scan_shield_event_commitments(
     tree_number: u32,
     start_pos: u64,
@@ -397,12 +394,11 @@ fn scan_shield_event_commitments(
     shield_ciphertext: &[ShieldCiphertext],
     source: &UtxoSource,
     keys: &WalletScanKeys,
-    utxos: &mut Vec<Utxo>,
-    commitment_observations: &mut Vec<CommitmentObservation>,
+    output: &mut WalletScanOutput<'_>,
 ) {
     for (index, preimage) in commitments.iter().enumerate() {
         let position = start_pos + index as u64;
-        commitment_observations.push(commitment_observation(
+        output.commitment_observations.push(commitment_observation(
             tree_number,
             position,
             preimage.hash(),
@@ -418,7 +414,7 @@ fn scan_shield_event_commitments(
                 keys,
             )
         {
-            utxos.push(utxo);
+            output.utxos.push(utxo);
         }
     }
 }
@@ -489,27 +485,31 @@ fn scan_legacy_generated_commitment(
 }
 
 fn scan_transact_commitment(
-    tree_number: u32,
-    tree_position: u64,
-    expected_hash: U256,
-    ciphertext: &[FixedBytes<32>; 4],
-    blinded_sender_viewing_key: &FixedBytes<32>,
-    memo: &[u8],
-    source: UtxoSource,
+    commitment: &IndexedTransactCommitmentInput,
     keys: &WalletScanKeys,
 ) -> Option<Utxo> {
-    let (tree, position) = normalize_tree_position(tree_number, tree_position);
-    let shared_key =
-        shared_symmetric_key(&keys.viewing_private_key, &blinded_sender_viewing_key.0).ok()?;
-    let note = Note::decrypt_v2(ciphertext, memo, &shared_key, keys.master_public_key).ok()?;
-    if note.commitment() != expected_hash {
+    let (tree, position) =
+        normalize_tree_position(commitment.tree_number, commitment.tree_position);
+    let shared_key = shared_symmetric_key(
+        &keys.viewing_private_key,
+        &commitment.blinded_sender_viewing_key.0,
+    )
+    .ok()?;
+    let note = Note::decrypt_v2(
+        &commitment.ciphertext,
+        commitment.memo.as_ref(),
+        &shared_key,
+        keys.master_public_key,
+    )
+    .ok()?;
+    if note.commitment() != commitment.hash {
         return None;
     }
     Some(Utxo::new(
         note,
         tree,
         position,
-        source,
+        commitment.source.clone(),
         UtxoCommitmentKind::Transact,
     ))
 }
@@ -564,30 +564,4 @@ fn source_from_log(
         block_number,
         block_timestamp,
     })
-}
-
-pub fn apply_commitment_updates_from_logs(
-    forest: &mut MerkleForest,
-    logs: &[Log],
-) -> Result<(), WalletScanError> {
-    for raw_log in logs {
-        let topic0 = raw_log.inner.topics().first().copied().unwrap_or_default();
-        if topic0 == Transact::SIGNATURE_HASH {
-            let event = Transact::decode_log(&raw_log.inner)?.data;
-            forest.insert_updates(event.commitment_updates())?;
-        } else if topic0 == Shield::SIGNATURE_HASH {
-            let event = Shield::decode_log(&raw_log.inner)?.data;
-            forest.insert_updates(event.commitment_updates())?;
-        } else if topic0 == ShieldLegacyPreMar23::SIGNATURE_HASH {
-            let event = ShieldLegacyPreMar23::decode_log(&raw_log.inner)?.data;
-            forest.insert_updates(event.commitment_updates())?;
-        } else if topic0 == CommitmentBatch::SIGNATURE_HASH {
-            let event = CommitmentBatch::decode_log(&raw_log.inner)?.data;
-            forest.insert_updates(event.commitment_updates())?;
-        } else if topic0 == GeneratedCommitmentBatch::SIGNATURE_HASH {
-            let event = GeneratedCommitmentBatch::decode_log(&raw_log.inner)?.data;
-            forest.insert_updates(event.commitment_updates())?;
-        }
-    }
-    Ok(())
 }

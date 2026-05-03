@@ -5,12 +5,14 @@ use tracing::info;
 
 use types::Commitment;
 
+use broadcaster_core::tree::{TREE_LEAF_COUNT, normalize_tree_position};
+
 use crate::sync::{SyncProgress, SyncResult};
 use std::collections::{BTreeMap, HashSet};
 use std::num::NonZeroUsize;
 use url::Url;
 
-use crate::tree::{MerkleForest, MerkleTreeUpdate, TREE_LEAF_COUNT, normalize_tree_position};
+use crate::tree::{MerkleForest, MerkleTreeUpdate};
 
 pub use graphql::{DEFAULT_PAGE_SIZE, QuickSyncClient};
 pub use types::{

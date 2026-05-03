@@ -27,6 +27,7 @@ use crate::zkey_cache::load_or_parse_zkey;
 use broadcaster_core::contracts::railgun::{G1Point, G2Point, SnarkProof};
 use broadcaster_core::crypto::ark_utils::prime_field_to_u256;
 use broadcaster_core::transact::{MERKLE_ZERO_VALUE, SnarkJsProof};
+use broadcaster_core::tree::TREE_DEPTH;
 use local_db::{DbConfig, DbStore};
 
 #[derive(Debug, Error)]
@@ -306,7 +307,7 @@ impl PoiWitnessInputs {
             pad_u256_rows(
                 inputs.poi_in_merkle_proof_path_elements.clone(),
                 max_inputs,
-                merkletree::tree::TREE_DEPTH,
+                TREE_DEPTH,
                 MERKLE_ZERO_VALUE,
             )
             .into_iter()

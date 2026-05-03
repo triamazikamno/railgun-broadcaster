@@ -3,13 +3,13 @@ use crate::protocols::codec::ProstLengthDelimitedCodec;
 use async_trait::async_trait;
 use libp2p::request_response;
 
-pub const LIGHTPUSH_V3_CODEC: &str = "/vac/waku/lightpush/3.0.0";
+pub(crate) const LIGHTPUSH_V3_CODEC: &str = "/vac/waku/lightpush/3.0.0";
 
 #[derive(Clone, Default)]
-pub struct LightPushCodec;
+pub(crate) struct LightPushCodec;
 
 #[derive(Clone)]
-pub struct LightPushProtocol;
+pub(crate) struct LightPushProtocol;
 
 impl AsRef<str> for LightPushProtocol {
     fn as_ref(&self) -> &str {
@@ -71,7 +71,7 @@ impl request_response::Codec for LightPushCodec {
 }
 
 #[must_use]
-pub fn behaviour() -> request_response::Behaviour<LightPushCodec> {
+pub(crate) fn behaviour() -> request_response::Behaviour<LightPushCodec> {
     request_response::Behaviour::new(
         [(LightPushProtocol, request_response::ProtocolSupport::Full)],
         request_response::Config::default(),

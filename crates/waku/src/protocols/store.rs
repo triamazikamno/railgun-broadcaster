@@ -3,13 +3,13 @@ use crate::protocols::codec::ProstLengthDelimitedCodec;
 use async_trait::async_trait;
 use libp2p::request_response;
 
-pub const STORE_QUERY_CODEC: &str = "/vac/waku/store-query/3.0.0";
+pub(crate) const STORE_QUERY_CODEC: &str = "/vac/waku/store-query/3.0.0";
 
 #[derive(Clone, Default)]
-pub struct StoreQueryCodec;
+pub(crate) struct StoreQueryCodec;
 
 #[derive(Clone)]
-pub struct StoreQueryProtocol;
+pub(crate) struct StoreQueryProtocol;
 
 impl AsRef<str> for StoreQueryProtocol {
     fn as_ref(&self) -> &str {
@@ -71,7 +71,7 @@ impl request_response::Codec for StoreQueryCodec {
 }
 
 #[must_use]
-pub fn behaviour() -> request_response::Behaviour<StoreQueryCodec> {
+pub(crate) fn behaviour() -> request_response::Behaviour<StoreQueryCodec> {
     request_response::Behaviour::new(
         [(
             StoreQueryProtocol,

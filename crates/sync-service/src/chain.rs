@@ -29,13 +29,14 @@ use merkletree::slow::types::{
     CommitmentBatch, GeneratedCommitmentBatch, Nullified, Nullifiers, Shield, ShieldLegacyPreMar23,
     Transact,
 };
+use merkletree::slow::{CommitmentUpdateError, apply_commitment_updates_from_logs};
 use merkletree::tree::MerkleForest;
-use merkletree::wallet::{
+use railgun_wallet::UtxoSource;
+use railgun_wallet::scan::{
     IndexedLegacyEncryptedCommitmentInput, IndexedLegacyGeneratedCommitmentInput,
     IndexedNullifierInput, IndexedShieldCommitmentInput, IndexedTransactCommitmentInput,
-    WalletScanError, apply_commitment_updates_from_logs, parse_indexed_wallet_delta,
+    WalletScanError, parse_indexed_wallet_delta,
 };
-use railgun_wallet::UtxoSource;
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -133,6 +134,8 @@ pub enum ChainError {
     Snapshot(#[from] PersistError),
     #[error("wallet scan error: {0}")]
     WalletScan(#[from] WalletScanError),
+    #[error("commitment update error: {0}")]
+    CommitmentUpdate(#[from] CommitmentUpdateError),
     #[error("db error: {0}")]
     Db(#[from] local_db::DbError),
     #[error("no healthy rpc available")]
@@ -1350,7 +1353,7 @@ where
 }
 
 fn indexed_source(
-    tx_hash: alloy::primitives::FixedBytes<32>,
+    tx_hash: FixedBytes<32>,
     block_number: u64,
     block_timestamp: u64,
 ) -> UtxoSource {

@@ -1,5 +1,5 @@
 use thiserror::Error;
-use waku::error::WakuError;
+use waku::WakuError;
 
 #[derive(Debug, Error)]
 pub enum ClientError {

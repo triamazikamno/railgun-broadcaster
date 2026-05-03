@@ -1,5 +1,5 @@
 use crate::error::ClientError;
-use crate::msg::Message;
+use crate::msg::{ContentTopic, Message};
 use base64::Engine;
 use base64::engine::general_purpose;
 use lru::LruCache;
@@ -8,10 +8,11 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
-use waku::discovery::DiscoveredPeer;
 use waku::proto::{HashKey, WakuMessage};
-use waku::types::{parse_multiaddr, parse_peer_id};
-use waku::{PeerSnapshot, PeerStats, StoreQueryOptions, WakuConfig, WakuNode};
+use waku::{
+    DiscoveredPeer, PeerSnapshot, PeerStats, StoreQueryOptions, WakuConfig, WakuNode,
+    parse_multiaddr, parse_peer_id,
+};
 
 pub const DEFAULT_CLUSTER_ID: u32 = 5;
 pub const DEFAULT_SHARD_ID: u32 = 1;
@@ -37,23 +38,9 @@ pub struct Client {
 
 impl Client {
     pub fn new(cfg: &config::Waku) -> Result<Self, ClientError> {
-        let mut config = WakuConfig::default();
-        let cluster_id = cfg.cluster_id.unwrap_or(DEFAULT_CLUSTER_ID);
-        let shard_id = cfg.shard_id.unwrap_or(DEFAULT_SHARD_ID);
-        if let Some(dns_enr_trees) = &cfg.dns_enr_trees {
-            config.discovery.enr_trees.clone_from(dns_enr_trees);
-        }
-        if let Some(doh_endpoint) = &cfg.doh_endpoint {
-            config.discovery.doh_endpoint.clone_from(doh_endpoint);
-        }
-        config.cluster_id = cluster_id;
-        config.shard_id = shard_id;
-        if let Some(max_peers) = cfg.max_peers {
-            config.node.connection_cap = max_peers;
-        }
-        if let Some(request_timeout) = cfg.peer_connection_timeout {
-            config.node.request_timeout = request_timeout.into_inner();
-        }
+        let cluster_id = configured_cluster_id(cfg);
+        let shard_id = configured_shard_id(cfg);
+        let config = waku_config_from_config(cfg);
         let waku = Arc::new(WakuNode::spawn(config).map_err(ClientError::SpawnNode)?);
         waku.add_additional_peers(
             cfg.direct_peers
@@ -440,12 +427,42 @@ fn duration_nanos(duration: Duration) -> i64 {
 }
 
 fn is_fee_content_topic(topic: &str) -> bool {
-    topic.starts_with("/railgun/v2/0-") && topic.ends_with("-fees/json")
+    matches!(ContentTopic::parse(topic), ContentTopic::Fees(_))
+}
+
+fn configured_cluster_id(cfg: &config::Waku) -> u32 {
+    cfg.cluster_id.unwrap_or(DEFAULT_CLUSTER_ID)
+}
+
+fn configured_shard_id(cfg: &config::Waku) -> u32 {
+    cfg.shard_id.unwrap_or(DEFAULT_SHARD_ID)
+}
+
+fn waku_config_from_config(cfg: &config::Waku) -> WakuConfig {
+    let mut config = WakuConfig::default();
+    if let Some(dns_enr_trees) = &cfg.dns_enr_trees {
+        config.discovery.enr_trees.clone_from(dns_enr_trees);
+    }
+    if let Some(doh_endpoint) = &cfg.doh_endpoint {
+        config.discovery.doh_endpoint.clone_from(doh_endpoint);
+    }
+    config.cluster_id = configured_cluster_id(cfg);
+    config.shard_id = configured_shard_id(cfg);
+    if let Some(max_peers) = cfg.max_peers {
+        config.node.connection_cap = max_peers;
+    }
+    if let Some(request_timeout) = cfg.peer_connection_timeout {
+        config.node.request_timeout = request_timeout.into_inner();
+    }
+    config
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_fee_content_topic, relay_shard_pubsub_path};
+    use super::{
+        DEFAULT_CLUSTER_ID, DEFAULT_SHARD_ID, is_fee_content_topic, relay_shard_pubsub_path,
+        waku_config_from_config,
+    };
 
     #[test]
     fn relay_shard_pubsub_path_uses_static_sharding_format() {
@@ -462,5 +479,49 @@ mod tests {
             "/railgun/v2/0-1-transact-response/json"
         ));
         assert!(!is_fee_content_topic("/other/v2/0-1-fees/json"));
+    }
+
+    #[test]
+    fn waku_config_from_config_applies_schema_fields() {
+        let cfg = config::Waku {
+            nwaku_url: None,
+            shard_id: Some(3),
+            direct_peers: Vec::new(),
+            dns_enr_trees: Some(vec!["enrtree://example".to_string()]),
+            doh_endpoint: Some("https://example.invalid/dns-query".to_string()),
+            cluster_id: Some(7),
+            max_peers: Some(42),
+            peer_connection_timeout: None,
+        };
+
+        let waku = waku_config_from_config(&cfg);
+
+        assert_eq!(waku.cluster_id, 7);
+        assert_eq!(waku.shard_id, 3);
+        assert_eq!(waku.discovery.enr_trees, vec!["enrtree://example"]);
+        assert_eq!(
+            waku.discovery.doh_endpoint,
+            "https://example.invalid/dns-query"
+        );
+        assert_eq!(waku.node.connection_cap, 42);
+    }
+
+    #[test]
+    fn waku_config_from_config_uses_relay_defaults() {
+        let cfg = config::Waku {
+            nwaku_url: None,
+            shard_id: None,
+            direct_peers: Vec::new(),
+            dns_enr_trees: None,
+            doh_endpoint: None,
+            cluster_id: None,
+            max_peers: None,
+            peer_connection_timeout: None,
+        };
+
+        let waku = waku_config_from_config(&cfg);
+
+        assert_eq!(waku.cluster_id, DEFAULT_CLUSTER_ID);
+        assert_eq!(waku.shard_id, DEFAULT_SHARD_ID);
     }
 }

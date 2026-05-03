@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 alloy = { workspace = true, features = ["serde"] }
+alloy-rpc-types-eth = { workspace = true }
 ark-bn254 = { workspace = true }
 ark-circom = "0.6"
 ark-ed-on-bn254 = { workspace = true }

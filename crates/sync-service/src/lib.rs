@@ -1,10 +1,10 @@
-pub mod chain;
-pub mod manager;
+mod chain;
+mod manager;
 pub mod types;
-pub mod wallet;
+mod wallet;
 
-pub use chain::{ChainHandle, ChainService};
-pub use manager::SyncManager;
+pub use chain::{ChainError, ChainHandle, ChainService};
+pub use manager::{SyncManager, SyncManagerError};
 pub use types::{
     ChainConfig, ChainConfigDefaults, ChainKey, DEFAULT_INDEXED_WALLET_BLOCK_RANGE,
     SyncProgressSender, SyncProgressStage, SyncProgressUpdate, WalletCacheStore, WalletConfig,

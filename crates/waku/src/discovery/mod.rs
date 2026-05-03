@@ -1,6 +1,6 @@
 pub(crate) mod enr;
 mod enr_tree;
-pub mod error;
+mod error;
 mod txt;
 
 pub use error::{DiscoveryError, DnsResolveError, EnrDecodeError, EnrTreeError};

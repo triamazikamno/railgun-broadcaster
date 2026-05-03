@@ -44,10 +44,9 @@ use poi::error::PoiError;
 use railgun_wallet::wallet_cache::wallet_cache_key;
 use railgun_wallet::{ProverService, Utxo, WalletKeys};
 use serde::{Deserialize, Serialize};
-use sync_service::manager::SyncManagerError;
 use sync_service::{
     ChainConfig, ChainConfigDefaults, ChainKey, DEFAULT_INDEXED_WALLET_BLOCK_RANGE, SyncManager,
-    WalletConfig,
+    SyncManagerError, WalletConfig,
 };
 use waku_relay::msg::ContentTopic;
 
@@ -635,12 +634,9 @@ impl BroadcasterService {
                             if is_valid {
                                 match serde_json::to_string(&payload) {
                                     Ok(payload) => {
-                                        if let Err(error) = client
-                                            .publish(
-                                                &format!("/railgun/v2/0-{chain_id}-fees/json"),
-                                                payload.as_bytes(),
-                                            )
-                                            .await
+                                        let content_topic = ContentTopic::fees_topic(chain_id);
+                                        if let Err(error) =
+                                            client.publish(&content_topic, payload.as_bytes()).await
                                         {
                                             warn!(%error, "publish fees failed");
                                         }
@@ -713,6 +709,7 @@ impl BroadcasterService {
         let evm_wallets = self.evm_wallets.clone();
         let broadcaster = self.broadcaster.clone();
         let client = self.client.clone();
+        let transact_response_topic = ContentTopic::transact_response_topic(chain_id);
 
         tokio::spawn(async move {
             loop {
@@ -812,13 +809,10 @@ impl BroadcasterService {
                                 .inspect_err(
                                     |error| error!(%error, "build error transact response failed"),
                                  ) && let Err(error) = client
-                                 .publish(
-                                     &format!("/railgun/v2/0-{chain_id}-transact-response/json"),
-                                     &transact_response,
-                                 )
-                                .await
-                            {
-                                error!(%error, "publish error transact response failed");
+                                 .publish(&transact_response_topic, &transact_response)
+                                 .await
+                             {
+                                 error!(%error, "publish error transact response failed");
                             }
                             continue;
                         }
@@ -859,15 +853,12 @@ impl BroadcasterService {
                                 &decrypted_payload.shared_key,
                                 tx_hash,
                             )
-                                 .inspect_err(|error| error!(%error, "build transact response failed"))
-                                 && let Err(error) = client
-                                 .publish(
-                                     &format!("/railgun/v2/0-{chain_id}-transact-response/json"),
-                                     &transact_response,
-                                 )
-                                .await
-                            {
-                                error!(%error, "publish transact response failed");
+                                  .inspect_err(|error| error!(%error, "build transact response failed"))
+                                  && let Err(error) = client
+                                  .publish(&transact_response_topic, &transact_response)
+                                 .await
+                             {
+                                 error!(%error, "publish transact response failed");
                             }
                         }
                     }
@@ -1265,11 +1256,11 @@ impl BroadcasterManager {
 
         let transact_content_topics: Vec<String> = chain_ids
             .iter()
-            .map(|chain_id| format!("/railgun/v2/0-{chain_id}-transact/json"))
+            .map(|chain_id| ContentTopic::transact_topic(*chain_id))
             .collect();
         let fee_content_topics: Vec<String> = chain_ids
             .iter()
-            .map(|chain_id| format!("/railgun/v2/0-{chain_id}-fees/json"))
+            .map(|chain_id| ContentTopic::fees_topic(*chain_id))
             .collect();
 
         let mut transact_rx = self.waku.subscribe(transact_content_topics).await?;
@@ -1290,7 +1281,7 @@ impl BroadcasterManager {
 
             let topic = ContentTopic::from(msg.content_topic.clone());
             match topic {
-                ContentTopic::Pong | ContentTopic::TransactResponse() | ContentTopic::Noop => {}
+                ContentTopic::Pong | ContentTopic::TransactResponse | ContentTopic::Noop => {}
                 ContentTopic::Fees(chain_id) => {
                     match serde_json::from_slice::<fees::Payload>(&msg.payload) {
                         Ok(payload) => {

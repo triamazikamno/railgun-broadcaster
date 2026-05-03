@@ -3,13 +3,13 @@ use crate::protocols::codec::ProstLengthDelimitedCodec;
 use async_trait::async_trait;
 use libp2p::request_response;
 
-pub const PEER_EXCHANGE_CODEC: &str = "/vac/waku/peer-exchange/2.0.0-alpha1";
+pub(crate) const PEER_EXCHANGE_CODEC: &str = "/vac/waku/peer-exchange/2.0.0-alpha1";
 
 #[derive(Clone, Default)]
-pub struct PeerExchangeCodec;
+pub(crate) struct PeerExchangeCodec;
 
 #[derive(Clone)]
-pub struct PeerExchangeProtocol;
+pub(crate) struct PeerExchangeProtocol;
 
 impl AsRef<str> for PeerExchangeProtocol {
     fn as_ref(&self) -> &str {
@@ -71,7 +71,7 @@ impl request_response::Codec for PeerExchangeCodec {
 }
 
 #[must_use]
-pub fn behaviour() -> request_response::Behaviour<PeerExchangeCodec> {
+pub(crate) fn behaviour() -> request_response::Behaviour<PeerExchangeCodec> {
     request_response::Behaviour::new(
         [(
             PeerExchangeProtocol,

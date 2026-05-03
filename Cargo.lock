@@ -9263,6 +9263,7 @@ name = "railgun-wallet"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "alloy-rpc-types-eth",
  "ark-bn254 0.6.0",
  "ark-circom",
  "ark-ed-on-bn254",

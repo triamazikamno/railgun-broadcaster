@@ -51,6 +51,7 @@ use sync_service::{
 pub use sync_service::{SyncProgressStage, SyncProgressUpdate};
 use tokio::sync::watch;
 use waku_relay::client::Client as WakuClient;
+use waku_relay::msg::ContentTopic;
 use zeroize::{Zeroize, Zeroizing};
 
 pub use waku_relay::client::Client as PublicBroadcasterWakuClient;
@@ -1404,12 +1405,12 @@ const fn unshield_approximate_shape(
 
 #[must_use]
 pub fn transact_topic(chain_id: u64) -> String {
-    format!("/railgun/v2/0-{chain_id}-transact/json")
+    ContentTopic::transact_topic(chain_id)
 }
 
 #[must_use]
 pub fn transact_response_topic(chain_id: u64) -> String {
-    format!("/railgun/v2/0-{chain_id}-transact-response/json")
+    ContentTopic::transact_response_topic(chain_id)
 }
 
 pub fn decode_public_broadcaster_response(

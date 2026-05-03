@@ -16,6 +16,7 @@ use crate::crypto::aes_gcm::{
 use crate::crypto::poseidon::poseidon;
 use crate::crypto::shared_key::{ed25519_private_scalar_bytes, shared_symmetric_key};
 use crate::notes::note_public_key;
+use crate::tree::{TREE_DEPTH, TREE_LEAF_COUNT_U256};
 
 #[derive(Debug, Error)]
 pub enum TransactError {
@@ -265,7 +266,9 @@ pub const MERKLE_ZERO_VALUE: U256 =
     uint!(2051258411002736885948763699317990061539314419500486054347250703186609807356_U256);
 
 pub const DEFAULT_TXID_VERSION: &str = "V2_PoseidonMerkle";
-pub const TXID_TREE_DEPTH: usize = 16;
+pub const RAILGUN_TXID_PARTS_WIDTH: usize = 13;
+pub const PRE_TRANSACTION_POI_TREE: U256 = uint!(199_999_U256);
+pub const PRE_TRANSACTION_POI_POSITION: U256 = uint!(199_999_U256);
 
 #[must_use]
 pub fn pad_with_merkle_zero(mut v: Vec<U256>, target: usize) -> Vec<U256> {
@@ -289,14 +292,25 @@ fn compute_railgun_txid_poseidon(tx0: &Transaction) -> U256 {
         .map(|b| U256::from_be_bytes(b.0))
         .collect();
 
-    let nullifiers_hash = poseidon(pad_with_merkle_zero(nullifiers, 13));
-    let commitments_hash = poseidon(pad_with_merkle_zero(commitments, 13));
+    compute_railgun_txid_parts(&nullifiers, &commitments, tx0.boundParams.hash())
+}
 
-    poseidon(vec![
-        nullifiers_hash,
-        commitments_hash,
-        tx0.boundParams.hash(),
-    ])
+#[must_use]
+pub fn compute_railgun_txid_parts(
+    nullifiers: &[U256],
+    commitments: &[U256],
+    bound_params_hash: U256,
+) -> U256 {
+    let nullifiers_hash = poseidon(pad_with_merkle_zero(
+        nullifiers.to_vec(),
+        RAILGUN_TXID_PARTS_WIDTH,
+    ));
+    let commitments_hash = poseidon(pad_with_merkle_zero(
+        commitments.to_vec(),
+        RAILGUN_TXID_PARTS_WIDTH,
+    ));
+
+    poseidon(vec![nullifiers_hash, commitments_hash, bound_params_hash])
 }
 
 #[must_use]
@@ -325,18 +339,35 @@ pub fn compute_railgun_txid(
 
 #[must_use]
 pub fn railgun_txid_leaf_hash(railgun_txid: U256, utxo_tree_in: u64) -> U256 {
-    const GLOBAL_TREE_POSITION_TREE: U256 = uint!(199_999_U256);
-    const GLOBAL_TREE_POSITION_POS: U256 = uint!(199_999_U256);
-    const TREE_MAX_ITEMS: U256 = uint!(65_536_U256);
+    railgun_txid_leaf_hash_with_output_start(
+        railgun_txid,
+        utxo_tree_in,
+        pre_transaction_output_global_position(),
+    )
+}
 
-    let gpos = GLOBAL_TREE_POSITION_TREE * TREE_MAX_ITEMS + GLOBAL_TREE_POSITION_POS;
-    poseidon(vec![railgun_txid, U256::from(utxo_tree_in), gpos])
+#[must_use]
+pub fn railgun_txid_leaf_hash_with_output_start(
+    railgun_txid: U256,
+    utxo_tree_in: u64,
+    output_start_global: U256,
+) -> U256 {
+    poseidon(vec![
+        railgun_txid,
+        U256::from(utxo_tree_in),
+        output_start_global,
+    ])
+}
+
+#[must_use]
+pub fn pre_transaction_output_global_position() -> U256 {
+    PRE_TRANSACTION_POI_TREE * TREE_LEAF_COUNT_U256 + PRE_TRANSACTION_POI_POSITION
 }
 
 #[must_use]
 pub fn dummy_txid_root(leaf: U256) -> U256 {
     let mut acc = leaf;
-    for _ in 0..TXID_TREE_DEPTH {
+    for _ in 0..TREE_DEPTH {
         acc = poseidon(vec![acc, U256::ZERO]);
     }
     acc

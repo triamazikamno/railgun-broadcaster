@@ -9,8 +9,7 @@ use axum::{
 use config::AdminConfig;
 use eyre::{Result, WrapErr};
 use serde::{Deserialize, Serialize};
-use sync_service::SyncManager;
-use sync_service::manager::SyncManagerError;
+use sync_service::{SyncManager, SyncManagerError};
 use tokio::net::TcpListener;
 use tracing::info;
 

@@ -3,11 +3,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Identifier for a single in-flight operation.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
-pub struct OpId(u64);
+pub(crate) struct OpId(u64);
 
 impl OpId {
     #[must_use]
-    pub fn next(counter: &AtomicU64) -> Self {
+    pub(crate) fn next(counter: &AtomicU64) -> Self {
         Self(counter.fetch_add(1, Ordering::Relaxed))
     }
 }

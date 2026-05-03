@@ -7,6 +7,7 @@ use waku::PeerSnapshot;
 use waku::proto::WakuMessage;
 use waku_relay::client::Client;
 pub use waku_relay::client::{DEFAULT_CLUSTER_ID, DEFAULT_SHARD_ID};
+use waku_relay::msg::ContentTopic;
 
 use broadcaster_monitor::{EventTx, FeeRow, MonitorEvent, PeerRow, PeerSummary, Shared};
 
@@ -69,7 +70,7 @@ pub async fn spawn_workers(
     let chain_ids = opts.chain_ids;
     let content_topics: Vec<String> = chain_ids
         .iter()
-        .map(|chain_id| format!("/railgun/v2/0-{chain_id}-fees/json"))
+        .map(|chain_id| ContentTopic::fees_topic(*chain_id))
         .collect();
 
     tracing::info!(
@@ -182,9 +183,10 @@ pub fn handle_fees_message(
 /// Returns `None` for non-fees topics.
 #[must_use]
 pub fn extract_fees_chain_id(topic: &str) -> Option<u64> {
-    let rest = topic.strip_prefix("/railgun/v2/0-")?;
-    let chain = rest.strip_suffix("-fees/json")?;
-    chain.parse::<u64>().ok()
+    match ContentTopic::parse(topic) {
+        ContentTopic::Fees(chain_id) => Some(chain_id),
+        _ => None,
+    }
 }
 
 async fn run_peer_poll_loop(waku: Arc<Client>, shared: Shared, events: EventTx) {

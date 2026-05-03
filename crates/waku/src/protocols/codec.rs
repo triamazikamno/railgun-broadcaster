@@ -3,7 +3,7 @@ use prost::Message;
 use std::io;
 use std::marker::PhantomData;
 
-pub struct ProstLengthDelimitedCodec<Req, Resp> {
+pub(crate) struct ProstLengthDelimitedCodec<Req, Resp> {
     _marker: PhantomData<(Req, Resp)>,
 }
 
@@ -54,7 +54,7 @@ where
     ///
     /// # Errors
     /// Returns an `io::Error` on EOF, framing errors, or protobuf decode errors.
-    pub async fn read_request<T>(io: &mut T) -> io::Result<Req>
+    pub(crate) async fn read_request<T>(io: &mut T) -> io::Result<Req>
     where
         T: AsyncRead + Unpin,
     {
@@ -66,7 +66,7 @@ where
     ///
     /// # Errors
     /// Returns an `io::Error` on EOF, framing errors, or protobuf decode errors.
-    pub async fn read_response<T>(io: &mut T) -> io::Result<Resp>
+    pub(crate) async fn read_response<T>(io: &mut T) -> io::Result<Resp>
     where
         T: AsyncRead + Unpin,
     {
@@ -78,7 +78,7 @@ where
     ///
     /// # Errors
     /// Returns an `io::Error` on write errors.
-    pub async fn write_request<T>(io: &mut T, req: Req) -> io::Result<()>
+    pub(crate) async fn write_request<T>(io: &mut T, req: Req) -> io::Result<()>
     where
         T: AsyncWrite + Unpin,
     {
@@ -90,7 +90,7 @@ where
     ///
     /// # Errors
     /// Returns an `io::Error` on write errors.
-    pub async fn write_response<T>(io: &mut T, resp: Resp) -> io::Result<()>
+    pub(crate) async fn write_response<T>(io: &mut T, resp: Resp) -> io::Result<()>
     where
         T: AsyncWrite + Unpin,
     {

@@ -17,9 +17,11 @@ use broadcaster_core::contracts::railgun::{
 use broadcaster_core::crypto::poseidon::poseidon;
 use broadcaster_core::crypto::railgun::{AddressData, ViewingKeyData};
 use broadcaster_core::transact::{
-    DEFAULT_TXID_VERSION, MERKLE_ZERO_VALUE, PreTxPoi, SnarkJsProof, dummy_txid_root,
-    pad_with_merkle_zero, railgun_txid_leaf_hash,
+    DEFAULT_TXID_VERSION, MERKLE_ZERO_VALUE, PreTxPoi, SnarkJsProof, compute_railgun_txid_parts,
+    dummy_txid_root, pre_transaction_output_global_position, railgun_txid_leaf_hash,
+    railgun_txid_leaf_hash_with_output_start,
 };
+use broadcaster_core::tree::TREE_DEPTH;
 use broadcaster_core::utxo::Utxo;
 use merkletree::tree::{MerkleForest, MerkleProof};
 use poi::error::PoiRpcError;
@@ -318,7 +320,7 @@ impl PrivateInputs {
         signer: &impl RailgunSpendSigner,
     ) -> Self {
         let token_address = U256::from_be_slice(token_address.as_slice());
-        let mut path_elements = Vec::with_capacity(inputs.len() * merkletree::tree::TREE_DEPTH);
+        let mut path_elements = Vec::with_capacity(inputs.len() * TREE_DEPTH);
         let mut random_in = Vec::with_capacity(inputs.len());
         let mut value_in = Vec::with_capacity(inputs.len());
         let mut leaves_indices = Vec::with_capacity(inputs.len());
@@ -461,10 +463,10 @@ impl PreTransactionPoiChunkInputs {
                     actual: leaf,
                 });
             }
-            if proof.elements.len() != merkletree::tree::TREE_DEPTH {
+            if proof.elements.len() != TREE_DEPTH {
                 return Err(PreTransactionPoiError::MerkleProofPathLengthMismatch {
                     index,
-                    expected: merkletree::tree::TREE_DEPTH,
+                    expected: TREE_DEPTH,
                     got: proof.elements.len(),
                 });
             }
@@ -716,7 +718,7 @@ pub fn pre_transaction_poi_inputs_from_chunk(
             utxo_batch_global_start_position_out: pre_transaction_output_global_position(),
             railgun_txid_if_has_unshield: railgun_txid_if_has_unshield_value,
             railgun_txid_merkle_proof_indices: U256::ZERO,
-            railgun_txid_merkle_proof_path_elements: vec![U256::ZERO; merkletree::tree::TREE_DEPTH],
+            railgun_txid_merkle_proof_path_elements: vec![U256::ZERO; TREE_DEPTH],
         },
     })
 }
@@ -731,9 +733,9 @@ pub fn post_transaction_poi_inputs_from_chunk(
             got: chunk.inputs.len(),
         });
     }
-    if txid_data.txid_merkle_proof_path_elements.len() != merkletree::tree::TREE_DEPTH {
+    if txid_data.txid_merkle_proof_path_elements.len() != TREE_DEPTH {
         return Err(PreTransactionPoiError::TxidMerkleProofPathLengthMismatch {
-            expected: merkletree::tree::TREE_DEPTH,
+            expected: TREE_DEPTH,
             got: txid_data.txid_merkle_proof_path_elements.len(),
         });
     }
@@ -762,11 +764,11 @@ pub fn post_transaction_poi_inputs_from_chunk(
     }
 
     let railgun_txid = compute_railgun_txid_from_public_inputs(&chunk.public_inputs);
-    let expected_txid_leaf = poseidon(vec![
+    let expected_txid_leaf = railgun_txid_leaf_hash_with_output_start(
         railgun_txid,
-        U256::from(chunk.tree_number),
+        u64::from(chunk.tree_number),
         txid_data.utxo_batch_global_start_position_out,
-    ]);
+    );
     let expected_txid_leaf_hash = FixedBytes::from(expected_txid_leaf.to_be_bytes::<32>());
     if expected_txid_leaf_hash != txid_data.txid_leaf_hash {
         return Err(PreTransactionPoiError::TxidLeafHashMismatch {
@@ -1012,23 +1014,11 @@ pub fn insert_pre_transaction_poi(
 }
 
 fn compute_railgun_txid_from_public_inputs(public_inputs: &PublicInputs) -> U256 {
-    let nullifiers_hash = poseidon(pad_with_merkle_zero(public_inputs.nullifiers.clone(), 13));
-    let commitments_hash = poseidon(pad_with_merkle_zero(
-        public_inputs.commitments_out.clone(),
-        13,
-    ));
-    poseidon(vec![
-        nullifiers_hash,
-        commitments_hash,
+    compute_railgun_txid_parts(
+        &public_inputs.nullifiers,
+        &public_inputs.commitments_out,
         public_inputs.bound_params_hash,
-    ])
-}
-
-fn pre_transaction_output_global_position() -> U256 {
-    const PRE_TRANSACTION_POI_TREE: U256 = uint!(199_999_U256);
-    const PRE_TRANSACTION_POI_POSITION: U256 = uint!(199_999_U256);
-
-    PRE_TRANSACTION_POI_TREE * merkletree::tree::TREE_LEAF_COUNT_U256 + PRE_TRANSACTION_POI_POSITION
+    )
 }
 
 fn validate_public_signal(
@@ -2897,8 +2887,8 @@ mod tests {
             root: U256::ZERO,
             leaf,
             leaf_index,
-            path_elements: [U256::ZERO; merkletree::tree::TREE_DEPTH],
-            path_indices: [0u8; merkletree::tree::TREE_DEPTH],
+            path_elements: [U256::ZERO; TREE_DEPTH],
+            path_indices: [0u8; TREE_DEPTH],
         }
     }
 
@@ -2956,7 +2946,7 @@ mod tests {
                 .map(|input| U256::from_be_slice(&input.utxo.note.random))
                 .collect(),
             value_in: inputs.iter().map(|input| input.utxo.note.value).collect(),
-            path_elements: vec![U256::ZERO; input_count * merkletree::tree::TREE_DEPTH],
+            path_elements: vec![U256::ZERO; input_count * TREE_DEPTH],
             leaves_indices: inputs
                 .iter()
                 .map(|input| U256::from(input.utxo.position))
@@ -2985,7 +2975,7 @@ mod tests {
             .enumerate()
             .map(|(index, blinded_commitment)| PoiMerkleProof {
                 leaf: hex::encode_prefixed(blinded_commitment),
-                elements: (0..merkletree::tree::TREE_DEPTH)
+                elements: (0..TREE_DEPTH)
                     .map(|level| format!("0x{:064x}", index + level + 1))
                     .collect(),
                 indices: format!("0x{index:064x}"),
@@ -3020,7 +3010,7 @@ mod tests {
             txid_merkleroot: FixedBytes::from([0x77; 32]),
             txid_merkleroot_index: 123,
             txid_merkle_proof_indices: uint!(9_U256),
-            txid_merkle_proof_path_elements: vec![uint!(8_U256); merkletree::tree::TREE_DEPTH],
+            txid_merkle_proof_path_elements: vec![uint!(8_U256); TREE_DEPTH],
             utxo_batch_global_start_position_out,
         }
     }

@@ -1,13 +1,10 @@
 use alloy::primitives::{Address, FixedBytes, U256};
-use alloy::uint;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::crypto::poseidon::poseidon;
 use crate::notes::Note;
-
-pub const TREE_LEAF_COUNT: u64 = 65_536;
-const TREE_LEAF_COUNT_U256: U256 = uint!(65_536_U256);
+use crate::tree::TREE_LEAF_COUNT_U256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UtxoSource {
@@ -143,8 +140,9 @@ impl WalletUtxo {
 
 #[cfg(test)]
 mod tests {
-    use super::{TREE_LEAF_COUNT_U256, derive_blinded_commitment};
+    use super::derive_blinded_commitment;
     use crate::crypto::poseidon::poseidon;
+    use crate::tree::TREE_LEAF_COUNT_U256;
     use alloy::primitives::{FixedBytes, U256};
 
     #[test]
