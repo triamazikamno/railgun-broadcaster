@@ -2384,6 +2384,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ui",
+ "wallet-ops",
 ]
 
 [[package]]
@@ -12590,6 +12591,7 @@ dependencies = [
  "local-db",
  "merkletree",
  "poi",
+ "railgun-ui",
  "railgun-wallet",
  "rand 0.10.1",
  "reqwest",

@@ -34,6 +34,7 @@ broadcaster-monitor-gpui = { path = "../../crates/broadcaster-monitor-gpui" }
 broadcaster-monitor-waku = { path = "../../crates/broadcaster-monitor-waku" }
 railgun-ui = { path = "../../crates/railgun-ui" }
 ui = { path = "../../crates/ui" }
+wallet-ops = { path = "../../crates/wallet-ops" }
 
 [lints]
 workspace = true

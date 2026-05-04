@@ -21,69 +21,180 @@ static TOKEN_ICON_DIR: LazyLock<PathBuf> =
 pub struct TokenInfo {
     pub symbol: &'static str,
     pub decimals: u8,
+    pub anchor_sources: &'static [TokenAnchorSource],
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct TokenAnchorInfo {
+    pub chain_id: u64,
+    pub token: Address,
+    pub anchor_sources: &'static [TokenAnchorSource],
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TokenAnchorSource {
+    Fixed {
+        token_fee_per_unit_gas: U256,
+    },
+    ChainlinkOracle {
+        addr: Address,
+        token_decimals: u8,
+        oracle_decimals: u8,
+        is_inversed: bool,
+    },
+    Product {
+        sources: &'static [Self],
+        scale_decimals: u8,
+    },
+}
+
+pub const WRAPPED_NATIVE_FEE_RATE: U256 = uint!(1_000_000_000_000_000_000_U256);
+
+const NO_ANCHORS: &[TokenAnchorSource] = &[];
+const WRAPPED_NATIVE_ANCHOR: &[TokenAnchorSource] = &[TokenAnchorSource::Fixed {
+    token_fee_per_unit_gas: WRAPPED_NATIVE_FEE_RATE,
+}];
+const ETH_USD_6_ANCHOR: &[TokenAnchorSource] = &[TokenAnchorSource::ChainlinkOracle {
+    addr: address!("0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419"),
+    token_decimals: 6,
+    oracle_decimals: 8,
+    is_inversed: false,
+}];
+const ETH_USD_18_ANCHOR: &[TokenAnchorSource] = &[TokenAnchorSource::ChainlinkOracle {
+    addr: address!("0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419"),
+    token_decimals: 18,
+    oracle_decimals: 8,
+    is_inversed: false,
+}];
+const BTC_ETH_8_ANCHOR: &[TokenAnchorSource] = &[TokenAnchorSource::ChainlinkOracle {
+    addr: address!("0xdeb288F737066589598e9214E782fa5A8eD689e8"),
+    token_decimals: 8,
+    oracle_decimals: 18,
+    is_inversed: true,
+}];
+const BNB_USD_18_ANCHOR: &[TokenAnchorSource] = &[TokenAnchorSource::ChainlinkOracle {
+    addr: address!("0x0567F2323251f0Aab15c8dFb1967E4e8A7D42aeE"),
+    token_decimals: 18,
+    oracle_decimals: 8,
+    is_inversed: false,
+}];
+const MATIC_USD_6_ANCHOR: &[TokenAnchorSource] = &[TokenAnchorSource::ChainlinkOracle {
+    addr: address!("0xAB594600376Ec9fD91F8e885dADF0CE036862dE0"),
+    token_decimals: 6,
+    oracle_decimals: 8,
+    is_inversed: false,
+}];
+const MATIC_USD_18_ANCHOR: &[TokenAnchorSource] = &[TokenAnchorSource::ChainlinkOracle {
+    addr: address!("0xAB594600376Ec9fD91F8e885dADF0CE036862dE0"),
+    token_decimals: 18,
+    oracle_decimals: 8,
+    is_inversed: false,
+}];
+const ARB_ETH_USD_6_ANCHOR: &[TokenAnchorSource] = &[TokenAnchorSource::ChainlinkOracle {
+    addr: address!("0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612"),
+    token_decimals: 6,
+    oracle_decimals: 8,
+    is_inversed: false,
+}];
+const ARB_ETH_USD_18_SOURCE: TokenAnchorSource = TokenAnchorSource::ChainlinkOracle {
+    addr: address!("0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612"),
+    token_decimals: 18,
+    oracle_decimals: 8,
+    is_inversed: false,
+};
+const ARB_ETH_USD_18_ANCHOR: &[TokenAnchorSource] = &[ARB_ETH_USD_18_SOURCE];
+const ARB_BTC_ETH_8_ANCHOR: &[TokenAnchorSource] = &[TokenAnchorSource::ChainlinkOracle {
+    addr: address!("0xc5a90A6d7e4Af242dA238FFe279e9f2BA0c64B2e"),
+    token_decimals: 8,
+    oracle_decimals: 18,
+    is_inversed: true,
+}];
+const ARB_USD_INVERSE_18_SOURCE: TokenAnchorSource = TokenAnchorSource::ChainlinkOracle {
+    addr: address!("0xB72359B2dc04Ff363e094648DF78247c98297c20"),
+    token_decimals: 18,
+    oracle_decimals: 8,
+    is_inversed: true,
+};
+const ARB_PER_ETH_18_PRODUCT_SOURCES: &[TokenAnchorSource] =
+    &[ARB_ETH_USD_18_SOURCE, ARB_USD_INVERSE_18_SOURCE];
+const ARB_PER_ETH_18_ANCHOR: &[TokenAnchorSource] = &[TokenAnchorSource::Product {
+    sources: ARB_PER_ETH_18_PRODUCT_SOURCES,
+    scale_decimals: 18,
+}];
+
 #[rustfmt::skip]
-const TOKENS: &[(u64, Address, &str, u8)] = &[
+const TOKENS: &[(u64, Address, &str, u8, &[TokenAnchorSource])] = &[
     // Ethereum (1)
-    (1, address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"), "WETH", 18),
-    (1, address!("0xdAC17F958D2ee523a2206206994597C13D831ec7"), "USDT", 6),
-    (1, address!("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"), "USDC", 6),
-    (1, address!("0x6b175474e89094c44da98b954eedeac495271d0f"), "DAI", 18),
-    (1, address!("0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"), "WBTC", 8),
-    (1, address!("0x1aBaEA1f7C830bD89Acc67eC4af516284b1bC33c"), "EURC", 6),
-    (1, address!("0x6f40d4a6237c257fff2db00fa0510deeecd303eb"), "FLUID", 18),
-    (1, address!("0xe76C6c83af64e4C60245D8C7dE953DF673a7A33D"), "RAIL", 18),
-    (1, address!("0x03ab458634910aad20ef5f1c8ee96f1d6ac54919"), "RAI", 18),
-    (1, address!("0x853d955aCEf822Db058eb8505911ED77F175b99e"), "FRAX", 18),
-    (1, address!("0x956f47f50a910163d8bf957cf5846d573e7f87ca"), "FEI", 18),
-    (1, address!("0xeb4c2781e4eba804ce9a9803c67d0893436bb27d"), "renBTC", 8),
-    (1, address!("0x085780639CC2cACd35E474e71f4d000e2405d8f6"), "fxUSD", 18),
-    (1, address!("0x4c9EDD5852cd905f086C759E8383e09bff1E68B3"), "USDe", 18),
-    (1, address!("0x4f8e5DE400DE08B164E7421B3EE387f461beCD1A"), "USDD", 18),
-    (1, address!("0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d"), "USD1", 18),
-    (1, address!("0xdC035D45d973E3EC169d2276DDab16f1e407384F"), "USDS", 18),
-    (1, address!("0xe343167631d89B6Ffc58B88d6b7fB0228795491D"), "USDG", 6),
-    (1, address!("0xFa2B947eEc368f42195f24F36d2aF29f7c24CeC2"), "USDF", 18),
-    (1, address!("0x514910771AF9Ca656af840dff83E8264EcF986CA"), "LINK", 18),
-    (1, address!("0x6c3ea9036406852006290770BEdFcAbA0e23A0e8"), "PYUSD", 6),
+    (1, address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"), "WETH", 18, WRAPPED_NATIVE_ANCHOR),
+    (1, address!("0xdAC17F958D2ee523a2206206994597C13D831ec7"), "USDT", 6, ETH_USD_6_ANCHOR),
+    (1, address!("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"), "USDC", 6, ETH_USD_6_ANCHOR),
+    (1, address!("0x6b175474e89094c44da98b954eedeac495271d0f"), "DAI", 18, ETH_USD_18_ANCHOR),
+    (1, address!("0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"), "WBTC", 8, BTC_ETH_8_ANCHOR),
+    (1, address!("0x1aBaEA1f7C830bD89Acc67eC4af516284b1bC33c"), "EURC", 6, NO_ANCHORS),
+    (1, address!("0x6f40d4a6237c257fff2db00fa0510deeecd303eb"), "FLUID", 18, NO_ANCHORS),
+    (1, address!("0xe76C6c83af64e4C60245D8C7dE953DF673a7A33D"), "RAIL", 18, NO_ANCHORS),
+    (1, address!("0x03ab458634910aad20ef5f1c8ee96f1d6ac54919"), "RAI", 18, NO_ANCHORS),
+    (1, address!("0x853d955aCEf822Db058eb8505911ED77F175b99e"), "FRAX", 18, ETH_USD_18_ANCHOR),
+    (1, address!("0x956f47f50a910163d8bf957cf5846d573e7f87ca"), "FEI", 18, ETH_USD_18_ANCHOR),
+    (1, address!("0xeb4c2781e4eba804ce9a9803c67d0893436bb27d"), "renBTC", 8, BTC_ETH_8_ANCHOR),
+    (1, address!("0x085780639CC2cACd35E474e71f4d000e2405d8f6"), "fxUSD", 18, ETH_USD_18_ANCHOR),
+    (1, address!("0x4c9EDD5852cd905f086C759E8383e09bff1E68B3"), "USDe", 18, ETH_USD_18_ANCHOR),
+    (1, address!("0x4f8e5DE400DE08B164E7421B3EE387f461beCD1A"), "USDD", 18, ETH_USD_18_ANCHOR),
+    (1, address!("0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d"), "USD1", 18, ETH_USD_18_ANCHOR),
+    (1, address!("0xdC035D45d973E3EC169d2276DDab16f1e407384F"), "USDS", 18, ETH_USD_18_ANCHOR),
+    (1, address!("0xe343167631d89B6Ffc58B88d6b7fB0228795491D"), "USDG", 6, ETH_USD_6_ANCHOR),
+    (1, address!("0xFa2B947eEc368f42195f24F36d2aF29f7c24CeC2"), "USDF", 18, ETH_USD_18_ANCHOR),
+    (1, address!("0x514910771AF9Ca656af840dff83E8264EcF986CA"), "LINK", 18, NO_ANCHORS),
+    (1, address!("0x6c3ea9036406852006290770BEdFcAbA0e23A0e8"), "PYUSD", 6, ETH_USD_6_ANCHOR),
     // BSC (56)
-    (56, address!("0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"), "BNB", 18),
-    (56, address!("0x55d398326f99059ff775485246999027b3197955"), "BSC-USD", 18),
-    (56, address!("0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d"), "USDC", 18),
-    (56, address!("0xe9e7cea3dedca5984780bafc599bd69add087d56"), "BUSD", 18),
-    (56, address!("0x1af3f329e8be154074d8769d1ffa4ee058b1dbc3"), "DAI", 18),
-    (56, address!("0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82"), "CAKE", 18),
-    (56, address!("0x2170Ed0880ac9A755fd29B2688956BD959F933F8"), "ETH", 18),
+    (56, address!("0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"), "BNB", 18, WRAPPED_NATIVE_ANCHOR),
+    (56, address!("0x55d398326f99059ff775485246999027b3197955"), "BSC-USD", 18, BNB_USD_18_ANCHOR),
+    (56, address!("0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d"), "USDC", 18, BNB_USD_18_ANCHOR),
+    (56, address!("0xe9e7cea3dedca5984780bafc599bd69add087d56"), "BUSD", 18, BNB_USD_18_ANCHOR),
+    (56, address!("0x1af3f329e8be154074d8769d1ffa4ee058b1dbc3"), "DAI", 18, BNB_USD_18_ANCHOR),
+    (56, address!("0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82"), "CAKE", 18, NO_ANCHORS),
+    (56, address!("0x2170Ed0880ac9A755fd29B2688956BD959F933F8"), "ETH", 18, NO_ANCHORS),
     // Polygon (137)
-    (137, address!("0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270"), "WMATIC", 18),
-    (137, address!("0xc2132d05d31c914a87c6611c10748aeb04b58e8f"), "USDT", 6),
-    (137, address!("0x2791bca1f2de4661ed88a30c99a7a9449aa84174"), "USDC.e", 6),
-    (137, address!("0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"), "USDC", 6),
-    (137, address!("0x8f3cf7ad23cd3cadbd9735aff958023239c6a063"), "DAI", 18),
-    (137, address!("0x1BFD67037B42Cf73acF2047067bd4F2C47D9BfD6"), "WBTC", 8),
-    (137, address!("0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619"), "WETH", 18),
+    (137, address!("0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270"), "WMATIC", 18, WRAPPED_NATIVE_ANCHOR),
+    (137, address!("0xc2132d05d31c914a87c6611c10748aeb04b58e8f"), "USDT", 6, MATIC_USD_6_ANCHOR),
+    (137, address!("0x2791bca1f2de4661ed88a30c99a7a9449aa84174"), "USDC.e", 6, MATIC_USD_6_ANCHOR),
+    (137, address!("0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"), "USDC", 6, MATIC_USD_6_ANCHOR),
+    (137, address!("0x8f3cf7ad23cd3cadbd9735aff958023239c6a063"), "DAI", 18, MATIC_USD_18_ANCHOR),
+    (137, address!("0x1BFD67037B42Cf73acF2047067bd4F2C47D9BfD6"), "WBTC", 8, NO_ANCHORS),
+    (137, address!("0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619"), "WETH", 18, NO_ANCHORS),
     // Arbitrum (42161)
-    (42161, address!("0x82af49447d8a07e3bd95bd0d56f35241523fbab1"), "WETH", 18),
-    (42161, address!("0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9"), "USDT", 6),
-    (42161, address!("0xff970a61a04b1ca14834a43f5de4533ebddb5cc8"), "USDC.e", 6),
-    (42161, address!("0xaf88d065e77c8cc2239327c5edb3a432268e5831"), "USDC", 6),
-    (42161, address!("0xda10009cbd5d07dd0cecc66161fc93d7c9000da1"), "DAI", 18),
-    (42161, address!("0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f"), "WBTC", 8),
-    (42161, address!("0x912ce59144191c1204e64559fe8253a0e49e6548"), "ARB", 18),
-    (42161, address!("0xFa7F8980b0f1E64A2062791cc3b0871572f1F7f0"), "UNI", 18),
-    (42161, address!("0x17FC002b466eEc40DaE837Fc4bE5c67993ddBd6F"), "FRAX", 18),
-    (42161, address!("0x4D15a3A2286D883AF0AA1B3f21367843FAc63E07"), "TUSD", 18),
+    (42161, address!("0x82af49447d8a07e3bd95bd0d56f35241523fbab1"), "WETH", 18, WRAPPED_NATIVE_ANCHOR),
+    (42161, address!("0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9"), "USDT", 6, ARB_ETH_USD_6_ANCHOR),
+    (42161, address!("0xff970a61a04b1ca14834a43f5de4533ebddb5cc8"), "USDC.e", 6, ARB_ETH_USD_6_ANCHOR),
+    (42161, address!("0xaf88d065e77c8cc2239327c5edb3a432268e5831"), "USDC", 6, ARB_ETH_USD_6_ANCHOR),
+    (42161, address!("0xda10009cbd5d07dd0cecc66161fc93d7c9000da1"), "DAI", 18, ARB_ETH_USD_18_ANCHOR),
+    (42161, address!("0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f"), "WBTC", 8, ARB_BTC_ETH_8_ANCHOR),
+    (42161, address!("0x912ce59144191c1204e64559fe8253a0e49e6548"), "ARB", 18, ARB_PER_ETH_18_ANCHOR),
+    (42161, address!("0xFa7F8980b0f1E64A2062791cc3b0871572f1F7f0"), "UNI", 18, NO_ANCHORS),
+    (42161, address!("0x17FC002b466eEc40DaE837Fc4bE5c67993ddBd6F"), "FRAX", 18, ARB_ETH_USD_18_ANCHOR),
+    (42161, address!("0x4D15a3A2286D883AF0AA1B3f21367843FAc63E07"), "TUSD", 18, ARB_ETH_USD_18_ANCHOR),
 ];
 
 #[must_use]
 pub fn lookup_token(chain_id: u64, addr: &Address) -> Option<TokenInfo> {
     TOKENS
         .iter()
-        .find(|(c, a, _, _)| *c == chain_id && a == addr)
-        .map(|(_, _, symbol, decimals)| TokenInfo {
+        .find(|(c, a, _, _, _)| *c == chain_id && a == addr)
+        .map(|(_, _, symbol, decimals, anchor_sources)| TokenInfo {
             symbol,
             decimals: *decimals,
+            anchor_sources,
+        })
+}
+
+pub fn token_anchor_entries() -> impl Iterator<Item = TokenAnchorInfo> {
+    TOKENS
+        .iter()
+        .filter(|(_, _, _, _, anchor_sources)| !anchor_sources.is_empty())
+        .map(|(chain_id, token, _, _, anchor_sources)| TokenAnchorInfo {
+            chain_id: *chain_id,
+            token: *token,
+            anchor_sources,
         })
 }
 
@@ -264,9 +375,63 @@ mod tests {
         let info = lookup_token(1, &addr).expect("WETH on Ethereum should be known");
         assert_eq!(info.symbol, "WETH");
         assert_eq!(info.decimals, 18);
+        assert_eq!(
+            info.anchor_sources,
+            &[TokenAnchorSource::Fixed {
+                token_fee_per_unit_gas: WRAPPED_NATIVE_FEE_RATE,
+            }]
+        );
         assert!(token_icon_path(1, &addr).is_some_and(|path| {
             path.ends_with("assets/tokens/1-0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2.png")
         }));
+    }
+
+    #[test]
+    fn lookup_exposes_oracle_anchor_sources() {
+        let addr = address!("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
+        let info = lookup_token(1, &addr).expect("USDC on Ethereum should be known");
+
+        assert_eq!(info.symbol, "USDC");
+        assert_eq!(info.decimals, 6);
+        assert_eq!(
+            info.anchor_sources,
+            &[TokenAnchorSource::ChainlinkOracle {
+                addr: address!("0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419"),
+                token_decimals: 6,
+                oracle_decimals: 8,
+                is_inversed: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn lookup_tokens_without_anchor_keep_empty_source_list() {
+        let addr = address!("0xe76C6c83af64e4C60245D8C7dE953DF673a7A33D");
+        let info = lookup_token(1, &addr).expect("RAIL on Ethereum should be known");
+
+        assert_eq!(info.symbol, "RAIL");
+        assert_eq!(info.decimals, 18);
+        assert!(info.anchor_sources.is_empty());
+    }
+
+    #[test]
+    fn lookup_exposes_composite_anchor_sources() {
+        let addr = address!("0x912ce59144191c1204e64559fe8253a0e49e6548");
+        let info = lookup_token(42161, &addr).expect("ARB on Arbitrum should be known");
+
+        assert_eq!(info.symbol, "ARB");
+        assert_eq!(info.decimals, 18);
+        let [
+            TokenAnchorSource::Product {
+                sources,
+                scale_decimals,
+            },
+        ] = info.anchor_sources
+        else {
+            panic!("ARB should use a composite anchor source");
+        };
+        assert_eq!(*scale_decimals, 18);
+        assert_eq!(sources.len(), 2);
     }
 
     #[test]

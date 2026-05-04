@@ -1,4 +1,8 @@
-use alloy::primitives::Address;
+use std::cmp::Ordering;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+use alloy::primitives::{Address, U256};
 use gpui::{
     App, Context, Entity, InteractiveElement, IntoElement, ParentElement, Pixels, SharedString,
     StatefulInteractiveElement, Styled, Window, div, img, px, rgb,
@@ -10,8 +14,6 @@ use gpui_component::{
     table::{Column, ColumnSort, TableDelegate, TableState},
     tooltip::Tooltip,
 };
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
 
 use broadcaster_monitor::FeeRow;
 use railgun_ui::{
@@ -20,6 +22,8 @@ use railgun_ui::{
 };
 use ui::clipboard::clipboard_with_toast;
 use ui::theme;
+
+pub type FeeAnchorLookup = Arc<dyn Fn(u64, Address) -> Option<U256> + Send + Sync>;
 
 /// A single-select filter: either "All" (no filter) or a specific value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,7 +171,8 @@ impl FeesTokenFilterItem {
 pub(crate) struct FeesDelegate {
     all_rows: Arc<[FeeRow]>,
     rows: Arc<[FeeRow]>,
-    columns: [Column; 8],
+    columns: [Column; 9],
+    fee_anchor_lookup: FeeAnchorLookup,
     chain_select: Entity<SelectState<Vec<FeesChainFilterItem>>>,
     chain_filter: FeesFilter<u64>,
     /// Lower-cased substring query for the broadcaster filter (empty = no filter).
@@ -179,13 +184,17 @@ pub(crate) struct FeesDelegate {
     /// Active sort state for the fee column. `Default` preserves the natural
     /// (chain, broadcaster, token) order set by `set_rows`.
     fee_sort: ColumnSort,
+    /// Active sort state for the anchor bonus column. Missing anchors sort last.
+    bonus_sort: ColumnSort,
 }
 
 impl FeesDelegate {
     pub(crate) fn new(
         broadcaster_input: Entity<InputState>,
         chain_select: Entity<SelectState<Vec<FeesChainFilterItem>>>,
+        initial_chain_filter: FeesFilter<u64>,
         token_select: Entity<SelectState<SearchableVec<FeesTokenFilterItem>>>,
+        fee_anchor_lookup: FeeAnchorLookup,
     ) -> Self {
         Self {
             all_rows: Arc::from(Vec::<FeeRow>::new()),
@@ -203,6 +212,9 @@ impl FeesDelegate {
                 // hitbox was too small (a ~14px square on the right edge);
                 // our replacement makes the entire header area clickable.
                 Column::new("fee", "fee").width(px(100.0)).movable(false),
+                Column::new("bonus", "bonus %")
+                    .width(px(78.0))
+                    .movable(false),
                 Column::new("sig", "sig").width(px(40.0)).movable(false),
                 Column::new("reliability", "rel")
                     .width(px(50.0))
@@ -214,13 +226,15 @@ impl FeesDelegate {
                     .width(px(120.0))
                     .movable(false),
             ],
+            fee_anchor_lookup,
             chain_select,
-            chain_filter: FeesFilter::One(1),
+            chain_filter: initial_chain_filter,
             broadcaster_query: Arc::from(""),
             broadcaster_input,
             token_filter: FeesFilter::All,
             token_select,
             fee_sort: ColumnSort::Default,
+            bonus_sort: ColumnSort::Default,
         }
     }
 
@@ -265,6 +279,22 @@ impl FeesDelegate {
             ColumnSort::Descending => ColumnSort::Ascending,
             ColumnSort::Ascending => ColumnSort::Default,
         };
+        self.bonus_sort = ColumnSort::Default;
+        self.rebuild_visible();
+    }
+
+    /// Advance bonus sort through Default → Descending → Ascending → Default.
+    pub(crate) fn toggle_bonus_sort(&mut self) {
+        self.bonus_sort = match self.bonus_sort {
+            ColumnSort::Default => ColumnSort::Descending,
+            ColumnSort::Descending => ColumnSort::Ascending,
+            ColumnSort::Ascending => ColumnSort::Default,
+        };
+        self.fee_sort = ColumnSort::Default;
+        self.rebuild_visible();
+    }
+
+    pub(crate) fn refresh_anchor_values(&mut self) {
         self.rebuild_visible();
     }
 
@@ -285,10 +315,15 @@ impl FeesDelegate {
         // within a single (chain, token) group; cross-token ordering is
         // meaningful only in wei — callers comparing human-scale magnitudes
         // across tokens should filter by token first.
-        match self.fee_sort {
-            ColumnSort::Default => {}
-            ColumnSort::Ascending => rows.sort_by_key(|row| row.fee),
-            ColumnSort::Descending => rows.sort_by_key(|row| std::cmp::Reverse(row.fee)),
+        match self.bonus_sort {
+            ColumnSort::Default => match self.fee_sort {
+                ColumnSort::Default => {}
+                ColumnSort::Ascending => rows.sort_by_key(|row| row.fee),
+                ColumnSort::Descending => rows.sort_by_key(|row| std::cmp::Reverse(row.fee)),
+            },
+            sort => {
+                rows.sort_by(|a, b| compare_fee_bonus_rows(a, b, sort, &self.fee_anchor_lookup));
+            }
         }
         self.rows = Arc::from(rows);
     }
@@ -482,6 +517,7 @@ impl TableDelegate for FeesDelegate {
                 .into_any_element(),
             2 => render_token_header(&self.token_select).into_any_element(),
             3 => render_fee_header(self.fee_sort, table).into_any_element(),
+            4 => render_bonus_header(self.bonus_sort, table).into_any_element(),
             _ => div()
                 .size_full()
                 .child(self.columns[col_ix].name.clone())
@@ -589,10 +625,7 @@ impl TableDelegate for FeesDelegate {
             }
             3 => {
                 let raw_fee = row.fee.to_string();
-                let label = lookup_token(row.chain_id, &row.token_address).map_or_else(
-                    || raw_fee.clone(),
-                    |info| format_token_amount(row.fee, info.decimals),
-                );
+                let label = raw_fee_label(row);
                 let group = SharedString::from(format!("fee-cell-group-{row_ix}"));
                 div()
                     .group(group.clone())
@@ -622,7 +655,8 @@ impl TableDelegate for FeesDelegate {
                     )
                     .into_any_element()
             }
-            4 => {
+            4 => render_fee_bonus_cell(row, &self.fee_anchor_lookup).into_any_element(),
+            5 => {
                 let (label, color) = if row.signature_valid {
                     ("OK", rgb(theme::SUCCESS))
                 } else {
@@ -633,7 +667,7 @@ impl TableDelegate for FeesDelegate {
                     .child(SharedString::from(label))
                     .into_any_element()
             }
-            5 => {
+            6 => {
                 let color = if row.reliability >= 0.9 {
                     rgb(theme::SUCCESS)
                 } else {
@@ -644,7 +678,7 @@ impl TableDelegate for FeesDelegate {
                     .child(SharedString::from(format!("{:.2}", row.reliability)))
                     .into_any_element()
             }
-            6 => {
+            7 => {
                 let age = humantime::Duration::from(Duration::from_secs(
                     SystemTime::now()
                         .duration_since(row.last_seen)
@@ -677,6 +711,71 @@ impl TableDelegate for FeesDelegate {
                 }
             }
         }
+    }
+}
+
+fn raw_fee_label(row: &FeeRow) -> String {
+    lookup_token(row.chain_id, &row.token_address).map_or_else(
+        || row.fee.to_string(),
+        |info| format_token_amount(row.fee, info.decimals),
+    )
+}
+
+fn render_fee_bonus_cell(row: &FeeRow, fee_anchor_lookup: &FeeAnchorLookup) -> gpui::Div {
+    match fee_bonus_bps(row, fee_anchor_lookup) {
+        Some(bonus_bps) => div()
+            .text_color(rgb(theme::WARNING))
+            .child(SharedString::from(format_bonus_bps(bonus_bps))),
+        None => div()
+            .text_color(rgb(theme::TEXT_MUTED))
+            .child(SharedString::from("n/a")),
+    }
+}
+
+fn fee_bonus_bps(row: &FeeRow, fee_anchor_lookup: &FeeAnchorLookup) -> Option<i128> {
+    let anchor = fee_anchor_lookup(row.chain_id, row.token_address)?;
+    fee_bonus_bps_from_anchor(row.fee, anchor)
+}
+
+fn fee_bonus_bps_from_anchor(fee: U256, anchor: U256) -> Option<i128> {
+    if anchor.is_zero() {
+        return None;
+    }
+    let bps = fee.checked_mul(U256::from(10_000))?.checked_div(anchor)?;
+    i128::try_from(bps).ok().map(|bps| bps - 10_000)
+}
+
+fn format_bonus_bps(bonus_bps: i128) -> String {
+    let sign = if bonus_bps >= 0 { "+" } else { "-" };
+    let abs_bps = bonus_bps.checked_abs().unwrap_or(i128::MAX);
+    let tenths = (abs_bps + 5) / 10;
+    format!("{sign}{}.{:01}%", tenths / 10, tenths % 10)
+}
+
+fn compare_fee_bonus_rows(
+    a: &FeeRow,
+    b: &FeeRow,
+    sort: ColumnSort,
+    fee_anchor_lookup: &FeeAnchorLookup,
+) -> Ordering {
+    let a_bonus = fee_bonus_bps(a, fee_anchor_lookup);
+    let b_bonus = fee_bonus_bps(b, fee_anchor_lookup);
+    compare_optional_bonus(a_bonus, b_bonus, sort)
+        .then_with(|| a.chain_id.cmp(&b.chain_id))
+        .then_with(|| a.railgun_address.cmp(&b.railgun_address))
+        .then_with(|| a.token_address.cmp(&b.token_address))
+}
+
+fn compare_optional_bonus(a: Option<i128>, b: Option<i128>, sort: ColumnSort) -> Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => match sort {
+            ColumnSort::Ascending => a.cmp(&b),
+            ColumnSort::Descending => b.cmp(&a),
+            ColumnSort::Default => Ordering::Equal,
+        },
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
     }
 }
 
@@ -738,6 +837,29 @@ fn render_fee_header(
         })
 }
 
+fn render_bonus_header(
+    sort: ColumnSort,
+    table: Entity<TableState<FeesDelegate>>,
+) -> impl IntoElement {
+    let arrow = match sort {
+        ColumnSort::Default => "⇅",
+        ColumnSort::Ascending => "▲",
+        ColumnSort::Descending => "▼",
+    };
+    div()
+        .id("fees-bonus-header")
+        .size_full()
+        .cursor_pointer()
+        .child(SharedString::from(format!("bonus % {arrow}")))
+        .on_click(move |_event, _window, cx| {
+            cx.stop_propagation();
+            table.update(cx, |state, cx| {
+                state.delegate_mut().toggle_bonus_sort();
+                cx.notify();
+            });
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -763,6 +885,77 @@ mod tests {
             last_seen: SystemTime::now(),
             reliability: 1.0,
         }
+    }
+
+    fn row_with_fee(fee: U256) -> FeeRow {
+        let mut row = row(
+            1,
+            "0zkaaa",
+            address!("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
+            None,
+        );
+        row.fee = fee;
+        row
+    }
+
+    fn fixed_anchor_lookup(anchor: Option<U256>) -> FeeAnchorLookup {
+        Arc::new(move |_chain_id, _token| anchor)
+    }
+
+    #[test]
+    fn fee_bonus_bps_calculates_premium_and_discount() {
+        assert_eq!(
+            fee_bonus_bps_from_anchor(uint!(1_500_U256), uint!(1_000_U256)),
+            Some(5_000)
+        );
+        assert_eq!(
+            fee_bonus_bps_from_anchor(uint!(900_U256), uint!(1_000_U256)),
+            Some(-1_000)
+        );
+    }
+
+    #[test]
+    fn fee_bonus_label_formats_signed_percent() {
+        assert_eq!(format_bonus_bps(5_250), "+52.5%");
+        assert_eq!(format_bonus_bps(-1_000), "-10.0%");
+    }
+
+    #[test]
+    fn fee_bonus_sort_keeps_missing_anchor_last() {
+        assert_eq!(
+            compare_optional_bonus(Some(100), None, ColumnSort::Ascending),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_optional_bonus(None, Some(100), ColumnSort::Descending),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_optional_bonus(Some(100), Some(200), ColumnSort::Ascending),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_optional_bonus(Some(100), Some(200), ColumnSort::Descending),
+            Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn raw_fee_label_remains_token_scaled() {
+        let row = row_with_fee(uint!(1_234_000_U256));
+
+        assert_eq!(raw_fee_label(&row), "1.23");
+    }
+
+    #[test]
+    fn fee_bonus_uses_anchor_lookup_and_allows_cache_miss() {
+        let row = row_with_fee(uint!(1_500_U256));
+
+        assert_eq!(
+            fee_bonus_bps(&row, &fixed_anchor_lookup(Some(uint!(1_000_U256)))),
+            Some(5_000)
+        );
+        assert_eq!(fee_bonus_bps(&row, &fixed_anchor_lookup(None)), None);
     }
 
     #[test]

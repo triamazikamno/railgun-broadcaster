@@ -15,12 +15,13 @@ use gpui::{
 use gpui_component::{
     Disableable, IconName, IndexPath, Root, Selectable, Sizable, StyledExt, WindowExt,
     alert::Alert,
-    button::{ButtonGroup, ButtonVariants},
+    button::{Button, ButtonGroup, ButtonVariants},
     checkbox::Checkbox,
     dialog::DialogButtonProps,
     divider::Divider,
     input::{Input, InputEvent, InputState},
     list::{List, ListDelegate, ListItem, ListState},
+    popover::Popover,
     progress::Progress as UiProgress,
     resizable::{ResizableState, resizable_panel, v_resizable},
     scroll::ScrollableElement,
@@ -35,7 +36,6 @@ use railgun_ui::{
     DEFAULT_CHAINS, chain_icon_path, chain_name, format_broadcaster_address_label,
     format_scaled_amount, format_token_amount, lookup_token, short_address, token_icon_path,
 };
-use reqwest::Url;
 use tokio::runtime::Handle;
 use tokio::sync::{OnceCell, watch};
 use ui::clipboard::clipboard_with_toast;
@@ -44,22 +44,24 @@ use ui::icons;
 use ui::logs::{LogStore, LogsPane};
 use ui::theme::{self, APP_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
-    DesktopSendCalldataRequest, DesktopSendPublicBroadcasterEstimateRequest,
-    DesktopSendPublicBroadcasterRequest, DesktopUnshieldCalldataRequest,
-    DesktopUnshieldPublicBroadcasterEstimateRequest, DesktopUnshieldPublicBroadcasterRequest,
-    DesktopWalletSyncStartPolicy, HttpContext, ListUtxosOutput, PreparedSendCall,
-    PreparedUnshieldCall, PublicBroadcasterCandidate, PublicBroadcasterCostEstimate,
-    PublicBroadcasterFeeMode, PublicBroadcasterResultKind, PublicBroadcasterSelection,
-    PublicBroadcasterSubmissionResult, PublicBroadcasterWakuClient, SyncProgressUpdate, TokenTotal,
+    BroadcasterFeePolicy, BroadcasterFeePolicyStatus, DesktopSendCalldataRequest,
+    DesktopSendPublicBroadcasterEstimateRequest, DesktopSendPublicBroadcasterRequest,
+    DesktopUnshieldCalldataRequest, DesktopUnshieldPublicBroadcasterEstimateRequest,
+    DesktopUnshieldPublicBroadcasterRequest, DesktopWalletSyncStartPolicy, HttpContext,
+    ListUtxosOutput, PreparedSendCall, PreparedUnshieldCall, PublicBroadcasterCandidate,
+    PublicBroadcasterCostEstimate, PublicBroadcasterFeeMode, PublicBroadcasterResultKind,
+    PublicBroadcasterSelection, PublicBroadcasterSubmissionResult, PublicBroadcasterWakuClient,
+    SyncProgressUpdate, TokenAnchorRateCache, TokenAnchorRefreshHandle, TokenTotal,
     TransactionGenerationStage, UtxoOutput, ViewWalletChainSessionRequest, WalletSessionStore,
-    eligible_public_broadcasters_for_asset, estimate_desktop_send_public_broadcaster_cost,
-    estimate_desktop_unshield_public_broadcaster_cost, is_wrapped_native_token,
-    max_send_amount_from_outputs as planner_max_send_amount_from_outputs,
+    estimate_desktop_send_public_broadcaster_cost,
+    estimate_desktop_unshield_public_broadcaster_cost, fee_policy_eligible_public_broadcasters,
+    is_wrapped_native_token, max_send_amount_from_outputs as planner_max_send_amount_from_outputs,
     max_unshield_amount_from_outputs as planner_max_unshield_amount_from_outputs,
     parse_railgun_recipient, parse_send_amount, parse_unshield_amount,
-    prepare_desktop_send_calldata, prepare_desktop_unshield_calldata, select_public_broadcaster,
-    sort_specific_public_broadcasters, submit_desktop_send_public_broadcaster,
-    submit_desktop_unshield_public_broadcaster,
+    prepare_desktop_send_calldata, prepare_desktop_unshield_calldata,
+    public_broadcaster_candidates_for_asset, select_public_broadcaster_with_policy,
+    sort_specific_public_broadcasters, spawn_token_anchor_refresh_worker,
+    submit_desktop_send_public_broadcaster, submit_desktop_unshield_public_broadcaster,
     vault::{
         DesktopVaultStore, DesktopViewSession, GeneratedSeedMaterial, PRIMARY_WALLET_LABEL,
         VaultError, WalletMetadataBundle, WalletSource, WalletStatus,
@@ -117,25 +119,13 @@ pub(crate) fn install_utxo_navigation_bindings(app: &mut App) {
 
 #[derive(Clone)]
 pub(crate) struct WalletAppOptions {
-    initial_chain_id: u64,
     db_path: PathBuf,
-    init_block_number: Option<u64>,
-    sync_to_block: Option<u64>,
-    use_indexed_wallet_catch_up: bool,
-    rewind_wallet_cache: bool,
-    rpc_url: Option<Url>,
 }
 
 impl From<crate::cli::Options> for WalletAppOptions {
     fn from(value: crate::cli::Options) -> Self {
         Self {
-            initial_chain_id: value.chain_id,
             db_path: value.db_path,
-            init_block_number: value.init_block_number,
-            sync_to_block: value.sync_to_block,
-            use_indexed_wallet_catch_up: !value.disable_indexed_wallet_catch_up,
-            rewind_wallet_cache: value.rewind_wallet_cache,
-            rpc_url: value.rpc_url,
         }
     }
 }
@@ -168,9 +158,25 @@ pub(crate) fn open_wallet_window(
 
     if let Err(error) = app.open_window(window_options, |window, cx| {
         let monitor_state = monitor.clone();
+        let public_broadcaster_anchor_cache = Arc::new(TokenAnchorRateCache::new());
+        let public_broadcaster_anchor_refresh = spawn_token_anchor_refresh_worker(
+            &runtime,
+            Arc::clone(&public_broadcaster_anchor_cache),
+            chain_ids.clone(),
+            http.clone(),
+        );
+        let fee_anchor_lookup: broadcaster_monitor_gpui::FeeAnchorLookup = Arc::new({
+            let public_broadcaster_anchor_cache = Arc::clone(&public_broadcaster_anchor_cache);
+            move |chain_id, token| public_broadcaster_anchor_cache.cached_rate(chain_id, token)
+        });
         let monitor = cx.new(|cx| {
             broadcaster_monitor_gpui::BroadcasterMonitorPane::new(
-                monitor, event_rx, &chain_ids, window, cx,
+                monitor,
+                event_rx,
+                &chain_ids,
+                fee_anchor_lookup,
+                window,
+                cx,
             )
         });
         let logs = cx.new(|cx| LogsPane::new(logs, window, cx));
@@ -181,6 +187,8 @@ pub(crate) fn open_wallet_window(
                 runtime,
                 monitor_state,
                 waku,
+                public_broadcaster_anchor_cache,
+                public_broadcaster_anchor_refresh,
                 monitor,
                 logs,
                 window,
@@ -235,6 +243,7 @@ struct BroadcasterPickerState {
     key: UnshieldAssetKey,
     query_input: Entity<InputState>,
     list: Entity<ListState<BroadcasterPickerDelegate>>,
+    fee_bonus_popover_open: bool,
 }
 
 struct PrivateActionFormState {
@@ -305,6 +314,10 @@ impl Render for BroadcasterPickerDialogContent {
             filtered_count,
             total_count,
             list_height,
+            show_all_broadcasters,
+            fee_bonus_popover_open,
+            kind,
+            key,
         } = snapshot;
         list.update(cx, |list, cx| {
             let content = BroadcasterPickerContent {
@@ -318,6 +331,7 @@ impl Render for BroadcasterPickerDialogContent {
             }
         });
 
+        let toggle_root = self.root.clone();
         div()
             .w_full()
             .h_full()
@@ -326,20 +340,39 @@ impl Render for BroadcasterPickerDialogContent {
             .flex_col()
             .gap_3()
             .child(
-                div().flex().items_end().gap_3().child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(app_muted_text("Search"))
-                        .child(app_input(&query_input).disabled(generating)),
-                ),
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(app_input(&query_input).small().disabled(generating)),
+                    )
+                    .child(
+                        Checkbox::new(delivery_element_id(key, kind, "show-all-broadcasters"))
+                            .label("Show all broadcasters")
+                            .checked(show_all_broadcasters)
+                            .xsmall()
+                            .disabled(generating)
+                            .on_click(move |checked, _window, cx| {
+                                let checked = *checked;
+                                toggle_root.update(cx, |root, cx| {
+                                    root.set_allow_suspicious_broadcasters(kind, key, checked, cx);
+                                });
+                            }),
+                    ),
             )
             .child(render_broadcaster_picker_header(
+                &self.root,
+                query_input,
                 filtered_count,
                 total_count,
+                fee_bonus_popover_open,
             ))
             .child(
                 List::new(&list)
@@ -439,6 +472,7 @@ struct BroadcasterPickerRow {
     railgun_address: String,
     label: String,
     fee_label: String,
+    fee_warning: Option<String>,
     reliability: f64,
     selected: bool,
 }
@@ -461,6 +495,10 @@ struct BroadcasterPickerDialogSnapshot {
     filtered_count: usize,
     total_count: usize,
     list_height: Pixels,
+    show_all_broadcasters: bool,
+    fee_bonus_popover_open: bool,
+    kind: DeliveryFormKind,
+    key: UnshieldAssetKey,
 }
 
 struct BroadcasterPickerDelegate {
@@ -604,7 +642,7 @@ impl ListDelegate for BroadcasterPickerDelegate {
                 "broadcaster-picker-list-row-{}",
                 stable_broadcaster_element_suffix(&row.railgun_address)
             )))
-            .h(px(52.0))
+            .h(px(64.0))
             .px(px(12.0))
             .py(px(0.0))
             .rounded_md()
@@ -800,6 +838,7 @@ struct UnshieldFormState {
     delivery_mode: DeliveryMode,
     broadcaster_choice: BroadcasterChoice,
     broadcaster_fee_mode: PublicBroadcasterFeeMode,
+    allow_suspicious_broadcasters: bool,
     cost_estimate_pending: bool,
     estimating_cost: bool,
     cost_estimate: Option<PublicBroadcasterCostEstimate>,
@@ -819,6 +858,7 @@ struct SendFormState {
     delivery_mode: DeliveryMode,
     broadcaster_choice: BroadcasterChoice,
     broadcaster_fee_mode: PublicBroadcasterFeeMode,
+    allow_suspicious_broadcasters: bool,
     cost_estimate_pending: bool,
     estimating_cost: bool,
     cost_estimate: Option<PublicBroadcasterCostEstimate>,
@@ -920,12 +960,6 @@ enum WalletSetupMode {
     Import,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ChainLoadSource {
-    Initial,
-    Selection,
-}
-
 #[derive(Clone, Copy)]
 enum UtxoNavigation {
     PageUp,
@@ -940,30 +974,14 @@ struct ChainLoadOverrides {
     sync_to_block: Option<u64>,
     use_indexed_wallet_catch_up: bool,
     rewind_wallet_cache: bool,
-    rpc_url: Option<Url>,
 }
 
-fn chain_load_overrides(
-    options: &WalletAppOptions,
-    chain_id: u64,
-    source: ChainLoadSource,
-) -> ChainLoadOverrides {
-    if source == ChainLoadSource::Initial && chain_id == options.initial_chain_id {
-        return ChainLoadOverrides {
-            init_block_number: options.init_block_number,
-            sync_to_block: options.sync_to_block,
-            use_indexed_wallet_catch_up: options.use_indexed_wallet_catch_up,
-            rewind_wallet_cache: options.rewind_wallet_cache,
-            rpc_url: options.rpc_url.clone(),
-        };
-    }
-
+const fn chain_load_overrides() -> ChainLoadOverrides {
     ChainLoadOverrides {
         init_block_number: None,
         sync_to_block: None,
         use_indexed_wallet_catch_up: true,
         rewind_wallet_cache: false,
-        rpc_url: None,
     }
 }
 
@@ -1004,6 +1022,8 @@ pub(crate) struct WalletRoot {
     runtime: Handle,
     monitor_state: Shared,
     waku: Arc<PublicBroadcasterWakuClient>,
+    public_broadcaster_anchor_cache: Arc<TokenAnchorRateCache>,
+    public_broadcaster_anchor_refresh: TokenAnchorRefreshHandle,
     monitor: Entity<broadcaster_monitor_gpui::BroadcasterMonitorPane>,
     logs: Entity<LogsPane>,
     active_activity: Activity,
@@ -1051,6 +1071,8 @@ impl WalletRoot {
         runtime: Handle,
         monitor_state: Shared,
         waku: Arc<PublicBroadcasterWakuClient>,
+        public_broadcaster_anchor_cache: Arc<TokenAnchorRateCache>,
+        public_broadcaster_anchor_refresh: TokenAnchorRefreshHandle,
         monitor: Entity<broadcaster_monitor_gpui::BroadcasterMonitorPane>,
         logs: Entity<LogsPane>,
         window: &mut Window,
@@ -1062,10 +1084,8 @@ impl WalletRoot {
             .copied()
             .map(|chain_id| ChainSelectItem { chain_id })
             .collect();
-        let selected_chain_index = chain_ids
-            .iter()
-            .position(|chain_id| *chain_id == options.initial_chain_id)
-            .map(|row| IndexPath::default().row(row));
+        let initial_chain_id = DEFAULT_CHAINS[0];
+        let selected_chain_index = Some(IndexPath::default().row(0));
         let mut chain_states = BTreeMap::new();
         for chain_id in &chain_ids {
             chain_states.insert(*chain_id, ChainUtxoState::Idle);
@@ -1129,9 +1149,8 @@ impl WalletRoot {
         });
         let utxo_table =
             cx.new(|cx| TableState::new(UtxoDelegate::new(tx_search_input.clone()), window, cx));
-
         let root = Self {
-            selected_chain: options.initial_chain_id,
+            selected_chain: initial_chain_id,
             options,
             vault_store,
             vault_state,
@@ -1146,6 +1165,8 @@ impl WalletRoot {
             runtime,
             monitor_state,
             waku,
+            public_broadcaster_anchor_cache,
+            public_broadcaster_anchor_refresh,
             monitor,
             logs,
             active_activity: Activity::Wallet,
@@ -1405,13 +1426,8 @@ impl WalletRoot {
         self.sync_utxo_table(cx);
     }
 
-    fn ensure_chain_load(
-        &mut self,
-        chain_id: u64,
-        source: ChainLoadSource,
-        cx: &mut Context<'_, Self>,
-    ) {
-        let overrides = chain_load_overrides(&self.options, chain_id, source);
+    fn ensure_chain_load(&mut self, chain_id: u64, cx: &mut Context<'_, Self>) {
+        let overrides = chain_load_overrides();
         self.start_chain_load(chain_id, overrides, false, cx);
     }
 
@@ -1483,7 +1499,6 @@ impl WalletRoot {
             rewind_wallet_cache: overrides.rewind_wallet_cache,
             progress_tx: Some(progress_tx),
         };
-        let rpc_url = overrides.rpc_url;
         let db_path = self.options.db_path.clone();
         let http = self.http.clone();
         let session_store = Arc::clone(&self.session_store);
@@ -1506,7 +1521,7 @@ impl WalletRoot {
                 .await?
                 .clone();
             store
-                .start_view_wallet_session_immediate(request, rpc_url, &http)
+                .start_view_wallet_session_immediate(request, None, &http)
                 .await
         });
 
@@ -1798,6 +1813,7 @@ impl WalletRoot {
         }
         window.close_all_dialogs(cx);
         self.selected_chain = chain_id;
+        self.sync_broadcaster_monitor_chain_filter(chain_id, window, cx);
         self.send_forms.clear();
         self.unshield_forms.clear();
         self.private_action_form = None;
@@ -1810,8 +1826,19 @@ impl WalletRoot {
         ) {
             self.focus_utxo_table_on_render = true;
         }
-        self.ensure_chain_load(chain_id, ChainLoadSource::Selection, cx);
+        self.ensure_chain_load(chain_id, cx);
         cx.notify();
+    }
+
+    fn sync_broadcaster_monitor_chain_filter(
+        &self,
+        chain_id: u64,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.monitor.update(cx, |monitor, cx| {
+            monitor.set_chain_filter(chain_id, window, cx);
+        });
     }
 
     fn select_wallet(&mut self, wallet_id: &str, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -1992,8 +2019,7 @@ impl WalletRoot {
             }
         };
 
-        let mut overrides =
-            chain_load_overrides(&self.options, self.selected_chain, ChainLoadSource::Initial);
+        let mut overrides = chain_load_overrides();
         overrides.init_block_number = rewind_from;
         overrides.sync_to_block = None;
         overrides.rewind_wallet_cache = true;
@@ -2447,7 +2473,7 @@ impl WalletRoot {
         self.vault_error = None;
         self.vault_state = VaultState::ViewUnlocked;
         self.wallet_setup_mode = WalletSetupMode::Choose;
-        self.ensure_chain_load(self.selected_chain, ChainLoadSource::Initial, cx);
+        self.ensure_chain_load(self.selected_chain, cx);
         cx.notify();
     }
 
@@ -2717,6 +2743,7 @@ impl WalletRoot {
                 delivery_mode: DeliveryMode::ManualCalldata,
                 broadcaster_choice: BroadcasterChoice::Random,
                 broadcaster_fee_mode: PublicBroadcasterFeeMode::DeductFromAmount,
+                allow_suspicious_broadcasters: false,
                 cost_estimate_pending: false,
                 estimating_cost: false,
                 cost_estimate: None,
@@ -2804,6 +2831,9 @@ impl WalletRoot {
         form.cost_estimate_pending = false;
         form.estimating_cost = false;
         cx.notify();
+        if mode == DeliveryMode::PublicBroadcaster {
+            self.refresh_public_broadcaster_anchor(DeliveryFormKind::Send, key, cx);
+        }
         self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
     }
 
@@ -2827,6 +2857,30 @@ impl WalletRoot {
         form.cost_estimate_pending = false;
         form.estimating_cost = false;
         cx.notify();
+        self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
+    }
+
+    fn set_send_allow_suspicious_broadcasters(
+        &mut self,
+        key: UnshieldAssetKey,
+        allow: bool,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(form) = self.send_forms.get_mut(&key) else {
+            return;
+        };
+        if form.generating || form.allow_suspicious_broadcasters == allow {
+            return;
+        }
+        form.allow_suspicious_broadcasters = allow;
+        form.error = None;
+        form.result = None;
+        form.cost_estimate = None;
+        form.estimate_id = 0;
+        form.cost_estimate_pending = false;
+        form.estimating_cost = false;
+        cx.notify();
+        self.refresh_public_broadcaster_anchor(DeliveryFormKind::Send, key, cx);
         self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
     }
 
@@ -2980,6 +3034,7 @@ impl WalletRoot {
         let amount_raw = form.amount_input.read(cx).value().to_string();
         let broadcaster_choice = form.broadcaster_choice.clone();
         let fee_mode = form.broadcaster_fee_mode;
+        let allow_suspicious_broadcasters = form.allow_suspicious_broadcasters;
         if parse_railgun_recipient(recipient.as_str()).is_err() {
             self.clear_pending_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
             return;
@@ -3006,14 +3061,11 @@ impl WalletRoot {
         };
         let session = Arc::clone(session);
         let fee_rows = self.monitor_fee_rows();
-        let Ok(candidates) =
-            eligible_public_broadcasters_for_asset(&fee_rows, asset.chain_id, asset.token, false)
-        else {
-            self.clear_pending_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
-            return;
-        };
+        let policy = Self::public_broadcaster_fee_policy(allow_suspicious_broadcasters);
+        let candidates =
+            self.current_public_broadcaster_candidates(asset.chain_id, asset.token, false, policy);
         let selection = Self::public_broadcaster_selection(&broadcaster_choice);
-        if select_public_broadcaster(&candidates, &selection).is_err() {
+        if select_public_broadcaster_with_policy(&candidates, &selection, policy).is_err() {
             self.clear_pending_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
             return;
         }
@@ -3038,6 +3090,8 @@ impl WalletRoot {
             fee_rows,
             selection,
             fee_mode,
+            allow_suspicious_broadcasters,
+            anchor_cache: Some(Arc::clone(&self.public_broadcaster_anchor_cache)),
         };
         let http = self.http.clone();
         let join = self.runtime.spawn(async move {
@@ -3077,6 +3131,30 @@ impl WalletRoot {
         self.monitor_state.read().fee_rows()
     }
 
+    fn public_broadcaster_fee_policy(allow_suspicious_broadcasters: bool) -> BroadcasterFeePolicy {
+        BroadcasterFeePolicy::default()
+            .with_allow_suspicious_broadcasters(allow_suspicious_broadcasters)
+    }
+
+    fn current_public_broadcaster_candidates(
+        &self,
+        chain_id: u64,
+        token: Address,
+        unwrap: bool,
+        policy: BroadcasterFeePolicy,
+    ) -> Vec<PublicBroadcasterCandidate> {
+        public_broadcaster_candidates_for_asset(
+            &self.monitor_fee_rows(),
+            chain_id,
+            token,
+            unwrap,
+            policy,
+            self.public_broadcaster_anchor_cache
+                .cached_rate(chain_id, token),
+        )
+        .unwrap_or_default()
+    }
+
     fn public_broadcaster_selection(choice: &BroadcasterChoice) -> PublicBroadcasterSelection {
         match choice {
             BroadcasterChoice::Random => PublicBroadcasterSelection::Random,
@@ -3086,6 +3164,62 @@ impl WalletRoot {
                 }
             }
         }
+    }
+
+    fn refresh_public_broadcaster_anchor(
+        &self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        cx: &Context<'_, Self>,
+    ) {
+        let Some((_chain_id, _token)) = (match kind {
+            DeliveryFormKind::Send => self
+                .send_forms
+                .get(&key)
+                .map(|form| (form.asset.chain_id, form.asset.token)),
+            DeliveryFormKind::Unshield => self
+                .unshield_forms
+                .get(&key)
+                .map(|form| (form.asset.chain_id, form.asset.token)),
+        }) else {
+            return;
+        };
+        self.public_broadcaster_anchor_refresh.wake();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(2)).await;
+            let _ = this.update(cx, |_root, cx| cx.notify());
+        })
+        .detach();
+    }
+
+    fn set_allow_suspicious_broadcasters(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        allow: bool,
+        cx: &mut Context<'_, Self>,
+    ) {
+        match kind {
+            DeliveryFormKind::Send => self.set_send_allow_suspicious_broadcasters(key, allow, cx),
+            DeliveryFormKind::Unshield => {
+                self.set_unshield_allow_suspicious_broadcasters(key, allow, cx);
+            }
+        }
+    }
+
+    fn set_broadcaster_picker_fee_bonus_popover_open(
+        &mut self,
+        open: bool,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(picker) = self.broadcaster_picker.as_mut() else {
+            return;
+        };
+        if picker.fee_bonus_popover_open == open {
+            return;
+        }
+        picker.fee_bonus_popover_open = open;
+        cx.notify();
     }
 
     fn open_broadcaster_picker(
@@ -3130,7 +3264,9 @@ impl WalletRoot {
             key,
             query_input,
             list,
+            fee_bonus_popover_open: false,
         });
+        self.refresh_public_broadcaster_anchor(kind, key, cx);
         Self::open_broadcaster_picker_dialog(
             asset_label,
             chain_name(chain_id).map_or_else(|| chain_id.to_string(), str::to_owned),
@@ -3219,6 +3355,7 @@ impl WalletRoot {
         let delivery_mode = form.delivery_mode;
         let broadcaster_choice = form.broadcaster_choice.clone();
         let broadcaster_fee_mode = form.broadcaster_fee_mode;
+        let allow_suspicious_broadcasters = form.allow_suspicious_broadcasters;
 
         let Some(view_session) = self.view_session.clone() else {
             self.set_send_form_error(key, "Unlock the wallet vault before sending", cx);
@@ -3275,21 +3412,17 @@ impl WalletRoot {
 
         let fee_rows = if delivery_mode == DeliveryMode::PublicBroadcaster {
             let rows = self.monitor_fee_rows();
-            let candidates = match eligible_public_broadcasters_for_asset(
-                &rows,
+            let policy = Self::public_broadcaster_fee_policy(allow_suspicious_broadcasters);
+            let candidates = self.current_public_broadcaster_candidates(
                 asset.chain_id,
                 asset.token,
                 false,
-            ) {
-                Ok(candidates) => candidates,
-                Err(error) => {
-                    self.set_send_form_error(key, error.to_string(), cx);
-                    return;
-                }
-            };
-            if let Err(error) = select_public_broadcaster(
+                policy,
+            );
+            if let Err(error) = select_public_broadcaster_with_policy(
                 &candidates,
                 &Self::public_broadcaster_selection(&broadcaster_choice),
+                policy,
             ) {
                 self.set_send_form_error(key, error.to_string(), cx);
                 return;
@@ -3359,6 +3492,8 @@ impl WalletRoot {
                     fee_rows,
                     selection: Self::public_broadcaster_selection(&broadcaster_choice),
                     fee_mode: broadcaster_fee_mode,
+                    allow_suspicious_broadcasters,
+                    anchor_cache: Some(Arc::clone(&self.public_broadcaster_anchor_cache)),
                     waku,
                     response_timeout: PUBLIC_BROADCASTER_RESPONSE_TIMEOUT,
                     progress_tx: Some(progress_tx),
@@ -3527,6 +3662,7 @@ impl WalletRoot {
                 delivery_mode: DeliveryMode::ManualCalldata,
                 broadcaster_choice: BroadcasterChoice::Random,
                 broadcaster_fee_mode: PublicBroadcasterFeeMode::DeductFromAmount,
+                allow_suspicious_broadcasters: false,
                 cost_estimate_pending: false,
                 estimating_cost: false,
                 cost_estimate: None,
@@ -3581,6 +3717,9 @@ impl WalletRoot {
         form.cost_estimate_pending = false;
         form.estimating_cost = false;
         cx.notify();
+        if form.delivery_mode == DeliveryMode::PublicBroadcaster {
+            self.refresh_public_broadcaster_anchor(DeliveryFormKind::Unshield, key, cx);
+        }
         self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
     }
 
@@ -3616,6 +3755,9 @@ impl WalletRoot {
         form.cost_estimate_pending = false;
         form.estimating_cost = false;
         cx.notify();
+        if form.delivery_mode == DeliveryMode::PublicBroadcaster {
+            self.refresh_public_broadcaster_anchor(DeliveryFormKind::Unshield, key, cx);
+        }
         self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
     }
 
@@ -3676,6 +3818,9 @@ impl WalletRoot {
         form.cost_estimate_pending = false;
         form.estimating_cost = false;
         cx.notify();
+        if mode == DeliveryMode::PublicBroadcaster {
+            self.refresh_public_broadcaster_anchor(DeliveryFormKind::Unshield, key, cx);
+        }
         self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
     }
 
@@ -3702,6 +3847,30 @@ impl WalletRoot {
         self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
     }
 
+    fn set_unshield_allow_suspicious_broadcasters(
+        &mut self,
+        key: UnshieldAssetKey,
+        allow: bool,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(form) = self.unshield_forms.get_mut(&key) else {
+            return;
+        };
+        if form.generating || form.allow_suspicious_broadcasters == allow {
+            return;
+        }
+        form.allow_suspicious_broadcasters = allow;
+        form.error = None;
+        form.result = None;
+        form.cost_estimate = None;
+        form.estimate_id = 0;
+        form.cost_estimate_pending = false;
+        form.estimating_cost = false;
+        cx.notify();
+        self.refresh_public_broadcaster_anchor(DeliveryFormKind::Unshield, key, cx);
+        self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
+    }
+
     fn estimate_unshield_public_broadcaster_cost_from_form(
         &mut self,
         key: UnshieldAssetKey,
@@ -3722,6 +3891,7 @@ impl WalletRoot {
         let amount_raw = form.amount_input.read(cx).value().to_string();
         let broadcaster_choice = form.broadcaster_choice.clone();
         let fee_mode = form.broadcaster_fee_mode;
+        let allow_suspicious_broadcasters = form.allow_suspicious_broadcasters;
         let Ok(recipient) = recipient_raw.trim().parse::<Address>() else {
             self.clear_pending_public_broadcaster_cost_estimate(
                 DeliveryFormKind::Unshield,
@@ -3760,18 +3930,11 @@ impl WalletRoot {
         };
         let session = Arc::clone(session);
         let fee_rows = self.monitor_fee_rows();
-        let Ok(candidates) =
-            eligible_public_broadcasters_for_asset(&fee_rows, asset.chain_id, asset.token, unwrap)
-        else {
-            self.clear_pending_public_broadcaster_cost_estimate(
-                DeliveryFormKind::Unshield,
-                key,
-                cx,
-            );
-            return;
-        };
+        let policy = Self::public_broadcaster_fee_policy(allow_suspicious_broadcasters);
+        let candidates =
+            self.current_public_broadcaster_candidates(asset.chain_id, asset.token, unwrap, policy);
         let selection = Self::public_broadcaster_selection(&broadcaster_choice);
-        if select_public_broadcaster(&candidates, &selection).is_err() {
+        if select_public_broadcaster_with_policy(&candidates, &selection, policy).is_err() {
             self.clear_pending_public_broadcaster_cost_estimate(
                 DeliveryFormKind::Unshield,
                 key,
@@ -3801,6 +3964,8 @@ impl WalletRoot {
             fee_rows,
             selection,
             fee_mode,
+            allow_suspicious_broadcasters,
+            anchor_cache: Some(Arc::clone(&self.public_broadcaster_anchor_cache)),
         };
         let http = self.http.clone();
         let join = self.runtime.spawn(async move {
@@ -3856,6 +4021,7 @@ impl WalletRoot {
         let delivery_mode = form.delivery_mode;
         let broadcaster_choice = form.broadcaster_choice.clone();
         let broadcaster_fee_mode = form.broadcaster_fee_mode;
+        let allow_suspicious_broadcasters = form.allow_suspicious_broadcasters;
 
         let Some(view_session) = self.view_session.clone() else {
             self.set_unshield_form_error(key, "Unlock the wallet vault before unshielding", cx);
@@ -3915,21 +4081,17 @@ impl WalletRoot {
 
         let fee_rows = if delivery_mode == DeliveryMode::PublicBroadcaster {
             let rows = self.monitor_fee_rows();
-            let candidates = match eligible_public_broadcasters_for_asset(
-                &rows,
+            let policy = Self::public_broadcaster_fee_policy(allow_suspicious_broadcasters);
+            let candidates = self.current_public_broadcaster_candidates(
                 asset.chain_id,
                 asset.token,
                 unwrap,
-            ) {
-                Ok(candidates) => candidates,
-                Err(error) => {
-                    self.set_unshield_form_error(key, error.to_string(), cx);
-                    return;
-                }
-            };
-            if let Err(error) = select_public_broadcaster(
+                policy,
+            );
+            if let Err(error) = select_public_broadcaster_with_policy(
                 &candidates,
                 &Self::public_broadcaster_selection(&broadcaster_choice),
+                policy,
             ) {
                 self.set_unshield_form_error(key, error.to_string(), cx);
                 return;
@@ -4005,6 +4167,8 @@ impl WalletRoot {
                     fee_rows,
                     selection: Self::public_broadcaster_selection(&broadcaster_choice),
                     fee_mode: broadcaster_fee_mode,
+                    allow_suspicious_broadcasters,
+                    anchor_cache: Some(Arc::clone(&self.public_broadcaster_anchor_cache)),
                     waku,
                     response_timeout: PUBLIC_BROADCASTER_RESPONSE_TIMEOUT,
                     progress_tx: Some(progress_tx),
@@ -4169,8 +4333,13 @@ impl WalletRoot {
                 false,
                 {
                     let root = root.clone();
-                    move |_event, _window, cx| {
+                    move |_event, window, cx| {
                         root.update(cx, |root, cx| {
+                            root.sync_broadcaster_monitor_chain_filter(
+                                root.selected_chain,
+                                window,
+                                cx,
+                            );
                             root.active_activity = Activity::Broadcaster;
                             cx.notify();
                         });
@@ -4774,11 +4943,7 @@ impl WalletRoot {
                                     return;
                                 }
                                 let chain_id = root.selected_chain;
-                                let overrides = chain_load_overrides(
-                                    &root.options,
-                                    chain_id,
-                                    ChainLoadSource::Selection,
-                                );
+                                let overrides = chain_load_overrides();
                                 root.start_chain_load(chain_id, overrides, true, cx);
                             });
                         }),
@@ -4988,6 +5153,7 @@ impl WalletRoot {
         let delivery_root = root.clone();
         let chooser_root = root.clone();
         let fee_mode_root = root.clone();
+        let allow_root = root.clone();
         let submit_root = root;
 
         let mut card =
@@ -5019,21 +5185,42 @@ impl WalletRoot {
             form.generating,
         ));
         if form.delivery_mode == DeliveryMode::PublicBroadcaster {
-            let candidates = eligible_public_broadcasters_for_asset(
-                &self.monitor_fee_rows(),
+            let policy = Self::public_broadcaster_fee_policy(form.allow_suspicious_broadcasters);
+            let candidates = self.current_public_broadcaster_candidates(
                 asset.chain_id,
                 asset.token,
                 false,
-            )
-            .unwrap_or_default();
+                policy,
+            );
+            let visible_candidates = fee_policy_eligible_public_broadcasters(&candidates, policy);
+            card = card.child(render_allow_suspicious_broadcasters_toggle(
+                allow_root,
+                key,
+                DeliveryFormKind::Send,
+                form.allow_suspicious_broadcasters,
+                form.generating,
+            ));
             card = card.child(render_broadcaster_chooser(
                 chooser_root,
                 key,
                 DeliveryFormKind::Send,
                 &form.broadcaster_choice,
-                candidates,
+                visible_candidates,
                 form.generating,
             ));
+            if let Some(warning) = selected_broadcaster_fee_warning(
+                &form.broadcaster_choice,
+                &candidates,
+                form.allow_suspicious_broadcasters,
+            ) {
+                card = card.child(
+                    Alert::warning(
+                        delivery_element_id(key, DeliveryFormKind::Send, "fee-policy-warning"),
+                        warning,
+                    )
+                    .small(),
+                );
+            }
             card = card.child(render_broadcaster_fee_mode_toggle(
                 fee_mode_root,
                 key,
@@ -5171,6 +5358,7 @@ impl WalletRoot {
         let chooser_root = root.clone();
         let fee_mode_root = root.clone();
         let output_root = root.clone();
+        let allow_root = root.clone();
         let submit_root = root;
 
         let mut card =
@@ -5202,21 +5390,42 @@ impl WalletRoot {
             form.generating,
         ));
         if form.delivery_mode == DeliveryMode::PublicBroadcaster {
-            let candidates = eligible_public_broadcasters_for_asset(
-                &self.monitor_fee_rows(),
+            let policy = Self::public_broadcaster_fee_policy(form.allow_suspicious_broadcasters);
+            let candidates = self.current_public_broadcaster_candidates(
                 asset.chain_id,
                 asset.token,
                 form.unwrap,
-            )
-            .unwrap_or_default();
+                policy,
+            );
+            let visible_candidates = fee_policy_eligible_public_broadcasters(&candidates, policy);
+            card = card.child(render_allow_suspicious_broadcasters_toggle(
+                allow_root,
+                key,
+                DeliveryFormKind::Unshield,
+                form.allow_suspicious_broadcasters,
+                form.generating,
+            ));
             card = card.child(render_broadcaster_chooser(
                 chooser_root,
                 key,
                 DeliveryFormKind::Unshield,
                 &form.broadcaster_choice,
-                candidates,
+                visible_candidates,
                 form.generating,
             ));
+            if let Some(warning) = selected_broadcaster_fee_warning(
+                &form.broadcaster_choice,
+                &candidates,
+                form.allow_suspicious_broadcasters,
+            ) {
+                card = card.child(
+                    Alert::warning(
+                        delivery_element_id(key, DeliveryFormKind::Unshield, "fee-policy-warning"),
+                        warning,
+                    )
+                    .small(),
+                );
+            }
             card = card.child(render_broadcaster_fee_mode_toggle(
                 fee_mode_root,
                 key,
@@ -5430,23 +5639,25 @@ impl WalletRoot {
         let search_active = !self.tx_search_query.is_empty();
         let clear_search_input = self.tx_search_input.clone();
         let clear_search_table = self.utxo_table.clone();
-        let search_input = app_input(&self.tx_search_input).small().when(search_active, |input| {
-            input.suffix(
-                app_button_base("wallet-search-clear")
-                    .ghost()
-                    .xsmall()
-                    .tooltip("Clear search")
-                    .icon(IconName::Close)
-                    .on_click(move |_event, window, cx| {
-                        clear_search_input.update(cx, |input, cx| {
-                            input.set_value("", window, cx);
-                        });
-                        clear_search_table.update(cx, |table, cx| {
-                            table.focus_handle(cx).focus(window);
-                        });
-                    }),
-            )
-        });
+        let search_input = app_input(&self.tx_search_input)
+            .small()
+            .when(search_active, |input| {
+                input.suffix(
+                    app_button_base("wallet-search-clear")
+                        .ghost()
+                        .xsmall()
+                        .tooltip("Clear search")
+                        .icon(IconName::Close)
+                        .on_click(move |_event, window, cx| {
+                            clear_search_input.update(cx, |input, cx| {
+                                input.set_value("", window, cx);
+                            });
+                            clear_search_table.update(cx, |table, cx| {
+                                table.focus_handle(cx).focus(window);
+                            });
+                        }),
+                )
+            });
         let spent_toggle = Checkbox::new("wallet-toggle-spent-utxos")
             .label("Show spent")
             .checked(self.show_spent_utxos)
@@ -5588,39 +5799,43 @@ impl WalletRoot {
         cx: &App,
     ) -> Option<BroadcasterPickerDialogSnapshot> {
         let picker = self.broadcaster_picker.as_ref()?;
-        let (chain_id, token, unwrap, current_choice, generating) = (match picker.kind {
-            DeliveryFormKind::Send => self.send_forms.get(&picker.key).map(|form| {
-                (
-                    form.asset.chain_id,
-                    form.asset.token,
-                    false,
-                    form.broadcaster_choice.clone(),
-                    form.generating,
-                )
-            }),
-            DeliveryFormKind::Unshield => self.unshield_forms.get(&picker.key).map(|form| {
-                (
-                    form.asset.chain_id,
-                    form.asset.token,
-                    form.unwrap,
-                    form.broadcaster_choice.clone(),
-                    form.generating,
-                )
-            }),
-        })?;
+        let (chain_id, token, unwrap, current_choice, generating, show_all_broadcasters) =
+            (match picker.kind {
+                DeliveryFormKind::Send => self.send_forms.get(&picker.key).map(|form| {
+                    (
+                        form.asset.chain_id,
+                        form.asset.token,
+                        false,
+                        form.broadcaster_choice.clone(),
+                        form.generating,
+                        form.allow_suspicious_broadcasters,
+                    )
+                }),
+                DeliveryFormKind::Unshield => self.unshield_forms.get(&picker.key).map(|form| {
+                    (
+                        form.asset.chain_id,
+                        form.asset.token,
+                        form.unwrap,
+                        form.broadcaster_choice.clone(),
+                        form.generating,
+                        form.allow_suspicious_broadcasters,
+                    )
+                }),
+            })?;
         let query = picker
             .query_input
             .read(cx)
             .value()
             .trim()
             .to_ascii_lowercase();
-        let candidates = eligible_public_broadcasters_for_asset(
-            &self.monitor_fee_rows(),
-            chain_id,
-            token,
-            unwrap,
-        )
-        .unwrap_or_default();
+        let policy = Self::public_broadcaster_fee_policy(show_all_broadcasters);
+        let candidates =
+            self.current_public_broadcaster_candidates(chain_id, token, unwrap, policy);
+        let candidates = if show_all_broadcasters {
+            candidates
+        } else {
+            fee_policy_eligible_public_broadcasters(&candidates, policy)
+        };
         let candidates = sort_specific_public_broadcasters(candidates);
         let total_count = candidates.len();
         let candidates: Vec<_> = candidates
@@ -5640,6 +5855,7 @@ impl WalletRoot {
                 railgun_address: candidate.railgun_address.clone(),
                 label: broadcaster_candidate_label(candidate),
                 fee_label: broadcaster_candidate_fee_label(candidate),
+                fee_warning: broadcaster_candidate_fee_warning(candidate),
                 reliability: candidate.reliability,
                 selected: matches!(
                     current_choice,
@@ -5657,6 +5873,10 @@ impl WalletRoot {
             filtered_count,
             total_count,
             list_height,
+            show_all_broadcasters,
+            fee_bonus_popover_open: picker.fee_bonus_popover_open,
+            kind: picker.kind,
+            key: picker.key,
         })
     }
 }
@@ -6486,6 +6706,23 @@ fn selected_broadcaster_label(
         )
 }
 
+fn selected_broadcaster_fee_warning(
+    choice: &BroadcasterChoice,
+    candidates: &[PublicBroadcasterCandidate],
+    allow_suspicious_broadcasters: bool,
+) -> Option<String> {
+    if allow_suspicious_broadcasters {
+        return None;
+    }
+    let BroadcasterChoice::Specific { railgun_address } = choice else {
+        return None;
+    };
+    candidates
+        .iter()
+        .find(|candidate| candidate.railgun_address == *railgun_address)
+        .and_then(broadcaster_candidate_fee_warning)
+}
+
 const fn stable_broadcaster_element_suffix(railgun_address: &str) -> &str {
     railgun_address
 }
@@ -6495,10 +6732,57 @@ fn broadcaster_candidate_label(candidate: &PublicBroadcasterCandidate) -> String
 }
 
 fn broadcaster_candidate_fee_label(candidate: &PublicBroadcasterCandidate) -> String {
+    match candidate.fee_policy_status {
+        BroadcasterFeePolicyStatus::Normal { premium_bps, .. }
+        | BroadcasterFeePolicyStatus::Suspicious {
+            premium_bps: Some(premium_bps),
+            ..
+        } => return format_premium_bps_one_decimal(premium_bps),
+        BroadcasterFeePolicyStatus::Suspicious {
+            premium_bps: None, ..
+        }
+        | BroadcasterFeePolicyStatus::UnknownAnchor => {}
+    }
+    broadcaster_candidate_raw_fee_label(candidate)
+}
+
+fn broadcaster_candidate_raw_fee_label(candidate: &PublicBroadcasterCandidate) -> String {
     lookup_token(candidate.chain_id, &candidate.token).map_or_else(
         || candidate.fee.to_string(),
         |info| format_token_amount(candidate.fee, info.decimals),
     )
+}
+
+fn broadcaster_candidate_fee_warning(candidate: &PublicBroadcasterCandidate) -> Option<String> {
+    let BroadcasterFeePolicyStatus::Suspicious { premium_bps, .. } = candidate.fee_policy_status
+    else {
+        return None;
+    };
+    Some(match premium_bps {
+        Some(premium_bps) => format!(
+            "Fee outside allowed range ({})",
+            format_premium_bps_compact(premium_bps)
+        ),
+        None => "Fee outside allowed range".to_string(),
+    })
+}
+
+fn format_premium_bps_one_decimal(premium_bps: i128) -> String {
+    let sign = if premium_bps >= 0 { "+" } else { "-" };
+    let abs_bps = premium_bps.checked_abs().unwrap_or(i128::MAX);
+    let tenths = (abs_bps + 5) / 10;
+    format!("{sign}{}.{:01}%", tenths / 10, tenths % 10)
+}
+
+fn format_premium_bps_compact(premium_bps: i128) -> String {
+    let sign = if premium_bps >= 0 { "+" } else { "-" };
+    let abs_bps = premium_bps.checked_abs().unwrap_or(i128::MAX);
+    let tenths = (abs_bps + 5) / 10;
+    if tenths % 10 == 0 {
+        format!("{sign}{}%", tenths / 10)
+    } else {
+        format!("{sign}{}.{:01}%", tenths / 10, tenths % 10)
+    }
 }
 
 fn broadcaster_reliability_label(reliability: f64) -> String {
@@ -6778,7 +7062,13 @@ fn broadcaster_candidate_matches_query(
             .contains(query)
 }
 
-fn render_broadcaster_picker_header(filtered_count: usize, total_count: usize) -> gpui::Div {
+fn render_broadcaster_picker_header(
+    root: &Entity<WalletRoot>,
+    query_input: Entity<InputState>,
+    filtered_count: usize,
+    total_count: usize,
+    fee_bonus_popover_open: bool,
+) -> gpui::Div {
     let broadcaster_header = if filtered_count == total_count {
         format!("Broadcaster ({total_count})")
     } else {
@@ -6792,8 +7082,88 @@ fn render_broadcaster_picker_header(filtered_count: usize, total_count: usize) -
         .text_size(px(11.0))
         .text_color(rgb(theme::TEXT_MUTED))
         .child(div().flex_1().min_w(px(0.0)).child(broadcaster_header))
-        .child(div().w(px(150.0)).flex_none().child("Fee"))
+        .child(
+            div()
+                .w(px(150.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child("Fee")
+                .child({
+                    let popover_root = root.clone();
+                    let focus_query_input = query_input.clone();
+                    let tooltip_enabled = !fee_bonus_popover_open;
+                    Popover::new("broadcaster-picker-fee-bonus-popover")
+                        .open(fee_bonus_popover_open)
+                        .on_open_change(move |open, window, cx| {
+                            popover_root.update(cx, |root, cx| {
+                                root.set_broadcaster_picker_fee_bonus_popover_open(*open, cx);
+                            });
+                            if !*open {
+                                focus_query_input.read(cx).focus_handle(cx).focus(window);
+                            }
+                        })
+                        .trigger(
+                            Button::new("broadcaster-picker-fee-bonus-trigger")
+                                .text()
+                                .xsmall()
+                                .compact()
+                                .child(render_fee_bonus_info_icon(tooltip_enabled)),
+                        )
+                        .content(|_state, _window, _cx| render_fee_bonus_popover())
+                }),
+        )
         .child(div().w(px(120.0)).flex_none().child("Reliability"))
+}
+
+fn render_fee_bonus_info_icon(tooltip_enabled: bool) -> impl IntoElement {
+    div()
+        .id("broadcaster-picker-fee-bonus-info")
+        .size(px(14.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .bg(rgb(theme::SURFACE_ELEVATED))
+        .border_1()
+        .border_color(rgb(theme::WARNING))
+        .text_color(rgb(theme::WARNING))
+        .text_size(px(9.0))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .hover(|this| this.bg(rgb(theme::SURFACE_HOVER)))
+        .child("i")
+        .when(tooltip_enabled, |this| {
+            this.tooltip(|window, cx| {
+                Tooltip::element(|_window, _cx| render_fee_bonus_popover()).build(window, cx)
+            })
+        })
+}
+
+fn render_fee_bonus_popover() -> gpui::Div {
+    div()
+        .w(px(360.0))
+        .p(px(12.0))
+        .flex()
+        .flex_col()
+        .gap_2()
+        .text_size(px(12.0))
+        .text_color(rgb(theme::TEXT))
+        .child(
+            div()
+                .text_color(rgb(theme::WARNING))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child("Fee bonus"),
+        )
+        .child(div().child(
+            "Fee is the broadcaster's bonus over the estimated gas cost, not their total payout or profit.",
+        ))
+        .child(div().child(
+            "Broadcasters still pay gas and later need to unshield this bonus, which has its own cost.",
+        ))
+        .child(div().child(
+            "Very low or negative bonuses can be suspicious because the broadcaster may not cover their costs, which can lead to more failed submissions.",
+        ))
 }
 
 fn render_broadcaster_picker_row(row: &BroadcasterPickerRow) -> gpui::Div {
@@ -6821,9 +7191,19 @@ fn render_broadcaster_picker_row(row: &BroadcasterPickerRow) -> gpui::Div {
             div()
                 .w(px(150.0))
                 .flex_none()
+                .flex()
+                .flex_col()
+                .gap_1()
                 .text_color(rgb(theme::WARNING))
                 .font_weight(gpui::FontWeight::SEMIBOLD)
-                .child(row.fee_label.clone()),
+                .child(row.fee_label.clone())
+                .children(row.fee_warning.clone().map(|warning| {
+                    div()
+                        .text_color(rgb(theme::DANGER))
+                        .text_size(px(11.0))
+                        .font_weight(gpui::FontWeight::NORMAL)
+                        .child(warning)
+                })),
         )
         .child(
             div()
@@ -7112,6 +7492,52 @@ fn render_broadcaster_chooser(
     list
 }
 
+fn render_allow_suspicious_broadcasters_toggle(
+    root: Entity<WalletRoot>,
+    key: UnshieldAssetKey,
+    kind: DeliveryFormKind,
+    allow_suspicious_broadcasters: bool,
+    generating: bool,
+) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .p(px(10.0))
+        .rounded_md()
+        .bg(rgb(theme::SURFACE_ELEVATED))
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(app_muted_text("Broadcaster fee policy"))
+                .child(cost_estimate_detail_text(
+                    "Suspicious broadcasters advertise fees outside the anchor range.",
+                )),
+        )
+        .child(
+            Checkbox::new(delivery_element_id(
+                key,
+                kind,
+                "allow-suspicious-broadcasters",
+            ))
+            .label("Allow suspicious broadcasters")
+            .checked(allow_suspicious_broadcasters)
+            .xsmall()
+            .disabled(generating)
+            .on_click(move |checked, _window, cx| {
+                let checked = *checked;
+                root.update(cx, |root, cx| {
+                    root.set_allow_suspicious_broadcasters(kind, key, checked, cx);
+                });
+            }),
+        )
+}
+
 fn render_unshield_output_toggle(
     root: Entity<WalletRoot>,
     key: UnshieldAssetKey,
@@ -7219,11 +7645,7 @@ fn render_broadcaster_fee_mode_toggle(
         .child(app_muted_text(helper))
 }
 
-fn private_action_segment_button(
-    id: SharedString,
-    label: &'static str,
-    selected: bool,
-) -> gpui_component::button::Button {
+fn private_action_segment_button(id: SharedString, label: &'static str, selected: bool) -> Button {
     let button = app_button(id, label)
         .flex_1()
         .min_w(px(0.0))
@@ -7843,7 +8265,6 @@ const fn vault_error_kind(error: &VaultError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::path::PathBuf;
     use std::sync::Arc;
 
     use alloy::primitives::{Address, U256};
@@ -7856,11 +8277,10 @@ mod tests {
     };
 
     use super::{
-        Activity, ChainLoadSource, ChainUtxoState, CostEstimateStatus, PrivateActionMetric,
-        SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_MINUTE, SECONDS_PER_MONTH, SECONDS_PER_YEAR,
-        UnshieldAsset, UnshieldAssetKey, WalletAppOptions, WalletSelectItem, WalletTab,
-        adjusted_amount_for_max_change, build_send_asset, build_unshield_asset,
-        chain_load_overrides, display_rows_from_output, format_compact_age,
+        Activity, ChainUtxoState, CostEstimateStatus, PrivateActionMetric, SECONDS_PER_DAY,
+        SECONDS_PER_HOUR, SECONDS_PER_MINUTE, SECONDS_PER_MONTH, SECONDS_PER_YEAR, UnshieldAsset,
+        UnshieldAssetKey, WalletSelectItem, WalletTab, adjusted_amount_for_max_change,
+        build_send_asset, build_unshield_asset, display_rows_from_output, format_compact_age,
         format_exact_asset_amount_for_display, format_form_error_for_asset,
         format_private_asset_rows, format_send_amount_input, format_total,
         format_unshield_amount_input, loading_summary, max_send_amount_from_snapshot,
@@ -7872,18 +8292,6 @@ mod tests {
         should_show_pending_poi_amount, unshield_asset_key_from_formatted, unshield_element_id,
         unshield_key_matches_asset, wallet_generation_matches, wallet_options_from_metadata,
     };
-
-    fn wallet_options_with_overrides() -> WalletAppOptions {
-        WalletAppOptions {
-            initial_chain_id: 1,
-            db_path: PathBuf::from("db"),
-            init_block_number: Some(123),
-            sync_to_block: Some(456),
-            use_indexed_wallet_catch_up: false,
-            rewind_wallet_cache: true,
-            rpc_url: Some(reqwest::Url::parse("https://example.invalid/rpc").unwrap()),
-        }
-    }
 
     fn utxo_output(token: &str, value: &str, is_spent: bool) -> UtxoOutput {
         const SOURCE_TX_HASH: &str =
@@ -8836,39 +9244,13 @@ mod tests {
     }
 
     #[test]
-    fn initial_chain_load_uses_cli_overrides() {
-        let options = wallet_options_with_overrides();
-        let overrides = chain_load_overrides(&options, 1, ChainLoadSource::Initial);
-
-        assert_eq!(overrides.init_block_number, Some(123));
-        assert_eq!(overrides.sync_to_block, Some(456));
-        assert!(!overrides.use_indexed_wallet_catch_up);
-        assert!(overrides.rewind_wallet_cache);
-        assert_eq!(overrides.rpc_url, options.rpc_url);
-    }
-
-    #[test]
-    fn selected_chain_load_ignores_cli_overrides() {
-        let options = wallet_options_with_overrides();
-        let overrides = chain_load_overrides(&options, 56, ChainLoadSource::Selection);
+    fn chain_load_uses_default_sync_options() {
+        let overrides = super::chain_load_overrides();
 
         assert_eq!(overrides.init_block_number, None);
         assert_eq!(overrides.sync_to_block, None);
         assert!(overrides.use_indexed_wallet_catch_up);
         assert!(!overrides.rewind_wallet_cache);
-        assert_eq!(overrides.rpc_url, None);
-    }
-
-    #[test]
-    fn selected_initial_chain_reload_ignores_cli_overrides() {
-        let options = wallet_options_with_overrides();
-        let overrides = chain_load_overrides(&options, 1, ChainLoadSource::Selection);
-
-        assert_eq!(overrides.init_block_number, None);
-        assert_eq!(overrides.sync_to_block, None);
-        assert!(overrides.use_indexed_wallet_catch_up);
-        assert!(!overrides.rewind_wallet_cache);
-        assert_eq!(overrides.rpc_url, None);
     }
 
     #[test]

@@ -7,9 +7,7 @@ mod root;
 use std::sync::Arc;
 
 use broadcaster_monitor::{DEFAULT_EVENT_CAPACITY, event_channel, shared};
-use broadcaster_monitor_waku::{
-    DEFAULT_CLUSTER_ID, DEFAULT_SHARD_ID, WakuViewerConfig, spawn_workers,
-};
+use broadcaster_monitor_waku::{WakuViewerConfig, spawn_workers};
 use eyre::{Result, WrapErr};
 use gpui::{App, Application};
 use railgun_ui::DEFAULT_CHAINS;
@@ -28,7 +26,7 @@ use crate::root::{WalletAppOptions, install_utxo_navigation_bindings, open_walle
 struct Quit;
 
 fn main() -> Result<()> {
-    let opts = Options::from_args()?;
+    let opts = Options::from_args();
     let http = build_http_client(opts.proxy.as_ref())?;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -47,20 +45,15 @@ fn main() -> Result<()> {
     let chain_ids = DEFAULT_CHAINS.to_vec();
     let waku_config = WakuViewerConfig {
         chain_ids: chain_ids.clone(),
-        cluster_id: opts.cluster_id,
-        shard_id: opts.shard_id,
+        cluster_id: None,
+        shard_id: None,
         doh_endpoint: None,
         max_peers: None,
         peer_connection_timeout: None,
         nwaku_url: None,
     };
 
-    tracing::info!(
-        chains = ?chain_ids,
-        cluster_id = waku_config.cluster_id.unwrap_or(DEFAULT_CLUSTER_ID),
-        shard_id = waku_config.shard_id.unwrap_or(DEFAULT_SHARD_ID),
-        "starting wallet"
-    );
+    tracing::info!(chains = ?chain_ids, "starting wallet");
 
     let runtime_guard = runtime.enter();
     let waku = waku_config.build_client()?;

@@ -1,6 +1,8 @@
 mod cli;
 mod pprof_server;
 
+use std::sync::Arc;
+
 use broadcaster_monitor::{DEFAULT_EVENT_CAPACITY, event_channel, shared};
 use broadcaster_monitor_waku::{
     DEFAULT_CLUSTER_ID, DEFAULT_SHARD_ID, WakuViewerConfig, spawn_workers,
@@ -11,6 +13,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 use ui::logs::{DEFAULT_LOG_CAPACITY, LogStore, UiLogLayer};
+use wallet_ops::{TokenAnchorRateCache, build_http_client, spawn_token_anchor_refresh_worker};
 
 use crate::cli::Options;
 
@@ -35,6 +38,21 @@ fn main() -> Result<()> {
     install_tracing(&opts, logs.clone())?;
 
     let chain_ids = opts.effective_chain_ids();
+    let http = build_http_client(None)?;
+    let anchor_cache = Arc::new(TokenAnchorRateCache::new());
+    let anchor_refresh = spawn_token_anchor_refresh_worker(
+        runtime.handle(),
+        Arc::clone(&anchor_cache),
+        chain_ids.clone(),
+        http,
+    );
+    let fee_anchor_lookup: broadcaster_monitor_gpui::FeeAnchorLookup = Arc::new({
+        let anchor_cache = Arc::clone(&anchor_cache);
+        move |chain_id, token| {
+            let _keep_worker_alive = &anchor_refresh;
+            anchor_cache.cached_rate(chain_id, token)
+        }
+    });
     let waku_config = WakuViewerConfig {
         chain_ids: chain_ids.clone(),
         cluster_id: opts.cluster_id,
@@ -94,6 +112,7 @@ fn main() -> Result<()> {
             event_rx,
             &chain_ids,
             logs,
+            fee_anchor_lookup.clone(),
         );
 
         #[cfg(target_os = "macos")]

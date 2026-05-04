@@ -20,7 +20,9 @@ use ui::logs::{LogStore, LogsPane};
 use ui::table::ColumnWidthSync;
 use ui::theme::{self, APP_FONT_FAMILY, APP_TEXT_SIZE};
 
-use crate::fees_view::{FeesChainFilterItem, FeesDelegate, FeesTokenFilterItem};
+use crate::fees_view::{
+    FeeAnchorLookup, FeesChainFilterItem, FeesDelegate, FeesFilter, FeesTokenFilterItem,
+};
 use crate::peers_view::{self, PeersDelegate};
 
 /// Lower bound between UI re-renders when events are arriving.
@@ -43,6 +45,7 @@ pub fn open_monitor_window(
     event_rx: EventRx,
     chain_ids: &[u64],
     logs: LogStore,
+    fee_anchor_lookup: FeeAnchorLookup,
 ) {
     let chain_ids = chain_ids.to_vec();
     let options = WindowOptions {
@@ -59,8 +62,16 @@ pub fn open_monitor_window(
     };
 
     if let Err(error) = app.open_window(options, |window, cx| {
-        let pane =
-            cx.new(|cx| BroadcasterMonitorPane::new(shared, event_rx, &chain_ids, window, cx));
+        let pane = cx.new(|cx| {
+            BroadcasterMonitorPane::new(
+                shared,
+                event_rx,
+                &chain_ids,
+                fee_anchor_lookup.clone(),
+                window,
+                cx,
+            )
+        });
         let logs = cx.new(|cx| LogsPane::new(logs, window, cx));
         let root = cx.new(|cx| StandaloneMonitorRoot::new(pane, logs, cx));
         cx.new(|cx| Root::new(root, window, cx))
@@ -267,10 +278,26 @@ pub struct BroadcasterMonitorPane {
 }
 
 impl BroadcasterMonitorPane {
+    pub fn set_chain_filter(
+        &mut self,
+        chain_id: u64,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.fees_table.update(cx, |state, cx| {
+            state
+                .delegate_mut()
+                .set_chain_filter(FeesFilter::One(chain_id));
+            state.delegate_mut().sync_filter_selects(window, cx);
+            cx.notify();
+        });
+    }
+
     pub fn new(
         shared: Shared,
         mut event_rx: EventRx,
         chain_ids: &[u64],
+        fee_anchor_lookup: FeeAnchorLookup,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
@@ -284,6 +311,11 @@ impl BroadcasterMonitorPane {
             .iter()
             .position(|chain_id| *chain_id == 1)
             .map_or(0, |ix| ix + 1);
+        let initial_chain_filter = if initial_chain_index == 0 {
+            FeesFilter::All
+        } else {
+            FeesFilter::One(1)
+        };
         let chain_select = cx.new(|cx| {
             SelectState::new(
                 chain_select_items,
@@ -306,7 +338,9 @@ impl BroadcasterMonitorPane {
                 FeesDelegate::new(
                     broadcaster_input.clone(),
                     chain_select.clone(),
+                    initial_chain_filter,
                     token_select.clone(),
+                    fee_anchor_lookup,
                 ),
                 window,
                 cx,
@@ -383,23 +417,27 @@ impl BroadcasterMonitorPane {
                 let notified = this.update_in(cx, |root, window, cx| {
                     let state = root.shared.read();
                     let current = state.rev();
-                    if current == last_rev {
-                        return false;
-                    }
+                    let changed = current != last_rev;
+                    let fees = changed.then(|| state.fee_rows());
+                    let peers = changed.then(|| state.peer_rows());
                     last_rev = current;
-                    let fees = state.fee_rows();
-                    let peers = state.peer_rows();
                     drop(state);
 
                     root.fees_table.update(cx, |s, cx| {
-                        s.delegate_mut().set_rows(fees);
+                        if let Some(fees) = fees {
+                            s.delegate_mut().set_rows(fees);
+                        } else {
+                            s.delegate_mut().refresh_anchor_values();
+                        }
                         s.delegate_mut().sync_filter_selects(window, cx);
                         cx.notify();
                     });
-                    root.peers_table.update(cx, |s, cx| {
-                        s.delegate_mut().set_rows(peers);
-                        cx.notify();
-                    });
+                    if let Some(peers) = peers {
+                        root.peers_table.update(cx, |s, cx| {
+                            s.delegate_mut().set_rows(peers);
+                            cx.notify();
+                        });
+                    }
                     cx.notify();
                     true
                 });

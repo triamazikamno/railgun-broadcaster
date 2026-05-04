@@ -57,6 +57,7 @@ use zeroize::{Zeroize, Zeroizing};
 pub use waku_relay::client::Client as PublicBroadcasterWakuClient;
 
 mod amounts;
+mod anchors;
 mod http;
 mod poi_contexts;
 mod signer;
@@ -66,6 +67,11 @@ pub mod vault;
 
 pub use amounts::{
     is_wrapped_native_token, parse_railgun_recipient, parse_send_amount, parse_unshield_amount,
+};
+pub use anchors::{
+    BroadcasterFeePolicy, BroadcasterFeePolicyStatus, TokenAnchorRateCache,
+    TokenAnchorRefreshHandle, average_non_outlier_anchor_rates, known_token_anchor_sources,
+    oracle_answer_to_anchor_rate, refresh_token_anchor_rates, spawn_token_anchor_refresh_worker,
 };
 pub use http::{HttpContext, build_http_client};
 pub use utxos::{
@@ -259,9 +265,20 @@ pub struct PublicBroadcasterCandidate {
     pub required_poi_list_keys: Vec<String>,
     pub viewing_public_key: [u8; 32],
     pub address_data: AddressData,
+    pub fee_policy_status: BroadcasterFeePolicyStatus,
 }
 
 impl PublicBroadcasterCandidate {
+    #[must_use]
+    pub fn is_allowed_by_fee_policy(&self, policy: BroadcasterFeePolicy) -> bool {
+        policy.allows_status(self.fee_policy_status)
+    }
+
+    #[must_use]
+    pub const fn is_fee_suspicious(&self) -> bool {
+        self.fee_policy_status.is_suspicious()
+    }
+
     pub fn parsed_required_poi_list_keys(&self) -> Result<Vec<FixedBytes<32>>> {
         self.required_poi_list_keys
             .iter()
@@ -280,6 +297,13 @@ impl PublicBroadcasterCandidate {
     }
 
     fn from_fee_row(row: &FeeRow) -> Option<Self> {
+        Self::from_fee_row_with_policy_status(row, BroadcasterFeePolicyStatus::UnknownAnchor)
+    }
+
+    fn from_fee_row_with_policy_status(
+        row: &FeeRow,
+        fee_policy_status: BroadcasterFeePolicyStatus,
+    ) -> Option<Self> {
         let railgun_address = RailgunAddress::from(row.railgun_address.as_ref());
         let address_data = AddressData::try_from(&railgun_address).ok()?;
         Some(Self {
@@ -302,6 +326,7 @@ impl PublicBroadcasterCandidate {
                 .collect(),
             viewing_public_key: address_data.viewing_public_key,
             address_data,
+            fee_policy_status,
         })
     }
 }
@@ -387,6 +412,8 @@ pub struct DesktopUnshieldPublicBroadcasterRequest {
     pub fee_rows: Vec<FeeRow>,
     pub selection: PublicBroadcasterSelection,
     pub fee_mode: PublicBroadcasterFeeMode,
+    pub allow_suspicious_broadcasters: bool,
+    pub anchor_cache: Option<Arc<TokenAnchorRateCache>>,
     pub waku: Arc<WakuClient>,
     pub response_timeout: Duration,
     pub progress_tx: Option<TransactionGenerationProgressSender>,
@@ -405,6 +432,8 @@ pub struct DesktopSendPublicBroadcasterRequest {
     pub fee_rows: Vec<FeeRow>,
     pub selection: PublicBroadcasterSelection,
     pub fee_mode: PublicBroadcasterFeeMode,
+    pub allow_suspicious_broadcasters: bool,
+    pub anchor_cache: Option<Arc<TokenAnchorRateCache>>,
     pub waku: Arc<WakuClient>,
     pub response_timeout: Duration,
     pub progress_tx: Option<TransactionGenerationProgressSender>,
@@ -420,6 +449,8 @@ pub struct DesktopUnshieldPublicBroadcasterEstimateRequest {
     pub fee_rows: Vec<FeeRow>,
     pub selection: PublicBroadcasterSelection,
     pub fee_mode: PublicBroadcasterFeeMode,
+    pub allow_suspicious_broadcasters: bool,
+    pub anchor_cache: Option<Arc<TokenAnchorRateCache>>,
 }
 
 pub struct DesktopSendPublicBroadcasterEstimateRequest {
@@ -431,6 +462,8 @@ pub struct DesktopSendPublicBroadcasterEstimateRequest {
     pub fee_rows: Vec<FeeRow>,
     pub selection: PublicBroadcasterSelection,
     pub fee_mode: PublicBroadcasterFeeMode,
+    pub allow_suspicious_broadcasters: bool,
+    pub anchor_cache: Option<Arc<TokenAnchorRateCache>>,
 }
 
 #[derive(Debug, Clone)]
@@ -648,6 +681,30 @@ pub fn eligible_public_broadcasters_for_asset(
     ))
 }
 
+pub fn public_broadcaster_candidates_for_asset(
+    rows: &[FeeRow],
+    chain_id: u64,
+    token: Address,
+    unwrap: bool,
+    policy: BroadcasterFeePolicy,
+    anchor_rate: Option<U256>,
+) -> Result<Vec<PublicBroadcasterCandidate>> {
+    let chain_defaults = chain_defaults_for_chain(chain_id, UnsupportedChainMessage::Generic)?;
+    Ok(public_broadcaster_candidates(
+        rows,
+        chain_id,
+        token,
+        if unwrap {
+            Some(chain_defaults.relay_adapt_contract)
+        } else {
+            None
+        },
+        SystemTime::now(),
+        policy,
+        anchor_rate,
+    ))
+}
+
 #[must_use]
 pub fn eligible_public_broadcasters(
     rows: &[FeeRow],
@@ -671,6 +728,45 @@ pub fn eligible_public_broadcasters(
 }
 
 #[must_use]
+pub fn public_broadcaster_candidates(
+    rows: &[FeeRow],
+    chain_id: u64,
+    token: Address,
+    required_relay_adapt: Option<Address>,
+    now: SystemTime,
+    policy: BroadcasterFeePolicy,
+    anchor_rate: Option<U256>,
+) -> Vec<PublicBroadcasterCandidate> {
+    rows.iter()
+        .filter(|row| row.chain_id == chain_id)
+        .filter(|row| row.token_address == token)
+        .filter(|row| row.signature_valid)
+        .filter(|row| row.fee_expiration > now)
+        .filter(|row| row.available_wallets > 0)
+        .filter(|row| supported_broadcaster_version(&row.version))
+        .filter(|row| required_relay_adapt.is_none_or(|relay| row.relay_adapt == relay))
+        .filter_map(|row| {
+            PublicBroadcasterCandidate::from_fee_row_with_policy_status(
+                row,
+                policy.classify_fee(row.fee, anchor_rate),
+            )
+        })
+        .collect()
+}
+
+#[must_use]
+pub fn fee_policy_eligible_public_broadcasters(
+    candidates: &[PublicBroadcasterCandidate],
+    policy: BroadcasterFeePolicy,
+) -> Vec<PublicBroadcasterCandidate> {
+    candidates
+        .iter()
+        .filter(|candidate| candidate.is_allowed_by_fee_policy(policy))
+        .cloned()
+        .collect()
+}
+
+#[must_use]
 pub fn sort_specific_public_broadcasters(
     mut candidates: Vec<PublicBroadcasterCandidate>,
 ) -> Vec<PublicBroadcasterCandidate> {
@@ -687,14 +783,34 @@ pub fn select_public_broadcaster(
     candidates: &[PublicBroadcasterCandidate],
     selection: &PublicBroadcasterSelection,
 ) -> Result<PublicBroadcasterCandidate> {
+    select_public_broadcaster_with_policy(
+        candidates,
+        selection,
+        BroadcasterFeePolicy::default().with_allow_suspicious_broadcasters(true),
+    )
+}
+
+pub fn select_public_broadcaster_with_policy(
+    candidates: &[PublicBroadcasterCandidate],
+    selection: &PublicBroadcasterSelection,
+    policy: BroadcasterFeePolicy,
+) -> Result<PublicBroadcasterCandidate> {
     match selection {
         PublicBroadcasterSelection::Random => {
             let supported_candidates = candidates
                 .iter()
+                .filter(|candidate| candidate.is_allowed_by_fee_policy(policy))
                 .filter(|candidate| candidate.required_poi_list_keys.is_empty())
                 .collect::<Vec<_>>();
+            let eligible_candidates = candidates
+                .iter()
+                .filter(|candidate| candidate.is_allowed_by_fee_policy(policy))
+                .collect::<Vec<_>>();
             let selected = if supported_candidates.is_empty() {
-                candidates.choose(&mut rand::rng()).cloned()
+                eligible_candidates
+                    .choose(&mut rand::rng())
+                    .copied()
+                    .cloned()
             } else {
                 supported_candidates
                     .choose(&mut rand::rng())
@@ -703,11 +819,20 @@ pub fn select_public_broadcaster(
             };
             selected.ok_or_else(|| eyre!("no eligible public broadcaster for selected token"))
         }
-        PublicBroadcasterSelection::Specific { railgun_address } => candidates
-            .iter()
-            .find(|candidate| candidate.railgun_address == *railgun_address)
-            .cloned()
-            .ok_or_else(|| eyre!("selected public broadcaster is no longer eligible")),
+        PublicBroadcasterSelection::Specific { railgun_address } => {
+            let candidate = candidates
+                .iter()
+                .find(|candidate| candidate.railgun_address == *railgun_address)
+                .cloned()
+                .ok_or_else(|| eyre!("selected public broadcaster is no longer eligible"))?;
+            if candidate.is_allowed_by_fee_policy(policy) {
+                Ok(candidate)
+            } else {
+                Err(eyre!(
+                    "selected public broadcaster fee is outside the allowed range"
+                ))
+            }
+        }
     }
 }
 
@@ -823,6 +948,14 @@ struct PublicBroadcasterSetup {
     utxos: Vec<Utxo>,
 }
 
+fn public_broadcaster_anchor_rate_for_policy(
+    anchor_cache: Option<&Arc<TokenAnchorRateCache>>,
+    chain_id: u64,
+    token: Address,
+) -> Option<U256> {
+    anchor_cache.and_then(|cache| cache.cached_rate(chain_id, token))
+}
+
 async fn public_broadcaster_setup(
     session: &WalletSession,
     chain_id: u64,
@@ -830,10 +963,13 @@ async fn public_broadcaster_setup(
     fee_rows: &[FeeRow],
     selection: &PublicBroadcasterSelection,
     require_relay_adapt: bool,
+    policy: BroadcasterFeePolicy,
+    anchor_cache: Option<&Arc<TokenAnchorRateCache>>,
     http: &HttpContext,
 ) -> Result<PublicBroadcasterSetup> {
     let chain_defaults = chain_defaults_for_chain(chain_id, UnsupportedChainMessage::Generic)?;
-    let candidates = eligible_public_broadcasters(
+    let anchor_rate = public_broadcaster_anchor_rate_for_policy(anchor_cache, chain_id, token);
+    let candidates = public_broadcaster_candidates(
         fee_rows,
         chain_id,
         token,
@@ -843,8 +979,10 @@ async fn public_broadcaster_setup(
             None
         },
         SystemTime::now(),
+        policy,
+        anchor_rate,
     );
-    let broadcaster = select_public_broadcaster(&candidates, selection)?;
+    let broadcaster = select_public_broadcaster_with_policy(&candidates, selection, policy)?;
     let provider = ProviderBuilder::new()
         .connect_reqwest(http.client.clone(), chain_defaults.rpc_url.clone())
         .erased();
@@ -1712,7 +1850,14 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
 
     let chain_defaults =
         chain_defaults_for_chain(request.chain_id, UnsupportedChainMessage::Generic)?;
-    let candidates = eligible_public_broadcasters(
+    let policy = BroadcasterFeePolicy::default()
+        .with_allow_suspicious_broadcasters(request.allow_suspicious_broadcasters);
+    let anchor_rate = public_broadcaster_anchor_rate_for_policy(
+        request.anchor_cache.as_ref(),
+        request.chain_id,
+        request.token,
+    );
+    let candidates = public_broadcaster_candidates(
         &request.fee_rows,
         request.chain_id,
         request.token,
@@ -1722,8 +1867,11 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
             None
         },
         SystemTime::now(),
+        policy,
+        anchor_rate,
     );
-    let broadcaster = select_public_broadcaster(&candidates, &request.selection)?;
+    let broadcaster =
+        select_public_broadcaster_with_policy(&candidates, &request.selection, policy)?;
     let provider = ProviderBuilder::new()
         .connect_reqwest(http.client.clone(), chain_defaults.rpc_url.clone())
         .erased();
@@ -1771,14 +1919,24 @@ pub async fn estimate_desktop_send_public_broadcaster_cost(
 
     let chain_defaults =
         chain_defaults_for_chain(request.chain_id, UnsupportedChainMessage::Generic)?;
-    let candidates = eligible_public_broadcasters(
+    let policy = BroadcasterFeePolicy::default()
+        .with_allow_suspicious_broadcasters(request.allow_suspicious_broadcasters);
+    let anchor_rate = public_broadcaster_anchor_rate_for_policy(
+        request.anchor_cache.as_ref(),
+        request.chain_id,
+        request.token,
+    );
+    let candidates = public_broadcaster_candidates(
         &request.fee_rows,
         request.chain_id,
         request.token,
         None,
         SystemTime::now(),
+        policy,
+        anchor_rate,
     );
-    let broadcaster = select_public_broadcaster(&candidates, &request.selection)?;
+    let broadcaster =
+        select_public_broadcaster_with_policy(&candidates, &request.selection, policy)?;
     let provider = ProviderBuilder::new()
         .connect_reqwest(http.client.clone(), chain_defaults.rpc_url.clone())
         .erased();
@@ -1897,6 +2055,9 @@ async fn prepare_desktop_unshield_public_broadcaster(
         &request.fee_rows,
         &request.selection,
         request.unwrap,
+        BroadcasterFeePolicy::default()
+            .with_allow_suspicious_broadcasters(request.allow_suspicious_broadcasters),
+        request.anchor_cache.as_ref(),
         http,
     )
     .await?;
@@ -2152,6 +2313,9 @@ async fn prepare_desktop_send_public_broadcaster(
         &request.fee_rows,
         &request.selection,
         false,
+        BroadcasterFeePolicy::default()
+            .with_allow_suspicious_broadcasters(request.allow_suspicious_broadcasters),
+        request.anchor_cache.as_ref(),
         http,
     )
     .await?;
@@ -3039,17 +3203,20 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ApproximateTransactionShape, DesktopWalletChainStart, DesktopWalletSyncStartPolicy,
-        EvmMessageSigner, EvmTransactionSigner, ListUtxosOutput, PublicBroadcasterCandidate,
+        ApproximateTransactionShape, BroadcasterFeePolicy, BroadcasterFeePolicyStatus,
+        DesktopWalletChainStart, DesktopWalletSyncStartPolicy, EvmMessageSigner,
+        EvmTransactionSigner, ListUtxosOutput, PublicBroadcasterCandidate,
         PublicBroadcasterFeeMode, PublicBroadcasterResultKind, PublicBroadcasterSelection,
         RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS, SoftwareEvmSigner, TokenTotal, UtxoOutput,
         approximate_public_broadcaster_cost, approximate_public_broadcaster_gas,
         broadcaster_fee_amount, broadcaster_fee_covers, buffered_public_broadcaster_fee,
-        decode_public_broadcaster_response, eligible_public_broadcasters, is_wrapped_native_token,
+        decode_public_broadcaster_response, eligible_public_broadcasters,
+        fee_policy_eligible_public_broadcasters, is_wrapped_native_token,
         max_send_amount_from_outputs, max_unshield_amount_from_outputs, parse_railgun_recipient,
         parse_send_amount, parse_unshield_amount, public_broadcaster_amount_split,
-        public_broadcaster_max_entered_amount, public_broadcaster_transact_params,
-        resolve_desktop_wallet_chain_start, select_public_broadcaster, send_approximate_shape,
+        public_broadcaster_candidates, public_broadcaster_max_entered_amount,
+        public_broadcaster_transact_params, resolve_desktop_wallet_chain_start,
+        select_public_broadcaster, select_public_broadcaster_with_policy, send_approximate_shape,
         sort_specific_public_broadcasters, transact_topic, unshield_approximate_shape,
         utxo_outputs_from_utxos, wrapped_native_token_for_chain,
     };
@@ -3135,6 +3302,7 @@ mod tests {
                 required_poi_list_keys: Vec::new(),
                 viewing_public_key: address_data.viewing_public_key,
                 address_data,
+                fee_policy_status: BroadcasterFeePolicyStatus::UnknownAnchor,
             },
             viewing,
         )
@@ -4127,6 +4295,159 @@ mod tests {
         .expect("specific candidate by stable address");
 
         assert_eq!(selected.fees_id, "fresh-fees-id");
+    }
+
+    #[test]
+    fn public_broadcaster_fee_policy_classifies_anchor_bounds() {
+        let token = address(0x28);
+        let policy = BroadcasterFeePolicy::default();
+        let candidates = public_broadcaster_candidates(
+            &[
+                fee_row(1, token, 89, 0.9, "below"),
+                fee_row(1, token, 90, 0.9, "lower-bound"),
+                fee_row(1, token, 150, 0.9, "upper-bound"),
+                fee_row(1, token, 151, 0.9, "above"),
+            ],
+            1,
+            token,
+            None,
+            SystemTime::now(),
+            policy,
+            Some(uint!(100_U256)),
+        );
+
+        let eligible_ids = fee_policy_eligible_public_broadcasters(&candidates, policy)
+            .into_iter()
+            .map(|candidate| candidate.fees_id)
+            .collect::<Vec<_>>();
+        assert_eq!(eligible_ids, vec!["lower-bound", "upper-bound"]);
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.fees_id == "below"
+                    && matches!(
+                        candidate.fee_policy_status,
+                        BroadcasterFeePolicyStatus::Suspicious {
+                            premium_bps: Some(-1100),
+                            ..
+                        }
+                    ))
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.fees_id == "above"
+                    && matches!(
+                        candidate.fee_policy_status,
+                        BroadcasterFeePolicyStatus::Suspicious {
+                            premium_bps: Some(5100),
+                            ..
+                        }
+                    ))
+        );
+    }
+
+    #[test]
+    fn public_broadcaster_fee_policy_allows_unknown_anchor_rows() {
+        let token = address(0x29);
+        let policy = BroadcasterFeePolicy::default();
+        let candidates = public_broadcaster_candidates(
+            &[fee_row(1, token, 1_000_000, 0.9, "raw")],
+            1,
+            token,
+            None,
+            SystemTime::now(),
+            policy,
+            None,
+        );
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].fee_policy_status,
+            BroadcasterFeePolicyStatus::UnknownAnchor
+        );
+        assert_eq!(
+            fee_policy_eligible_public_broadcasters(&candidates, policy).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn public_broadcaster_fee_policy_override_includes_suspicious_rows() {
+        let token = address(0x2a);
+        let policy = BroadcasterFeePolicy::default();
+        let allow_policy = policy.with_allow_suspicious_broadcasters(true);
+        let candidates = public_broadcaster_candidates(
+            &[fee_row(1, token, 151, 0.9, "above")],
+            1,
+            token,
+            None,
+            SystemTime::now(),
+            policy,
+            Some(uint!(100_U256)),
+        );
+
+        assert!(
+            select_public_broadcaster_with_policy(
+                &candidates,
+                &PublicBroadcasterSelection::Random,
+                policy
+            )
+            .is_err()
+        );
+        assert!(
+            select_public_broadcaster_with_policy(
+                &candidates,
+                &PublicBroadcasterSelection::Random,
+                allow_policy
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn specific_public_broadcaster_drift_rechecks_latest_fee_policy() {
+        let token = address(0x2b);
+        let railgun_address = sample_railgun_address(41);
+        let policy = BroadcasterFeePolicy::default();
+        let initial = public_broadcaster_candidates(
+            &[fee_row_with_broadcaster_seed(
+                1, token, 100, 0.9, "initial", 41,
+            )],
+            1,
+            token,
+            None,
+            SystemTime::now(),
+            policy,
+            Some(uint!(100_U256)),
+        );
+        let selection = PublicBroadcasterSelection::Specific {
+            railgun_address: railgun_address.clone(),
+        };
+        assert!(select_public_broadcaster_with_policy(&initial, &selection, policy).is_ok());
+
+        let drifted = public_broadcaster_candidates(
+            &[fee_row_with_broadcaster_seed(
+                1, token, 151, 0.9, "drifted", 41,
+            )],
+            1,
+            token,
+            None,
+            SystemTime::now(),
+            policy,
+            Some(uint!(100_U256)),
+        );
+        let error = select_public_broadcaster_with_policy(&drifted, &selection, policy)
+            .expect_err("drifted broadcaster should be blocked");
+        assert!(error.to_string().contains("outside the allowed range"));
+        assert!(
+            select_public_broadcaster_with_policy(
+                &drifted,
+                &selection,
+                policy.with_allow_suspicious_broadcasters(true)
+            )
+            .is_ok()
+        );
     }
 
     #[test]
