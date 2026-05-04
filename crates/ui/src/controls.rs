@@ -1,7 +1,6 @@
 use gpui::{
     Div, ElementId, Entity, FontWeight, ParentElement, SharedString, Styled, div, px, relative, rgb,
 };
-use gpui_component::Sizable;
 use gpui_component::button::Button;
 use gpui_component::input::{Input, InputState};
 
@@ -9,7 +8,7 @@ use crate::theme::{self, APP_TEXT_SIZE};
 
 #[must_use]
 pub fn app_input(state: &Entity<InputState>) -> Input {
-    Input::new(state).xsmall().px(px(8.0)).py(px(13.0))
+    Input::new(state).w_full().px(px(8.0))
 }
 
 #[must_use]

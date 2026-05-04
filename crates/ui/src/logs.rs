@@ -30,8 +30,8 @@ const LOG_SCROLLBAR_WIDTH: Pixels = px(16.0);
 const LOG_RESIZE_HANDLE_WIDTH: Pixels = px(10.0);
 const LOG_LIST_OVERDRAW: Pixels = px(480.0);
 
-const DEFAULT_TIME_WIDTH: Pixels = px(90.0);
-const DEFAULT_LEVEL_WIDTH: Pixels = px(60.0);
+const DEFAULT_TIME_WIDTH: Pixels = px(100.0);
+const DEFAULT_LEVEL_WIDTH: Pixels = px(50.0);
 const DEFAULT_TARGET_WIDTH: Pixels = px(200.0);
 
 const MIN_TIME_WIDTH: Pixels = px(72.0);
@@ -165,17 +165,6 @@ impl MessageVisitor {
 }
 
 impl Visit for MessageVisitor {
-    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            let _ = write!(&mut self.message, "{value:?}");
-        } else {
-            if !self.extras.is_empty() {
-                self.extras.push(' ');
-            }
-            let _ = write!(&mut self.extras, "{}={value:?}", field.name());
-        }
-    }
-
     fn record_str(&mut self, field: &Field, value: &str) {
         if field.name() == "message" {
             self.message.push_str(value);
@@ -184,6 +173,17 @@ impl Visit for MessageVisitor {
                 self.extras.push(' ');
             }
             let _ = write!(&mut self.extras, "{}={value}", field.name());
+        }
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            let _ = write!(&mut self.message, "{value:?}");
+        } else {
+            if !self.extras.is_empty() {
+                self.extras.push(' ');
+            }
+            let _ = write!(&mut self.extras, "{}={value:?}", field.name());
         }
     }
 }

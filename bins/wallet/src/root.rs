@@ -18,6 +18,7 @@ use gpui_component::{
     button::{ButtonGroup, ButtonVariants},
     checkbox::Checkbox,
     dialog::DialogButtonProps,
+    divider::Divider,
     input::{Input, InputEvent, InputState},
     list::{List, ListDelegate, ListItem, ListState},
     progress::Progress as UiProgress,
@@ -46,11 +47,11 @@ use wallet_ops::{
     DesktopSendCalldataRequest, DesktopSendPublicBroadcasterEstimateRequest,
     DesktopSendPublicBroadcasterRequest, DesktopUnshieldCalldataRequest,
     DesktopUnshieldPublicBroadcasterEstimateRequest, DesktopUnshieldPublicBroadcasterRequest,
-    HttpContext, ListUtxosOutput, PreparedSendCall, PreparedUnshieldCall,
-    PublicBroadcasterCandidate, PublicBroadcasterCostEstimate, PublicBroadcasterFeeMode,
-    PublicBroadcasterResultKind, PublicBroadcasterSelection, PublicBroadcasterSubmissionResult,
-    PublicBroadcasterWakuClient, SyncProgressUpdate, TokenTotal, TransactionGenerationStage,
-    UtxoOutput, ViewWalletChainSessionRequest, WalletSessionStore,
+    DesktopWalletSyncStartPolicy, HttpContext, ListUtxosOutput, PreparedSendCall,
+    PreparedUnshieldCall, PublicBroadcasterCandidate, PublicBroadcasterCostEstimate,
+    PublicBroadcasterFeeMode, PublicBroadcasterResultKind, PublicBroadcasterSelection,
+    PublicBroadcasterSubmissionResult, PublicBroadcasterWakuClient, SyncProgressUpdate, TokenTotal,
+    TransactionGenerationStage, UtxoOutput, ViewWalletChainSessionRequest, WalletSessionStore,
     eligible_public_broadcasters_for_asset, estimate_desktop_send_public_broadcaster_cost,
     estimate_desktop_unshield_public_broadcaster_cost, is_wrapped_native_token,
     max_send_amount_from_outputs as planner_max_send_amount_from_outputs,
@@ -60,8 +61,10 @@ use wallet_ops::{
     sort_specific_public_broadcasters, submit_desktop_send_public_broadcaster,
     submit_desktop_unshield_public_broadcaster,
     vault::{
-        DesktopVaultStore, DesktopViewSession, GeneratedSeedMaterial, VaultError,
-        WalletMetadataBundle, generate_opaque_id, generate_seed_material,
+        DesktopVaultStore, DesktopViewSession, GeneratedSeedMaterial, PRIMARY_WALLET_LABEL,
+        VaultError, WalletMetadataBundle, WalletSource, WalletStatus,
+        default_wallet_label_for_metadata, generate_opaque_id, generate_seed_material,
+        sort_wallet_metadata,
     },
 };
 use zeroize::Zeroizing;
@@ -74,6 +77,7 @@ const BROADCASTER_PICKER_MAX_HEIGHT: Pixels = px(680.0);
 const BROADCASTER_PICKER_LIVE_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 const PRIVATE_ACTION_FORM_MAX_HEIGHT: Pixels = px(760.0);
 const PRIVATE_ASSET_LIST_WIDTH: Pixels = px(760.0);
+const DIALOG_CONTENT_HORIZONTAL_INSET: Pixels = px(56.0);
 const UNSHIELD_SPINNER_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const UTXO_AGE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const COST_ESTIMATE_DEBOUNCE: Duration = Duration::from_secs(1);
@@ -350,18 +354,24 @@ impl Render for BroadcasterPickerDialogContent {
 
 struct RepairCacheDialogContent {
     root: Entity<WalletRoot>,
+    content_width: Pixels,
 }
 
 impl RepairCacheDialogContent {
-    fn new(root: Entity<WalletRoot>, cx: &mut Context<'_, Self>) -> Self {
+    fn new(root: Entity<WalletRoot>, content_width: Pixels, cx: &mut Context<'_, Self>) -> Self {
         cx.observe(&root, |_this, _root, cx| cx.notify()).detach();
-        Self { root }
+        Self {
+            root,
+            content_width,
+        }
     }
 }
 
 impl Render for RepairCacheDialogContent {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        self.root.read(cx).render_repair_cache_dialog_content()
+        self.root
+            .read(cx)
+            .render_repair_cache_dialog_content(self.content_width)
     }
 }
 
@@ -398,6 +408,29 @@ impl Render for VaultDialogContent {
         self.root
             .read(cx)
             .render_vault_dialog_content(self.root.clone())
+    }
+}
+
+struct AddWalletDialogContent {
+    root: Entity<WalletRoot>,
+    content_width: Pixels,
+}
+
+impl AddWalletDialogContent {
+    fn new(root: Entity<WalletRoot>, content_width: Pixels, cx: &mut Context<'_, Self>) -> Self {
+        cx.observe(&root, |_this, _root, cx| cx.notify()).detach();
+        Self {
+            root,
+            content_width,
+        }
+    }
+}
+
+impl Render for AddWalletDialogContent {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        self.root
+            .read(cx)
+            .render_add_wallet_dialog_content(self.root.clone(), self.content_width)
     }
 }
 
@@ -658,6 +691,7 @@ impl WalletTab {
 struct WalletOption {
     wallet_id: Arc<str>,
     label: Arc<str>,
+    source: WalletSource,
 }
 
 #[derive(Clone)]
@@ -812,21 +846,34 @@ enum ChainUtxoState {
         session: Arc<wallet_ops::WalletSession>,
         poi_refreshing: bool,
     },
-    Error(Arc<str>),
+    Error {
+        message: Arc<str>,
+        start_block: Option<u64>,
+    },
 }
 
 impl ChainUtxoState {
     const fn snapshot(&self) -> Option<&Arc<ListUtxosOutput>> {
         match self {
             Self::Syncing { snapshot, .. } | Self::Ready { snapshot, .. } => Some(snapshot),
-            Self::Idle | Self::Loading { .. } | Self::Error(_) => None,
+            Self::Idle | Self::Loading { .. } | Self::Error { .. } => None,
         }
     }
 
     const fn progress(&self) -> Option<SyncProgressUpdate> {
         match self {
             Self::Loading { progress } | Self::Syncing { progress, .. } => *progress,
-            Self::Idle | Self::Ready { .. } | Self::Error(_) => None,
+            Self::Idle | Self::Ready { .. } | Self::Error { .. } => None,
+        }
+    }
+
+    fn start_block(&self) -> Option<u64> {
+        match self {
+            Self::Syncing { session, .. } | Self::Ready { session, .. } => {
+                Some(session.start_block)
+            }
+            Self::Error { start_block, .. } => *start_block,
+            Self::Idle | Self::Loading { .. } => None,
         }
     }
 
@@ -846,14 +893,14 @@ impl ChainUtxoState {
             Self::Syncing { poi_refreshing, .. } | Self::Ready { poi_refreshing, .. } => {
                 *poi_refreshing
             }
-            Self::Idle | Self::Loading { .. } | Self::Error(_) => false,
+            Self::Idle | Self::Loading { .. } | Self::Error { .. } => false,
         }
     }
 
     fn poi_refresh_session(&self) -> Option<Arc<wallet_ops::WalletSession>> {
         match self {
             Self::Syncing { session, .. } | Self::Ready { session, .. } => Some(session.clone()),
-            Self::Idle | Self::Loading { .. } | Self::Error(_) => None,
+            Self::Idle | Self::Loading { .. } | Self::Error { .. } => None,
         }
     }
 }
@@ -920,6 +967,28 @@ fn chain_load_overrides(
     }
 }
 
+fn wallet_options_from_metadata(mut metadata: Vec<WalletMetadataBundle>) -> Vec<WalletOption> {
+    metadata.retain(|metadata| metadata.status == WalletStatus::Active);
+    sort_wallet_metadata(&mut metadata);
+    metadata
+        .into_iter()
+        .map(|metadata| WalletOption {
+            wallet_id: Arc::from(metadata.wallet_uuid),
+            label: Arc::from(metadata.label),
+            source: metadata.source,
+        })
+        .collect()
+}
+
+fn wallet_generation_matches(
+    selected_wallet_id: Option<&str>,
+    active_wallet_generation: u64,
+    wallet_id: &str,
+    generation: u64,
+) -> bool {
+    active_wallet_generation == generation && selected_wallet_id == Some(wallet_id)
+}
+
 pub(crate) struct WalletRoot {
     options: WalletAppOptions,
     vault_store: Option<Arc<DesktopVaultStore>>,
@@ -940,8 +1009,11 @@ pub(crate) struct WalletRoot {
     active_activity: Activity,
     active_wallet_tab: WalletTab,
     wallet_select: Entity<SelectState<SearchableVec<WalletSelectItem>>>,
+    wallet_metadata: Vec<WalletMetadataBundle>,
     wallet_options: Vec<WalletOption>,
     selected_wallet_id: Option<Arc<str>>,
+    active_wallet_generation: u64,
+    wallet_switch_generation: u64,
     selected_chain: u64,
     chain_select: Entity<SelectState<Vec<ChainSelectItem>>>,
     chain_states: BTreeMap<u64, ChainUtxoState>,
@@ -949,6 +1021,8 @@ pub(crate) struct WalletRoot {
     unlock_password_input: Entity<InputState>,
     new_password_input: Entity<InputState>,
     confirm_password_input: Entity<InputState>,
+    wallet_name_input: Entity<InputState>,
+    add_wallet_password_input: Entity<InputState>,
     import_mnemonic_input: Entity<InputState>,
     send_forms: BTreeMap<UnshieldAssetKey, SendFormState>,
     private_action_form: Option<PrivateActionFormState>,
@@ -1033,6 +1107,12 @@ impl WalletRoot {
                 .placeholder("confirm vault password")
                 .masked(true)
         });
+        let wallet_name_input = cx.new(|cx| InputState::new(window, cx).placeholder("wallet name"));
+        let add_wallet_password_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("vault password")
+                .masked(true)
+        });
         let import_mnemonic_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .auto_grow(3, 6)
@@ -1045,7 +1125,7 @@ impl WalletRoot {
         let chain_select =
             cx.new(|cx| SelectState::new(chain_select_items, selected_chain_index, window, cx));
         let wallet_select = cx.new(|cx| {
-            SelectState::new(SearchableVec::new(vec![]), None, window, cx).searchable(true)
+            SelectState::new(SearchableVec::new(Vec::new()), None, window, cx).searchable(true)
         });
         let utxo_table =
             cx.new(|cx| TableState::new(UtxoDelegate::new(tx_search_input.clone()), window, cx));
@@ -1071,14 +1151,19 @@ impl WalletRoot {
             active_activity: Activity::Wallet,
             active_wallet_tab: WalletTab::default(),
             wallet_select: wallet_select.clone(),
+            wallet_metadata: Vec::new(),
             wallet_options: Vec::new(),
             selected_wallet_id: None,
+            active_wallet_generation: 0,
+            wallet_switch_generation: 0,
             chain_select: chain_select.clone(),
             chain_states,
             session_store: Arc::new(OnceCell::new()),
             unlock_password_input,
             new_password_input,
             confirm_password_input,
+            wallet_name_input,
+            add_wallet_password_input,
             import_mnemonic_input,
             send_forms: BTreeMap::new(),
             private_action_form: None,
@@ -1126,10 +1211,10 @@ impl WalletRoot {
             &wallet_select,
             window,
             |this, _select, event: &SelectEvent<SearchableVec<WalletSelectItem>>, window, cx| {
-                let SelectEvent::Confirm(Some(wallet_id)) = event else {
+                let SelectEvent::Confirm(Some(value)) = event else {
                     return;
                 };
-                this.select_wallet(Arc::clone(wallet_id), window, cx);
+                this.select_wallet(value.as_ref(), window, cx);
                 cx.defer_in(window, |_this, window, _cx| {
                     window.blur();
                 });
@@ -1247,6 +1332,79 @@ impl WalletRoot {
         root
     }
 
+    fn set_wallet_name_input(&self, value: &str, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let value = value.to_owned();
+        self.wallet_name_input
+            .update(cx, |input, cx| input.set_value(&value, window, cx));
+    }
+
+    fn set_default_wallet_name_from_password(
+        &self,
+        password: &str,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let label = self
+            .vault_store
+            .as_ref()
+            .and_then(|store| store.default_wallet_label(password).ok())
+            .unwrap_or_else(|| PRIMARY_WALLET_LABEL.to_owned());
+        Self::defer_wallet_name_input(label, window, cx);
+    }
+
+    fn defer_wallet_name_input(value: String, window: &Window, cx: &mut Context<'_, Self>) {
+        cx.defer_in(window, move |root, window, cx| {
+            root.set_wallet_name_input(&value, window, cx);
+        });
+    }
+
+    fn selected_wallet_source(&self) -> WalletSource {
+        let Some(selected_wallet_id) = self.selected_wallet_id.as_ref() else {
+            return WalletSource::Imported;
+        };
+        self.wallet_options
+            .iter()
+            .find(|option| option.wallet_id.as_ref() == selected_wallet_id.as_ref())
+            .map_or(WalletSource::Imported, |option| option.source)
+    }
+
+    fn selected_wallet_sync_start_policy(&self) -> DesktopWalletSyncStartPolicy {
+        DesktopWalletSyncStartPolicy::from(self.selected_wallet_source())
+    }
+
+    fn selected_chain_wallet_start_block(&self) -> Option<u64> {
+        self.chain_states
+            .get(&self.selected_chain)
+            .and_then(ChainUtxoState::start_block)
+    }
+
+    fn is_active_wallet_generation(&self, wallet_id: &str, generation: u64) -> bool {
+        wallet_generation_matches(
+            self.selected_wallet_id.as_deref(),
+            self.active_wallet_generation,
+            wallet_id,
+            generation,
+        )
+    }
+
+    fn reset_wallet_scoped_state(&mut self, cx: &mut Context<'_, Self>) {
+        if let Some(store) = self.session_store.get().cloned() {
+            self.runtime.spawn(async move {
+                store.shutdown().await;
+            });
+        }
+        self.session_store = Arc::new(OnceCell::new());
+        self.send_forms.clear();
+        self.unshield_forms.clear();
+        self.private_action_form = None;
+        self.broadcaster_picker = None;
+        self.active_wallet_tab = WalletTab::default();
+        for state in self.chain_states.values_mut() {
+            *state = ChainUtxoState::Idle;
+        }
+        self.sync_utxo_table(cx);
+    }
+
     fn ensure_chain_load(
         &mut self,
         chain_id: u64,
@@ -1276,6 +1434,11 @@ impl WalletRoot {
             return;
         }
 
+        let previous_start_block = self
+            .chain_states
+            .get(&chain_id)
+            .and_then(ChainUtxoState::start_block);
+
         let previous_session = if force {
             match self.chain_states.remove(&chain_id) {
                 Some(
@@ -1298,16 +1461,22 @@ impl WalletRoot {
         let Some(view_session) = self.view_session.clone() else {
             self.chain_states.insert(
                 chain_id,
-                ChainUtxoState::Error(Arc::from("wallet vault is locked")),
+                ChainUtxoState::Error {
+                    message: Arc::from("wallet vault is locked"),
+                    start_block: previous_start_block,
+                },
             );
             self.sync_utxo_table(cx);
             cx.notify();
             return;
         };
+        let active_wallet_id: Arc<str> = Arc::from(view_session.wallet_id().to_owned());
+        let active_wallet_generation = self.active_wallet_generation;
         let (progress_tx, mut progress_rx) = watch::channel(None);
         let request = ViewWalletChainSessionRequest {
             view_session,
             chain_id,
+            sync_start_policy: self.selected_wallet_sync_start_policy(),
             init_block_number: overrides.init_block_number,
             sync_to_block: overrides.sync_to_block,
             use_indexed_wallet_catch_up: overrides.use_indexed_wallet_catch_up,
@@ -1341,6 +1510,7 @@ impl WalletRoot {
                 .await
         });
 
+        let progress_wallet_id = Arc::clone(&active_wallet_id);
         cx.spawn(async move |this, cx| {
             loop {
                 if progress_rx.changed().await.is_err() {
@@ -1348,6 +1518,12 @@ impl WalletRoot {
                 }
                 let progress = *progress_rx.borrow();
                 let should_continue = this.update(cx, |root, cx| {
+                    if !root.is_active_wallet_generation(
+                        progress_wallet_id.as_ref(),
+                        active_wallet_generation,
+                    ) {
+                        return false;
+                    }
                     match root.chain_states.get_mut(&chain_id) {
                         Some(
                             ChainUtxoState::Loading { progress: state }
@@ -1358,7 +1534,7 @@ impl WalletRoot {
                         Some(
                             ChainUtxoState::Idle
                             | ChainUtxoState::Ready { .. }
-                            | ChainUtxoState::Error(_),
+                            | ChainUtxoState::Error { .. },
                         )
                         | None => return false,
                     }
@@ -1372,14 +1548,24 @@ impl WalletRoot {
         })
         .detach();
 
+        let result_wallet_id = active_wallet_id;
         cx.spawn(async move |this, cx| {
             let session = match join.await {
                 Ok(Ok(session)) => Arc::new(session),
                 Ok(Err(error)) => {
                     let _ = this.update(cx, |root, cx| {
+                        if !root.is_active_wallet_generation(
+                            result_wallet_id.as_ref(),
+                            active_wallet_generation,
+                        ) {
+                            return;
+                        }
                         root.chain_states.insert(
                             chain_id,
-                            ChainUtxoState::Error(Arc::from(error.to_string())),
+                            ChainUtxoState::Error {
+                                message: Arc::from(error.to_string()),
+                                start_block: previous_start_block,
+                            },
                         );
                         if root.selected_chain == chain_id {
                             root.sync_utxo_table(cx);
@@ -1390,11 +1576,18 @@ impl WalletRoot {
                 }
                 Err(error) => {
                     let _ = this.update(cx, |root, cx| {
+                        if !root.is_active_wallet_generation(
+                            result_wallet_id.as_ref(),
+                            active_wallet_generation,
+                        ) {
+                            return;
+                        }
                         root.chain_states.insert(
                             chain_id,
-                            ChainUtxoState::Error(Arc::from(format!(
-                                "wallet UTXO task failed: {error}"
-                            ))),
+                            ChainUtxoState::Error {
+                                message: Arc::from(format!("wallet UTXO task failed: {error}")),
+                                start_block: previous_start_block,
+                            },
                         );
                         if root.selected_chain == chain_id {
                             root.sync_utxo_table(cx);
@@ -1413,6 +1606,12 @@ impl WalletRoot {
             let initial_poi_refreshing = *poi_refreshing_rx.borrow();
 
             let _ = this.update(cx, |root, cx| {
+                if !root.is_active_wallet_generation(
+                    result_wallet_id.as_ref(),
+                    active_wallet_generation,
+                ) {
+                    return;
+                }
                 let progress = root
                     .chain_states
                     .get(&chain_id)
@@ -1451,6 +1650,12 @@ impl WalletRoot {
                         }
                         let snapshot = snapshots_rx.borrow().clone();
                         let should_continue = this.update(cx, |root, cx| {
+                            if !root.is_active_wallet_generation(
+                                result_wallet_id.as_ref(),
+                                active_wallet_generation,
+                            ) {
+                                return false;
+                            }
                             {
                                 let Some(state) = root.chain_states.get_mut(&chain_id) else {
                                     return false;
@@ -1462,7 +1667,7 @@ impl WalletRoot {
                                     }
                                     ChainUtxoState::Idle
                                     | ChainUtxoState::Loading { .. }
-                                    | ChainUtxoState::Error(_) => return false,
+                                    | ChainUtxoState::Error { .. } => return false,
                                 }
                             }
                             root.refresh_open_form_assets_for_snapshot(&snapshot, cx);
@@ -1486,6 +1691,12 @@ impl WalletRoot {
                             continue;
                         }
                         let should_continue = this.update(cx, |root, cx| {
+                            if !root.is_active_wallet_generation(
+                                result_wallet_id.as_ref(),
+                                active_wallet_generation,
+                            ) {
+                                return false;
+                            }
                             let Some(state) = root.chain_states.remove(&chain_id) else {
                                 return false;
                             };
@@ -1507,7 +1718,7 @@ impl WalletRoot {
                                 }
                                 ChainUtxoState::Idle
                                 | ChainUtxoState::Loading { .. }
-                                | ChainUtxoState::Error(_) => {
+                                | ChainUtxoState::Error { .. } => {
                                     root.chain_states.insert(chain_id, state);
                                     false
                                 }
@@ -1523,6 +1734,12 @@ impl WalletRoot {
                         }
                         let poi_refreshing = *poi_refreshing_rx.borrow();
                         let should_continue = this.update(cx, |root, cx| {
+                            if !root.is_active_wallet_generation(
+                                result_wallet_id.as_ref(),
+                                active_wallet_generation,
+                            ) {
+                                return false;
+                            }
                             let Some(state) = root.chain_states.get_mut(&chain_id) else {
                                 return false;
                             };
@@ -1533,7 +1750,7 @@ impl WalletRoot {
                                 }
                                 ChainUtxoState::Idle
                                 | ChainUtxoState::Loading { .. }
-                                | ChainUtxoState::Error(_) => return false,
+                                | ChainUtxoState::Error { .. } => return false,
                             }
                             if root.selected_chain == chain_id {
                                 root.sync_utxo_table(cx);
@@ -1597,22 +1814,137 @@ impl WalletRoot {
         cx.notify();
     }
 
-    fn select_wallet(
-        &mut self,
-        wallet_id: Arc<str>,
-        window: &mut Window,
-        cx: &mut Context<'_, Self>,
-    ) {
-        if self.selected_wallet_id.as_deref() == Some(wallet_id.as_ref()) {
+    fn select_wallet(&mut self, wallet_id: &str, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.selected_wallet_id.as_deref() == Some(wallet_id) {
             return;
         }
         window.close_all_dialogs(cx);
-        self.selected_wallet_id = Some(wallet_id);
-        self.send_forms.clear();
-        self.unshield_forms.clear();
-        self.private_action_form = None;
-        self.broadcaster_picker = None;
+        self.switch_active_wallet(wallet_id, window, cx);
+    }
+
+    fn open_add_wallet_dialog(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        window.close_all_dialogs(cx);
+        self.generated_seed = None;
+        self.vault_error = None;
+        self.wallet_setup_mode = WalletSetupMode::Choose;
+        let label = default_wallet_label_for_metadata(&self.wallet_metadata);
+        let root = cx.entity();
+        let dialog_width = (window.viewport_size().width * 0.92).min(px(520.0));
+        let content_width = secondary_dialog_content_width(dialog_width);
+        let content = cx.new(|cx| AddWalletDialogContent::new(root, content_width, cx));
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            dialog
+                .w(dialog_width)
+                .title(app_strong_text("Add wallet"))
+                .child(content.clone())
+        });
+        cx.defer_in(window, move |root, window, cx| {
+            root.set_wallet_name_input(&label, window, cx);
+            root.add_wallet_password_input
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        });
+    }
+
+    fn switch_active_wallet(
+        &mut self,
+        wallet_id: &str,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(store) = self.vault_store.clone() else {
+            self.set_vault_error("Wallet vault storage is unavailable", cx);
+            return;
+        };
+        let Some(current_session) = self.view_session.clone() else {
+            self.set_vault_error("Wallet vault is locked", cx);
+            return;
+        };
+
+        let current_wallet_id: Arc<str> = Arc::from(current_session.wallet_id().to_owned());
+        let active_wallet_generation = self.active_wallet_generation;
+        self.wallet_switch_generation = self.wallet_switch_generation.wrapping_add(1);
+        let switch_generation = self.wallet_switch_generation;
+        self.vault_error = None;
+        let wallet_id_string = wallet_id.to_owned();
+        let metadata = self.wallet_metadata.clone();
+        let join = self.runtime.spawn_blocking(move || {
+            store.load_view_session_with_view_session(current_session.as_ref(), &wallet_id_string)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = join.await;
+            let _ = this.update_in(cx, |root, window, cx| {
+                if root.wallet_switch_generation != switch_generation
+                    || !root.is_active_wallet_generation(
+                        current_wallet_id.as_ref(),
+                        active_wallet_generation,
+                    )
+                {
+                    return;
+                }
+                match result {
+                    Ok(Ok(session)) => root.install_view_session(session, metadata, window, cx),
+                    Ok(Err(error)) => {
+                        root.handle_vault_error(&error, cx);
+                        root.sync_wallet_select(window, cx);
+                    }
+                    Err(error) => {
+                        root.set_vault_error(
+                            format!("Failed to switch wallet: {error}").as_str(),
+                            cx,
+                        );
+                        root.sync_wallet_select(window, cx);
+                    }
+                }
+            });
+        })
+        .detach();
         cx.notify();
+    }
+
+    #[allow(dead_code)]
+    fn deactivate_wallet_and_switch(
+        &mut self,
+        wallet_id: &str,
+        password: &str,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(store) = self.vault_store.clone() else {
+            self.set_vault_error("Wallet vault storage is unavailable", cx);
+            return;
+        };
+        if let Err(error) = store.deactivate_wallet(password, wallet_id) {
+            self.handle_vault_error(&error, cx);
+            return;
+        }
+        let metadata = match store.list_wallet_metadata(password) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                self.handle_vault_error(&error, cx);
+                return;
+            }
+        };
+        self.wallet_metadata.clone_from(&metadata);
+        self.wallet_options = wallet_options_from_metadata(metadata.clone());
+
+        if self.selected_wallet_id.as_deref() != Some(wallet_id) {
+            self.sync_wallet_select(window, cx);
+            cx.notify();
+            return;
+        }
+
+        let Some(next_wallet_id) = self
+            .wallet_options
+            .first()
+            .map(|option| Arc::clone(&option.wallet_id))
+        else {
+            self.set_vault_error("No active wallet remains after deactivation", cx);
+            return;
+        };
+        match store.load_view_session(password, next_wallet_id.as_ref()) {
+            Ok(session) => self.install_view_session(session, metadata, window, cx),
+            Err(error) => self.handle_vault_error(&error, cx),
+        }
     }
 
     fn select_wallet_tab(&mut self, tab: WalletTab, cx: &mut Context<'_, Self>) {
@@ -1840,6 +2172,7 @@ impl WalletRoot {
 
         match store.create_vault(password.as_str()) {
             Ok(_) => {
+                Self::defer_wallet_name_input(PRIMARY_WALLET_LABEL.to_owned(), window, cx);
                 self.setup_password = Some(password);
                 self.vault_error = None;
                 self.vault_state = VaultState::SetupWallet;
@@ -1875,19 +2208,24 @@ impl WalletRoot {
         cx.notify();
 
         let join = self.runtime.spawn_blocking(move || {
-            store
-                .unlock_first_view_session(password.as_str())
-                .map(|session| (session, password))
+            let metadata = store.list_wallet_metadata(password.as_str())?;
+            let active = wallet_options_from_metadata(metadata.clone());
+            let Some(wallet_id) = active.first().map(|option| option.wallet_id.to_string()) else {
+                return Ok((None, metadata, password));
+            };
+            let session = store.load_view_session(password.as_str(), &wallet_id)?;
+            Ok((Some(session), metadata, password))
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = join.await;
             let _ = this.update_in(cx, |root, window, cx| {
                 root.unlock_in_progress = false;
                 match result {
-                    Ok(Ok((Some(session), _password))) => {
-                        root.enter_view_unlocked(session, window, cx);
+                    Ok(Ok((Some(session), metadata, _password))) => {
+                        root.enter_view_unlocked(session, metadata, window, cx);
                     }
-                    Ok(Ok((None, password))) => {
+                    Ok(Ok((None, _metadata, password))) => {
+                        root.set_default_wallet_name_from_password(password.as_str(), window, cx);
                         root.setup_password = Some(password);
                         root.vault_error = None;
                         root.vault_state = VaultState::SetupWallet;
@@ -1924,15 +2262,19 @@ impl WalletRoot {
         }
     }
 
-    fn choose_import_wallet(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+    fn choose_import_wallet(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
         self.generated_seed = None;
         self.vault_error = None;
         self.wallet_setup_mode = WalletSetupMode::Import;
-        self.import_mnemonic_input
-            .read(cx)
-            .focus_handle(cx)
-            .focus(window);
         cx.notify();
+        cx.defer_in(window, |root, window, cx| {
+            if root.wallet_setup_mode == WalletSetupMode::Import {
+                root.import_mnemonic_input
+                    .read(cx)
+                    .focus_handle(cx)
+                    .focus(window);
+            }
+        });
     }
 
     fn back_to_wallet_setup_choice(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -1944,6 +2286,30 @@ impl WalletRoot {
         cx.notify();
     }
 
+    fn wallet_creation_password(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Option<Zeroizing<String>> {
+        if matches!(self.vault_state, VaultState::ViewUnlocked) {
+            let password = Self::read_and_clear_input(&self.add_wallet_password_input, window, cx);
+            if password.trim().is_empty() {
+                self.set_vault_error("Enter the vault password to add a wallet", cx);
+                return None;
+            }
+            return Some(password);
+        }
+        let Some(password) = self.setup_password.as_ref() else {
+            self.set_vault_error("Unlock the wallet vault before adding a wallet", cx);
+            return None;
+        };
+        Some(Zeroizing::new(password.to_string()))
+    }
+
+    fn wallet_name_from_input(&self, cx: &Context<'_, Self>) -> String {
+        self.wallet_name_input.read(cx).value().to_string()
+    }
+
     fn store_generated_wallet(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         let wallet_id = match generate_opaque_id() {
             Ok(wallet_id) => wallet_id,
@@ -1952,23 +2318,29 @@ impl WalletRoot {
                 return;
             }
         };
+        let label = self.wallet_name_from_input(cx);
+        let Some(password) = self.wallet_creation_password(window, cx) else {
+            return;
+        };
         let result = {
             let Some(store) = self.vault_store.as_ref() else {
                 self.set_vault_error("Wallet vault storage is unavailable", cx);
-                return;
-            };
-            let Some(password) = self.setup_password.as_ref() else {
-                self.set_vault_error("Unlock the wallet vault before adding a wallet", cx);
                 return;
             };
             let Some(seed) = self.generated_seed.as_ref() else {
                 self.set_vault_error("Generate a recovery phrase before creating the wallet", cx);
                 return;
             };
-            let metadata = WalletMetadataBundle {
-                wallet_uuid: wallet_id.clone(),
-                label: "Primary wallet".to_string(),
-                derivation_index: 0,
+            let metadata = store.new_wallet_metadata(
+                password.as_str(),
+                &wallet_id,
+                0,
+                WalletSource::Generated,
+                &label,
+            );
+            let metadata = match metadata {
+                Ok(metadata) => metadata,
+                Err(error) => return self.handle_vault_error(&error, cx),
             };
             store
                 .store_generated_wallet_with_metadata(
@@ -1979,11 +2351,15 @@ impl WalletRoot {
                     seed,
                     &metadata,
                 )
-                .and_then(|_| store.load_view_session(password.as_str(), &wallet_id))
+                .and_then(|_| {
+                    let metadata = store.list_wallet_metadata(password.as_str())?;
+                    let session = store.load_view_session(password.as_str(), &wallet_id)?;
+                    Ok((session, metadata))
+                })
         };
 
         match result {
-            Ok(session) => self.enter_view_unlocked(session, window, cx),
+            Ok((session, metadata)) => self.enter_view_unlocked(session, metadata, window, cx),
             Err(error) => self.handle_vault_error(&error, cx),
         }
     }
@@ -2001,20 +2377,26 @@ impl WalletRoot {
                 return;
             }
         };
+        let label = self.wallet_name_from_input(cx);
+        let Some(password) = self.wallet_creation_password(window, cx) else {
+            return;
+        };
 
         let result = {
             let Some(store) = self.vault_store.as_ref() else {
                 self.set_vault_error("Wallet vault storage is unavailable", cx);
                 return;
             };
-            let Some(password) = self.setup_password.as_ref() else {
-                self.set_vault_error("Unlock the wallet vault before importing a wallet", cx);
-                return;
-            };
-            let metadata = WalletMetadataBundle {
-                wallet_uuid: wallet_id.clone(),
-                label: "Primary wallet".to_string(),
-                derivation_index: 0,
+            let metadata = store.new_wallet_metadata(
+                password.as_str(),
+                &wallet_id,
+                0,
+                WalletSource::Imported,
+                &label,
+            );
+            let metadata = match metadata {
+                Ok(metadata) => metadata,
+                Err(error) => return self.handle_vault_error(&error, cx),
             };
             store
                 .import_wallet_mnemonic_with_metadata(
@@ -2025,11 +2407,15 @@ impl WalletRoot {
                     mnemonic.as_str(),
                     &metadata,
                 )
-                .and_then(|_| store.load_view_session(password.as_str(), &wallet_id))
+                .and_then(|_| {
+                    let metadata = store.list_wallet_metadata(password.as_str())?;
+                    let session = store.load_view_session(password.as_str(), &wallet_id)?;
+                    Ok((session, metadata))
+                })
         };
 
         match result {
-            Ok(session) => self.enter_view_unlocked(session, window, cx),
+            Ok((session, metadata)) => self.enter_view_unlocked(session, metadata, window, cx),
             Err(error) => self.handle_vault_error(&error, cx),
         }
     }
@@ -2037,6 +2423,7 @@ impl WalletRoot {
     fn install_view_session(
         &mut self,
         session: DesktopViewSession,
+        metadata: Vec<WalletMetadataBundle>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -2044,28 +2431,22 @@ impl WalletRoot {
         let wallet_id: Arc<str> = Arc::from(session.wallet_id().to_owned());
         window.close_all_dialogs(cx);
         self.vault_dialog_open = false;
+        self.active_wallet_generation = self.active_wallet_generation.wrapping_add(1);
         self.view_session = Some(session);
-        self.wallet_options = vec![WalletOption {
-            wallet_id: Arc::clone(&wallet_id),
-            label: Arc::from("Primary wallet"),
-        }];
+        self.wallet_metadata = metadata;
+        self.wallet_options = wallet_options_from_metadata(self.wallet_metadata.clone());
         self.selected_wallet_id = Some(wallet_id);
         self.sync_wallet_select(window, cx);
-        self.send_forms.clear();
-        self.unshield_forms.clear();
-        self.private_action_form = None;
-        self.broadcaster_picker = None;
-        self.active_wallet_tab = WalletTab::default();
+        self.reset_wallet_scoped_state(cx);
         self.setup_password = None;
         self.generated_seed = None;
+        self.add_wallet_password_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.import_mnemonic_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
         self.vault_error = None;
         self.vault_state = VaultState::ViewUnlocked;
         self.wallet_setup_mode = WalletSetupMode::Choose;
-        self.session_store = Arc::new(OnceCell::new());
-        for state in self.chain_states.values_mut() {
-            *state = ChainUtxoState::Idle;
-        }
-        self.sync_utxo_table(cx);
         self.ensure_chain_load(self.selected_chain, ChainLoadSource::Initial, cx);
         cx.notify();
     }
@@ -2094,10 +2475,11 @@ impl WalletRoot {
     fn enter_view_unlocked(
         &mut self,
         session: DesktopViewSession,
+        metadata: Vec<WalletMetadataBundle>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        self.install_view_session(session, window, cx);
+        self.install_view_session(session, metadata, window, cx);
     }
 
     fn lock_vault(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -2109,8 +2491,10 @@ impl WalletRoot {
         window.close_all_dialogs(cx);
         self.vault_dialog_open = false;
         self.view_session = None;
+        self.wallet_metadata.clear();
         self.wallet_options.clear();
         self.selected_wallet_id = None;
+        self.active_wallet_generation = self.active_wallet_generation.wrapping_add(1);
         self.sync_wallet_select(window, cx);
         self.send_forms.clear();
         self.unshield_forms.clear();
@@ -2195,11 +2579,13 @@ impl WalletRoot {
     fn open_repair_cache_dialog(window: &mut Window, cx: &mut Context<'_, Self>) {
         let root = cx.entity();
         let content_root = root.clone();
-        let content = cx.new(|cx| RepairCacheDialogContent::new(content_root, cx));
+        let dialog_width = (window.viewport_size().width * 0.92).min(px(420.0));
+        let content_width = secondary_dialog_content_width(dialog_width);
+        let content = cx.new(|cx| RepairCacheDialogContent::new(content_root, content_width, cx));
         window.open_dialog(cx, move |dialog, _window, _cx| {
             let submit_root = root.clone();
             dialog
-                .w(px(420.0))
+                .w(dialog_width)
                 .title(app_strong_text("Repair wallet cache"))
                 .button_props(DialogButtonProps::default().ok_text("Repair"))
                 .footer(|ok, _, window, cx| vec![ok(window, cx)])
@@ -3863,6 +4249,17 @@ impl WalletRoot {
         }
     }
 
+    fn render_add_wallet_dialog_content(
+        &self,
+        root: Entity<Self>,
+        content_width: Pixels,
+    ) -> gpui::AnyElement {
+        div()
+            .w(content_width)
+            .child(self.render_wallet_setup(root))
+            .into_any_element()
+    }
+
     fn render_create_vault(&self, root: Entity<Self>) -> gpui::Div {
         let submit_root = root;
         let mut body = vault_dialog_body(
@@ -3976,6 +4373,11 @@ impl WalletRoot {
             body = body.child(error);
         }
 
+        body = body.child(app_input(&self.wallet_name_input));
+        if matches!(self.vault_state, VaultState::ViewUnlocked) {
+            body = body.child(app_input(&self.add_wallet_password_input));
+        }
+
         body.child(
             div()
                 .w_full()
@@ -4022,7 +4424,12 @@ impl WalletRoot {
             body = body.child(error);
         }
 
-        body.child(app_input(&self.import_mnemonic_input))
+        body.child(app_input(&self.wallet_name_input))
+            .when(
+                matches!(self.vault_state, VaultState::ViewUnlocked),
+                |this| this.child(app_input(&self.add_wallet_password_input)),
+            )
+            .child(app_input(&self.import_mnemonic_input))
             .child(
                 app_button("store-imported-wallet", "Import wallet")
                     .primary()
@@ -4160,7 +4567,14 @@ impl WalletRoot {
             .bg(rgb(theme::SURFACE))
             .border_b_1()
             .border_color(rgb(theme::BORDER))
-            .child(self.render_wallet_selector())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(self.render_wallet_selector())
+                    .child(Self::render_add_wallet_button(root.clone())),
+            )
             .child(self.render_chain_selector())
             .child(div().flex_1())
             .children(receive_address.clone().map(|address| {
@@ -4216,18 +4630,47 @@ impl WalletRoot {
             })
     }
 
-    fn render_repair_cache_dialog_content(&self) -> gpui::Div {
+    fn render_repair_cache_dialog_content(&self, content_width: Pixels) -> gpui::Div {
         let input = self.repair_cache_block_input.clone();
         let error = self.repair_cache_error.clone();
+        let start_block = self.selected_chain_wallet_start_block();
+        let help_text = repair_cache_help_text(start_block.is_some());
+        let start_block_hint = start_block.map(|start_block| {
+            let hint_input = input.clone();
+            let value = start_block.to_string();
+            let label = match self.selected_wallet_source() {
+                WalletSource::Generated => "generated wallet start block",
+                WalletSource::Imported => "wallet init block",
+            };
+
+            div()
+                .id("wallet-repair-current-start-block")
+                .w_full()
+                .px(px(8.0))
+                .py(px(6.0))
+                .rounded_sm()
+                .cursor_pointer()
+                .text_size(APP_TEXT_SIZE)
+                .text_color(rgb(theme::PRIMARY))
+                .hover(|this| this.bg(rgb(theme::SURFACE_HOVER_SUBTLE)))
+                .tooltip(|window, cx| {
+                    Tooltip::new("Fill repair block with this start block").build(window, cx)
+                })
+                .on_click(move |_event, window, cx| {
+                    hint_input.update(cx, |input, cx| {
+                        input.set_value(&value, window, cx);
+                    });
+                })
+                .child(SharedString::from(format!("Use {label}: {start_block}")))
+        });
 
         div()
-            .w_full()
+            .w(content_width)
             .flex()
             .flex_col()
             .gap_3()
-            .child(app_muted_text(
-                "Rewind and rescan this chain's wallet cache. Use 0 for deployment block.",
-            ))
+            .child(app_muted_text(help_text))
+            .children(start_block_hint)
             .child(app_input(&input))
             .children(error.as_ref().map(|message| {
                 div()
@@ -4238,15 +4681,30 @@ impl WalletRoot {
     }
 
     fn render_wallet_selector(&self) -> impl IntoElement {
-        div().h(px(24.0)).w(px(220.0)).flex().items_center().child(
+        div().h(px(24.0)).w(px(180.0)).flex().items_center().child(
             Select::new(&self.wallet_select)
                 .appearance(false)
                 .small()
-                .w(px(220.0))
+                .w(px(180.0))
                 .h(px(24.0))
-                .menu_width(px(300.0))
+                .menu_width(px(220.0))
                 .search_placeholder("Search wallets"),
         )
+    }
+
+    fn render_add_wallet_button(root: Entity<Self>) -> impl IntoElement {
+        app_button_base("wallet-add-wallet-trigger")
+            .outline()
+            .xsmall()
+            .h(px(24.0))
+            .w(px(28.0))
+            .tooltip("Add wallet")
+            .icon(IconName::Plus)
+            .on_click(move |_event, window, cx| {
+                root.update(cx, |root, cx| {
+                    root.open_add_wallet_dialog(window, cx);
+                });
+            })
     }
 
     fn render_wallet_tabs(&self, root: &Entity<Self>) -> impl IntoElement {
@@ -4286,9 +4744,53 @@ impl WalletRoot {
         }
     }
 
+    fn render_chain_error_body(&self, root: &Entity<Self>, message: &str) -> gpui::Div {
+        let can_retry =
+            matches!(self.vault_state, VaultState::ViewUnlocked) && self.view_session.is_some();
+        let retry_root = root.clone();
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .child(
+                div()
+                    .max_w(px(520.0))
+                    .text_color(rgb(theme::DANGER))
+                    .text_align(gpui::TextAlign::Center)
+                    .child(SharedString::from(message.to_owned())),
+            )
+            .when(can_retry, |this| {
+                this.child(
+                    app_button("wallet-chain-retry-sync", "Retry sync")
+                        .outline()
+                        .xsmall()
+                        .on_click(move |_event, _window, cx| {
+                            retry_root.update(cx, |root, cx| {
+                                if root.view_session.is_none() {
+                                    return;
+                                }
+                                let chain_id = root.selected_chain;
+                                let overrides = chain_load_overrides(
+                                    &root.options,
+                                    chain_id,
+                                    ChainLoadSource::Selection,
+                                );
+                                root.start_chain_load(chain_id, overrides, true, cx);
+                            });
+                        }),
+                )
+            })
+    }
+
     fn render_private_assets_body(&self, root: &Entity<Self>) -> gpui::AnyElement {
         match self.chain_states.get(&self.selected_chain) {
-            Some(ChainUtxoState::Error(error)) => error_message(error.as_ref()).into_any_element(),
+            Some(ChainUtxoState::Error { message, .. }) => self
+                .render_chain_error_body(root, message.as_ref())
+                .into_any_element(),
             Some(ChainUtxoState::Loading { progress }) => {
                 centered_message(loading_summary(*progress)).into_any_element()
             }
@@ -4875,19 +5377,21 @@ impl WalletRoot {
     }
 
     fn render_chain_selector(&self) -> impl IntoElement {
-        div().h(px(24.0)).w(px(180.0)).flex().items_center().child(
+        div().h(px(24.0)).w(px(130.0)).flex().items_center().child(
             Select::new(&self.chain_select)
                 .appearance(false)
                 .small()
-                .w(px(180.0))
+                .w(px(130.0))
                 .h(px(24.0))
-                .menu_width(px(220.0)),
+                .menu_width(px(150.0)),
         )
     }
 
     fn render_utxo_body(&self, root: &Entity<Self>, window: &Window) -> impl IntoElement {
         match self.chain_states.get(&self.selected_chain) {
-            Some(ChainUtxoState::Error(error)) => error_message(error.as_ref()),
+            Some(ChainUtxoState::Error { message, .. }) => {
+                self.render_chain_error_body(root, message.as_ref())
+            }
             Some(ChainUtxoState::Ready { snapshot, .. }) if snapshot.utxo_count == 0 => {
                 centered_message("No UTXOs found")
             }
@@ -4926,18 +5430,13 @@ impl WalletRoot {
         let search_active = !self.tx_search_query.is_empty();
         let clear_search_input = self.tx_search_input.clone();
         let clear_search_table = self.utxo_table.clone();
-        let search_input = app_input(&self.tx_search_input).when(search_active, |input| {
+        let search_input = app_input(&self.tx_search_input).small().when(search_active, |input| {
             input.suffix(
-                div()
-                    .id("wallet-search-clear")
-                    .size(px(18.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .hover(|this| this.bg(rgb(theme::SURFACE_HOVER)))
-                    .tooltip(|window, cx| Tooltip::new("Clear search").build(window, cx))
+                app_button_base("wallet-search-clear")
+                    .ghost()
+                    .xsmall()
+                    .tooltip("Clear search")
+                    .icon(IconName::Close)
                     .on_click(move |_event, window, cx| {
                         clear_search_input.update(cx, |input, cx| {
                             input.set_value("", window, cx);
@@ -4945,8 +5444,7 @@ impl WalletRoot {
                         clear_search_table.update(cx, |table, cx| {
                             table.focus_handle(cx).focus(window);
                         });
-                    })
-                    .child(img(icons::close_icon_path()).size(px(12.0)).flex_none()),
+                    }),
             )
         });
         let spent_toggle = Checkbox::new("wallet-toggle-spent-utxos")
@@ -5062,27 +5560,17 @@ impl WalletRoot {
                     )
                     .child(div().flex_1())
                     .child(
-                        div()
-                            .id("close-wallet-logs-drawer")
-                            .size(px(24.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .text_color(rgb(theme::TEXT_MUTED))
-                            .hover(|this| {
-                                this.bg(rgb(theme::SURFACE_HOVER))
-                                    .text_color(rgb(theme::TEXT))
-                            })
-                            .tooltip(|window, cx| Tooltip::new("Hide logs").build(window, cx))
+                        app_button_base("close-wallet-logs-drawer")
+                            .ghost()
+                            .xsmall()
+                            .tooltip("Hide logs")
+                            .icon(IconName::Close)
                             .on_click(move |_event, _window, cx| {
                                 root.update(cx, |root, cx| {
                                     root.logs_open = false;
                                     cx.notify();
                                 });
-                            })
-                            .child(img(icons::close_icon_path()).size(px(14.0)).flex_none()),
+                            }),
                     ),
             )
             .child(
@@ -5543,26 +6031,18 @@ fn tx_hash_cell(
                         )),
                 )
                 .child(
-                    div()
-                        .id(SharedString::from(format!(
-                            "wallet-{kind}-tx-search-{row_ix}"
-                        )))
-                        .size(px(20.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_sm()
-                        .cursor_pointer()
-                        .hover(|this| this.bg(rgb(theme::SURFACE_HOVER)))
-                        .tooltip(|window, cx| {
-                            Tooltip::new("Filter by this transaction").build(window, cx)
-                        })
-                        .on_click(move |_event, window, cx| {
-                            tx_search_input.update(cx, |input, cx| {
-                                input.set_value(search_hash.clone(), window, cx);
-                            });
-                        })
-                        .child(img(icons::search_icon_path()).size(px(14.0)).flex_none()),
+                    app_button_base(SharedString::from(format!(
+                        "wallet-{kind}-tx-search-{row_ix}"
+                    )))
+                    .ghost()
+                    .xsmall()
+                    .tooltip("Filter by this transaction")
+                    .icon(IconName::Search)
+                    .on_click(move |_event, window, cx| {
+                        tx_search_input.update(cx, |input, cx| {
+                            input.set_value(search_hash.clone(), window, cx);
+                        });
+                    }),
                 ),
         )
         .into_any_element()
@@ -5599,6 +6079,10 @@ fn centered_message(message: impl Into<SharedString>) -> gpui::Div {
 
 fn private_action_input(state: &Entity<InputState>) -> Input {
     Input::new(state).px(px(12.0)).py(px(8.0))
+}
+
+fn secondary_dialog_content_width(dialog_width: Pixels) -> Pixels {
+    (dialog_width - DIALOG_CONTENT_HORIZONTAL_INSET).max(px(0.0))
 }
 
 fn vault_dialog_body(subtitle: impl Into<SharedString>) -> gpui::Div {
@@ -5673,16 +6157,6 @@ fn progress_detail(progress: SyncProgressUpdate) -> String {
     format!("Block {current} of {}", progress.target_block)
 }
 
-fn error_message(message: &str) -> gpui::Div {
-    div()
-        .size_full()
-        .flex()
-        .items_center()
-        .justify_center()
-        .text_color(rgb(theme::DANGER))
-        .child(SharedString::from(message.to_owned()))
-}
-
 fn chain_label_row(chain_id: u64) -> impl IntoElement {
     let label = chain_name(chain_id).map_or_else(|| chain_id.to_string(), str::to_owned);
     let mut row = div()
@@ -5697,7 +6171,7 @@ fn chain_label_row(chain_id: u64) -> impl IntoElement {
     row.child(SharedString::from(label))
 }
 
-fn wallet_label_row(label: SharedString) -> impl IntoElement {
+fn wallet_label_row(label: SharedString) -> gpui::Div {
     div()
         .flex()
         .items_center()
@@ -5708,12 +6182,11 @@ fn wallet_label_row(label: SharedString) -> impl IntoElement {
         .child(label)
 }
 
-fn header_divider() -> gpui::Div {
-    div()
+fn header_divider() -> impl IntoElement {
+    Divider::vertical()
         .h(px(18.0))
-        .w(px(1.0))
         .mx(px(2.0))
-        .bg(rgb(theme::BORDER))
+        .color(rgb(theme::BORDER))
 }
 
 fn token_label_row(
@@ -7332,6 +7805,14 @@ fn parse_repair_cache_block(raw: &str) -> Result<Option<u64>, &'static str> {
     Ok(Some(block))
 }
 
+const fn repair_cache_help_text(has_start_block_hint: bool) -> &'static str {
+    if has_start_block_hint {
+        "Rewind and rescan this chain's wallet cache. Use 0 for deployment block, or use the wallet start block below."
+    } else {
+        "Rewind and rescan this chain's wallet cache. Use 0 for deployment block."
+    }
+}
+
 const fn vault_error_kind(error: &VaultError) -> &'static str {
     match error {
         VaultError::Random => "random",
@@ -7350,6 +7831,12 @@ const fn vault_error_kind(error: &VaultError) -> &'static str {
         VaultError::VaultNotFound => "vault_not_found",
         VaultError::UnlockFailed => "unlock_failed",
         VaultError::InvalidSpendGrant => "invalid_spend_grant",
+        VaultError::WalletNotFound => "wallet_not_found",
+        VaultError::InvalidWalletLabel => "invalid_wallet_label",
+        VaultError::DuplicateWalletLabel => "duplicate_wallet_label",
+        VaultError::InvalidWalletOrder => "invalid_wallet_order",
+        VaultError::LastActiveWallet => "last_active_wallet",
+        VaultError::WalletDisplayOrderOverflow => "wallet_display_order_overflow",
     }
 }
 
@@ -7357,18 +7844,21 @@ const fn vault_error_kind(error: &VaultError) -> &'static str {
 mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     use alloy::primitives::{Address, U256};
     use alloy::uint;
+    use gpui_component::select::SelectItem;
     use wallet_ops::{
         ListUtxosOutput, SyncProgressStage, SyncProgressUpdate, TransactionGenerationStage,
         UtxoOutput,
+        vault::{WalletMetadataBundle, WalletSource, WalletStatus},
     };
 
     use super::{
         Activity, ChainLoadSource, ChainUtxoState, CostEstimateStatus, PrivateActionMetric,
         SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_MINUTE, SECONDS_PER_MONTH, SECONDS_PER_YEAR,
-        UnshieldAsset, UnshieldAssetKey, WalletAppOptions, WalletTab,
+        UnshieldAsset, UnshieldAssetKey, WalletAppOptions, WalletSelectItem, WalletTab,
         adjusted_amount_for_max_change, build_send_asset, build_unshield_asset,
         chain_load_overrides, display_rows_from_output, format_compact_age,
         format_exact_asset_amount_for_display, format_form_error_for_asset,
@@ -7377,9 +7867,10 @@ mod tests {
         max_unshield_amount_from_snapshot, native_wrapped_output_labels, parse_repair_cache_block,
         private_action_metrics, progress_detail, public_broadcaster_cost_status,
         public_broadcaster_cost_status_text, refresh_form_asset_from_snapshot,
-        send_asset_key_from_formatted, send_element_id, send_key_matches_asset,
-        should_focus_utxo_table, should_show_distinct_amount, should_show_pending_poi_amount,
-        unshield_asset_key_from_formatted, unshield_element_id, unshield_key_matches_asset,
+        repair_cache_help_text, send_asset_key_from_formatted, send_element_id,
+        send_key_matches_asset, should_focus_utxo_table, should_show_distinct_amount,
+        should_show_pending_poi_amount, unshield_asset_key_from_formatted, unshield_element_id,
+        unshield_key_matches_asset, wallet_generation_matches, wallet_options_from_metadata,
     };
 
     fn wallet_options_with_overrides() -> WalletAppOptions {
@@ -7466,6 +7957,91 @@ mod tests {
             spent_tx_hash: None,
             spent_block_number: None,
         }
+    }
+
+    fn wallet_metadata(
+        wallet_uuid: &str,
+        label: &str,
+        source: WalletSource,
+        status: WalletStatus,
+        display_order: u32,
+    ) -> WalletMetadataBundle {
+        WalletMetadataBundle {
+            wallet_uuid: wallet_uuid.to_string(),
+            label: label.to_string(),
+            derivation_index: 0,
+            source,
+            status,
+            display_order,
+        }
+    }
+
+    #[test]
+    fn wallet_options_hide_inactive_and_sort_active_metadata() {
+        let options = wallet_options_from_metadata(vec![
+            wallet_metadata(
+                "wallet-b",
+                "Beta",
+                WalletSource::Imported,
+                WalletStatus::Active,
+                2,
+            ),
+            wallet_metadata(
+                "wallet-hidden",
+                "Hidden",
+                WalletSource::Imported,
+                WalletStatus::Inactive,
+                0,
+            ),
+            wallet_metadata(
+                "wallet-a",
+                "Alpha",
+                WalletSource::Generated,
+                WalletStatus::Active,
+                1,
+            ),
+        ]);
+
+        assert_eq!(options.len(), 2);
+        assert_eq!(options[0].wallet_id.as_ref(), "wallet-a");
+        assert_eq!(options[0].label.as_ref(), "Alpha");
+        assert_eq!(options[0].source, WalletSource::Generated);
+        assert_eq!(options[1].wallet_id.as_ref(), "wallet-b");
+    }
+
+    #[test]
+    fn wallet_select_item_matches_label_and_wallet_id() {
+        let wallet = WalletSelectItem {
+            wallet_id: "wallet-a".into(),
+            label: "Alpha".into(),
+        };
+
+        assert!(wallet.matches("alpha"));
+        assert!(wallet.matches("wallet-a"));
+        assert!(!wallet.matches("add"));
+    }
+
+    #[test]
+    fn wallet_generation_guard_rejects_stale_async_results() {
+        assert!(wallet_generation_matches(
+            Some("wallet-a"),
+            2,
+            "wallet-a",
+            2
+        ));
+        assert!(!wallet_generation_matches(
+            Some("wallet-b"),
+            2,
+            "wallet-a",
+            2
+        ));
+        assert!(!wallet_generation_matches(
+            Some("wallet-a"),
+            3,
+            "wallet-a",
+            2
+        ));
+        assert!(!wallet_generation_matches(None, 2, "wallet-a", 2));
     }
 
     #[test]
@@ -8301,6 +8877,24 @@ mod tests {
         assert_eq!(parse_repair_cache_block(""), Ok(None));
         assert_eq!(parse_repair_cache_block(" 24936249 "), Ok(Some(24936249)));
         assert!(parse_repair_cache_block("nope").is_err());
+    }
+
+    #[test]
+    fn repair_cache_help_text_only_mentions_hint_when_available() {
+        assert!(repair_cache_help_text(true).contains("wallet start block below"));
+        assert!(!repair_cache_help_text(false).contains("wallet start block below"));
+        assert!(repair_cache_help_text(false).contains("deployment block"));
+    }
+
+    #[test]
+    fn chain_error_state_preserves_start_block_hint() {
+        let state = ChainUtxoState::Error {
+            message: Arc::from("sync failed"),
+            start_block: Some(24936250),
+        };
+
+        assert_eq!(state.start_block(), Some(24936250));
+        assert!(!state.renders_table());
     }
 
     #[test]

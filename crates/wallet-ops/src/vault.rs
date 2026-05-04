@@ -1,15 +1,16 @@
-use argon2::{Algorithm, Argon2, Params, Version};
-use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use getrandom::fill;
-use hkdf::Hkdf;
-use hmac::{Hmac, KeyInit as HmacKeyInit, Mac};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use alloy::primitives::U256;
+use argon2::{Algorithm, Argon2, Params, Version};
 use broadcaster_core::crypto::railgun::{RailgunError, ViewingKeyData};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use getrandom::fill;
+use hkdf::Hkdf;
+use hmac::{Hmac, KeyInit as HmacKeyInit, Mac};
 use local_db::{DbConfig, DbStore, WalletMeta};
 use railgun_wallet::keys::KeyError;
 use railgun_wallet::wallet_cache::{
@@ -39,6 +40,8 @@ const WALLET_VIEW_PREFIX: &str = "wallet-view|";
 const WALLET_SPEND_PREFIX: &str = "wallet-spend|";
 const WALLET_CHAIN_METADATA_PREFIX: &str = "wallet-chain-meta|";
 const WALLET_CACHE_ROW_PREFIX: &str = "wallet-cache-row|";
+pub const PRIMARY_WALLET_LABEL: &str = "Primary wallet";
+const ADDITIONAL_WALLET_LABEL_PREFIX: &str = "Wallet ";
 type HmacSha256 = Hmac<Sha256>;
 type VaultRecordEntries = Vec<(String, Vec<u8>)>;
 
@@ -76,6 +79,18 @@ pub enum VaultError {
     UnlockFailed,
     #[error("spend grant is invalid")]
     InvalidSpendGrant,
+    #[error("wallet not found")]
+    WalletNotFound,
+    #[error("wallet label cannot be empty")]
+    InvalidWalletLabel,
+    #[error("wallet label already exists")]
+    DuplicateWalletLabel,
+    #[error("wallet order does not match active wallets")]
+    InvalidWalletOrder,
+    #[error("cannot deactivate the only active wallet")]
+    LastActiveWallet,
+    #[error("wallet display order overflow")]
+    WalletDisplayOrderOverflow,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -187,6 +202,10 @@ impl SecretKey {
     #[must_use]
     pub fn expose_secret(&self) -> &[u8; KEY_LEN] {
         &self.0
+    }
+
+    fn clone_secret(&self) -> Self {
+        Self(Zeroizing::new(*self.expose_secret()))
     }
 }
 
@@ -472,6 +491,20 @@ impl DesktopVaultStore {
         ))
     }
 
+    pub fn load_view_session_with_view_session(
+        &self,
+        view_session: &DesktopViewSession,
+        wallet_id: &str,
+    ) -> Result<DesktopViewSession, VaultError> {
+        let record = self.encrypted_record(&wallet_view_record_key(wallet_id))?;
+        let bundle = view_session.view.decrypt_view_bundle(wallet_id, &record)?;
+        Ok(DesktopViewSession::from_bundle(
+            wallet_id.to_owned(),
+            &bundle,
+            view_session.view.clone_unlock(),
+        ))
+    }
+
     pub fn unlock_first_view_session(
         &self,
         password: &str,
@@ -515,8 +548,23 @@ impl DesktopVaultStore {
         metadata: &WalletMetadataBundle,
     ) -> Result<(), VaultError> {
         let view = self.unlock_view(password)?;
-        let record = view.encrypt_wallet_metadata(&metadata.wallet_uuid, metadata)?;
-        self.put_encrypted_record(&wallet_metadata_record_key(&metadata.wallet_uuid), &record)
+        let (key, data) = wallet_metadata_record_entry(&view, metadata)?;
+        self.db.put_desktop_wallet_vault_record(&key, &data)?;
+        Ok(())
+    }
+
+    fn store_wallet_metadata_batch(
+        &self,
+        password: &str,
+        metadata: &[WalletMetadataBundle],
+    ) -> Result<(), VaultError> {
+        let view = self.unlock_view(password)?;
+        let records = metadata
+            .iter()
+            .map(|metadata| wallet_metadata_record_entry(&view, metadata))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.db.put_desktop_wallet_vault_records(&records)?;
+        Ok(())
     }
 
     pub fn load_wallet_metadata(
@@ -527,6 +575,197 @@ impl DesktopVaultStore {
         let view = self.unlock_view(password)?;
         let record = self.encrypted_record(&wallet_metadata_record_key(wallet_uuid))?;
         view.decrypt_wallet_metadata(wallet_uuid, &record)
+    }
+
+    pub fn list_wallet_metadata(
+        &self,
+        password: &str,
+    ) -> Result<Vec<WalletMetadataBundle>, VaultError> {
+        let view = self.unlock_view(password)?;
+        let mut wallet_ids = self.list_wallet_ids()?;
+        wallet_ids.sort();
+
+        let mut loaded = Vec::with_capacity(wallet_ids.len());
+        let mut missing_wallets = Vec::new();
+        for wallet_id in wallet_ids {
+            let Some(record) =
+                self.encrypted_record_optional(&wallet_metadata_record_key(&wallet_id))?
+            else {
+                let view_record = self.encrypted_record(&wallet_view_record_key(&wallet_id))?;
+                let view_bundle = view.decrypt_view_bundle(&wallet_id, &view_record)?;
+                missing_wallets.push((wallet_id, view_bundle.derivation_index));
+                continue;
+            };
+
+            let mut decoded = view.decrypt_wallet_metadata_record(&wallet_id, &record)?;
+            if decoded.metadata.wallet_uuid != wallet_id {
+                decoded.metadata.wallet_uuid.clone_from(&wallet_id);
+                decoded.missing_lifecycle_fields = true;
+            }
+            loaded.push(LoadedWalletMetadata {
+                metadata: decoded.metadata,
+                needs_persist: decoded.missing_lifecycle_fields,
+                missing_display_order: decoded.missing_display_order,
+            });
+        }
+
+        for (wallet_id, derivation_index) in missing_wallets {
+            let existing = loaded
+                .iter()
+                .map(|loaded| loaded.metadata.clone())
+                .collect::<Vec<_>>();
+            let label = default_wallet_label_for_metadata(&existing);
+            loaded.push(LoadedWalletMetadata {
+                metadata: WalletMetadataBundle {
+                    wallet_uuid: wallet_id,
+                    label,
+                    derivation_index,
+                    source: WalletSource::Imported,
+                    status: WalletStatus::Active,
+                    display_order: 0,
+                },
+                needs_persist: true,
+                missing_display_order: true,
+            });
+        }
+
+        assign_missing_display_orders(&mut loaded)?;
+        if loaded.iter().any(|loaded| loaded.needs_persist) {
+            let mut records = Vec::new();
+            for loaded in loaded.iter().filter(|loaded| loaded.needs_persist) {
+                records.push(wallet_metadata_record_entry(&view, &loaded.metadata)?);
+            }
+            self.db.put_desktop_wallet_vault_records(&records)?;
+        }
+
+        let mut metadata = loaded
+            .into_iter()
+            .map(|loaded| loaded.metadata)
+            .collect::<Vec<_>>();
+        sort_wallet_metadata(&mut metadata);
+        Ok(metadata)
+    }
+
+    pub fn active_wallet_metadata(
+        &self,
+        password: &str,
+    ) -> Result<Vec<WalletMetadataBundle>, VaultError> {
+        let mut metadata = self.list_wallet_metadata(password)?;
+        metadata.retain(|metadata| metadata.status == WalletStatus::Active);
+        sort_wallet_metadata(&mut metadata);
+        Ok(metadata)
+    }
+
+    pub fn default_wallet_label(&self, password: &str) -> Result<String, VaultError> {
+        let metadata = self.list_wallet_metadata(password)?;
+        Ok(default_wallet_label_for_metadata(&metadata))
+    }
+
+    pub fn new_wallet_metadata(
+        &self,
+        password: &str,
+        wallet_uuid: &str,
+        derivation_index: u32,
+        source: WalletSource,
+        label: &str,
+    ) -> Result<WalletMetadataBundle, VaultError> {
+        let existing = self.list_wallet_metadata(password)?;
+        let label = validate_wallet_label(label, &existing, None)?;
+        let display_order = next_wallet_display_order(&existing)?;
+        Ok(WalletMetadataBundle {
+            wallet_uuid: wallet_uuid.to_owned(),
+            label,
+            derivation_index,
+            source,
+            status: WalletStatus::Active,
+            display_order,
+        })
+    }
+
+    pub fn update_wallet_label(
+        &self,
+        password: &str,
+        wallet_uuid: &str,
+        label: &str,
+    ) -> Result<WalletMetadataBundle, VaultError> {
+        let mut metadata = self.list_wallet_metadata(password)?;
+        let label = validate_wallet_label(label, &metadata, Some(wallet_uuid))?;
+        let Some(target) = metadata
+            .iter_mut()
+            .find(|metadata| metadata.wallet_uuid == wallet_uuid)
+        else {
+            return Err(VaultError::WalletNotFound);
+        };
+        target.label = label;
+        let updated = target.clone();
+        self.store_wallet_metadata(password, &updated)?;
+        Ok(updated)
+    }
+
+    pub fn reorder_active_wallets(
+        &self,
+        password: &str,
+        ordered_wallet_uuids: &[String],
+    ) -> Result<Vec<WalletMetadataBundle>, VaultError> {
+        let mut metadata = self.list_wallet_metadata(password)?;
+        let active_ids = metadata
+            .iter()
+            .filter(|metadata| metadata.status == WalletStatus::Active)
+            .map(|metadata| metadata.wallet_uuid.as_str())
+            .collect::<BTreeSet<_>>();
+        let submitted_ids = ordered_wallet_uuids
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        if active_ids != submitted_ids || submitted_ids.len() != ordered_wallet_uuids.len() {
+            return Err(VaultError::InvalidWalletOrder);
+        }
+
+        for (display_order, wallet_uuid) in ordered_wallet_uuids.iter().enumerate() {
+            let display_order =
+                u32::try_from(display_order).map_err(|_| VaultError::WalletDisplayOrderOverflow)?;
+            let Some(target) = metadata
+                .iter_mut()
+                .find(|metadata| metadata.wallet_uuid == *wallet_uuid)
+            else {
+                return Err(VaultError::InvalidWalletOrder);
+            };
+            target.display_order = display_order;
+        }
+
+        self.store_wallet_metadata_batch(password, &metadata)?;
+        metadata.retain(|metadata| metadata.status == WalletStatus::Active);
+        sort_wallet_metadata(&mut metadata);
+        Ok(metadata)
+    }
+
+    pub fn deactivate_wallet(
+        &self,
+        password: &str,
+        wallet_uuid: &str,
+    ) -> Result<WalletMetadataBundle, VaultError> {
+        let mut metadata = self.list_wallet_metadata(password)?;
+        let active_count = metadata
+            .iter()
+            .filter(|metadata| metadata.status == WalletStatus::Active)
+            .count();
+        let Some(target) = metadata
+            .iter_mut()
+            .find(|metadata| metadata.wallet_uuid == wallet_uuid)
+        else {
+            return Err(VaultError::WalletNotFound);
+        };
+        if target.status == WalletStatus::Inactive {
+            return Ok(target.clone());
+        }
+        if active_count <= 1 {
+            return Err(VaultError::LastActiveWallet);
+        }
+
+        target.status = WalletStatus::Inactive;
+        let updated = target.clone();
+        self.store_wallet_metadata(password, &updated)?;
+        Ok(updated)
     }
 
     pub fn store_wallet_chain_metadata(
@@ -560,6 +799,32 @@ impl DesktopVaultStore {
         contract: &str,
         start_block: u64,
     ) -> Result<WalletChainMetadataBundle, VaultError> {
+        if let Some(metadata) = self.find_wallet_chain_metadata_for_session(
+            view_session,
+            chain_type,
+            chain_id,
+            contract,
+        )? {
+            return Ok(metadata);
+        }
+
+        self.create_wallet_chain_metadata_for_session(
+            view_session,
+            chain_type,
+            chain_id,
+            contract,
+            start_block,
+            start_block.saturating_sub(1),
+        )
+    }
+
+    pub fn find_wallet_chain_metadata_for_session(
+        &self,
+        view_session: &DesktopViewSession,
+        chain_type: u8,
+        chain_id: u64,
+        contract: &str,
+    ) -> Result<Option<WalletChainMetadataBundle>, VaultError> {
         let records = self
             .db
             .list_desktop_wallet_vault_records(WALLET_CHAIN_METADATA_PREFIX)?;
@@ -576,10 +841,22 @@ impl DesktopVaultStore {
                 && metadata.chain_id == chain_id
                 && metadata.contract.eq_ignore_ascii_case(contract)
             {
-                return Ok(metadata);
+                return Ok(Some(metadata));
             }
         }
 
+        Ok(None)
+    }
+
+    pub fn create_wallet_chain_metadata_for_session(
+        &self,
+        view_session: &DesktopViewSession,
+        chain_type: u8,
+        chain_id: u64,
+        contract: &str,
+        start_block: u64,
+        last_scanned_block: u64,
+    ) -> Result<WalletChainMetadataBundle, VaultError> {
         let wallet_chain_uuid = generate_opaque_id()?;
         let metadata = WalletChainMetadataBundle {
             wallet_chain_uuid,
@@ -588,7 +865,7 @@ impl DesktopVaultStore {
             chain_id,
             contract: contract.to_owned(),
             start_block,
-            last_scanned_block: start_block.saturating_sub(1),
+            last_scanned_block,
             last_scanned_block_hash: None,
         };
         self.store_wallet_chain_metadata_with_session(view_session, &metadata)?;
@@ -723,6 +1000,13 @@ impl DesktopVaultStore {
             .get_desktop_wallet_vault_record(key)?
             .ok_or(VaultError::VaultNotFound)?;
         Ok(rmp_serde::from_slice(&data)?)
+    }
+
+    fn encrypted_record_optional(&self, key: &str) -> Result<Option<EncryptedRecord>, VaultError> {
+        self.db
+            .get_desktop_wallet_vault_record(key)?
+            .map(|data| rmp_serde::from_slice(&data).map_err(VaultError::from))
+            .transpose()
     }
 
     fn put_encrypted_record(&self, key: &str, record: &EncryptedRecord) -> Result<(), VaultError> {
@@ -1060,6 +1344,12 @@ impl ViewUnlock {
         &self.view_dek
     }
 
+    fn clone_unlock(&self) -> Self {
+        Self {
+            view_dek: self.view_dek.clone_secret(),
+        }
+    }
+
     pub fn encrypt_record(
         &self,
         kind: RecordKind,
@@ -1122,12 +1412,37 @@ impl ViewUnlock {
         wallet_uuid: &str,
         record: &EncryptedRecord,
     ) -> Result<WalletMetadataBundle, VaultError> {
-        decrypt_serialized(
+        Ok(self
+            .decrypt_wallet_metadata_record(wallet_uuid, record)?
+            .metadata)
+    }
+
+    fn decrypt_wallet_metadata_record(
+        &self,
+        wallet_uuid: &str,
+        record: &EncryptedRecord,
+    ) -> Result<DecodedWalletMetadata, VaultError> {
+        let wire: WalletMetadataWire = decrypt_serialized(
             &self.view_dek,
             RecordKind::WalletMetadata,
             wallet_uuid,
             record,
-        )
+        )?;
+        let missing_display_order = wire.display_order.is_none();
+        let missing_lifecycle_fields =
+            wire.source.is_none() || wire.status.is_none() || missing_display_order;
+        Ok(DecodedWalletMetadata {
+            metadata: WalletMetadataBundle {
+                wallet_uuid: wire.wallet_uuid,
+                label: wire.label,
+                derivation_index: wire.derivation_index,
+                source: wire.source.unwrap_or_default(),
+                status: wire.status.unwrap_or_default(),
+                display_order: wire.display_order.unwrap_or_default(),
+            },
+            missing_lifecycle_fields,
+            missing_display_order,
+        })
     }
 
     pub fn encrypt_wallet_chain_metadata(
@@ -1366,11 +1681,50 @@ pub struct WalletSpendBundle {
     pub bip39_entropy: Vec<u8>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum WalletStatus {
+    #[default]
+    Active,
+    Inactive,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum WalletSource {
+    Generated,
+    #[default]
+    Imported,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WalletMetadataBundle {
     pub wallet_uuid: String,
     pub label: String,
     pub derivation_index: u32,
+    #[serde(default)]
+    pub source: WalletSource,
+    #[serde(default)]
+    pub status: WalletStatus,
+    #[serde(default)]
+    pub display_order: u32,
+}
+
+#[derive(Deserialize)]
+struct WalletMetadataWire {
+    wallet_uuid: String,
+    label: String,
+    derivation_index: u32,
+    #[serde(default)]
+    source: Option<WalletSource>,
+    #[serde(default)]
+    status: Option<WalletStatus>,
+    #[serde(default)]
+    display_order: Option<u32>,
+}
+
+struct DecodedWalletMetadata {
+    metadata: WalletMetadataBundle,
+    missing_lifecycle_fields: bool,
+    missing_display_order: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1691,10 +2045,134 @@ fn vault_error_from_wallet_cache(error: WalletCacheError) -> VaultError {
     }
 }
 
+struct LoadedWalletMetadata {
+    metadata: WalletMetadataBundle,
+    needs_persist: bool,
+    missing_display_order: bool,
+}
+
+fn wallet_metadata_record_entry(
+    view: &ViewUnlock,
+    metadata: &WalletMetadataBundle,
+) -> Result<(String, Vec<u8>), VaultError> {
+    let key = wallet_metadata_record_key(&metadata.wallet_uuid);
+    let record = view.encrypt_wallet_metadata(&metadata.wallet_uuid, metadata)?;
+    record.to_record_entry(key)
+}
+
+#[must_use]
+pub fn normalize_wallet_label(label: &str) -> String {
+    label.trim().to_owned()
+}
+
+fn wallet_label_duplicate_key(label: &str) -> String {
+    normalize_wallet_label(label).to_lowercase()
+}
+
+pub fn validate_wallet_label(
+    label: &str,
+    existing: &[WalletMetadataBundle],
+    current_wallet_uuid: Option<&str>,
+) -> Result<String, VaultError> {
+    let label = normalize_wallet_label(label);
+    if label.is_empty() {
+        return Err(VaultError::InvalidWalletLabel);
+    }
+    let label_key = wallet_label_duplicate_key(&label);
+    if existing.iter().any(|metadata| {
+        current_wallet_uuid != Some(metadata.wallet_uuid.as_str())
+            && wallet_label_duplicate_key(&metadata.label) == label_key
+    }) {
+        return Err(VaultError::DuplicateWalletLabel);
+    }
+    Ok(label)
+}
+
+#[must_use]
+pub fn default_wallet_label_for_metadata(metadata: &[WalletMetadataBundle]) -> String {
+    if metadata.is_empty() {
+        return PRIMARY_WALLET_LABEL.to_owned();
+    }
+
+    let used = metadata
+        .iter()
+        .map(|metadata| wallet_label_duplicate_key(&metadata.label))
+        .collect::<BTreeSet<_>>();
+    let mut label_index = 2u32;
+    loop {
+        let label = format!("{ADDITIONAL_WALLET_LABEL_PREFIX}{label_index}");
+        if !used.contains(&wallet_label_duplicate_key(&label)) {
+            return label;
+        }
+        label_index = label_index.saturating_add(1);
+    }
+}
+
+fn next_wallet_display_order(metadata: &[WalletMetadataBundle]) -> Result<u32, VaultError> {
+    metadata
+        .iter()
+        .map(|metadata| metadata.display_order)
+        .max()
+        .map_or(Ok(0), |max_display_order| {
+            max_display_order
+                .checked_add(1)
+                .ok_or(VaultError::WalletDisplayOrderOverflow)
+        })
+}
+
+fn assign_missing_display_orders(metadata: &mut [LoadedWalletMetadata]) -> Result<(), VaultError> {
+    let mut next_order = metadata
+        .iter()
+        .filter(|metadata| !metadata.missing_display_order)
+        .map(|metadata| metadata.metadata.display_order)
+        .max()
+        .map_or(Ok(0), |display_order| {
+            display_order
+                .checked_add(1)
+                .ok_or(VaultError::WalletDisplayOrderOverflow)
+        })?;
+    let mut missing_indices = metadata
+        .iter()
+        .enumerate()
+        .filter_map(|(index, metadata)| metadata.missing_display_order.then_some(index))
+        .collect::<Vec<_>>();
+    missing_indices.sort_by(|left, right| {
+        metadata[*left]
+            .metadata
+            .label
+            .cmp(&metadata[*right].metadata.label)
+            .then_with(|| {
+                metadata[*left]
+                    .metadata
+                    .wallet_uuid
+                    .cmp(&metadata[*right].metadata.wallet_uuid)
+            })
+    });
+
+    for index in missing_indices {
+        metadata[index].metadata.display_order = next_order;
+        metadata[index].needs_persist = true;
+        next_order = next_order
+            .checked_add(1)
+            .ok_or(VaultError::WalletDisplayOrderOverflow)?;
+    }
+    Ok(())
+}
+
+pub fn sort_wallet_metadata(metadata: &mut [WalletMetadataBundle]) {
+    metadata.sort_by(|left, right| {
+        left.display_order
+            .cmp(&right.display_order)
+            .then_with(|| left.label.cmp(&right.label))
+            .then_with(|| left.wallet_uuid.cmp(&right.wallet_uuid))
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy::uint;
+    use serde::Serialize;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1716,6 +2194,29 @@ mod tests {
             .map_or(0, |duration| duration.as_nanos());
         let counter = TEMP_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
         dir.join(format!("db-{pid}-{nanos}-{counter}"))
+    }
+
+    fn desktop_store_with_vault() -> (PathBuf, Arc<DbStore>, DesktopVaultStore) {
+        let root_dir = temp_db_root();
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open db"),
+        );
+        let store = DesktopVaultStore::from_db(Arc::clone(&db));
+        let created = create_with_params(TEST_PASSWORD, test_kdf()).expect("create vault");
+        store
+            .put_metadata(&created.metadata)
+            .expect("persist metadata");
+        (root_dir, db, store)
+    }
+
+    #[derive(Serialize)]
+    struct LegacyWalletMetadataBundle {
+        wallet_uuid: String,
+        label: String,
+        derivation_index: u32,
     }
 
     #[test]
@@ -1886,6 +2387,9 @@ mod tests {
             wallet_uuid: wallet_id.to_string(),
             label: "Primary wallet".to_string(),
             derivation_index: 0,
+            source: WalletSource::Generated,
+            status: WalletStatus::Active,
+            display_order: 0,
         };
 
         let stored = store
@@ -1915,6 +2419,290 @@ mod tests {
         assert_eq!(loaded.wallet_uuid, wallet_id);
         assert_eq!(loaded.label, "Primary wallet");
         assert_eq!(loaded.derivation_index, 0);
+
+        drop(store);
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn wallet_metadata_listing_defaults_and_synthesizes_records() {
+        let (root_dir, db, store) = desktop_store_with_vault();
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let legacy_wallet_id = "legacy-wallet";
+        let missing_wallet_id = "missing-metadata-wallet";
+        store
+            .import_wallet_mnemonic(TEST_PASSWORD, legacy_wallet_id, 0, "english", mnemonic)
+            .expect("import legacy wallet");
+        store
+            .import_wallet_mnemonic(TEST_PASSWORD, missing_wallet_id, 1, "english", mnemonic)
+            .expect("import metadata-less wallet");
+
+        let legacy = LegacyWalletMetadataBundle {
+            wallet_uuid: legacy_wallet_id.to_string(),
+            label: "Legacy wallet".to_string(),
+            derivation_index: 0,
+        };
+        let view = store.unlock_view(TEST_PASSWORD).expect("unlock view");
+        let record = encrypt_serialized(
+            view.view_dek(),
+            RecordKind::WalletMetadata,
+            legacy_wallet_id,
+            &legacy,
+        )
+        .expect("encrypt legacy metadata");
+        let (key, payload) = record
+            .to_record_entry(wallet_metadata_record_key(legacy_wallet_id))
+            .expect("encode legacy metadata");
+        db.put_desktop_wallet_vault_records(&[(key, payload)])
+            .expect("store legacy metadata");
+
+        let metadata = store
+            .list_wallet_metadata(TEST_PASSWORD)
+            .expect("list wallet metadata");
+        let legacy = metadata
+            .iter()
+            .find(|metadata| metadata.wallet_uuid == legacy_wallet_id)
+            .expect("legacy metadata");
+        let synthesized = metadata
+            .iter()
+            .find(|metadata| metadata.wallet_uuid == missing_wallet_id)
+            .expect("synthesized metadata");
+
+        assert_eq!(metadata.len(), 2);
+        assert_eq!(legacy.status, WalletStatus::Active);
+        assert_eq!(legacy.display_order, 0);
+        assert_eq!(synthesized.label, "Wallet 2");
+        assert_eq!(synthesized.derivation_index, 1);
+        assert_eq!(synthesized.status, WalletStatus::Active);
+        assert_eq!(synthesized.display_order, 1);
+
+        let persisted_legacy = store
+            .load_wallet_metadata(TEST_PASSWORD, legacy_wallet_id)
+            .expect("load persisted legacy metadata");
+        let persisted_synthesized = store
+            .load_wallet_metadata(TEST_PASSWORD, missing_wallet_id)
+            .expect("load synthesized metadata");
+        assert_eq!(persisted_legacy, legacy.clone());
+        assert_eq!(persisted_synthesized, synthesized.clone());
+
+        drop(store);
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn wallet_label_validation_defaults_update_reorder_and_deactivate() {
+        let (root_dir, db, store) = desktop_store_with_vault();
+        assert_eq!(
+            store
+                .default_wallet_label(TEST_PASSWORD)
+                .expect("default label"),
+            PRIMARY_WALLET_LABEL
+        );
+
+        let seed = generate_seed_material().expect("generate seed");
+        let first_wallet_id = "first-wallet";
+        let first_metadata = store
+            .new_wallet_metadata(
+                TEST_PASSWORD,
+                first_wallet_id,
+                0,
+                WalletSource::Generated,
+                "  Primary wallet  ",
+            )
+            .expect("first wallet metadata");
+        assert_eq!(first_metadata.label, PRIMARY_WALLET_LABEL);
+        assert_eq!(first_metadata.display_order, 0);
+        store
+            .store_generated_wallet_with_metadata(
+                TEST_PASSWORD,
+                first_wallet_id,
+                0,
+                "english",
+                &seed,
+                &first_metadata,
+            )
+            .expect("store first wallet");
+        assert_eq!(
+            store
+                .default_wallet_label(TEST_PASSWORD)
+                .expect("second default label"),
+            "Wallet 2"
+        );
+        assert!(matches!(
+            store.new_wallet_metadata(
+                TEST_PASSWORD,
+                "duplicate",
+                0,
+                WalletSource::Imported,
+                "primary wallet",
+            ),
+            Err(VaultError::DuplicateWalletLabel)
+        ));
+        assert!(matches!(
+            store.new_wallet_metadata(TEST_PASSWORD, "empty", 0, WalletSource::Imported, "   "),
+            Err(VaultError::InvalidWalletLabel)
+        ));
+
+        let second_wallet_id = "second-wallet";
+        let second_metadata = store
+            .new_wallet_metadata(
+                TEST_PASSWORD,
+                second_wallet_id,
+                0,
+                WalletSource::Generated,
+                "Wallet 2",
+            )
+            .expect("second wallet metadata");
+        store
+            .store_generated_wallet_with_metadata(
+                TEST_PASSWORD,
+                second_wallet_id,
+                0,
+                "english",
+                &seed,
+                &second_metadata,
+            )
+            .expect("store second wallet");
+
+        let updated = store
+            .update_wallet_label(TEST_PASSWORD, first_wallet_id, "  Main  ")
+            .expect("update label");
+        assert_eq!(updated.label, "Main");
+        assert_eq!(updated.wallet_uuid, first_wallet_id);
+        assert_eq!(updated.status, WalletStatus::Active);
+        assert_eq!(updated.display_order, 0);
+        assert!(matches!(
+            store.update_wallet_label(TEST_PASSWORD, second_wallet_id, "main"),
+            Err(VaultError::DuplicateWalletLabel)
+        ));
+
+        let reordered = store
+            .reorder_active_wallets(
+                TEST_PASSWORD,
+                &[second_wallet_id.to_string(), first_wallet_id.to_string()],
+            )
+            .expect("reorder active wallets");
+        assert_eq!(reordered[0].wallet_uuid, second_wallet_id);
+        assert_eq!(reordered[0].display_order, 0);
+        assert_eq!(reordered[1].wallet_uuid, first_wallet_id);
+        assert_eq!(reordered[1].display_order, 1);
+        assert!(matches!(
+            store.reorder_active_wallets(TEST_PASSWORD, &[first_wallet_id.to_string()]),
+            Err(VaultError::InvalidWalletOrder)
+        ));
+
+        let deactivated = store
+            .deactivate_wallet(TEST_PASSWORD, second_wallet_id)
+            .expect("deactivate second wallet");
+        assert_eq!(deactivated.status, WalletStatus::Inactive);
+        let active = store
+            .active_wallet_metadata(TEST_PASSWORD)
+            .expect("active metadata");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].wallet_uuid, first_wallet_id);
+        assert!(
+            store
+                .load_view_session(TEST_PASSWORD, second_wallet_id)
+                .is_ok()
+        );
+        assert!(matches!(
+            store.deactivate_wallet(TEST_PASSWORD, first_wallet_id),
+            Err(VaultError::LastActiveWallet)
+        ));
+
+        drop(store);
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn duplicate_seed_imports_keep_distinct_wallet_and_chain_ids() {
+        let (root_dir, db, store) = desktop_store_with_vault();
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let first_wallet_id = "duplicate-seed-a";
+        let first_metadata = store
+            .new_wallet_metadata(
+                TEST_PASSWORD,
+                first_wallet_id,
+                0,
+                WalletSource::Imported,
+                "Duplicate A",
+            )
+            .expect("first duplicate metadata");
+        store
+            .import_wallet_mnemonic_with_metadata(
+                TEST_PASSWORD,
+                first_wallet_id,
+                0,
+                "english",
+                mnemonic,
+                &first_metadata,
+            )
+            .expect("import first duplicate seed");
+
+        let second_wallet_id = "duplicate-seed-b";
+        let second_metadata = store
+            .new_wallet_metadata(
+                TEST_PASSWORD,
+                second_wallet_id,
+                0,
+                WalletSource::Imported,
+                "Duplicate B",
+            )
+            .expect("second duplicate metadata");
+        store
+            .import_wallet_mnemonic_with_metadata(
+                TEST_PASSWORD,
+                second_wallet_id,
+                0,
+                "english",
+                mnemonic,
+                &second_metadata,
+            )
+            .expect("import second duplicate seed");
+
+        let first_session = store
+            .load_view_session(TEST_PASSWORD, first_wallet_id)
+            .expect("load first session");
+        let second_session = store
+            .load_view_session(TEST_PASSWORD, second_wallet_id)
+            .expect("load second session");
+        let first_chain = store
+            .wallet_chain_metadata_for_session(
+                &first_session,
+                0,
+                1,
+                "0x1111111111111111111111111111111111111111",
+                100,
+            )
+            .expect("first chain metadata");
+        let second_chain = store
+            .wallet_chain_metadata_for_session(
+                &second_session,
+                0,
+                1,
+                "0x1111111111111111111111111111111111111111",
+                100,
+            )
+            .expect("second chain metadata");
+
+        assert_ne!(first_wallet_id, second_wallet_id);
+        assert_ne!(
+            first_chain.wallet_chain_uuid,
+            second_chain.wallet_chain_uuid
+        );
+        assert_eq!(first_chain.wallet_uuid, first_wallet_id);
+        assert_eq!(second_chain.wallet_uuid, second_wallet_id);
+        assert_eq!(
+            first_session.scan_keys().master_public_key,
+            second_session.scan_keys().master_public_key
+        );
+        assert_eq!(
+            first_session.scan_keys().nullifying_key,
+            second_session.scan_keys().nullifying_key
+        );
 
         drop(store);
         drop(db);
@@ -2102,6 +2890,9 @@ mod tests {
             wallet_uuid: wallet_uuid.clone(),
             label: "primary wallet".to_string(),
             derivation_index: 0,
+            source: WalletSource::Imported,
+            status: WalletStatus::Active,
+            display_order: 0,
         };
         let chain_metadata = WalletChainMetadataBundle {
             wallet_chain_uuid: wallet_chain_uuid.clone(),

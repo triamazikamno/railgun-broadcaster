@@ -140,9 +140,25 @@ pub struct WalletChainSessionRequest {
     pub progress_tx: Option<SyncProgressSender>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DesktopWalletSyncStartPolicy {
+    ImportedHistoricalBackfill,
+    CurrentSafeHeadNoBackfill,
+}
+
+impl From<vault::WalletSource> for DesktopWalletSyncStartPolicy {
+    fn from(value: vault::WalletSource) -> Self {
+        match value {
+            vault::WalletSource::Generated => Self::CurrentSafeHeadNoBackfill,
+            vault::WalletSource::Imported => Self::ImportedHistoricalBackfill,
+        }
+    }
+}
+
 pub struct ViewWalletChainSessionRequest {
     pub view_session: Arc<vault::DesktopViewSession>,
     pub chain_id: u64,
+    pub sync_start_policy: DesktopWalletSyncStartPolicy,
     pub init_block_number: Option<u64>,
     pub sync_to_block: Option<u64>,
     pub use_indexed_wallet_catch_up: bool,
@@ -574,6 +590,7 @@ pub enum UnshieldResult {
 pub struct WalletSession {
     pub chain_id: u64,
     pub cache_key: String,
+    pub start_block: u64,
     pub ready_rx: watch::Receiver<bool>,
     pub snapshots_rx: watch::Receiver<Arc<ListUtxosOutput>>,
     pub poi_refreshing_rx: watch::Receiver<bool>,
@@ -1097,6 +1114,7 @@ impl WalletSessionStore {
         let synced = setup_synced_view_wallet_with_store(
             request.view_session,
             chain_id,
+            request.sync_start_policy,
             request.init_block_number,
             request.sync_to_block,
             request.use_indexed_wallet_catch_up,
@@ -1148,6 +1166,7 @@ async fn wallet_session_from_synced(chain_id: u64, synced: SyncedWallet) -> Resu
         synced.db,
         synced.sync_manager,
         synced.chain_key,
+        synced.start_block,
         synced.handle,
     )
     .await
@@ -1162,6 +1181,7 @@ async fn wallet_session_from_view_synced(
         synced.db,
         synced.sync_manager,
         synced.chain_key,
+        synced.start_block,
         synced.handle,
     )
     .await
@@ -1172,6 +1192,7 @@ async fn wallet_session_from_parts(
     db: Arc<DbStore>,
     sync_manager: Arc<SyncManager>,
     chain_key: ChainKey,
+    start_block: u64,
     handle: WalletHandle,
 ) -> Result<WalletSession> {
     let mut rev_rx = handle.rev_rx.clone();
@@ -1196,6 +1217,7 @@ async fn wallet_session_from_parts(
     Ok(WalletSession {
         chain_id,
         cache_key,
+        start_block,
         ready_rx,
         snapshots_rx,
         poi_refreshing_rx,
@@ -2564,6 +2586,7 @@ struct SyncedWallet {
     chain_defaults: ChainConfigDefaults,
     rpc_url: Url,
     wallet: WalletKeys,
+    start_block: u64,
     handle: WalletHandle,
 }
 
@@ -2571,7 +2594,62 @@ struct SyncedViewWallet {
     db: Arc<DbStore>,
     sync_manager: Arc<SyncManager>,
     chain_key: ChainKey,
+    start_block: u64,
     handle: WalletHandle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DesktopWalletChainStart {
+    start_block: u64,
+    last_scanned_block: u64,
+}
+
+fn resolve_desktop_wallet_chain_start(
+    policy: DesktopWalletSyncStartPolicy,
+    existing_metadata: Option<&vault::WalletChainMetadataBundle>,
+    init_block_number: Option<u64>,
+    deployment_block: u64,
+    safe_head: Option<u64>,
+    rewind_wallet_cache: bool,
+) -> Result<DesktopWalletChainStart> {
+    if let Some(metadata) = existing_metadata
+        && !rewind_wallet_cache
+    {
+        return Ok(DesktopWalletChainStart {
+            start_block: metadata.start_block,
+            last_scanned_block: metadata.last_scanned_block,
+        });
+    }
+
+    if rewind_wallet_cache {
+        let start_block = init_block_number.unwrap_or(deployment_block);
+        return Ok(DesktopWalletChainStart {
+            start_block,
+            last_scanned_block: start_block.saturating_sub(1),
+        });
+    }
+
+    match policy {
+        DesktopWalletSyncStartPolicy::ImportedHistoricalBackfill => {
+            let start_block = init_block_number.unwrap_or(deployment_block);
+            Ok(DesktopWalletChainStart {
+                start_block,
+                last_scanned_block: start_block.saturating_sub(1),
+            })
+        }
+        DesktopWalletSyncStartPolicy::CurrentSafeHeadNoBackfill => {
+            let safe_head = safe_head.ok_or_else(|| {
+                eyre!("chain safe head unavailable for generated wallet; retry sync later")
+            })?;
+            let start_block = safe_head
+                .checked_add(1)
+                .ok_or_else(|| eyre!("chain safe head overflow for generated wallet"))?;
+            Ok(DesktopWalletChainStart {
+                start_block,
+                last_scanned_block: safe_head,
+            })
+        }
+    }
 }
 
 async fn setup_synced_wallet(
@@ -2671,6 +2749,7 @@ async fn setup_synced_wallet_with_store(
         chain_defaults,
         rpc_url,
         wallet,
+        start_block,
         handle,
     })
 }
@@ -2678,6 +2757,7 @@ async fn setup_synced_wallet_with_store(
 async fn setup_synced_view_wallet_with_store(
     view_session: Arc<vault::DesktopViewSession>,
     chain_id: u64,
+    sync_start_policy: DesktopWalletSyncStartPolicy,
     init_block_number: Option<u64>,
     sync_to_block: Option<u64>,
     use_indexed_wallet_catch_up: bool,
@@ -2698,30 +2778,52 @@ async fn setup_synced_view_wallet_with_store(
     };
 
     let chain_cfg = chain_config(&chain_defaults, rpc_url, http, progress_tx.clone());
-    sync_manager
+    let chain_service = sync_manager
         .add_chain(chain_cfg)
         .await
         .wrap_err("register chain sync service")?;
 
-    let start_block = init_block_number.unwrap_or(chain_defaults.deployment_block);
+    let vault_store = vault::DesktopVaultStore::from_db(Arc::clone(&db));
+    let contract = chain_key.contract.to_checksum(None);
+    let existing_wallet_chain_metadata = vault_store
+        .find_wallet_chain_metadata_for_session(view_session.as_ref(), 0, chain_id, &contract)
+        .wrap_err("load encrypted wallet chain metadata")?;
+    let chain_handle = chain_service.handle();
+    let safe_head = *chain_handle.safe_head_rx.borrow();
+    let safe_head = (safe_head > 0).then_some(safe_head);
+    let resolved_start = resolve_desktop_wallet_chain_start(
+        sync_start_policy,
+        existing_wallet_chain_metadata.as_ref(),
+        init_block_number,
+        chain_defaults.deployment_block,
+        safe_head,
+        rewind_wallet_cache,
+    )?;
     tracing::info!(
         chain_id,
-        start_block,
+        start_block = resolved_start.start_block,
+        last_scanned_block = resolved_start.last_scanned_block,
         sync_to_block,
         use_indexed_wallet_catch_up,
+        sync_start_policy = ?sync_start_policy,
         "starting desktop view wallet sync"
     );
-    let vault_store = vault::DesktopVaultStore::from_db(Arc::clone(&db));
-    let mut wallet_chain_metadata = vault_store
-        .wallet_chain_metadata_for_session(
-            view_session.as_ref(),
-            0,
-            chain_id,
-            &chain_key.contract.to_checksum(None),
-            start_block,
-        )
-        .wrap_err("load encrypted wallet chain metadata")?;
+    let mut wallet_chain_metadata = match existing_wallet_chain_metadata {
+        Some(metadata) => metadata,
+        None => vault_store
+            .create_wallet_chain_metadata_for_session(
+                view_session.as_ref(),
+                0,
+                chain_id,
+                &contract,
+                resolved_start.start_block,
+                resolved_start.last_scanned_block,
+            )
+            .wrap_err("create encrypted wallet chain metadata")?,
+    };
+    let start_block = resolved_start.start_block;
     if rewind_wallet_cache {
+        wallet_chain_metadata.start_block = start_block;
         vault_store
             .rewind_wallet_chain_cache_with_session(
                 view_session.as_ref(),
@@ -2773,6 +2875,7 @@ async fn setup_synced_view_wallet_with_store(
         db,
         sync_manager,
         chain_key,
+        start_block,
         handle,
     })
 }
@@ -2936,19 +3039,19 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ApproximateTransactionShape, EvmMessageSigner, EvmTransactionSigner, ListUtxosOutput,
-        PublicBroadcasterCandidate, PublicBroadcasterFeeMode, PublicBroadcasterResultKind,
-        PublicBroadcasterSelection, RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS, SoftwareEvmSigner,
-        TokenTotal, UtxoOutput, approximate_public_broadcaster_cost,
-        approximate_public_broadcaster_gas, broadcaster_fee_amount, broadcaster_fee_covers,
-        buffered_public_broadcaster_fee, decode_public_broadcaster_response,
-        eligible_public_broadcasters, is_wrapped_native_token, max_send_amount_from_outputs,
-        max_unshield_amount_from_outputs, parse_railgun_recipient, parse_send_amount,
-        parse_unshield_amount, public_broadcaster_amount_split,
+        ApproximateTransactionShape, DesktopWalletChainStart, DesktopWalletSyncStartPolicy,
+        EvmMessageSigner, EvmTransactionSigner, ListUtxosOutput, PublicBroadcasterCandidate,
+        PublicBroadcasterFeeMode, PublicBroadcasterResultKind, PublicBroadcasterSelection,
+        RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS, SoftwareEvmSigner, TokenTotal, UtxoOutput,
+        approximate_public_broadcaster_cost, approximate_public_broadcaster_gas,
+        broadcaster_fee_amount, broadcaster_fee_covers, buffered_public_broadcaster_fee,
+        decode_public_broadcaster_response, eligible_public_broadcasters, is_wrapped_native_token,
+        max_send_amount_from_outputs, max_unshield_amount_from_outputs, parse_railgun_recipient,
+        parse_send_amount, parse_unshield_amount, public_broadcaster_amount_split,
         public_broadcaster_max_entered_amount, public_broadcaster_transact_params,
-        select_public_broadcaster, send_approximate_shape, sort_specific_public_broadcasters,
-        transact_topic, unshield_approximate_shape, utxo_outputs_from_utxos,
-        wrapped_native_token_for_chain,
+        resolve_desktop_wallet_chain_start, select_public_broadcaster, send_approximate_shape,
+        sort_specific_public_broadcasters, transact_topic, unshield_approximate_shape,
+        utxo_outputs_from_utxos, wrapped_native_token_for_chain,
     };
 
     static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -3052,6 +3155,127 @@ mod tests {
             blinded_commitments_out: vec![FixedBytes::from([byte + 2; 32])],
             railgun_txid_if_has_unshield: Bytes::copy_from_slice(&[0_u8]),
         }
+    }
+
+    #[test]
+    fn desktop_wallet_start_policy_generated_uses_safe_head_no_backfill() {
+        let resolved = resolve_desktop_wallet_chain_start(
+            DesktopWalletSyncStartPolicy::CurrentSafeHeadNoBackfill,
+            None,
+            None,
+            100,
+            Some(250),
+            false,
+        )
+        .expect("resolve generated start");
+
+        assert_eq!(
+            resolved,
+            DesktopWalletChainStart {
+                start_block: 251,
+                last_scanned_block: 250,
+            }
+        );
+    }
+
+    #[test]
+    fn desktop_wallet_start_policy_imported_uses_deployment_block() {
+        let resolved = resolve_desktop_wallet_chain_start(
+            DesktopWalletSyncStartPolicy::ImportedHistoricalBackfill,
+            None,
+            None,
+            100,
+            Some(250),
+            false,
+        )
+        .expect("resolve imported start");
+
+        assert_eq!(
+            resolved,
+            DesktopWalletChainStart {
+                start_block: 100,
+                last_scanned_block: 99,
+            }
+        );
+    }
+
+    #[test]
+    fn desktop_wallet_start_policy_reuses_existing_metadata() {
+        let existing = super::vault::WalletChainMetadataBundle {
+            wallet_chain_uuid: "wallet-chain".to_string(),
+            wallet_uuid: "wallet".to_string(),
+            chain_type: 0,
+            chain_id: 1,
+            contract: "0x1111111111111111111111111111111111111111".to_string(),
+            start_block: 251,
+            last_scanned_block: 300,
+            last_scanned_block_hash: None,
+        };
+
+        let resolved = resolve_desktop_wallet_chain_start(
+            DesktopWalletSyncStartPolicy::CurrentSafeHeadNoBackfill,
+            Some(&existing),
+            None,
+            100,
+            None,
+            false,
+        )
+        .expect("resolve existing start");
+
+        assert_eq!(
+            resolved,
+            DesktopWalletChainStart {
+                start_block: 251,
+                last_scanned_block: 300,
+            }
+        );
+    }
+
+    #[test]
+    fn desktop_wallet_start_policy_generated_requires_safe_head() {
+        let error = resolve_desktop_wallet_chain_start(
+            DesktopWalletSyncStartPolicy::CurrentSafeHeadNoBackfill,
+            None,
+            None,
+            100,
+            None,
+            false,
+        )
+        .expect_err("safe head required");
+
+        assert!(error.to_string().contains("safe head unavailable"));
+    }
+
+    #[test]
+    fn desktop_wallet_rewind_uses_explicit_init_block() {
+        let existing = super::vault::WalletChainMetadataBundle {
+            wallet_chain_uuid: "wallet-chain".to_string(),
+            wallet_uuid: "wallet".to_string(),
+            chain_type: 0,
+            chain_id: 1,
+            contract: "0x1111111111111111111111111111111111111111".to_string(),
+            start_block: 251,
+            last_scanned_block: 300,
+            last_scanned_block_hash: None,
+        };
+
+        let resolved = resolve_desktop_wallet_chain_start(
+            DesktopWalletSyncStartPolicy::CurrentSafeHeadNoBackfill,
+            Some(&existing),
+            Some(existing.start_block),
+            100,
+            None,
+            true,
+        )
+        .expect("resolve explicit rewind start");
+
+        assert_eq!(
+            resolved,
+            DesktopWalletChainStart {
+                start_block: existing.start_block,
+                last_scanned_block: existing.start_block.saturating_sub(1),
+            }
+        );
     }
 
     fn sample_poi_map(
