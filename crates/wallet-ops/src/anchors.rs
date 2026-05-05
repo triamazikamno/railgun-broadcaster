@@ -411,6 +411,18 @@ pub fn known_token_anchor_sources(
 }
 
 #[must_use]
+pub fn fixed_token_anchor_rate(chain_id: u64, token: Address) -> Option<U256> {
+    known_token_anchor_sources(chain_id, token)?
+        .iter()
+        .find_map(|source| match source {
+            TokenAnchorSource::Fixed {
+                token_fee_per_unit_gas,
+            } => Some(*token_fee_per_unit_gas),
+            TokenAnchorSource::ChainlinkOracle { .. } | TokenAnchorSource::Product { .. } => None,
+        })
+}
+
+#[must_use]
 pub fn oracle_answer_to_anchor_rate(
     price: U256,
     token_decimals: u8,

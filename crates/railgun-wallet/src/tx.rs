@@ -46,6 +46,8 @@ pub const MAX_BATCH_TRANSACTIONS: usize = 8;
 pub enum BuildError {
     #[error("no matching utxos for amount. max immediately spendable: {0}")]
     InsufficientBalance(U256),
+    #[error("no matching fee-token utxos for broadcaster fee. max immediately spendable: {0}")]
+    InsufficientFeeTokenBalance(U256),
     #[error("utxos exceed circuit input limit")]
     TooManyInputs,
     #[error("inputs span multiple trees")]
@@ -1092,6 +1094,7 @@ pub enum UnshieldMode {
 #[derive(Debug, Clone, Copy)]
 pub struct BroadcasterFeeOutput {
     pub recipient: AddressData,
+    pub token_address: Address,
     pub amount: U256,
 }
 
@@ -1119,8 +1122,19 @@ pub struct SendRequest {
 }
 
 impl UnshieldRequest {
+    fn same_token_broadcaster_fee(self) -> Option<BroadcasterFeeOutput> {
+        self.broadcaster_fee
+            .filter(|fee| fee.token_address == self.token_address)
+    }
+
+    fn different_token_broadcaster_fee(self) -> Option<BroadcasterFeeOutput> {
+        self.broadcaster_fee
+            .filter(|fee| fee.token_address != self.token_address)
+    }
+
     fn fee_amount(self) -> U256 {
-        self.broadcaster_fee.map_or(U256::ZERO, |fee| fee.amount)
+        self.same_token_broadcaster_fee()
+            .map_or(U256::ZERO, |fee| fee.amount)
     }
 
     fn target_amount(self) -> U256 {
@@ -1128,13 +1142,24 @@ impl UnshieldRequest {
     }
 
     fn base_output_count(self) -> usize {
-        1 + usize::from(self.broadcaster_fee.is_some())
+        1 + usize::from(self.same_token_broadcaster_fee().is_some())
     }
 }
 
 impl SendRequest {
+    fn same_token_broadcaster_fee(self) -> Option<BroadcasterFeeOutput> {
+        self.broadcaster_fee
+            .filter(|fee| fee.token_address == self.token_address)
+    }
+
+    fn different_token_broadcaster_fee(self) -> Option<BroadcasterFeeOutput> {
+        self.broadcaster_fee
+            .filter(|fee| fee.token_address != self.token_address)
+    }
+
     fn fee_amount(self) -> U256 {
-        self.broadcaster_fee.map_or(U256::ZERO, |fee| fee.amount)
+        self.same_token_broadcaster_fee()
+            .map_or(U256::ZERO, |fee| fee.amount)
     }
 
     fn target_amount(self) -> U256 {
@@ -1142,7 +1167,7 @@ impl SendRequest {
     }
 
     fn base_output_count(self) -> usize {
-        1 + usize::from(self.broadcaster_fee.is_some())
+        1 + usize::from(self.same_token_broadcaster_fee().is_some())
     }
 }
 
@@ -1195,6 +1220,31 @@ impl TransactionBuilder {
         request: UnshieldRequest,
         prover: &ProverService,
     ) -> Result<UnshieldPlan, BuildError> {
+        if let Some(fee) = request.different_token_broadcaster_fee() {
+            let fee_selection = select_fee_utxos(utxos, fee.token_address, fee.amount)?;
+            let action_selection = select_batched_utxos_with_limit(
+                utxos,
+                request.token_address,
+                request.amount,
+                request.spend_up_to,
+                1,
+                1,
+                MAX_BATCH_TRANSACTIONS - 1,
+            )?;
+            return self
+                .build_unshield_batch_with_separate_fee_token(
+                    viewing,
+                    signer,
+                    forest,
+                    fee_selection,
+                    action_selection,
+                    request,
+                    fee,
+                    prover,
+                )
+                .await;
+        }
+
         let selection = select_batched_utxos(
             utxos,
             request.token_address,
@@ -1231,6 +1281,31 @@ impl TransactionBuilder {
         request: SendRequest,
         prover: &ProverService,
     ) -> Result<SendPlan, BuildError> {
+        if let Some(fee) = request.different_token_broadcaster_fee() {
+            let fee_selection = select_fee_utxos(utxos, fee.token_address, fee.amount)?;
+            let action_selection = select_batched_utxos_with_limit(
+                utxos,
+                request.token_address,
+                request.amount,
+                request.spend_up_to,
+                1,
+                1,
+                MAX_BATCH_TRANSACTIONS - 1,
+            )?;
+            return self
+                .build_send_batch_with_separate_fee_token(
+                    viewing,
+                    signer,
+                    forest,
+                    fee_selection,
+                    action_selection,
+                    request,
+                    fee,
+                    prover,
+                )
+                .await;
+        }
+
         let selection = select_batched_utxos(
             utxos,
             request.token_address,
@@ -1242,6 +1317,309 @@ impl TransactionBuilder {
 
         self.build_send_batch_with_signer(viewing, signer, forest, selection, request, prover)
             .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn build_unshield_batch_with_separate_fee_token(
+        &self,
+        viewing: &ViewingKeyData,
+        signer: &impl RailgunSpendSigner,
+        forest: &MerkleForest,
+        fee_selection: UtxoSelection,
+        action_selection: BatchUtxoSelection,
+        request: UnshieldRequest,
+        fee: BroadcasterFeeOutput,
+        prover: &ProverService,
+    ) -> Result<UnshieldPlan, BuildError> {
+        let receiver = viewing.address_data();
+        let fee_change = fee_selection.total - fee.amount;
+        let fee_plan_builder = TransactionPlanBuilder::new(
+            self,
+            viewing,
+            signer,
+            forest,
+            prover,
+            fee_selection.utxos,
+            fee.token_address,
+        )?;
+        let FeeOnlyOutputs {
+            outputs,
+            commitment_ciphertext,
+            broadcaster_fee_note,
+            mut change_note,
+        } = build_fee_only_outputs(fee, fee_change, &receiver, &viewing.viewing_private_key)?;
+        let fee_unproven_plan = fee_plan_builder.build_unproven_fee_only(
+            fee.token_address,
+            request.min_gas_price,
+            outputs,
+            commitment_ciphertext,
+        )?;
+
+        let allocations = spend_allocations(
+            &action_selection,
+            request.amount,
+            U256::ZERO,
+            None,
+            request.spend_up_to,
+        )?;
+        let unshield_to = match request.mode {
+            UnshieldMode::Token => request.recipient,
+            UnshieldMode::UnwrapBase => self.relay_adapt_contract,
+        };
+        let mut unproven_plans = Vec::with_capacity(1 + action_selection.chunks.len());
+        unproven_plans.push(fee_unproven_plan);
+        let mut unshield_notes = Vec::with_capacity(action_selection.chunks.len());
+
+        for (chunk, allocation) in action_selection.chunks.into_iter().zip(allocations) {
+            let plan_builder = TransactionPlanBuilder::new(
+                self,
+                viewing,
+                signer,
+                forest,
+                prover,
+                chunk.utxos,
+                request.token_address,
+            )?;
+            let UnshieldOutputs {
+                outputs,
+                commitment_ciphertext,
+                broadcaster_fee_note: _,
+                unshield_note,
+                change_note: chunk_change_note,
+            } = build_unshield_outputs(
+                request.token_address,
+                allocation.amount,
+                unshield_to,
+                allocation.change,
+                &receiver,
+                None,
+                &viewing.viewing_private_key,
+            )?;
+            if chunk_change_note.is_some() {
+                change_note = chunk_change_note.clone();
+            }
+            unshield_notes.push(unshield_note);
+            unproven_plans.push(plan_builder.build_unproven_unshield(
+                request,
+                outputs,
+                commitment_ciphertext,
+                unshield_notes.last().expect("pushed unshield note"),
+            )?);
+        }
+
+        let action_data = if matches!(request.mode, UnshieldMode::UnwrapBase) {
+            let random = FixedBytes::<31>::from(rand_array());
+            Some(ActionData::unwrap_base(
+                self.relay_adapt_contract,
+                request.recipient,
+                random,
+                true,
+            ))
+        } else {
+            None
+        };
+        if let Some(action_data) = action_data.as_ref() {
+            let transactions = unproven_plans
+                .iter()
+                .map(|plan| &plan.transaction)
+                .collect::<Vec<_>>();
+            let adapt_params = action_data.adapt_params(&transactions);
+            for plan in &mut unproven_plans {
+                plan.transaction.boundParams.adaptContract = self.relay_adapt_contract;
+                plan.transaction.boundParams.adaptParams = adapt_params;
+            }
+        }
+
+        let mut transactions = Vec::with_capacity(unproven_plans.len());
+        let mut chunks = Vec::with_capacity(unproven_plans.len());
+        for plan in unproven_plans {
+            let proven = prove_transaction_plan(plan, signer, prover, request.verify_proof).await?;
+            transactions.push(proven.transaction);
+            chunks.push(proven.chunk);
+        }
+
+        let first_chunk = chunks.first().expect("fee selection has one chunk").clone();
+        let inputs = chunks
+            .iter()
+            .flat_map(|chunk| chunk.inputs.clone())
+            .collect::<Vec<_>>();
+        let outputs = chunks
+            .iter()
+            .flat_map(|chunk| chunk.outputs.clone())
+            .collect::<Vec<_>>();
+        let unshield_note = unshield_notes
+            .first()
+            .expect("action selection has at least one chunk")
+            .clone();
+
+        let call = if matches!(request.mode, UnshieldMode::UnwrapBase) {
+            let action_data = action_data.ok_or(BuildError::MissingActionData)?;
+            let data = relayCall {
+                _transactions: transactions,
+                _actionData: action_data,
+            }
+            .abi_encode();
+            TransactionCall {
+                to: self.relay_adapt_contract,
+                data: data.into(),
+            }
+        } else {
+            let data = transactCall {
+                _transactions: transactions,
+            }
+            .abi_encode();
+            TransactionCall {
+                to: self.railgun_contract,
+                data: data.into(),
+            }
+        };
+
+        Ok(UnshieldPlan {
+            call,
+            tree_number: first_chunk.tree_number,
+            merkle_root: first_chunk.merkle_root,
+            inputs,
+            outputs,
+            chunks,
+            broadcaster_fee_note: Some(broadcaster_fee_note),
+            unshield_note,
+            unshield_notes,
+            change_note,
+            public_inputs: first_chunk.public_inputs,
+            private_inputs: first_chunk.private_inputs,
+            signature: first_chunk.signature,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn build_send_batch_with_separate_fee_token(
+        &self,
+        viewing: &ViewingKeyData,
+        signer: &impl RailgunSpendSigner,
+        forest: &MerkleForest,
+        fee_selection: UtxoSelection,
+        action_selection: BatchUtxoSelection,
+        request: SendRequest,
+        fee: BroadcasterFeeOutput,
+        prover: &ProverService,
+    ) -> Result<SendPlan, BuildError> {
+        let sender = viewing.address_data();
+        let fee_change = fee_selection.total - fee.amount;
+        let fee_plan_builder = TransactionPlanBuilder::new(
+            self,
+            viewing,
+            signer,
+            forest,
+            prover,
+            fee_selection.utxos,
+            fee.token_address,
+        )?;
+        let FeeOnlyOutputs {
+            outputs,
+            commitment_ciphertext,
+            broadcaster_fee_note,
+            mut change_note,
+        } = build_fee_only_outputs(fee, fee_change, &sender, &viewing.viewing_private_key)?;
+        let fee_unproven_plan = fee_plan_builder.build_unproven_fee_only(
+            fee.token_address,
+            request.min_gas_price,
+            outputs,
+            commitment_ciphertext,
+        )?;
+
+        let allocations = spend_allocations(
+            &action_selection,
+            request.amount,
+            U256::ZERO,
+            None,
+            request.spend_up_to,
+        )?;
+        let mut unproven_plans = Vec::with_capacity(1 + action_selection.chunks.len());
+        unproven_plans.push(fee_unproven_plan);
+        let mut recipient_notes = Vec::with_capacity(action_selection.chunks.len());
+
+        for (chunk, allocation) in action_selection.chunks.into_iter().zip(allocations) {
+            let plan_builder = TransactionPlanBuilder::new(
+                self,
+                viewing,
+                signer,
+                forest,
+                prover,
+                chunk.utxos,
+                request.token_address,
+            )?;
+            let SendOutputs {
+                outputs,
+                commitment_ciphertext,
+                broadcaster_fee_note: _,
+                recipient_note,
+                change_note: chunk_change_note,
+            } = build_send_outputs(
+                request.token_address,
+                allocation.amount,
+                allocation.change,
+                &sender,
+                &request.recipient,
+                None,
+                &viewing.viewing_private_key,
+            )?;
+            if chunk_change_note.is_some() {
+                change_note = chunk_change_note.clone();
+            }
+            recipient_notes.push(recipient_note);
+            unproven_plans.push(plan_builder.build_unproven_send(
+                request,
+                outputs,
+                commitment_ciphertext,
+            )?);
+        }
+
+        let mut transactions = Vec::with_capacity(unproven_plans.len());
+        let mut chunks = Vec::with_capacity(unproven_plans.len());
+        for plan in unproven_plans {
+            let proven = prove_transaction_plan(plan, signer, prover, request.verify_proof).await?;
+            transactions.push(proven.transaction);
+            chunks.push(proven.chunk);
+        }
+
+        let first_chunk = chunks.first().expect("fee selection has one chunk").clone();
+        let inputs = chunks
+            .iter()
+            .flat_map(|chunk| chunk.inputs.clone())
+            .collect::<Vec<_>>();
+        let outputs = chunks
+            .iter()
+            .flat_map(|chunk| chunk.outputs.clone())
+            .collect::<Vec<_>>();
+        let recipient_note = recipient_notes
+            .first()
+            .expect("action selection has at least one chunk")
+            .clone();
+
+        let data = transactCall {
+            _transactions: transactions,
+        }
+        .abi_encode();
+        let call = TransactionCall {
+            to: self.railgun_contract,
+            data: data.into(),
+        };
+
+        Ok(SendPlan {
+            call,
+            tree_number: first_chunk.tree_number,
+            merkle_root: first_chunk.merkle_root,
+            inputs,
+            outputs,
+            chunks,
+            broadcaster_fee_note: Some(broadcaster_fee_note),
+            recipient_note,
+            recipient_notes,
+            change_note,
+            public_inputs: first_chunk.public_inputs,
+            private_inputs: first_chunk.private_inputs,
+            signature: first_chunk.signature,
+        })
     }
 
     async fn build_unshield_batch_with_signer(
@@ -1257,7 +1635,7 @@ impl TransactionBuilder {
             &selection,
             request.amount,
             request.fee_amount(),
-            request.broadcaster_fee,
+            request.same_token_broadcaster_fee(),
             request.spend_up_to,
         )?;
         let receiver = viewing.address_data();
@@ -1411,7 +1789,7 @@ impl TransactionBuilder {
             &selection,
             request.amount,
             request.fee_amount(),
-            request.broadcaster_fee,
+            request.same_token_broadcaster_fee(),
             request.spend_up_to,
         )?;
         let sender = viewing.address_data();
@@ -1790,6 +2168,55 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
         })
     }
 
+    fn build_unproven_fee_only(
+        self,
+        token_address: Address,
+        min_gas_price: u128,
+        outputs: Vec<Note>,
+        commitment_ciphertext: Vec<NoteCiphertext>,
+    ) -> Result<UnprovenTransactionPlan, BuildError> {
+        self.validate_signature_limit(outputs.len())?;
+
+        let tree_number = self.tree_number();
+        let (inputs, root) = self.build_input_witnesses_and_root()?;
+        let nullifiers = self.compute_nullifiers();
+        let commitments = Self::compute_commitments(&outputs);
+        let commitment_ciphertext = commitment_ciphertext
+            .into_iter()
+            .map(NoteCiphertext::into_commitment_ciphertext)
+            .collect();
+        let bound_params = BoundParams::new_transact(
+            tree_number,
+            self.builder.chain_type,
+            self.builder.chain_id,
+            commitment_ciphertext,
+            Address::ZERO,
+            UNRELAYED_ADAPT_PARAMS,
+        )
+        .with_min_gas_price(min_gas_price)?;
+
+        let transaction = Transaction {
+            proof: SnarkProof::default(),
+            merkleRoot: FixedBytes::from(root.to_be_bytes::<32>()),
+            nullifiers,
+            commitments,
+            boundParams: bound_params,
+            unshieldPreimage: CommitmentPreimage::empty(),
+        };
+        let private_inputs =
+            PrivateInputs::from_inputs(token_address, &inputs, &outputs, self.viewing, self.signer);
+
+        Ok(UnprovenTransactionPlan {
+            transaction,
+            tree_number,
+            merkle_root: root,
+            inputs,
+            outputs,
+            has_unshield: false,
+            private_inputs,
+        })
+    }
+
     /// Build a transact plan.
     async fn build_transact(self) -> Result<TransactPlan, BuildError> {
         let total = self.total_value();
@@ -1899,6 +2326,13 @@ struct UnshieldOutputs {
     change_note: Option<Note>,
 }
 
+struct FeeOnlyOutputs {
+    outputs: Vec<Note>,
+    commitment_ciphertext: Vec<NoteCiphertext>,
+    broadcaster_fee_note: Note,
+    change_note: Option<Note>,
+}
+
 trait BoundParamsExt {
     fn with_min_gas_price(self, min_gas_price: u128) -> Result<BoundParams, BuildError>;
 }
@@ -2003,7 +2437,6 @@ async fn prove_transaction_plan(
 fn push_broadcaster_fee_output(
     outputs: &mut Vec<Note>,
     commitment_ciphertext: &mut Vec<NoteCiphertext>,
-    token_address: Address,
     sender: &AddressData,
     broadcaster_fee: Option<BroadcasterFeeOutput>,
     sender_viewing_private_key: &[u8; 32],
@@ -2013,7 +2446,7 @@ fn push_broadcaster_fee_output(
     };
     let note = Note::new_change(
         fee.recipient.master_public_key,
-        token_address,
+        fee.token_address,
         fee.amount,
         rand_array(),
     );
@@ -2022,6 +2455,46 @@ fn push_broadcaster_fee_output(
     outputs.push(note.clone());
     commitment_ciphertext.push(ciphertext);
     Ok(Some(note))
+}
+
+fn build_fee_only_outputs(
+    broadcaster_fee: BroadcasterFeeOutput,
+    change: U256,
+    sender: &AddressData,
+    sender_viewing_private_key: &[u8; 32],
+) -> Result<FeeOnlyOutputs, BuildError> {
+    let mut outputs = Vec::with_capacity(1 + usize::from(!change.is_zero()));
+    let mut commitment_ciphertext = Vec::with_capacity(outputs.capacity());
+    let broadcaster_fee_note = push_broadcaster_fee_output(
+        &mut outputs,
+        &mut commitment_ciphertext,
+        sender,
+        Some(broadcaster_fee),
+        sender_viewing_private_key,
+    )?
+    .expect("broadcaster fee is provided");
+
+    let mut change_note = None;
+    if !change.is_zero() {
+        let note = Note::new_change(
+            sender.master_public_key,
+            broadcaster_fee.token_address,
+            change,
+            rand_array(),
+        );
+        let ciphertext =
+            NoteCiphertext::try_from_note(&note, sender, sender, sender_viewing_private_key)?;
+        outputs.push(note.clone());
+        commitment_ciphertext.push(ciphertext);
+        change_note = Some(note);
+    }
+
+    Ok(FeeOnlyOutputs {
+        outputs,
+        commitment_ciphertext,
+        broadcaster_fee_note,
+        change_note,
+    })
 }
 
 fn build_unshield_outputs(
@@ -2038,7 +2511,6 @@ fn build_unshield_outputs(
     let broadcaster_fee_note = push_broadcaster_fee_output(
         &mut outputs,
         &mut commitment_ciphertext,
-        token_address,
         receiver,
         broadcaster_fee,
         sender_viewing_private_key,
@@ -2085,7 +2557,6 @@ fn build_send_outputs(
     let broadcaster_fee_note = push_broadcaster_fee_output(
         &mut outputs,
         &mut commitment_ciphertext,
-        token_address,
         sender,
         broadcaster_fee,
         sender_viewing_private_key,
@@ -2242,9 +2713,75 @@ pub fn unshield_selection_info_with_broadcaster_fee(
     })
 }
 
+pub fn unshield_selection_info_with_broadcaster_fee_token(
+    utxos: &[Utxo],
+    token_address: Address,
+    fee_token_address: Address,
+    amount: U256,
+    fee_amount: U256,
+    spend_up_to: bool,
+) -> Result<UnshieldSelectionInfo, BuildError> {
+    if fee_token_address == token_address {
+        return unshield_selection_info_with_broadcaster_fee(
+            utxos,
+            token_address,
+            amount,
+            fee_amount,
+            spend_up_to,
+        );
+    }
+
+    let fee_selection = select_fee_utxos(utxos, fee_token_address, fee_amount)?;
+    let max_spendable =
+        max_batch_spendable_with_limit(utxos, token_address, 1, 1, MAX_BATCH_TRANSACTIONS - 1);
+    let selection = select_batched_utxos_with_limit(
+        utxos,
+        token_address,
+        amount,
+        spend_up_to,
+        1,
+        1,
+        MAX_BATCH_TRANSACTIONS - 1,
+    )?;
+    let action_shape = batch_shape(&selection, amount, U256::ZERO, false, false);
+    let fee_private_outputs = 1 + usize::from(fee_selection.total > fee_amount);
+
+    Ok(UnshieldSelectionInfo {
+        total: selection.total,
+        input_count: fee_selection.utxos.len() + selection.input_count(),
+        transaction_count: 1 + action_shape.transaction_count,
+        private_output_count: fee_private_outputs + action_shape.private_output_count,
+        public_output_count: action_shape.public_output_count,
+        max_spendable,
+    })
+}
+
+pub fn unshield_selection_info_with_separate_broadcaster_fee_seed(
+    utxos: &[Utxo],
+    token_address: Address,
+    fee_token_address: Address,
+    amount: U256,
+    spend_up_to: bool,
+) -> Result<UnshieldSelectionInfo, BuildError> {
+    separate_broadcaster_fee_seed_selection_info(
+        utxos,
+        token_address,
+        fee_token_address,
+        amount,
+        spend_up_to,
+        false,
+    )
+}
+
 #[must_use]
 pub fn max_send_spendable(utxos: &[Utxo], token_address: Address) -> U256 {
     max_batch_spendable(utxos, token_address, 1, 1)
+}
+
+#[must_use]
+pub fn max_broadcaster_fee_token_spendable(utxos: &[Utxo], token_address: Address) -> U256 {
+    max_unshield_selection_with_output_count(utxos, token_address, 1)
+        .map_or(U256::ZERO, |selection| selection.total)
 }
 
 pub fn send_selection_info(
@@ -2292,6 +2829,102 @@ pub fn send_selection_info_with_broadcaster_fee(
         transaction_count: shape.transaction_count,
         private_output_count: shape.private_output_count,
         public_output_count: shape.public_output_count,
+        max_spendable,
+    })
+}
+
+pub fn send_selection_info_with_broadcaster_fee_token(
+    utxos: &[Utxo],
+    token_address: Address,
+    fee_token_address: Address,
+    amount: U256,
+    fee_amount: U256,
+    spend_up_to: bool,
+) -> Result<UnshieldSelectionInfo, BuildError> {
+    if fee_token_address == token_address {
+        return send_selection_info_with_broadcaster_fee(
+            utxos,
+            token_address,
+            amount,
+            fee_amount,
+            spend_up_to,
+        );
+    }
+
+    let fee_selection = select_fee_utxos(utxos, fee_token_address, fee_amount)?;
+    let max_spendable =
+        max_batch_spendable_with_limit(utxos, token_address, 1, 1, MAX_BATCH_TRANSACTIONS - 1);
+    let selection = select_batched_utxos_with_limit(
+        utxos,
+        token_address,
+        amount,
+        spend_up_to,
+        1,
+        1,
+        MAX_BATCH_TRANSACTIONS - 1,
+    )?;
+    let action_shape = batch_shape(&selection, amount, U256::ZERO, false, true);
+    let fee_private_outputs = 1 + usize::from(fee_selection.total > fee_amount);
+
+    Ok(UnshieldSelectionInfo {
+        total: selection.total,
+        input_count: fee_selection.utxos.len() + selection.input_count(),
+        transaction_count: 1 + action_shape.transaction_count,
+        private_output_count: fee_private_outputs + action_shape.private_output_count,
+        public_output_count: action_shape.public_output_count,
+        max_spendable,
+    })
+}
+
+pub fn send_selection_info_with_separate_broadcaster_fee_seed(
+    utxos: &[Utxo],
+    token_address: Address,
+    fee_token_address: Address,
+    amount: U256,
+    spend_up_to: bool,
+) -> Result<UnshieldSelectionInfo, BuildError> {
+    separate_broadcaster_fee_seed_selection_info(
+        utxos,
+        token_address,
+        fee_token_address,
+        amount,
+        spend_up_to,
+        true,
+    )
+}
+
+fn separate_broadcaster_fee_seed_selection_info(
+    utxos: &[Utxo],
+    token_address: Address,
+    fee_token_address: Address,
+    amount: U256,
+    spend_up_to: bool,
+    send: bool,
+) -> Result<UnshieldSelectionInfo, BuildError> {
+    let fee_max_spendable = max_broadcaster_fee_token_spendable(utxos, fee_token_address);
+    if fee_max_spendable.is_zero() {
+        return Err(BuildError::InsufficientFeeTokenBalance(U256::ZERO));
+    }
+
+    let max_spendable =
+        max_batch_spendable_with_limit(utxos, token_address, 1, 1, MAX_BATCH_TRANSACTIONS - 1);
+    let selection = select_batched_utxos_with_limit(
+        utxos,
+        token_address,
+        amount,
+        spend_up_to,
+        1,
+        1,
+        MAX_BATCH_TRANSACTIONS - 1,
+    )?;
+    let action_shape = batch_shape(&selection, amount, U256::ZERO, false, send);
+
+    Ok(UnshieldSelectionInfo {
+        total: selection.total,
+        input_count: 1 + selection.input_count(),
+        transaction_count: 1 + action_shape.transaction_count,
+        private_output_count: 2 + action_shape.private_output_count,
+        public_output_count: action_shape.public_output_count,
         max_spendable,
     })
 }
@@ -2344,11 +2977,29 @@ fn max_batch_spendable(
     first_base_output_count: usize,
     continuation_base_output_count: usize,
 ) -> U256 {
+    max_batch_spendable_with_limit(
+        utxos,
+        token_address,
+        first_base_output_count,
+        continuation_base_output_count,
+        MAX_BATCH_TRANSACTIONS,
+    )
+}
+
+#[must_use]
+fn max_batch_spendable_with_limit(
+    utxos: &[Utxo],
+    token_address: Address,
+    first_base_output_count: usize,
+    continuation_base_output_count: usize,
+    max_transactions: usize,
+) -> U256 {
     max_batch_selection(
         utxos,
         token_address,
         first_base_output_count,
         continuation_base_output_count,
+        max_transactions,
     )
     .map_or(U256::ZERO, |selection| selection.total)
 }
@@ -2358,12 +3009,13 @@ fn max_batch_selection(
     token_address: Address,
     first_base_output_count: usize,
     continuation_base_output_count: usize,
+    max_transactions: usize,
 ) -> Option<BatchUtxoSelection> {
     let mut remaining = utxos.to_vec();
     let mut chunks = Vec::new();
     let mut total = U256::ZERO;
 
-    for index in 0..MAX_BATCH_TRANSACTIONS {
+    for index in 0..max_transactions {
         let base_output_count = if index == 0 {
             first_base_output_count
         } else {
@@ -2397,11 +3049,32 @@ fn select_batched_utxos(
     first_base_output_count: usize,
     continuation_base_output_count: usize,
 ) -> Result<BatchUtxoSelection, BuildError> {
+    select_batched_utxos_with_limit(
+        utxos,
+        token_address,
+        amount,
+        spend_up_to,
+        first_base_output_count,
+        continuation_base_output_count,
+        MAX_BATCH_TRANSACTIONS,
+    )
+}
+
+fn select_batched_utxos_with_limit(
+    utxos: &[Utxo],
+    token_address: Address,
+    amount: U256,
+    spend_up_to: bool,
+    first_base_output_count: usize,
+    continuation_base_output_count: usize,
+    max_transactions: usize,
+) -> Result<BatchUtxoSelection, BuildError> {
     let max_selection = max_batch_selection(
         utxos,
         token_address,
         first_base_output_count,
         continuation_base_output_count,
+        max_transactions,
     );
     let max_spendable = max_selection
         .as_ref()
@@ -2427,6 +3100,7 @@ fn select_batched_utxos(
         amount,
         first_base_output_count,
         continuation_base_output_count,
+        max_transactions,
     ) {
         return Ok(selection);
     }
@@ -2442,19 +3116,38 @@ fn select_batched_utxos(
     Err(BuildError::InsufficientBalance(max_spendable))
 }
 
+fn select_fee_utxos(
+    utxos: &[Utxo],
+    fee_token_address: Address,
+    fee_amount: U256,
+) -> Result<UtxoSelection, BuildError> {
+    let max_selection = max_unshield_selection_with_output_count(utxos, fee_token_address, 1);
+    let max_spendable = max_selection
+        .as_ref()
+        .map_or(U256::ZERO, |selection| selection.total);
+
+    if fee_amount.is_zero() {
+        return Err(BuildError::InsufficientFeeTokenBalance(max_spendable));
+    }
+
+    best_unshield_selection(utxos, fee_token_address, fee_amount, 1)
+        .ok_or(BuildError::InsufficientFeeTokenBalance(max_spendable))
+}
+
 fn greedy_batched_selection(
     utxos: &[Utxo],
     token_address: Address,
     amount: U256,
     first_base_output_count: usize,
     continuation_base_output_count: usize,
+    max_transactions: usize,
 ) -> Option<BatchUtxoSelection> {
     let mut remaining_utxos = utxos.to_vec();
     let mut remaining_amount = amount;
     let mut chunks = Vec::new();
     let mut total = U256::ZERO;
 
-    for index in 0..MAX_BATCH_TRANSACTIONS {
+    for index in 0..max_transactions {
         let base_output_count = if index == 0 {
             first_base_output_count
         } else {
@@ -3505,13 +4198,13 @@ mod tests {
         assert_eq!(outputs.recipient_note.value, uint!(7_U256));
         assert_eq!(
             outputs.recipient_note.npk,
-            crate::notes::Note::npk_for(recipient.master_public_key, outputs.recipient_note.random)
+            Note::npk_for(recipient.master_public_key, outputs.recipient_note.random)
         );
         let change_note = outputs.change_note.expect("change note");
         assert_eq!(change_note.value, uint!(3_U256));
         assert_eq!(
             change_note.npk,
-            crate::notes::Note::npk_for(sender.master_public_key, change_note.random)
+            Note::npk_for(sender.master_public_key, change_note.random)
         );
     }
 
@@ -3553,6 +4246,7 @@ mod tests {
             &recipient,
             Some(BroadcasterFeeOutput {
                 recipient: broadcaster,
+                token_address: token,
                 amount: uint!(2_U256),
             }),
             &sender_viewing.viewing_private_key,
@@ -3565,7 +4259,7 @@ mod tests {
         assert_eq!(fee_note.value, uint!(2_U256));
         assert_eq!(
             outputs.outputs[0].npk,
-            crate::notes::Note::npk_for(broadcaster.master_public_key, outputs.outputs[0].random)
+            Note::npk_for(broadcaster.master_public_key, outputs.outputs[0].random)
         );
         assert_eq!(outputs.outputs[1].value, uint!(7_U256));
         assert_eq!(outputs.outputs[2].value, uint!(3_U256));
@@ -3587,6 +4281,7 @@ mod tests {
             &receiver,
             Some(BroadcasterFeeOutput {
                 recipient: broadcaster,
+                token_address: token,
                 amount: uint!(2_U256),
             }),
             &receiver_viewing.viewing_private_key,
@@ -3669,6 +4364,176 @@ mod tests {
         assert_eq!(info.private_output_count, 3);
         assert_eq!(info.public_output_count, 0);
         assert_eq!(info.max_spendable, uint!(23_U256));
+    }
+
+    #[test]
+    fn same_token_fee_token_selection_preserves_existing_shape() {
+        let token = Address::from([23_u8; 20]);
+        let utxos = (0..13)
+            .map(|position| test_utxo(token, 2, 0, position))
+            .collect::<Vec<_>>();
+
+        let existing = send_selection_info_with_broadcaster_fee(
+            &utxos,
+            token,
+            uint!(23_U256),
+            uint!(3_U256),
+            false,
+        )
+        .expect("same-token existing selection");
+        let selected_fee_token = send_selection_info_with_broadcaster_fee_token(
+            &utxos,
+            token,
+            token,
+            uint!(23_U256),
+            uint!(3_U256),
+            false,
+        )
+        .expect("same-token fee-token selection");
+
+        assert_eq!(selected_fee_token, existing);
+    }
+
+    #[test]
+    fn different_token_fee_shape_includes_fee_transaction_first() {
+        let action_token = Address::from([24_u8; 20]);
+        let fee_token = Address::from([25_u8; 20]);
+        let utxos = vec![
+            test_utxo(fee_token, 5, 0, 0),
+            test_utxo(action_token, 10, 0, 1),
+        ];
+
+        let info = send_selection_info_with_broadcaster_fee_token(
+            &utxos,
+            action_token,
+            fee_token,
+            uint!(7_U256),
+            uint!(3_U256),
+            false,
+        )
+        .expect("different-token selection");
+
+        assert_eq!(info.transaction_count, 2);
+        assert_eq!(info.input_count, 2);
+        assert_eq!(info.private_output_count, 4);
+        assert_eq!(info.public_output_count, 0);
+        assert_eq!(info.total, uint!(10_U256));
+    }
+
+    #[test]
+    fn fee_only_outputs_use_fee_token_and_private_change() {
+        let fee_token = Address::from([26_u8; 20]);
+        let sender_viewing = sample_address_data(14);
+        let sender = sender_viewing.address_data();
+        let broadcaster = sample_address_data(34).address_data();
+
+        let outputs = build_fee_only_outputs(
+            BroadcasterFeeOutput {
+                recipient: broadcaster,
+                token_address: fee_token,
+                amount: uint!(3_U256),
+            },
+            uint!(2_U256),
+            &sender,
+            &sender_viewing.viewing_private_key,
+        )
+        .expect("fee-only outputs");
+
+        assert_eq!(outputs.outputs.len(), 2);
+        assert_eq!(outputs.outputs[0].value, uint!(3_U256));
+        assert_eq!(
+            outputs.outputs[0].token_hash,
+            U256::from_be_slice(fee_token.as_slice())
+        );
+        assert_eq!(
+            outputs.outputs[0].npk,
+            Note::npk_for(broadcaster.master_public_key, outputs.outputs[0].random)
+        );
+        let change = outputs.change_note.expect("fee-token change");
+        assert_eq!(outputs.outputs[1].value, uint!(2_U256));
+        assert_eq!(
+            outputs.outputs[1].token_hash,
+            U256::from_be_slice(fee_token.as_slice())
+        );
+        assert_eq!(change.value, uint!(2_U256));
+    }
+
+    #[test]
+    fn different_token_fee_selection_reports_fee_token_balance() {
+        let action_token = Address::from([27_u8; 20]);
+        let fee_token = Address::from([28_u8; 20]);
+        let utxos = vec![test_utxo(action_token, 10, 0, 1)];
+
+        let error = send_selection_info_with_broadcaster_fee_token(
+            &utxos,
+            action_token,
+            fee_token,
+            uint!(7_U256),
+            uint!(3_U256),
+            false,
+        )
+        .expect_err("missing fee token should fail");
+
+        assert!(matches!(error, BuildError::InsufficientFeeTokenBalance(max) if max == U256::ZERO));
+    }
+
+    #[test]
+    fn fee_token_max_spendable_matches_single_fee_transaction_limit() {
+        let fee_token = Address::from([31_u8; 20]);
+        let utxos: Vec<_> = (0..20)
+            .map(|position| test_utxo(fee_token, 1, 0, position))
+            .collect();
+
+        assert_eq!(
+            max_broadcaster_fee_token_spendable(&utxos, fee_token),
+            U256::from(MAX_CIRCUIT_INPUTS)
+        );
+    }
+
+    #[test]
+    fn separate_fee_seed_selection_reserves_fee_transaction_without_fee_amount() {
+        let action_token = Address::from([32_u8; 20]);
+        let fee_token = Address::from([33_u8; 20]);
+        let utxos = vec![
+            test_utxo(fee_token, 1, 0, 100),
+            test_utxo(action_token, 10, 0, 1),
+        ];
+
+        let info = send_selection_info_with_separate_broadcaster_fee_seed(
+            &utxos,
+            action_token,
+            fee_token,
+            uint!(7_U256),
+            false,
+        )
+        .expect("seed selection");
+
+        assert_eq!(info.transaction_count, 2);
+        assert_eq!(info.input_count, 2);
+        assert_eq!(info.private_output_count, 4);
+        assert_eq!(info.max_spendable, uint!(10_U256));
+    }
+
+    #[test]
+    fn different_token_fee_selection_reserves_one_batch_slot() {
+        let action_token = Address::from([29_u8; 20]);
+        let fee_token = Address::from([30_u8; 20]);
+        let mut utxos = vec![test_utxo(fee_token, 1, 0, 100)];
+        utxos.extend((0..8).flat_map(|tree| {
+            (0..13).map(move |position| test_utxo(action_token, 1, tree, position))
+        }));
+
+        let error = send_selection_info_with_broadcaster_fee_token(
+            &utxos,
+            action_token,
+            fee_token,
+            uint!(92_U256),
+            uint!(1_U256),
+            false,
+        )
+        .expect_err("fee transaction should reduce action batch capacity");
+
+        assert!(matches!(error, BuildError::InsufficientBalance(max) if max == uint!(91_U256)));
     }
 
     #[test]

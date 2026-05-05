@@ -32,9 +32,12 @@ use railgun_wallet::artifacts::ArtifactSource;
 use railgun_wallet::tx::{
     BroadcasterFeeOutput, BuildError, PreTransactionPoiGenerationRequest, PreTransactionPoiMap,
     SendPlan, SendRequest as RailgunSendRequest, TransactionPlanChunk, UnshieldMode, UnshieldPlan,
-    UnshieldRequest as RailgunUnshieldRequest, generate_pre_transaction_pois, max_send_spendable,
-    max_unshield_spendable, send_selection_info, send_selection_info_with_broadcaster_fee,
-    unshield_selection_info, unshield_selection_info_with_broadcaster_fee,
+    UnshieldRequest as RailgunUnshieldRequest, generate_pre_transaction_pois,
+    max_broadcaster_fee_token_spendable, max_send_spendable, max_unshield_spendable,
+    send_selection_info, send_selection_info_with_broadcaster_fee_token,
+    send_selection_info_with_separate_broadcaster_fee_seed, unshield_selection_info,
+    unshield_selection_info_with_broadcaster_fee_token,
+    unshield_selection_info_with_separate_broadcaster_fee_seed,
 };
 use railgun_wallet::wallet_cache::wallet_cache_key;
 use railgun_wallet::{
@@ -70,13 +73,14 @@ pub use amounts::{
 };
 pub use anchors::{
     BroadcasterFeePolicy, BroadcasterFeePolicyStatus, TokenAnchorRateCache,
-    TokenAnchorRefreshHandle, average_non_outlier_anchor_rates, known_token_anchor_sources,
-    oracle_answer_to_anchor_rate, refresh_token_anchor_rates, spawn_token_anchor_refresh_worker,
+    TokenAnchorRefreshHandle, average_non_outlier_anchor_rates, fixed_token_anchor_rate,
+    known_token_anchor_sources, oracle_answer_to_anchor_rate, refresh_token_anchor_rates,
+    spawn_token_anchor_refresh_worker,
 };
 pub use http::{HttpContext, build_http_client};
 pub use utxos::{
-    ListUtxosOutput, TokenTotal, UtxoOutput, max_send_amount_from_outputs,
-    max_unshield_amount_from_outputs,
+    ListUtxosOutput, TokenTotal, UtxoOutput, max_broadcaster_fee_token_amount_from_outputs,
+    max_send_amount_from_outputs, max_unshield_amount_from_outputs,
 };
 
 pub(crate) use poi_contexts::{
@@ -111,6 +115,8 @@ const APPROX_SEND_EXTRA_GAS: u64 = 40_000;
 const APPROX_UNWRAP_EXTRA_GAS: u64 = 50_000;
 const APPROX_SAFETY_GAS: u64 = 150_000;
 const PUBLIC_BROADCASTER_MAX_ENTERED_AMOUNT_ERROR: &str = "public broadcaster max entered amount: ";
+const PUBLIC_BROADCASTER_FEE_TOKEN_MAX_SPENDABLE_ERROR: &str =
+    "public broadcaster fee-token max spendable: ";
 const FEE_BASIS_POINTS_DENOMINATOR: U256 = uint!(10_000_U256);
 pub const RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS: U256 = uint!(25_U256);
 
@@ -228,6 +234,7 @@ pub struct DesktopUnshieldCalldataRequest {
     pub vault_store: Arc<vault::DesktopVaultStore>,
     pub vault_password: Zeroizing<String>,
     pub token: Address,
+    pub fee_token: Address,
     pub amount: U256,
     pub recipient: Address,
     pub unwrap: bool,
@@ -242,6 +249,7 @@ pub struct DesktopSendCalldataRequest {
     pub vault_store: Arc<vault::DesktopVaultStore>,
     pub vault_password: Zeroizing<String>,
     pub token: Address,
+    pub fee_token: Address,
     pub amount: U256,
     pub recipient: String,
     pub verify_proof: bool,
@@ -270,7 +278,7 @@ pub struct PublicBroadcasterCandidate {
 
 impl PublicBroadcasterCandidate {
     #[must_use]
-    pub fn is_allowed_by_fee_policy(&self, policy: BroadcasterFeePolicy) -> bool {
+    pub const fn is_allowed_by_fee_policy(&self, policy: BroadcasterFeePolicy) -> bool {
         policy.allows_status(self.fee_policy_status)
     }
 
@@ -405,6 +413,7 @@ pub struct DesktopUnshieldPublicBroadcasterRequest {
     pub vault_store: Arc<vault::DesktopVaultStore>,
     pub vault_password: Zeroizing<String>,
     pub token: Address,
+    pub fee_token: Address,
     pub amount: U256,
     pub recipient: Address,
     pub unwrap: bool,
@@ -426,6 +435,7 @@ pub struct DesktopSendPublicBroadcasterRequest {
     pub vault_store: Arc<vault::DesktopVaultStore>,
     pub vault_password: Zeroizing<String>,
     pub token: Address,
+    pub fee_token: Address,
     pub amount: U256,
     pub recipient: String,
     pub verify_proof: bool,
@@ -443,6 +453,7 @@ pub struct DesktopUnshieldPublicBroadcasterEstimateRequest {
     pub chain_id: u64,
     pub session: Arc<WalletSession>,
     pub token: Address,
+    pub fee_token: Address,
     pub amount: U256,
     pub recipient: Address,
     pub unwrap: bool,
@@ -457,6 +468,7 @@ pub struct DesktopSendPublicBroadcasterEstimateRequest {
     pub chain_id: u64,
     pub session: Arc<WalletSession>,
     pub token: Address,
+    pub fee_token: Address,
     pub amount: U256,
     pub recipient: String,
     pub fee_rows: Vec<FeeRow>,
@@ -469,6 +481,8 @@ pub struct DesktopSendPublicBroadcasterEstimateRequest {
 #[derive(Debug, Clone)]
 pub struct PublicBroadcasterCostEstimate {
     pub broadcaster: PublicBroadcasterCandidate,
+    pub action_token: Address,
+    pub fee_token: Address,
     pub entered_amount: U256,
     pub receiver_amount: U256,
     pub recipient_amount: U256,
@@ -498,6 +512,8 @@ pub enum PublicBroadcasterResultKind {
 #[derive(Debug, Clone)]
 pub struct PublicBroadcasterSubmissionResult {
     pub broadcaster: PublicBroadcasterCandidate,
+    pub action_token: Address,
+    pub fee_token: Address,
     pub entered_amount: U256,
     pub receiver_amount: U256,
     pub recipient_amount: U256,
@@ -516,6 +532,8 @@ struct PreparedPublicBroadcasterPlan<P> {
     plan: P,
     pre_transaction_pois_per_txid_leaf_per_list: PreTransactionPoiMap,
     broadcaster: PublicBroadcasterCandidate,
+    action_token: Address,
+    fee_token: Address,
     entered_amount: U256,
     receiver_amount: U256,
     recipient_amount: U256,
@@ -846,6 +864,65 @@ pub fn broadcaster_fee_amount(
     token_fee_per_unit_gas * U256::from(gas_limit) * U256::from(gas_price) / FEE_SCALE
 }
 
+#[must_use]
+pub const fn public_broadcaster_service_gas_price(min_gas_price: u128) -> u128 {
+    min_gas_price * 101 / 100
+}
+
+#[must_use]
+pub fn public_broadcaster_native_gas_cost(gas_limit: u64, min_gas_price: u128) -> U256 {
+    U256::from(gas_limit) * U256::from(public_broadcaster_service_gas_price(min_gas_price))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicBroadcasterFeeMargin {
+    Zero,
+    Positive(U256),
+    Negative(U256),
+}
+
+impl PublicBroadcasterFeeMargin {
+    #[must_use]
+    pub fn from_total_and_gas(total_fee: U256, gas_cost: U256) -> Self {
+        if total_fee >= gas_cost {
+            let margin = total_fee - gas_cost;
+            if margin.is_zero() {
+                Self::Zero
+            } else {
+                Self::Positive(margin)
+            }
+        } else {
+            Self::Negative(gas_cost - total_fee)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicBroadcasterFeeBreakdown {
+    pub native_gas_cost: U256,
+    pub fee_token_gas_cost: Option<U256>,
+    pub broadcaster_fee: Option<PublicBroadcasterFeeMargin>,
+}
+
+#[must_use]
+pub fn public_broadcaster_fee_breakdown(
+    total_fee: U256,
+    gas_limit: u64,
+    min_gas_price: u128,
+    fee_token_anchor_rate: Option<U256>,
+) -> PublicBroadcasterFeeBreakdown {
+    let service_gas_price = public_broadcaster_service_gas_price(min_gas_price);
+    let fee_token_gas_cost = fee_token_anchor_rate
+        .filter(|anchor_rate| !anchor_rate.is_zero())
+        .map(|anchor_rate| broadcaster_fee_amount(anchor_rate, gas_limit, service_gas_price));
+    PublicBroadcasterFeeBreakdown {
+        native_gas_cost: U256::from(gas_limit) * U256::from(service_gas_price),
+        fee_token_gas_cost,
+        broadcaster_fee: fee_token_gas_cost
+            .map(|gas_cost| PublicBroadcasterFeeMargin::from_total_and_gas(total_fee, gas_cost)),
+    }
+}
+
 fn broadcaster_fee_covers(available_fee: U256, required_fee: U256) -> bool {
     available_fee >= required_fee
 }
@@ -905,6 +982,25 @@ fn public_broadcaster_amount_split(
     })
 }
 
+fn public_broadcaster_amount_split_for_tokens(
+    entered_amount: U256,
+    fee_amount: U256,
+    fee_mode: PublicBroadcasterFeeMode,
+    same_token_fee: bool,
+) -> Result<PublicBroadcasterAmountSplit> {
+    if same_token_fee {
+        return public_broadcaster_amount_split(entered_amount, fee_amount, fee_mode);
+    }
+
+    Ok(PublicBroadcasterAmountSplit {
+        entered_amount,
+        receiver_amount: entered_amount,
+        total_private_spend: entered_amount,
+        fee_amount,
+        fee_mode: PublicBroadcasterFeeMode::AddToAmount,
+    })
+}
+
 fn public_broadcaster_max_entered_amount(
     max_receiver_amount: U256,
     fee_amount: U256,
@@ -913,6 +1009,19 @@ fn public_broadcaster_max_entered_amount(
     match fee_mode {
         PublicBroadcasterFeeMode::DeductFromAmount => max_receiver_amount + fee_amount,
         PublicBroadcasterFeeMode::AddToAmount => max_receiver_amount,
+    }
+}
+
+fn public_broadcaster_max_entered_amount_for_tokens(
+    max_receiver_amount: U256,
+    fee_amount: U256,
+    fee_mode: PublicBroadcasterFeeMode,
+    same_token_fee: bool,
+) -> U256 {
+    if same_token_fee {
+        public_broadcaster_max_entered_amount(max_receiver_amount, fee_amount, fee_mode)
+    } else {
+        max_receiver_amount
     }
 }
 
@@ -928,12 +1037,21 @@ fn public_broadcaster_build_error(
     error: BuildError,
     fee_amount: U256,
     fee_mode: PublicBroadcasterFeeMode,
+    same_token_fee: bool,
 ) -> Report {
     match error {
         BuildError::InsufficientBalance(max_receiver_amount) => eyre!(
             "{PUBLIC_BROADCASTER_MAX_ENTERED_AMOUNT_ERROR}{}",
-            public_broadcaster_max_entered_amount(max_receiver_amount, fee_amount, fee_mode)
+            public_broadcaster_max_entered_amount_for_tokens(
+                max_receiver_amount,
+                fee_amount,
+                fee_mode,
+                same_token_fee
+            )
         ),
+        BuildError::InsufficientFeeTokenBalance(max_spendable) => {
+            eyre!("{PUBLIC_BROADCASTER_FEE_TOKEN_MAX_SPENDABLE_ERROR}{max_spendable}")
+        }
         other => Report::new(other),
     }
 }
@@ -953,7 +1071,9 @@ fn public_broadcaster_anchor_rate_for_policy(
     chain_id: u64,
     token: Address,
 ) -> Option<U256> {
-    anchor_cache.and_then(|cache| cache.cached_rate(chain_id, token))
+    anchor_cache
+        .and_then(|cache| cache.cached_rate(chain_id, token))
+        .or_else(|| fixed_token_anchor_rate(chain_id, token))
 }
 
 async fn public_broadcaster_setup(
@@ -1026,20 +1146,29 @@ const fn approximate_public_broadcaster_gas(shape: ApproximateTransactionShape) 
 
 fn approximate_public_broadcaster_cost(
     broadcaster: PublicBroadcasterCandidate,
+    action_token: Address,
+    fee_token: Address,
     entered_amount: U256,
     fee_mode: PublicBroadcasterFeeMode,
     protocol_fee_bps: U256,
     min_gas_price: u128,
+    initial_fee_amount: U256,
     mut select_shape: impl FnMut(PublicBroadcasterAmountSplit) -> Result<ApproximateTransactionShape>,
 ) -> Result<PublicBroadcasterCostEstimate> {
-    let service_gas_price = min_gas_price * 101 / 100;
-    let mut fee_amount = U256::ZERO;
+    let service_gas_price = public_broadcaster_service_gas_price(min_gas_price);
+    let mut fee_amount = initial_fee_amount;
     let mut latest_shape = None;
     let mut latest_split = None;
     let mut latest_gas_limit = 0;
+    let same_token_fee = action_token == fee_token;
 
     for _ in 0..PUBLIC_BROADCASTER_FEE_ATTEMPTS {
-        let split = public_broadcaster_amount_split(entered_amount, fee_amount, fee_mode)?;
+        let split = public_broadcaster_amount_split_for_tokens(
+            entered_amount,
+            fee_amount,
+            fee_mode,
+            same_token_fee,
+        )?;
         let shape = select_shape(split)?;
         let gas_limit = approximate_public_broadcaster_gas(shape);
         let computed_fee = broadcaster_fee_amount(broadcaster.fee, gas_limit, service_gas_price);
@@ -1051,6 +1180,8 @@ fn approximate_public_broadcaster_cost(
                 railgun_protocol_fee_amount(split.receiver_amount, protocol_fee_bps);
             return Ok(PublicBroadcasterCostEstimate {
                 broadcaster,
+                action_token,
+                fee_token,
                 entered_amount: split.entered_amount,
                 receiver_amount: split.receiver_amount,
                 recipient_amount: recipient_amount_after_protocol_fee(
@@ -1063,14 +1194,15 @@ fn approximate_public_broadcaster_cost(
                 protocol_fee_bps,
                 fee_mode: split.fee_mode,
                 max_receiver_amount: shape.max_receiver_amount,
-                max_entered_amount: public_broadcaster_max_entered_amount(
+                max_entered_amount: public_broadcaster_max_entered_amount_for_tokens(
                     shape.max_receiver_amount,
                     fee_amount,
                     split.fee_mode,
+                    same_token_fee,
                 ),
                 gas_limit,
                 min_gas_price,
-                native_gas_cost: U256::from(gas_limit) * U256::from(min_gas_price),
+                native_gas_cost: public_broadcaster_native_gas_cost(gas_limit, min_gas_price),
                 transaction_count: shape.transaction_count,
                 input_count: shape.input_count,
                 private_output_count: shape.private_output_count,
@@ -1085,6 +1217,8 @@ fn approximate_public_broadcaster_cost(
     let protocol_fee_amount = railgun_protocol_fee_amount(split.receiver_amount, protocol_fee_bps);
     Ok(PublicBroadcasterCostEstimate {
         broadcaster,
+        action_token,
+        fee_token,
         entered_amount: split.entered_amount,
         receiver_amount: split.receiver_amount,
         recipient_amount: recipient_amount_after_protocol_fee(
@@ -1097,19 +1231,51 @@ fn approximate_public_broadcaster_cost(
         protocol_fee_bps,
         fee_mode: split.fee_mode,
         max_receiver_amount: shape.max_receiver_amount,
-        max_entered_amount: public_broadcaster_max_entered_amount(
+        max_entered_amount: public_broadcaster_max_entered_amount_for_tokens(
             shape.max_receiver_amount,
             split.fee_amount,
             split.fee_mode,
+            same_token_fee,
         ),
         gas_limit: latest_gas_limit,
         min_gas_price,
-        native_gas_cost: U256::from(latest_gas_limit) * U256::from(min_gas_price),
+        native_gas_cost: public_broadcaster_native_gas_cost(latest_gas_limit, min_gas_price),
         transaction_count: shape.transaction_count,
         input_count: shape.input_count,
         private_output_count: shape.private_output_count,
         public_output_count: shape.public_output_count,
     })
+}
+
+fn initial_separate_token_public_broadcaster_fee(
+    broadcaster: &PublicBroadcasterCandidate,
+    min_gas_price: u128,
+    seed_shape: ApproximateTransactionShape,
+) -> U256 {
+    let service_gas_price = public_broadcaster_service_gas_price(min_gas_price);
+    let gas_limit = approximate_public_broadcaster_gas(seed_shape);
+    buffered_public_broadcaster_fee(broadcaster_fee_amount(
+        broadcaster.fee,
+        gas_limit,
+        service_gas_price,
+    ))
+}
+
+fn initial_public_broadcaster_fee_amount(
+    broadcaster: &PublicBroadcasterCandidate,
+    min_gas_price: u128,
+    same_token_fee: bool,
+    seed_shape: impl FnOnce() -> Result<ApproximateTransactionShape>,
+) -> Result<U256> {
+    if same_token_fee {
+        Ok(U256::ZERO)
+    } else {
+        Ok(initial_separate_token_public_broadcaster_fee(
+            broadcaster,
+            min_gas_price,
+            seed_shape()?,
+        ))
+    }
 }
 
 const fn send_approximate_shape(
@@ -1701,6 +1867,7 @@ pub async fn prepare_desktop_unshield_calldata(
         &pending_pois,
         &pending_poi_list_keys,
         false,
+        false,
     )?;
 
     Ok(PreparedUnshieldCall {
@@ -1816,6 +1983,7 @@ pub async fn prepare_desktop_send_calldata(
         &pending_pois,
         &pending_poi_list_keys,
         false,
+        false,
     )?;
 
     Ok(PreparedSendCall {
@@ -1855,12 +2023,12 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
     let anchor_rate = public_broadcaster_anchor_rate_for_policy(
         request.anchor_cache.as_ref(),
         request.chain_id,
-        request.token,
+        request.fee_token,
     );
     let candidates = public_broadcaster_candidates(
         &request.fee_rows,
         request.chain_id,
-        request.token,
+        request.fee_token,
         if request.unwrap {
             Some(chain_defaults.relay_adapt_contract)
         } else {
@@ -1877,23 +2045,56 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
         .erased();
     let min_gas_price = buffered_gas_price(&provider).await?;
     let utxos = request.session.unspent_utxos().await;
+    let same_token_fee = request.fee_token == request.token;
+    let initial_fee_amount =
+        initial_public_broadcaster_fee_amount(&broadcaster, min_gas_price, same_token_fee, || {
+            let selection = unshield_selection_info_with_separate_broadcaster_fee_seed(
+                &utxos,
+                request.token,
+                request.fee_token,
+                request.amount,
+                false,
+            )
+            .map_err(|error| {
+                public_broadcaster_build_error(
+                    error,
+                    U256::ZERO,
+                    PublicBroadcasterFeeMode::AddToAmount,
+                    same_token_fee,
+                )
+            })?;
+            Ok(unshield_approximate_shape(
+                &selection,
+                selection.max_spendable,
+                request.unwrap,
+            ))
+        })?;
 
     approximate_public_broadcaster_cost(
         broadcaster,
+        request.token,
+        request.fee_token,
         request.amount,
         request.fee_mode,
         RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
         min_gas_price,
+        initial_fee_amount,
         |split| {
-            let selection = unshield_selection_info_with_broadcaster_fee(
+            let selection = unshield_selection_info_with_broadcaster_fee_token(
                 &utxos,
                 request.token,
+                request.fee_token,
                 split.receiver_amount,
                 split.fee_amount,
                 false,
             )
             .map_err(|error| {
-                public_broadcaster_build_error(error, split.fee_amount, split.fee_mode)
+                public_broadcaster_build_error(
+                    error,
+                    split.fee_amount,
+                    split.fee_mode,
+                    same_token_fee,
+                )
             })?;
             Ok(unshield_approximate_shape(
                 &selection,
@@ -1924,12 +2125,12 @@ pub async fn estimate_desktop_send_public_broadcaster_cost(
     let anchor_rate = public_broadcaster_anchor_rate_for_policy(
         request.anchor_cache.as_ref(),
         request.chain_id,
-        request.token,
+        request.fee_token,
     );
     let candidates = public_broadcaster_candidates(
         &request.fee_rows,
         request.chain_id,
-        request.token,
+        request.fee_token,
         None,
         SystemTime::now(),
         policy,
@@ -1942,23 +2143,52 @@ pub async fn estimate_desktop_send_public_broadcaster_cost(
         .erased();
     let min_gas_price = buffered_gas_price(&provider).await?;
     let utxos = request.session.unspent_utxos().await;
+    let same_token_fee = request.fee_token == request.token;
+    let initial_fee_amount =
+        initial_public_broadcaster_fee_amount(&broadcaster, min_gas_price, same_token_fee, || {
+            let selection = send_selection_info_with_separate_broadcaster_fee_seed(
+                &utxos,
+                request.token,
+                request.fee_token,
+                request.amount,
+                false,
+            )
+            .map_err(|error| {
+                public_broadcaster_build_error(
+                    error,
+                    U256::ZERO,
+                    PublicBroadcasterFeeMode::AddToAmount,
+                    same_token_fee,
+                )
+            })?;
+            Ok(send_approximate_shape(&selection, selection.max_spendable))
+        })?;
 
     approximate_public_broadcaster_cost(
         broadcaster,
+        request.token,
+        request.fee_token,
         request.amount,
         request.fee_mode,
         U256::ZERO,
         min_gas_price,
+        initial_fee_amount,
         |split| {
-            let selection = send_selection_info_with_broadcaster_fee(
+            let selection = send_selection_info_with_broadcaster_fee_token(
                 &utxos,
                 request.token,
+                request.fee_token,
                 split.receiver_amount,
                 split.fee_amount,
                 false,
             )
             .map_err(|error| {
-                public_broadcaster_build_error(error, split.fee_amount, split.fee_mode)
+                public_broadcaster_build_error(
+                    error,
+                    split.fee_amount,
+                    split.fee_mode,
+                    same_token_fee,
+                )
             })?;
             Ok(send_approximate_shape(&selection, selection.max_spendable))
         },
@@ -1979,6 +2209,8 @@ pub async fn submit_desktop_unshield_public_broadcaster(
         prepared.plan.call.data,
         prepared.pre_transaction_pois_per_txid_leaf_per_list,
         prepared.broadcaster,
+        prepared.action_token,
+        prepared.fee_token,
         prepared.entered_amount,
         prepared.receiver_amount,
         prepared.recipient_amount,
@@ -2009,6 +2241,8 @@ pub async fn submit_desktop_send_public_broadcaster(
         prepared.plan.call.data,
         prepared.pre_transaction_pois_per_txid_leaf_per_list,
         prepared.broadcaster,
+        prepared.action_token,
+        prepared.fee_token,
         prepared.entered_amount,
         prepared.receiver_amount,
         prepared.recipient_amount,
@@ -2051,7 +2285,7 @@ async fn prepare_desktop_unshield_public_broadcaster(
     } = public_broadcaster_setup(
         &request.session,
         request.chain_id,
-        request.token,
+        request.fee_token,
         &request.fee_rows,
         &request.selection,
         request.unwrap,
@@ -2061,26 +2295,59 @@ async fn prepare_desktop_unshield_public_broadcaster(
         http,
     )
     .await?;
+    let same_token_fee = request.fee_token == request.token;
     update_transaction_generation_stage(
         request.progress_tx.as_ref(),
         TransactionGenerationStage::SelectingPrivateNotes,
     );
+    let seeded_fee_amount =
+        initial_public_broadcaster_fee_amount(&broadcaster, min_gas_price, same_token_fee, || {
+            let selection = unshield_selection_info_with_separate_broadcaster_fee_seed(
+                &utxos,
+                request.token,
+                request.fee_token,
+                request.amount,
+                false,
+            )
+            .map_err(|error| {
+                public_broadcaster_build_error(
+                    error,
+                    U256::ZERO,
+                    PublicBroadcasterFeeMode::AddToAmount,
+                    same_token_fee,
+                )
+            })?;
+            Ok(unshield_approximate_shape(
+                &selection,
+                selection.max_spendable,
+                request.unwrap,
+            ))
+        })?;
     let initial_fee_amount = match approximate_public_broadcaster_cost(
         broadcaster.clone(),
+        request.token,
+        request.fee_token,
         request.amount,
         request.fee_mode,
         RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
         min_gas_price,
+        seeded_fee_amount,
         |split| {
-            let selection = unshield_selection_info_with_broadcaster_fee(
+            let selection = unshield_selection_info_with_broadcaster_fee_token(
                 &utxos,
                 request.token,
+                request.fee_token,
                 split.receiver_amount,
                 split.fee_amount,
                 false,
             )
             .map_err(|error| {
-                public_broadcaster_build_error(error, split.fee_amount, split.fee_mode)
+                public_broadcaster_build_error(
+                    error,
+                    split.fee_amount,
+                    split.fee_mode,
+                    same_token_fee,
+                )
             })?;
             Ok(unshield_approximate_shape(
                 &selection,
@@ -2105,11 +2372,14 @@ async fn prepare_desktop_unshield_public_broadcaster(
             estimate.fee_amount
         }
         Err(err) => {
+            if !same_token_fee {
+                return Err(err).wrap_err("estimate initial public broadcaster unshield fee");
+            }
             tracing::warn!(
                 ?err,
                 broadcaster = %broadcaster.railgun_address,
                 fees_id = %broadcaster.fees_id,
-                "failed to estimate initial public broadcaster unshield fee; starting at zero"
+                "failed to estimate initial same-token public broadcaster unshield fee; starting at zero"
             );
             U256::ZERO
         }
@@ -2138,7 +2408,12 @@ async fn prepare_desktop_unshield_public_broadcaster(
 
     let mut fee_amount = initial_fee_amount;
     for attempt in 1..=PUBLIC_BROADCASTER_FEE_ATTEMPTS {
-        let split = public_broadcaster_amount_split(request.amount, fee_amount, request.fee_mode)?;
+        let split = public_broadcaster_amount_split_for_tokens(
+            request.amount,
+            fee_amount,
+            request.fee_mode,
+            same_token_fee,
+        )?;
         let unshield_request = RailgunUnshieldRequest {
             token_address: request.token,
             amount: split.receiver_amount,
@@ -2148,6 +2423,7 @@ async fn prepare_desktop_unshield_public_broadcaster(
             spend_up_to: false,
             broadcaster_fee: Some(BroadcasterFeeOutput {
                 recipient: broadcaster.address_data,
+                token_address: request.fee_token,
                 amount: fee_amount,
             }),
             min_gas_price,
@@ -2167,7 +2443,9 @@ async fn prepare_desktop_unshield_public_broadcaster(
                 &prover,
             )
             .await
-            .map_err(|error| public_broadcaster_build_error(error, fee_amount, split.fee_mode))
+            .map_err(|error| {
+                public_broadcaster_build_error(error, fee_amount, split.fee_mode, same_token_fee)
+            })
             .wrap_err("build public broadcaster unshield proof")?;
         tracing::info!(
             attempt,
@@ -2243,6 +2521,7 @@ async fn prepare_desktop_unshield_public_broadcaster(
                 &pre_transaction_pois.pending_pois,
                 &pre_transaction_pois.pending_poi_list_keys,
                 true,
+                !same_token_fee,
             )?;
             tracing::info!(
                 chain_id = request.chain_id,
@@ -2254,6 +2533,8 @@ async fn prepare_desktop_unshield_public_broadcaster(
                 plan,
                 pre_transaction_pois_per_txid_leaf_per_list: pre_transaction_pois.request_pois,
                 broadcaster,
+                action_token: request.token,
+                fee_token: request.fee_token,
                 entered_amount: split.entered_amount,
                 receiver_amount: split.receiver_amount,
                 recipient_amount: recipient_amount_after_protocol_fee(
@@ -2309,7 +2590,7 @@ async fn prepare_desktop_send_public_broadcaster(
     } = public_broadcaster_setup(
         &request.session,
         request.chain_id,
-        request.token,
+        request.fee_token,
         &request.fee_rows,
         &request.selection,
         false,
@@ -2319,26 +2600,55 @@ async fn prepare_desktop_send_public_broadcaster(
         http,
     )
     .await?;
+    let same_token_fee = request.fee_token == request.token;
     update_transaction_generation_stage(
         request.progress_tx.as_ref(),
         TransactionGenerationStage::SelectingPrivateNotes,
     );
+    let seeded_fee_amount =
+        initial_public_broadcaster_fee_amount(&broadcaster, min_gas_price, same_token_fee, || {
+            let selection = send_selection_info_with_separate_broadcaster_fee_seed(
+                &utxos,
+                request.token,
+                request.fee_token,
+                request.amount,
+                false,
+            )
+            .map_err(|error| {
+                public_broadcaster_build_error(
+                    error,
+                    U256::ZERO,
+                    PublicBroadcasterFeeMode::AddToAmount,
+                    same_token_fee,
+                )
+            })?;
+            Ok(send_approximate_shape(&selection, selection.max_spendable))
+        })?;
     let initial_fee_amount = match approximate_public_broadcaster_cost(
         broadcaster.clone(),
+        request.token,
+        request.fee_token,
         request.amount,
         request.fee_mode,
         U256::ZERO,
         min_gas_price,
+        seeded_fee_amount,
         |split| {
-            let selection = send_selection_info_with_broadcaster_fee(
+            let selection = send_selection_info_with_broadcaster_fee_token(
                 &utxos,
                 request.token,
+                request.fee_token,
                 split.receiver_amount,
                 split.fee_amount,
                 false,
             )
             .map_err(|error| {
-                public_broadcaster_build_error(error, split.fee_amount, split.fee_mode)
+                public_broadcaster_build_error(
+                    error,
+                    split.fee_amount,
+                    split.fee_mode,
+                    same_token_fee,
+                )
             })?;
             Ok(send_approximate_shape(&selection, selection.max_spendable))
         },
@@ -2359,11 +2669,14 @@ async fn prepare_desktop_send_public_broadcaster(
             estimate.fee_amount
         }
         Err(err) => {
+            if !same_token_fee {
+                return Err(err).wrap_err("estimate initial public broadcaster send fee");
+            }
             tracing::warn!(
                 ?err,
                 broadcaster = %broadcaster.railgun_address,
                 fees_id = %broadcaster.fees_id,
-                "failed to estimate initial public broadcaster send fee; starting at zero"
+                "failed to estimate initial same-token public broadcaster send fee; starting at zero"
             );
             U256::ZERO
         }
@@ -2387,7 +2700,12 @@ async fn prepare_desktop_send_public_broadcaster(
 
     let mut fee_amount = initial_fee_amount;
     for attempt in 1..=PUBLIC_BROADCASTER_FEE_ATTEMPTS {
-        let split = public_broadcaster_amount_split(request.amount, fee_amount, request.fee_mode)?;
+        let split = public_broadcaster_amount_split_for_tokens(
+            request.amount,
+            fee_amount,
+            request.fee_mode,
+            same_token_fee,
+        )?;
         let send_request = RailgunSendRequest {
             token_address: request.token,
             amount: split.receiver_amount,
@@ -2396,6 +2714,7 @@ async fn prepare_desktop_send_public_broadcaster(
             spend_up_to: false,
             broadcaster_fee: Some(BroadcasterFeeOutput {
                 recipient: broadcaster.address_data,
+                token_address: request.fee_token,
                 amount: fee_amount,
             }),
             min_gas_price,
@@ -2415,7 +2734,9 @@ async fn prepare_desktop_send_public_broadcaster(
                 &prover,
             )
             .await
-            .map_err(|error| public_broadcaster_build_error(error, fee_amount, split.fee_mode))
+            .map_err(|error| {
+                public_broadcaster_build_error(error, fee_amount, split.fee_mode, same_token_fee)
+            })
             .wrap_err("build public broadcaster send proof")?;
         tracing::info!(
             attempt,
@@ -2488,6 +2809,7 @@ async fn prepare_desktop_send_public_broadcaster(
                 &pre_transaction_pois.pending_pois,
                 &pre_transaction_pois.pending_poi_list_keys,
                 true,
+                !same_token_fee,
             )?;
             tracing::info!(
                 chain_id = request.chain_id,
@@ -2499,6 +2821,8 @@ async fn prepare_desktop_send_public_broadcaster(
                 plan,
                 pre_transaction_pois_per_txid_leaf_per_list: pre_transaction_pois.request_pois,
                 broadcaster,
+                action_token: request.token,
+                fee_token: request.fee_token,
                 entered_amount: split.entered_amount,
                 receiver_amount: split.receiver_amount,
                 recipient_amount: recipient_amount_after_protocol_fee(
@@ -2548,7 +2872,7 @@ async fn estimate_public_broadcaster_fee(
         .await
         .wrap_err("estimate public broadcaster gas")?
         + GAS_LIMIT_BUFFER;
-    let service_gas_price = min_gas_price * 101 / 100;
+    let service_gas_price = public_broadcaster_service_gas_price(min_gas_price);
     Ok((
         gas_limit,
         broadcaster_fee_amount(token_fee_per_unit_gas, gas_limit, service_gas_price),
@@ -2581,6 +2905,8 @@ async fn submit_public_broadcaster_plan(
     data: Bytes,
     pre_transaction_pois_per_txid_leaf_per_list: PreTransactionPoiMap,
     broadcaster: PublicBroadcasterCandidate,
+    action_token: Address,
+    fee_token: Address,
     entered_amount: U256,
     receiver_amount: U256,
     recipient_amount: U256,
@@ -2712,6 +3038,8 @@ async fn submit_public_broadcaster_plan(
 
     Ok(PublicBroadcasterSubmissionResult {
         broadcaster,
+        action_token,
+        fee_token,
         entered_amount,
         receiver_amount,
         recipient_amount,
@@ -3197,7 +3525,7 @@ mod tests {
     use local_db::{DbConfig, DbStore, PendingOutputPoiRole};
     use poi::poi::default_active_poi_list_keys;
     use railgun_wallet::tx::{
-        PrivateInputs, PublicInputs, TransactionPlanChunk, UnshieldSelectionInfo,
+        BuildError, PrivateInputs, PublicInputs, TransactionPlanChunk, UnshieldSelectionInfo,
     };
     use railgun_wallet::{PoiStatus, Utxo, UtxoCommitmentKind, UtxoSource, WalletKeys, WalletUtxo};
     use serde_json::json;
@@ -3206,17 +3534,22 @@ mod tests {
         ApproximateTransactionShape, BroadcasterFeePolicy, BroadcasterFeePolicyStatus,
         DesktopWalletChainStart, DesktopWalletSyncStartPolicy, EvmMessageSigner,
         EvmTransactionSigner, ListUtxosOutput, PublicBroadcasterCandidate,
-        PublicBroadcasterFeeMode, PublicBroadcasterResultKind, PublicBroadcasterSelection,
-        RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS, SoftwareEvmSigner, TokenTotal, UtxoOutput,
-        approximate_public_broadcaster_cost, approximate_public_broadcaster_gas,
-        broadcaster_fee_amount, broadcaster_fee_covers, buffered_public_broadcaster_fee,
-        decode_public_broadcaster_response, eligible_public_broadcasters,
-        fee_policy_eligible_public_broadcasters, is_wrapped_native_token,
+        PublicBroadcasterFeeMargin, PublicBroadcasterFeeMode, PublicBroadcasterResultKind,
+        PublicBroadcasterSelection, RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS, SoftwareEvmSigner,
+        TokenTotal, UtxoOutput, approximate_public_broadcaster_cost,
+        approximate_public_broadcaster_gas, broadcaster_fee_amount, broadcaster_fee_covers,
+        buffered_public_broadcaster_fee, decode_public_broadcaster_response,
+        eligible_public_broadcasters, fee_policy_eligible_public_broadcasters,
+        fixed_token_anchor_rate, initial_separate_token_public_broadcaster_fee,
+        is_wrapped_native_token, max_broadcaster_fee_token_amount_from_outputs,
         max_send_amount_from_outputs, max_unshield_amount_from_outputs, parse_railgun_recipient,
         parse_send_amount, parse_unshield_amount, public_broadcaster_amount_split,
-        public_broadcaster_candidates, public_broadcaster_max_entered_amount,
-        public_broadcaster_transact_params, resolve_desktop_wallet_chain_start,
-        select_public_broadcaster, select_public_broadcaster_with_policy, send_approximate_shape,
+        public_broadcaster_amount_split_for_tokens, public_broadcaster_anchor_rate_for_policy,
+        public_broadcaster_build_error, public_broadcaster_candidates,
+        public_broadcaster_fee_breakdown, public_broadcaster_max_entered_amount,
+        public_broadcaster_max_entered_amount_for_tokens, public_broadcaster_transact_params,
+        resolve_desktop_wallet_chain_start, select_public_broadcaster,
+        select_public_broadcaster_with_policy, send_approximate_shape,
         sort_specific_public_broadcasters, transact_topic, unshield_approximate_shape,
         utxo_outputs_from_utxos, wrapped_native_token_for_chain,
     };
@@ -3625,6 +3958,7 @@ mod tests {
             &pre_transaction_pois,
             &poi_list_keys,
             false,
+            false,
         )
         .expect("persist pending send output contexts");
 
@@ -3685,6 +4019,7 @@ mod tests {
             &pre_transaction_pois,
             &poi_list_keys,
             false,
+            false,
         )
         .expect("persist pending unshield output contexts");
 
@@ -3737,6 +4072,7 @@ mod tests {
             &pre_transaction_pois,
             &poi_list_keys,
             true,
+            false,
         )
         .expect("persist public broadcaster send output contexts");
 
@@ -3782,6 +4118,7 @@ mod tests {
             &pre_transaction_pois,
             &poi_list_keys,
             true,
+            false,
         )
         .expect("persist public broadcaster unshield output contexts");
 
@@ -3808,6 +4145,127 @@ mod tests {
     }
 
     #[test]
+    fn separate_fee_token_send_pending_output_contexts_keep_fee_change_role() {
+        let fee_token = address(0x39);
+        let action_token = address(0x3a);
+        let fee_note = sample_note(11, fee_token, 1);
+        let fee_change_note = sample_note(12, fee_token, 4);
+        let recipient_note = sample_note(13, action_token, 8);
+        let action_change_note = sample_note(14, action_token, 2);
+        let chunks = vec![
+            sample_chunk(
+                10,
+                0x80,
+                vec![fee_note.clone(), fee_change_note.clone()],
+                false,
+            ),
+            sample_chunk(
+                11,
+                0x81,
+                vec![recipient_note.clone(), action_change_note.clone()],
+                false,
+            ),
+        ];
+        let poi_list_keys = default_active_poi_list_keys();
+        let pre_transaction_pois = poi_map_for_chunks(&poi_list_keys, &chunks);
+
+        let records = super::build_pending_output_poi_context_records(
+            1,
+            "wallet-1",
+            123,
+            &chunks,
+            &pre_transaction_pois,
+            &poi_list_keys,
+            &super::pending_send_output_role_plans(true, true),
+        )
+        .expect("build separate fee send records");
+
+        assert_eq!(records.len(), 4);
+        assert!(records.iter().any(|record| record.output_role
+            == PendingOutputPoiRole::BroadcasterFee
+            && record.output_commitment
+                == FixedBytes::from(fee_note.commitment().to_be_bytes::<32>())));
+        assert!(
+            records
+                .iter()
+                .any(|record| record.output_role == PendingOutputPoiRole::Change
+                    && record.output_commitment
+                        == FixedBytes::from(fee_change_note.commitment().to_be_bytes::<32>()))
+        );
+        assert!(records.iter().any(
+            |record| record.output_role == PendingOutputPoiRole::Recipient
+                && record.output_commitment
+                    == FixedBytes::from(recipient_note.commitment().to_be_bytes::<32>())
+        ));
+        assert!(
+            records
+                .iter()
+                .any(|record| record.output_role == PendingOutputPoiRole::Change
+                    && record.output_commitment
+                        == FixedBytes::from(action_change_note.commitment().to_be_bytes::<32>()))
+        );
+    }
+
+    #[test]
+    fn separate_fee_token_unshield_pending_output_contexts_skip_action_public_output() {
+        let fee_token = address(0x3b);
+        let action_token = address(0x3c);
+        let fee_note = sample_note(15, fee_token, 1);
+        let fee_change_note = sample_note(16, fee_token, 4);
+        let action_change_note = sample_note(17, action_token, 2);
+        let unshield_note = Note::new_unshield(address(0xdd), action_token, uint!(6_U256));
+        let chunks = vec![
+            sample_chunk(
+                12,
+                0x82,
+                vec![fee_note.clone(), fee_change_note.clone()],
+                false,
+            ),
+            sample_chunk(
+                13,
+                0x83,
+                vec![action_change_note.clone(), unshield_note.clone()],
+                true,
+            ),
+        ];
+        let poi_list_keys = default_active_poi_list_keys();
+        let pre_transaction_pois = poi_map_for_chunks(&poi_list_keys, &chunks);
+
+        let records = super::build_pending_output_poi_context_records(
+            1,
+            "wallet-1",
+            123,
+            &chunks,
+            &pre_transaction_pois,
+            &poi_list_keys,
+            &super::pending_unshield_output_role_plans(true, true),
+        )
+        .expect("build separate fee unshield records");
+
+        assert_eq!(records.len(), 3);
+        assert!(records.iter().any(|record| record.output_role
+            == PendingOutputPoiRole::BroadcasterFee
+            && record.output_commitment
+                == FixedBytes::from(fee_note.commitment().to_be_bytes::<32>())));
+        assert!(
+            records
+                .iter()
+                .any(|record| record.output_role == PendingOutputPoiRole::Change
+                    && record.output_commitment
+                        == FixedBytes::from(fee_change_note.commitment().to_be_bytes::<32>()))
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| record.output_role == PendingOutputPoiRole::Change
+                    && record.output_commitment
+                        == FixedBytes::from(action_change_note.commitment().to_be_bytes::<32>()))
+        );
+        assert!(records.iter().all(|record| record.output_commitment
+            != FixedBytes::from(unshield_note.commitment().to_be_bytes::<32>())));
+    }
+
+    #[test]
     fn send_pending_output_role_plan_omits_absent_change() {
         let token = address(0x37);
         let recipient_note = sample_note(9, token, 11);
@@ -3822,7 +4280,7 @@ mod tests {
             &[chunk],
             &pre_transaction_pois,
             &poi_list_keys,
-            &super::pending_send_output_role_plans(false),
+            &super::pending_send_output_role_plans(false, false),
         )
         .expect("build pending send records");
 
@@ -3850,7 +4308,7 @@ mod tests {
             &[chunk],
             &pre_transaction_pois,
             &poi_list_keys,
-            &super::pending_unshield_output_role_plans(true),
+            &super::pending_unshield_output_role_plans(true, false),
         )
         .expect("build pending unshield records");
 
@@ -3880,6 +4338,21 @@ mod tests {
             .map(|output| (output.tree, output.position))
             .collect();
         assert_eq!(positions, vec![(1, 1), (1, 2), (2, 1)]);
+    }
+
+    #[test]
+    fn fee_token_amount_from_outputs_matches_single_fee_transaction_limit() {
+        let token = address(0x12);
+        let (outputs, _) = utxo_outputs_from_utxos(
+            (0..20)
+                .map(|position| utxo(token, 1, 0, position))
+                .collect(),
+        );
+
+        assert_eq!(
+            max_broadcaster_fee_token_amount_from_outputs(&outputs, token),
+            uint!(13_U256)
+        );
     }
 
     #[test]
@@ -4206,6 +4679,60 @@ mod tests {
     }
 
     #[test]
+    fn public_broadcaster_candidates_are_keyed_by_selected_fee_token() {
+        let action_token = address(0x43);
+        let fee_token = address(0x44);
+        let candidates = public_broadcaster_candidates(
+            &[
+                fee_row(1, action_token, 10, 0.9, "action-token"),
+                fee_row(1, fee_token, 11, 0.9, "fee-token"),
+            ],
+            1,
+            fee_token,
+            None,
+            SystemTime::now(),
+            BroadcasterFeePolicy::default(),
+            None,
+        );
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].fees_id, "fee-token");
+        assert_eq!(candidates[0].token, fee_token);
+    }
+
+    #[test]
+    fn specific_public_broadcaster_fails_when_not_available_for_fee_token() {
+        let action_token = address(0x45);
+        let fee_token = address(0x46);
+        let railgun_address = sample_railgun_address(51);
+        let candidates = public_broadcaster_candidates(
+            &[fee_row_with_broadcaster_seed(
+                1,
+                action_token,
+                10,
+                0.9,
+                "action-only",
+                51,
+            )],
+            1,
+            fee_token,
+            None,
+            SystemTime::now(),
+            BroadcasterFeePolicy::default(),
+            None,
+        );
+
+        let error = select_public_broadcaster_with_policy(
+            &candidates,
+            &PublicBroadcasterSelection::Specific { railgun_address },
+            BroadcasterFeePolicy::default(),
+        )
+        .expect_err("specific broadcaster should not match action-token row");
+
+        assert!(error.to_string().contains("no longer eligible"));
+    }
+
+    #[test]
     fn public_broadcaster_selection_sorts_by_fee_then_reliability() {
         let token = address(0x23);
         let candidates = eligible_public_broadcasters(
@@ -4373,6 +4900,56 @@ mod tests {
     }
 
     #[test]
+    fn public_broadcaster_policy_uses_fixed_anchor_without_cache() {
+        let weth = wrapped_native_token_for_chain(1).expect("ethereum wrapped native");
+
+        assert_eq!(
+            fixed_token_anchor_rate(1, weth),
+            Some(uint!(1_000_000_000_000_000_000_U256))
+        );
+        assert_eq!(
+            public_broadcaster_anchor_rate_for_policy(None, 1, weth),
+            Some(uint!(1_000_000_000_000_000_000_U256))
+        );
+    }
+
+    #[test]
+    fn public_broadcaster_fee_breakdown_splits_gas_and_margin() {
+        let breakdown = public_broadcaster_fee_breakdown(
+            uint!(2_500_U256),
+            10,
+            100,
+            Some(uint!(2_000_000_000_000_000_000_U256)),
+        );
+
+        assert_eq!(breakdown.native_gas_cost, uint!(1_010_U256));
+        assert_eq!(breakdown.fee_token_gas_cost, Some(uint!(2_020_U256)));
+        assert_eq!(
+            breakdown.broadcaster_fee,
+            Some(PublicBroadcasterFeeMargin::Positive(uint!(480_U256)))
+        );
+    }
+
+    #[test]
+    fn public_broadcaster_fee_breakdown_handles_negative_and_missing_anchor() {
+        let negative = public_broadcaster_fee_breakdown(
+            uint!(1_000_U256),
+            10,
+            100,
+            Some(uint!(2_000_000_000_000_000_000_U256)),
+        );
+        let missing = public_broadcaster_fee_breakdown(uint!(1_000_U256), 10, 100, None);
+
+        assert_eq!(
+            negative.broadcaster_fee,
+            Some(PublicBroadcasterFeeMargin::Negative(uint!(1_020_U256)))
+        );
+        assert_eq!(missing.native_gas_cost, uint!(1_010_U256));
+        assert_eq!(missing.fee_token_gas_cost, None);
+        assert_eq!(missing.broadcaster_fee, None);
+    }
+
+    #[test]
     fn public_broadcaster_fee_policy_override_includes_suspicious_rows() {
         let token = address(0x2a);
         let policy = BroadcasterFeePolicy::default();
@@ -4421,9 +4998,7 @@ mod tests {
             policy,
             Some(uint!(100_U256)),
         );
-        let selection = PublicBroadcasterSelection::Specific {
-            railgun_address: railgun_address.clone(),
-        };
+        let selection = PublicBroadcasterSelection::Specific { railgun_address };
         assert!(select_public_broadcaster_with_policy(&initial, &selection, policy).is_ok());
 
         let drifted = public_broadcaster_candidates(
@@ -4518,6 +5093,50 @@ mod tests {
     }
 
     #[test]
+    fn different_token_public_broadcaster_fee_mode_is_separate_add_on() {
+        let entered = uint!(100_U256);
+        let fee = uint!(7_U256);
+
+        let split = public_broadcaster_amount_split_for_tokens(
+            entered,
+            fee,
+            PublicBroadcasterFeeMode::DeductFromAmount,
+            false,
+        )
+        .expect("different-token split");
+
+        assert_eq!(split.entered_amount, entered);
+        assert_eq!(split.receiver_amount, entered);
+        assert_eq!(split.total_private_spend, entered);
+        assert_eq!(split.fee_amount, fee);
+        assert_eq!(split.fee_mode, PublicBroadcasterFeeMode::AddToAmount);
+        assert_eq!(
+            public_broadcaster_max_entered_amount_for_tokens(
+                uint!(123_U256),
+                fee,
+                PublicBroadcasterFeeMode::DeductFromAmount,
+                false,
+            ),
+            uint!(123_U256)
+        );
+    }
+
+    #[test]
+    fn public_broadcaster_build_error_distinguishes_fee_token_balance() {
+        let report = public_broadcaster_build_error(
+            BuildError::InsufficientFeeTokenBalance(uint!(123_U256)),
+            uint!(7_U256),
+            PublicBroadcasterFeeMode::AddToAmount,
+            false,
+        );
+
+        assert_eq!(
+            report.to_string(),
+            "public broadcaster fee-token max spendable: 123"
+        );
+    }
+
+    #[test]
     fn public_broadcaster_fee_mode_rejects_deducting_full_amount() {
         assert!(
             public_broadcaster_amount_split(
@@ -4576,10 +5195,13 @@ mod tests {
 
         let deducted = approximate_public_broadcaster_cost(
             broadcaster.clone(),
+            token,
+            token,
             entered,
             PublicBroadcasterFeeMode::DeductFromAmount,
             U256::ZERO,
             100,
+            U256::ZERO,
             |_split| {
                 let selection = selection_info(selected_total, 1, 1, 2, 0, selected_total);
                 Ok(send_approximate_shape(&selection, selected_total))
@@ -4598,10 +5220,13 @@ mod tests {
 
         let added = approximate_public_broadcaster_cost(
             broadcaster,
+            token,
+            token,
             entered,
             PublicBroadcasterFeeMode::AddToAmount,
             U256::ZERO,
             100,
+            U256::ZERO,
             |_split| {
                 let selection = selection_info(selected_total, 1, 1, 2, 0, selected_total);
                 Ok(send_approximate_shape(&selection, selected_total))
@@ -4614,6 +5239,73 @@ mod tests {
         assert_eq!(added.protocol_fee_amount, U256::ZERO);
         assert_eq!(added.recipient_amount, added.receiver_amount);
         assert_eq!(added.fee_mode, PublicBroadcasterFeeMode::AddToAmount);
+    }
+
+    #[test]
+    fn public_broadcaster_estimate_reports_separate_fee_token_amounts() {
+        let action_token = address(0x41);
+        let fee_token = address(0x42);
+        let broadcaster = eligible_public_broadcasters(
+            &[fee_row(
+                1,
+                fee_token,
+                1_000_000_000_000_000_000,
+                0.9,
+                "separate-fee",
+            )],
+            1,
+            fee_token,
+            None,
+            SystemTime::now(),
+        )
+        .into_iter()
+        .next()
+        .expect("candidate");
+        let entered = uint!(1_000_000_000_U256);
+        let max_receiver = uint!(2_000_000_000_U256);
+        let seed_shape = ApproximateTransactionShape {
+            transaction_count: 2,
+            input_count: 2,
+            private_output_count: 3,
+            public_output_count: 0,
+            max_receiver_amount: max_receiver,
+            unwrap: false,
+            send: true,
+        };
+        let initial_fee_amount =
+            initial_separate_token_public_broadcaster_fee(&broadcaster, 100, seed_shape);
+        let mut observed_fee_amounts = Vec::new();
+
+        let estimate = approximate_public_broadcaster_cost(
+            broadcaster,
+            action_token,
+            fee_token,
+            entered,
+            PublicBroadcasterFeeMode::DeductFromAmount,
+            U256::ZERO,
+            100,
+            initial_fee_amount,
+            |split| {
+                observed_fee_amounts.push(split.fee_amount);
+                let selection = selection_info(max_receiver, 2, 2, 3, 0, max_receiver);
+                Ok(send_approximate_shape(&selection, max_receiver))
+            },
+        )
+        .expect("separate-token estimate");
+
+        assert_eq!(estimate.action_token, action_token);
+        assert_eq!(estimate.fee_token, fee_token);
+        assert_eq!(estimate.entered_amount, entered);
+        assert_eq!(estimate.receiver_amount, entered);
+        assert_eq!(estimate.total_private_spend, entered);
+        assert_eq!(estimate.recipient_amount, entered);
+        assert_eq!(estimate.fee_mode, PublicBroadcasterFeeMode::AddToAmount);
+        assert_eq!(estimate.max_receiver_amount, max_receiver);
+        assert_eq!(estimate.max_entered_amount, max_receiver);
+        assert_eq!(estimate.transaction_count, 2);
+        assert!(!initial_fee_amount.is_zero());
+        assert_eq!(observed_fee_amounts.first(), Some(&initial_fee_amount));
+        assert!(observed_fee_amounts.iter().all(|fee| !fee.is_zero()));
     }
 
     #[test]
@@ -4640,10 +5332,13 @@ mod tests {
 
         let estimate = approximate_public_broadcaster_cost(
             broadcaster,
+            token,
+            token,
             entered,
             PublicBroadcasterFeeMode::AddToAmount,
             RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
             100,
+            U256::ZERO,
             |_split| {
                 let selection = selection_info(selected_total, 1, 1, 1, 1, selected_total);
                 Ok(unshield_approximate_shape(

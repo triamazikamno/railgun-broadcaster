@@ -126,32 +126,66 @@ fn retain_pre_transaction_poi_lists(
 #[derive(Clone, Copy)]
 pub(crate) struct PendingOutputPoiRolePlan {
     role: PendingOutputPoiRole,
-    first_chunk_only: bool,
+    chunk_filter: PendingOutputPoiChunkFilter,
     required: bool,
     missing_output: &'static str,
 }
 
+#[derive(Clone, Copy)]
+enum PendingOutputPoiChunkFilter {
+    Any,
+    FirstOnly,
+    SkipFirst,
+}
+
+impl PendingOutputPoiChunkFilter {
+    const fn includes(self, chunk_index: usize) -> bool {
+        match self {
+            Self::Any => true,
+            Self::FirstOnly => chunk_index == 0,
+            Self::SkipFirst => chunk_index != 0,
+        }
+    }
+}
+
 pub(crate) fn pending_send_output_role_plans(
     include_broadcaster_fee: bool,
+    separate_fee_token: bool,
 ) -> Vec<PendingOutputPoiRolePlan> {
     let mut plans = Vec::with_capacity(3);
     if include_broadcaster_fee {
         plans.push(PendingOutputPoiRolePlan {
             role: PendingOutputPoiRole::BroadcasterFee,
-            first_chunk_only: true,
+            chunk_filter: PendingOutputPoiChunkFilter::FirstOnly,
             required: true,
             missing_output: "missing public broadcaster send fee output for pending POI",
         });
+        if separate_fee_token {
+            plans.push(PendingOutputPoiRolePlan {
+                role: PendingOutputPoiRole::Change,
+                chunk_filter: PendingOutputPoiChunkFilter::FirstOnly,
+                required: false,
+                missing_output: "missing public broadcaster send fee-token change output for pending POI",
+            });
+        }
     }
     plans.push(PendingOutputPoiRolePlan {
         role: PendingOutputPoiRole::Recipient,
-        first_chunk_only: false,
+        chunk_filter: if separate_fee_token {
+            PendingOutputPoiChunkFilter::SkipFirst
+        } else {
+            PendingOutputPoiChunkFilter::Any
+        },
         required: true,
         missing_output: "missing send recipient output for pending POI",
     });
     plans.push(PendingOutputPoiRolePlan {
         role: PendingOutputPoiRole::Change,
-        first_chunk_only: false,
+        chunk_filter: if separate_fee_token {
+            PendingOutputPoiChunkFilter::SkipFirst
+        } else {
+            PendingOutputPoiChunkFilter::Any
+        },
         required: false,
         missing_output: "missing send change output for pending POI",
     });
@@ -160,19 +194,33 @@ pub(crate) fn pending_send_output_role_plans(
 
 pub(crate) fn pending_unshield_output_role_plans(
     include_broadcaster_fee: bool,
+    separate_fee_token: bool,
 ) -> Vec<PendingOutputPoiRolePlan> {
     let mut plans = Vec::with_capacity(2);
     if include_broadcaster_fee {
         plans.push(PendingOutputPoiRolePlan {
             role: PendingOutputPoiRole::BroadcasterFee,
-            first_chunk_only: true,
+            chunk_filter: PendingOutputPoiChunkFilter::FirstOnly,
             required: true,
             missing_output: "missing public broadcaster unshield fee output for pending POI",
         });
+        if separate_fee_token {
+            plans.push(PendingOutputPoiRolePlan {
+                role: PendingOutputPoiRole::Change,
+                chunk_filter: PendingOutputPoiChunkFilter::FirstOnly,
+                required: false,
+                missing_output:
+                    "missing public broadcaster unshield fee-token change output for pending POI",
+            });
+        }
     }
     plans.push(PendingOutputPoiRolePlan {
         role: PendingOutputPoiRole::Change,
-        first_chunk_only: false,
+        chunk_filter: if separate_fee_token {
+            PendingOutputPoiChunkFilter::SkipFirst
+        } else {
+            PendingOutputPoiChunkFilter::Any
+        },
         required: false,
         missing_output: "missing unshield change output for pending POI",
     });
@@ -187,6 +235,7 @@ pub(crate) fn persist_pending_send_output_poi_contexts(
     pre_transaction_pois: &PreTransactionPoiMap,
     poi_list_keys: &[FixedBytes<32>],
     include_broadcaster_fee: bool,
+    separate_fee_token: bool,
 ) -> Result<usize> {
     let created_at = now_epoch_secs()?;
     let records = build_pending_output_poi_context_records(
@@ -196,7 +245,7 @@ pub(crate) fn persist_pending_send_output_poi_contexts(
         chunks,
         pre_transaction_pois,
         poi_list_keys,
-        &pending_send_output_role_plans(include_broadcaster_fee),
+        &pending_send_output_role_plans(include_broadcaster_fee, separate_fee_token),
     )?;
     persist_pending_output_poi_context_records(db, &records)
 }
@@ -209,6 +258,7 @@ pub(crate) fn persist_pending_unshield_output_poi_contexts(
     pre_transaction_pois: &PreTransactionPoiMap,
     poi_list_keys: &[FixedBytes<32>],
     include_broadcaster_fee: bool,
+    separate_fee_token: bool,
 ) -> Result<usize> {
     let created_at = now_epoch_secs()?;
     let records = build_pending_output_poi_context_records(
@@ -218,7 +268,7 @@ pub(crate) fn persist_pending_unshield_output_poi_contexts(
         chunks,
         pre_transaction_pois,
         poi_list_keys,
-        &pending_unshield_output_role_plans(include_broadcaster_fee),
+        &pending_unshield_output_role_plans(include_broadcaster_fee, separate_fee_token),
     )?;
     persist_pending_output_poi_context_records(db, &records)
 }
@@ -241,7 +291,7 @@ pub(crate) fn build_pending_output_poi_context_records(
         let mut output_index = 0;
 
         for role_plan in role_plans {
-            if role_plan.first_chunk_only && chunk_index != 0 {
+            if !role_plan.chunk_filter.includes(chunk_index) {
                 continue;
             }
             if output_index >= private_output_count {

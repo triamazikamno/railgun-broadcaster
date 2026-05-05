@@ -7,16 +7,17 @@ use alloy::primitives::{Address, U256};
 use broadcaster_monitor::{EventRx, Shared};
 use chrono::{DateTime, Local, Utc};
 use gpui::{
-    App, AppContext, Bounds, Context, Entity, Focusable, InteractiveElement, IntoElement,
-    KeyBinding, MouseButton, ParentElement, Pixels, Point, Render, SharedString,
-    StatefulInteractiveElement, Styled, WeakEntity, Window, WindowBounds, WindowOptions, div, img,
-    prelude::FluentBuilder as _, px, rgb, size,
+    Animation, AnimationExt as _, App, AppContext, Bounds, Context, ElementId, Entity, Focusable,
+    InteractiveElement, IntoElement, KeyBinding, MouseButton, ParentElement, Pixels, Point, Render,
+    SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window, WindowBounds,
+    WindowOptions, div, img, prelude::FluentBuilder as _, px, rgb, size,
 };
 use gpui_component::{
-    Disableable, IconName, IndexPath, Root, Selectable, Sizable, StyledExt, WindowExt,
+    Disableable, Icon, IconName, IndexPath, Root, Selectable, Sizable, StyledExt, WindowExt,
     alert::Alert,
     button::{Button, ButtonGroup, ButtonVariants},
     checkbox::Checkbox,
+    collapsible::Collapsible,
     dialog::DialogButtonProps,
     divider::Divider,
     input::{Input, InputEvent, InputState},
@@ -49,17 +50,21 @@ use wallet_ops::{
     DesktopUnshieldCalldataRequest, DesktopUnshieldPublicBroadcasterEstimateRequest,
     DesktopUnshieldPublicBroadcasterRequest, DesktopWalletSyncStartPolicy, HttpContext,
     ListUtxosOutput, PreparedSendCall, PreparedUnshieldCall, PublicBroadcasterCandidate,
-    PublicBroadcasterCostEstimate, PublicBroadcasterFeeMode, PublicBroadcasterResultKind,
-    PublicBroadcasterSelection, PublicBroadcasterSubmissionResult, PublicBroadcasterWakuClient,
-    SyncProgressUpdate, TokenAnchorRateCache, TokenAnchorRefreshHandle, TokenTotal,
-    TransactionGenerationStage, UtxoOutput, ViewWalletChainSessionRequest, WalletSessionStore,
+    PublicBroadcasterCostEstimate, PublicBroadcasterFeeBreakdown, PublicBroadcasterFeeMargin,
+    PublicBroadcasterFeeMode, PublicBroadcasterResultKind, PublicBroadcasterSelection,
+    PublicBroadcasterSubmissionResult, PublicBroadcasterWakuClient, SyncProgressUpdate,
+    TokenAnchorRateCache, TokenAnchorRefreshHandle, TokenTotal, TransactionGenerationStage,
+    UtxoOutput, ViewWalletChainSessionRequest, WalletSessionStore,
     estimate_desktop_send_public_broadcaster_cost,
     estimate_desktop_unshield_public_broadcaster_cost, fee_policy_eligible_public_broadcasters,
-    is_wrapped_native_token, max_send_amount_from_outputs as planner_max_send_amount_from_outputs,
+    fixed_token_anchor_rate, is_wrapped_native_token,
+    max_broadcaster_fee_token_amount_from_outputs as planner_max_broadcaster_fee_token_amount_from_outputs,
+    max_send_amount_from_outputs as planner_max_send_amount_from_outputs,
     max_unshield_amount_from_outputs as planner_max_unshield_amount_from_outputs,
     parse_railgun_recipient, parse_send_amount, parse_unshield_amount,
     prepare_desktop_send_calldata, prepare_desktop_unshield_calldata,
-    public_broadcaster_candidates_for_asset, select_public_broadcaster_with_policy,
+    public_broadcaster_candidates_for_asset, public_broadcaster_fee_breakdown,
+    public_broadcaster_service_gas_price, select_public_broadcaster_with_policy,
     sort_specific_public_broadcasters, spawn_token_anchor_refresh_worker,
     submit_desktop_send_public_broadcaster, submit_desktop_unshield_public_broadcaster,
     vault::{
@@ -90,7 +95,7 @@ const SECONDS_PER_DAY: u64 = 24 * SECONDS_PER_HOUR;
 const SECONDS_PER_MONTH: u64 = 30 * SECONDS_PER_DAY;
 const SECONDS_PER_YEAR: u64 = 365 * SECONDS_PER_DAY;
 const TABLE_KEY_CONTEXT: &str = "Table";
-const COST_ESTIMATE_DETAIL_TEXT_SIZE: Pixels = px(11.0);
+const COST_ESTIMATE_DETAIL_TEXT_SIZE: Pixels = px(12.0);
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, gpui::Action)]
 #[action(no_json)]
@@ -369,7 +374,7 @@ impl Render for BroadcasterPickerDialogContent {
             )
             .child(render_broadcaster_picker_header(
                 &self.root,
-                query_input,
+                &query_input,
                 filtered_count,
                 total_count,
                 fee_bonus_popover_open,
@@ -813,6 +818,16 @@ struct UnshieldAsset {
     icon_path: Option<PathBuf>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PublicBroadcasterFeeTokenOption {
+    token: Address,
+    label: String,
+    decimals: Option<u8>,
+    max_spendable: U256,
+    eligible_broadcaster_count: usize,
+    icon_path: Option<PathBuf>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct UnshieldAssetKey {
     chain_id: u64,
@@ -836,9 +851,12 @@ struct UnshieldFormState {
     password_input: Entity<InputState>,
     unwrap: bool,
     delivery_mode: DeliveryMode,
+    selected_fee_token: Address,
     broadcaster_choice: BroadcasterChoice,
     broadcaster_fee_mode: PublicBroadcasterFeeMode,
     allow_suspicious_broadcasters: bool,
+    transaction_fee_breakdown_open: bool,
+    pending_programmatic_amount_input: Option<String>,
     cost_estimate_pending: bool,
     estimating_cost: bool,
     cost_estimate: Option<PublicBroadcasterCostEstimate>,
@@ -856,9 +874,12 @@ struct SendFormState {
     amount_input: Entity<InputState>,
     password_input: Entity<InputState>,
     delivery_mode: DeliveryMode,
+    selected_fee_token: Address,
     broadcaster_choice: BroadcasterChoice,
     broadcaster_fee_mode: PublicBroadcasterFeeMode,
     allow_suspicious_broadcasters: bool,
+    transaction_fee_breakdown_open: bool,
+    pending_programmatic_amount_input: Option<String>,
     cost_estimate_pending: bool,
     estimating_cost: bool,
     cost_estimate: Option<PublicBroadcasterCostEstimate>,
@@ -1428,13 +1449,13 @@ impl WalletRoot {
 
     fn ensure_chain_load(&mut self, chain_id: u64, cx: &mut Context<'_, Self>) {
         let overrides = chain_load_overrides();
-        self.start_chain_load(chain_id, overrides, false, cx);
+        self.start_chain_load(chain_id, &overrides, false, cx);
     }
 
     fn start_chain_load(
         &mut self,
         chain_id: u64,
-        overrides: ChainLoadOverrides,
+        overrides: &ChainLoadOverrides,
         force: bool,
         cx: &mut Context<'_, Self>,
     ) {
@@ -2024,7 +2045,7 @@ impl WalletRoot {
         overrides.sync_to_block = None;
         overrides.rewind_wallet_cache = true;
         self.repair_cache_error = None;
-        self.start_chain_load(self.selected_chain, overrides, true, cx);
+        self.start_chain_load(self.selected_chain, &overrides, true, cx);
         cx.notify();
         true
     }
@@ -2084,16 +2105,17 @@ impl WalletRoot {
             else {
                 continue;
             };
-            if apply_amount_adjustment_for_max_change(
+            if let Some(adjusted) = amount_adjustment_for_max_change(
                 &form.amount_input,
                 &form.asset,
                 None,
                 Some(max_entered_amount),
-                window,
                 cx,
             ) {
+                form.pending_programmatic_amount_input = Some(adjusted.clone());
+                form.amount_input
+                    .update(cx, |input, cx| input.set_value(adjusted, window, cx));
                 form.error = None;
-                form.cost_estimate = None;
                 form.estimate_id = 0;
                 form.cost_estimate_pending = false;
                 form.estimating_cost = false;
@@ -2112,16 +2134,17 @@ impl WalletRoot {
             else {
                 continue;
             };
-            if apply_amount_adjustment_for_max_change(
+            if let Some(adjusted) = amount_adjustment_for_max_change(
                 &form.amount_input,
                 &form.asset,
                 None,
                 Some(max_entered_amount),
-                window,
                 cx,
             ) {
+                form.pending_programmatic_amount_input = Some(adjusted.clone());
+                form.amount_input
+                    .update(cx, |input, cx| input.set_value(adjusted, window, cx));
                 form.error = None;
-                form.cost_estimate = None;
                 form.estimate_id = 0;
                 form.cost_estimate_pending = false;
                 form.estimating_cost = false;
@@ -2714,8 +2737,8 @@ impl WalletRoot {
             &recipient_input,
             move |this, _input, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
-                    this.clear_send_form_prepared_output(key, cx);
-                    this.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
+                    this.clear_send_form_text_edit_state(key, cx);
+                    this.debounce_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
                 }
             },
         )
@@ -2724,8 +2747,15 @@ impl WalletRoot {
             &amount_input,
             move |this, _input, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
-                    this.clear_send_form_prepared_output(key, cx);
-                    this.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
+                    if this.consume_programmatic_amount_input_change(
+                        DeliveryFormKind::Send,
+                        key,
+                        cx,
+                    ) {
+                        return;
+                    }
+                    this.clear_send_form_text_edit_state(key, cx);
+                    this.debounce_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
                 }
             },
         )
@@ -2733,6 +2763,8 @@ impl WalletRoot {
         self.send_forms.clear();
         self.unshield_forms.clear();
         self.broadcaster_picker = None;
+        let selected_fee_token =
+            self.default_public_broadcaster_fee_token(key.chain_id, key.token, false, false);
         self.send_forms.insert(
             key,
             SendFormState {
@@ -2741,9 +2773,12 @@ impl WalletRoot {
                 amount_input,
                 password_input,
                 delivery_mode: DeliveryMode::ManualCalldata,
+                selected_fee_token,
                 broadcaster_choice: BroadcasterChoice::Random,
                 broadcaster_fee_mode: PublicBroadcasterFeeMode::DeductFromAmount,
                 allow_suspicious_broadcasters: false,
+                transaction_fee_breakdown_open: true,
+                pending_programmatic_amount_input: None,
                 cost_estimate_pending: false,
                 estimating_cost: false,
                 cost_estimate: None,
@@ -2775,7 +2810,7 @@ impl WalletRoot {
         cx.notify();
     }
 
-    fn clear_send_form_prepared_output(
+    fn clear_send_form_text_edit_state(
         &mut self,
         key: UnshieldAssetKey,
         cx: &mut Context<'_, Self>,
@@ -2784,17 +2819,97 @@ impl WalletRoot {
             return;
         };
         if form.generating
-            || (form.result.is_none() && form.error.is_none() && form.cost_estimate.is_none())
+            || (form.result.is_none()
+                && form.error.is_none()
+                && !form.cost_estimate_pending
+                && !form.estimating_cost)
         {
             return;
         }
         form.result = None;
         form.error = None;
-        form.cost_estimate = None;
         form.estimate_id = 0;
         form.cost_estimate_pending = false;
         form.estimating_cost = false;
         cx.notify();
+    }
+
+    fn consume_programmatic_amount_input_change(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        cx: &Context<'_, Self>,
+    ) -> bool {
+        match kind {
+            DeliveryFormKind::Send => self.send_forms.get_mut(&key).is_some_and(|form| {
+                let Some(expected) = form.pending_programmatic_amount_input.take() else {
+                    return false;
+                };
+                form.amount_input.read(cx).value().as_ref() == expected
+            }),
+            DeliveryFormKind::Unshield => self.unshield_forms.get_mut(&key).is_some_and(|form| {
+                let Some(expected) = form.pending_programmatic_amount_input.take() else {
+                    return false;
+                };
+                form.amount_input.read(cx).value().as_ref() == expected
+            }),
+        }
+    }
+
+    fn set_private_action_metric_amount(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        amount: U256,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let changed = self.set_programmatic_amount_input(kind, key, amount, window, cx);
+        if changed {
+            self.schedule_public_broadcaster_cost_estimate(kind, key, cx);
+        }
+    }
+
+    fn set_programmatic_amount_input(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        amount: U256,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        match kind {
+            DeliveryFormKind::Send => self.send_forms.get_mut(&key).is_some_and(|form| {
+                if form.generating {
+                    return false;
+                }
+                let value = format_send_amount_input(amount, form.asset.decimals);
+                form.pending_programmatic_amount_input = Some(value.clone());
+                form.error = None;
+                form.result = None;
+                form.estimate_id = 0;
+                form.cost_estimate_pending = false;
+                form.estimating_cost = false;
+                form.amount_input
+                    .update(cx, |input, cx| input.set_value(value, window, cx));
+                true
+            }),
+            DeliveryFormKind::Unshield => self.unshield_forms.get_mut(&key).is_some_and(|form| {
+                if form.generating {
+                    return false;
+                }
+                let value = format_unshield_amount_input(amount, form.asset.decimals);
+                form.pending_programmatic_amount_input = Some(value.clone());
+                form.error = None;
+                form.result = None;
+                form.estimate_id = 0;
+                form.cost_estimate_pending = false;
+                form.estimating_cost = false;
+                form.amount_input
+                    .update(cx, |input, cx| input.set_value(value, window, cx));
+                true
+            }),
+        }
     }
 
     fn set_send_delivery_mode(
@@ -2813,19 +2928,18 @@ impl WalletRoot {
         let old_max =
             send_form_max_entered_amount(form, form.delivery_mode, form.broadcaster_fee_mode);
         let new_max = send_form_max_entered_amount(form, mode, form.broadcaster_fee_mode);
-        let adjusted = apply_amount_adjustment_for_max_change(
-            &form.amount_input,
-            &form.asset,
-            old_max,
-            new_max,
-            window,
-            cx,
-        );
+        let adjusted =
+            amount_adjustment_for_max_change(&form.amount_input, &form.asset, old_max, new_max, cx);
         form.delivery_mode = mode;
         form.error = None;
         form.result = None;
-        if mode == DeliveryMode::PublicBroadcaster || adjusted {
+        if mode == DeliveryMode::PublicBroadcaster || adjusted.is_some() {
             form.cost_estimate = None;
+        }
+        if let Some(adjusted) = adjusted {
+            form.pending_programmatic_amount_input = Some(adjusted.clone());
+            form.amount_input
+                .update(cx, |input, cx| input.set_value(adjusted, window, cx));
         }
         form.estimate_id = 0;
         form.cost_estimate_pending = false;
@@ -2852,7 +2966,6 @@ impl WalletRoot {
         form.broadcaster_choice = choice;
         form.error = None;
         form.result = None;
-        form.cost_estimate = None;
         form.estimate_id = 0;
         form.cost_estimate_pending = false;
         form.estimating_cost = false;
@@ -2860,19 +2973,46 @@ impl WalletRoot {
         self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
     }
 
-    fn set_send_allow_suspicious_broadcasters(
+    fn set_send_fee_token(
         &mut self,
         key: UnshieldAssetKey,
-        allow: bool,
+        fee_token: Address,
         cx: &mut Context<'_, Self>,
     ) {
+        let Some((chain_id, action_token, current_choice, generating, allow_suspicious)) =
+            self.send_forms.get(&key).map(|form| {
+                (
+                    form.asset.chain_id,
+                    form.asset.token,
+                    form.broadcaster_choice.clone(),
+                    form.generating,
+                    form.allow_suspicious_broadcasters,
+                )
+            })
+        else {
+            return;
+        };
+        if generating {
+            return;
+        }
+        let policy = Self::public_broadcaster_fee_policy(allow_suspicious);
+        let candidates =
+            self.current_public_broadcaster_candidates(chain_id, fee_token, false, policy);
+        let reset_specific =
+            !broadcaster_choice_supported_by_candidates(&current_choice, &candidates, policy);
         let Some(form) = self.send_forms.get_mut(&key) else {
             return;
         };
-        if form.generating || form.allow_suspicious_broadcasters == allow {
+        if form.selected_fee_token == fee_token && !reset_specific {
             return;
         }
-        form.allow_suspicious_broadcasters = allow;
+        form.selected_fee_token = fee_token;
+        if fee_token != action_token {
+            form.broadcaster_fee_mode = PublicBroadcasterFeeMode::AddToAmount;
+        }
+        if reset_specific {
+            form.broadcaster_choice = BroadcasterChoice::Random;
+        }
         form.error = None;
         form.result = None;
         form.cost_estimate = None;
@@ -2882,6 +3022,57 @@ impl WalletRoot {
         cx.notify();
         self.refresh_public_broadcaster_anchor(DeliveryFormKind::Send, key, cx);
         self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
+    }
+
+    fn set_send_allow_suspicious_broadcasters(
+        &mut self,
+        key: UnshieldAssetKey,
+        allow: bool,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some((chain_id, fee_token, choice, generating, current_allow)) =
+            self.send_forms.get(&key).map(|form| {
+                (
+                    form.asset.chain_id,
+                    form.selected_fee_token,
+                    form.broadcaster_choice.clone(),
+                    form.generating,
+                    form.allow_suspicious_broadcasters,
+                )
+            })
+        else {
+            return;
+        };
+        if generating || current_allow == allow {
+            return;
+        }
+        let policy = Self::public_broadcaster_fee_policy(allow);
+        let candidates =
+            self.current_public_broadcaster_candidates(chain_id, fee_token, false, policy);
+        let preserve_estimate =
+            should_preserve_estimate_after_broadcaster_policy_change(&choice, &candidates, policy);
+        let reset_specific =
+            matches!(choice, BroadcasterChoice::Specific { .. }) && !preserve_estimate;
+        let Some(form) = self.send_forms.get_mut(&key) else {
+            return;
+        };
+        form.allow_suspicious_broadcasters = allow;
+        if reset_specific {
+            form.broadcaster_choice = BroadcasterChoice::Random;
+        }
+        let should_reestimate = !preserve_estimate || matches!(choice, BroadcasterChoice::Random);
+        if should_reestimate {
+            form.error = None;
+            form.result = None;
+            form.estimate_id = 0;
+            form.cost_estimate_pending = false;
+            form.estimating_cost = false;
+        }
+        cx.notify();
+        if should_reestimate {
+            self.refresh_public_broadcaster_anchor(DeliveryFormKind::Send, key, cx);
+            self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
+        }
     }
 
     fn set_send_broadcaster_fee_mode(
@@ -2894,27 +3085,28 @@ impl WalletRoot {
         let Some(form) = self.send_forms.get_mut(&key) else {
             return;
         };
-        if form.generating || form.broadcaster_fee_mode == fee_mode {
+        if form.generating
+            || form.selected_fee_token != form.asset.token
+            || form.broadcaster_fee_mode == fee_mode
+        {
             return;
         }
         let old_max =
             send_form_max_entered_amount(form, form.delivery_mode, form.broadcaster_fee_mode);
         let new_max = send_form_max_entered_amount(form, form.delivery_mode, fee_mode);
-        apply_amount_adjustment_for_max_change(
-            &form.amount_input,
-            &form.asset,
-            old_max,
-            new_max,
-            window,
-            cx,
-        );
+        let adjusted =
+            amount_adjustment_for_max_change(&form.amount_input, &form.asset, old_max, new_max, cx);
         form.broadcaster_fee_mode = fee_mode;
         form.error = None;
         form.result = None;
-        form.cost_estimate = None;
         form.estimate_id = 0;
         form.cost_estimate_pending = false;
         form.estimating_cost = false;
+        if let Some(adjusted) = adjusted {
+            form.pending_programmatic_amount_input = Some(adjusted.clone());
+            form.amount_input
+                .update(cx, |input, cx| input.set_value(adjusted, window, cx));
+        }
         cx.notify();
         self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
     }
@@ -2925,15 +3117,47 @@ impl WalletRoot {
         key: UnshieldAssetKey,
         cx: &mut Context<'_, Self>,
     ) {
-        let should_schedule = match kind {
-            DeliveryFormKind::Send => self.send_forms.get(&key).is_some_and(|form| {
-                !form.generating && form.delivery_mode == DeliveryMode::PublicBroadcaster
-            }),
-            DeliveryFormKind::Unshield => self.unshield_forms.get(&key).is_some_and(|form| {
-                !form.generating && form.delivery_mode == DeliveryMode::PublicBroadcaster
-            }),
-        };
-        if !should_schedule {
+        if !self.can_schedule_public_broadcaster_cost_estimate(kind, key) {
+            return;
+        }
+
+        self.cost_estimate_seq = self.cost_estimate_seq.wrapping_add(1);
+        let estimate_id = self.cost_estimate_seq;
+        match kind {
+            DeliveryFormKind::Send => {
+                if let Some(form) = self.send_forms.get_mut(&key) {
+                    form.estimate_id = estimate_id;
+                    form.cost_estimate_pending = false;
+                    form.estimating_cost = false;
+                    form.error = None;
+                }
+            }
+            DeliveryFormKind::Unshield => {
+                if let Some(form) = self.unshield_forms.get_mut(&key) {
+                    form.estimate_id = estimate_id;
+                    form.cost_estimate_pending = false;
+                    form.estimating_cost = false;
+                    form.error = None;
+                }
+            }
+        }
+        cx.notify();
+
+        match kind {
+            DeliveryFormKind::Send => self.estimate_send_public_broadcaster_cost_from_form(key, cx),
+            DeliveryFormKind::Unshield => {
+                self.estimate_unshield_public_broadcaster_cost_from_form(key, cx);
+            }
+        }
+    }
+
+    fn debounce_public_broadcaster_cost_estimate(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if !self.can_schedule_public_broadcaster_cost_estimate(kind, key) {
             return;
         }
 
@@ -2945,7 +3169,6 @@ impl WalletRoot {
                     form.estimate_id = estimate_id;
                     form.cost_estimate_pending = true;
                     form.estimating_cost = false;
-                    form.cost_estimate = None;
                     form.error = None;
                 }
             }
@@ -2954,7 +3177,6 @@ impl WalletRoot {
                     form.estimate_id = estimate_id;
                     form.cost_estimate_pending = true;
                     form.estimating_cost = false;
-                    form.cost_estimate = None;
                     form.error = None;
                 }
             }
@@ -2986,6 +3208,21 @@ impl WalletRoot {
             });
         })
         .detach();
+    }
+
+    fn can_schedule_public_broadcaster_cost_estimate(
+        &self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+    ) -> bool {
+        match kind {
+            DeliveryFormKind::Send => self.send_forms.get(&key).is_some_and(|form| {
+                !form.generating && form.delivery_mode == DeliveryMode::PublicBroadcaster
+            }),
+            DeliveryFormKind::Unshield => self.unshield_forms.get(&key).is_some_and(|form| {
+                !form.generating && form.delivery_mode == DeliveryMode::PublicBroadcaster
+            }),
+        }
     }
 
     fn clear_pending_public_broadcaster_cost_estimate(
@@ -3033,7 +3270,12 @@ impl WalletRoot {
         let recipient = form.recipient_input.read(cx).value().trim().to_string();
         let amount_raw = form.amount_input.read(cx).value().to_string();
         let broadcaster_choice = form.broadcaster_choice.clone();
-        let fee_mode = form.broadcaster_fee_mode;
+        let fee_token = form.selected_fee_token;
+        let fee_mode = effective_public_broadcaster_fee_mode(
+            asset.token,
+            fee_token,
+            form.broadcaster_fee_mode,
+        );
         let allow_suspicious_broadcasters = form.allow_suspicious_broadcasters;
         if parse_railgun_recipient(recipient.as_str()).is_err() {
             self.clear_pending_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
@@ -3063,7 +3305,7 @@ impl WalletRoot {
         let fee_rows = self.monitor_fee_rows();
         let policy = Self::public_broadcaster_fee_policy(allow_suspicious_broadcasters);
         let candidates =
-            self.current_public_broadcaster_candidates(asset.chain_id, asset.token, false, policy);
+            self.current_public_broadcaster_candidates(asset.chain_id, fee_token, false, policy);
         let selection = Self::public_broadcaster_selection(&broadcaster_choice);
         if select_public_broadcaster_with_policy(&candidates, &selection, policy).is_err() {
             self.clear_pending_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
@@ -3075,7 +3317,6 @@ impl WalletRoot {
         if let Some(form) = self.send_forms.get_mut(&key) {
             form.cost_estimate_pending = false;
             form.estimating_cost = true;
-            form.cost_estimate = None;
             form.error = None;
             form.estimate_id = estimate_id;
         }
@@ -3085,6 +3326,7 @@ impl WalletRoot {
             chain_id: asset.chain_id,
             session,
             token: asset.token,
+            fee_token,
             amount,
             recipient,
             fee_rows,
@@ -3117,7 +3359,6 @@ impl WalletRoot {
                         form.cost_estimate = Some(estimate);
                     }
                     Err(error) => {
-                        form.cost_estimate = None;
                         form.error = Some(Arc::from(error.to_string()));
                     }
                 }
@@ -3155,6 +3396,44 @@ impl WalletRoot {
         .unwrap_or_default()
     }
 
+    fn current_public_broadcaster_fee_token_options(
+        &self,
+        chain_id: u64,
+        unwrap: bool,
+        policy: BroadcasterFeePolicy,
+    ) -> Vec<PublicBroadcasterFeeTokenOption> {
+        let Some(snapshot) = self
+            .chain_states
+            .get(&chain_id)
+            .and_then(|state| state.snapshot())
+        else {
+            return Vec::new();
+        };
+        let fee_rows = self.monitor_fee_rows();
+        public_broadcaster_fee_token_options_from_snapshot(
+            snapshot,
+            &fee_rows,
+            unwrap,
+            policy,
+            |token| {
+                self.public_broadcaster_anchor_cache
+                    .cached_rate(chain_id, token)
+            },
+        )
+    }
+
+    fn default_public_broadcaster_fee_token(
+        &self,
+        chain_id: u64,
+        action_token: Address,
+        unwrap: bool,
+        allow_suspicious_broadcasters: bool,
+    ) -> Address {
+        let policy = Self::public_broadcaster_fee_policy(allow_suspicious_broadcasters);
+        let options = self.current_public_broadcaster_fee_token_options(chain_id, unwrap, policy);
+        resolve_selected_public_broadcaster_fee_token(action_token, action_token, &options)
+    }
+
     fn public_broadcaster_selection(choice: &BroadcasterChoice) -> PublicBroadcasterSelection {
         match choice {
             BroadcasterChoice::Random => PublicBroadcasterSelection::Random,
@@ -3176,11 +3455,11 @@ impl WalletRoot {
             DeliveryFormKind::Send => self
                 .send_forms
                 .get(&key)
-                .map(|form| (form.asset.chain_id, form.asset.token)),
+                .map(|form| (form.asset.chain_id, form.selected_fee_token)),
             DeliveryFormKind::Unshield => self
                 .unshield_forms
                 .get(&key)
-                .map(|form| (form.asset.chain_id, form.asset.token)),
+                .map(|form| (form.asset.chain_id, form.selected_fee_token)),
         }) else {
             return;
         };
@@ -3204,6 +3483,36 @@ impl WalletRoot {
             DeliveryFormKind::Unshield => {
                 self.set_unshield_allow_suspicious_broadcasters(key, allow, cx);
             }
+        }
+    }
+
+    fn set_transaction_fee_breakdown_open(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        open: bool,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let changed = match kind {
+            DeliveryFormKind::Send => self.send_forms.get_mut(&key).is_some_and(|form| {
+                if form.transaction_fee_breakdown_open == open {
+                    false
+                } else {
+                    form.transaction_fee_breakdown_open = open;
+                    true
+                }
+            }),
+            DeliveryFormKind::Unshield => self.unshield_forms.get_mut(&key).is_some_and(|form| {
+                if form.transaction_fee_breakdown_open == open {
+                    false
+                } else {
+                    form.transaction_fee_breakdown_open = open;
+                    true
+                }
+            }),
+        };
+        if changed {
+            cx.notify();
         }
     }
 
@@ -3232,15 +3541,21 @@ impl WalletRoot {
         if self.broadcaster_picker.is_some() {
             return;
         }
-        let Some((asset_label, chain_id)) = (match kind {
-            DeliveryFormKind::Send => self
-                .send_forms
-                .get(&key)
-                .map(|form| (form.asset.label.clone(), form.asset.chain_id)),
-            DeliveryFormKind::Unshield => self
-                .unshield_forms
-                .get(&key)
-                .map(|form| (form.asset.label.clone(), form.asset.chain_id)),
+        let Some((asset_label, chain_id, fee_token)) = (match kind {
+            DeliveryFormKind::Send => self.send_forms.get(&key).map(|form| {
+                (
+                    form.asset.label.clone(),
+                    form.asset.chain_id,
+                    form.selected_fee_token,
+                )
+            }),
+            DeliveryFormKind::Unshield => self.unshield_forms.get(&key).map(|form| {
+                (
+                    form.asset.label.clone(),
+                    form.asset.chain_id,
+                    form.selected_fee_token,
+                )
+            }),
         }) else {
             return;
         };
@@ -3268,7 +3583,10 @@ impl WalletRoot {
         });
         self.refresh_public_broadcaster_anchor(kind, key, cx);
         Self::open_broadcaster_picker_dialog(
-            asset_label,
+            format!(
+                "{asset_label} · fee token {}",
+                token_display_label(chain_id, fee_token)
+            ),
             chain_name(chain_id).map_or_else(|| chain_id.to_string(), str::to_owned),
             window,
             cx,
@@ -3354,7 +3672,12 @@ impl WalletRoot {
         let password_input = form.password_input.clone();
         let delivery_mode = form.delivery_mode;
         let broadcaster_choice = form.broadcaster_choice.clone();
-        let broadcaster_fee_mode = form.broadcaster_fee_mode;
+        let fee_token = form.selected_fee_token;
+        let broadcaster_fee_mode = effective_public_broadcaster_fee_mode(
+            asset.token,
+            fee_token,
+            form.broadcaster_fee_mode,
+        );
         let allow_suspicious_broadcasters = form.allow_suspicious_broadcasters;
 
         let Some(view_session) = self.view_session.clone() else {
@@ -3415,7 +3738,7 @@ impl WalletRoot {
             let policy = Self::public_broadcaster_fee_policy(allow_suspicious_broadcasters);
             let candidates = self.current_public_broadcaster_candidates(
                 asset.chain_id,
-                asset.token,
+                fee_token,
                 false,
                 policy,
             );
@@ -3467,6 +3790,7 @@ impl WalletRoot {
                     vault_store,
                     vault_password,
                     token,
+                    fee_token,
                     amount,
                     recipient,
                     verify_proof: true,
@@ -3486,6 +3810,7 @@ impl WalletRoot {
                     vault_store,
                     vault_password,
                     token,
+                    fee_token,
                     amount,
                     recipient,
                     verify_proof: true,
@@ -3624,8 +3949,8 @@ impl WalletRoot {
             &recipient_input,
             move |this, _input, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
-                    this.clear_unshield_form_prepared_output(key, cx);
-                    this.schedule_public_broadcaster_cost_estimate(
+                    this.clear_unshield_form_text_edit_state(key, cx);
+                    this.debounce_public_broadcaster_cost_estimate(
                         DeliveryFormKind::Unshield,
                         key,
                         cx,
@@ -3638,8 +3963,15 @@ impl WalletRoot {
             &amount_input,
             move |this, _input, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
-                    this.clear_unshield_form_prepared_output(key, cx);
-                    this.schedule_public_broadcaster_cost_estimate(
+                    if this.consume_programmatic_amount_input_change(
+                        DeliveryFormKind::Unshield,
+                        key,
+                        cx,
+                    ) {
+                        return;
+                    }
+                    this.clear_unshield_form_text_edit_state(key, cx);
+                    this.debounce_public_broadcaster_cost_estimate(
                         DeliveryFormKind::Unshield,
                         key,
                         cx,
@@ -3651,6 +3983,8 @@ impl WalletRoot {
         self.send_forms.clear();
         self.unshield_forms.clear();
         self.broadcaster_picker = None;
+        let selected_fee_token =
+            self.default_public_broadcaster_fee_token(key.chain_id, key.token, false, false);
         self.unshield_forms.insert(
             key,
             UnshieldFormState {
@@ -3660,9 +3994,12 @@ impl WalletRoot {
                 password_input,
                 unwrap: false,
                 delivery_mode: DeliveryMode::ManualCalldata,
+                selected_fee_token,
                 broadcaster_choice: BroadcasterChoice::Random,
                 broadcaster_fee_mode: PublicBroadcasterFeeMode::DeductFromAmount,
                 allow_suspicious_broadcasters: false,
+                transaction_fee_breakdown_open: true,
+                pending_programmatic_amount_input: None,
                 cost_estimate_pending: false,
                 estimating_cost: false,
                 cost_estimate: None,
@@ -3712,7 +4049,6 @@ impl WalletRoot {
         form.unwrap = unwrap;
         form.error = None;
         form.result = None;
-        form.cost_estimate = None;
         form.estimate_id = 0;
         form.cost_estimate_pending = false;
         form.estimating_cost = false;
@@ -3733,27 +4069,28 @@ impl WalletRoot {
         let Some(form) = self.unshield_forms.get_mut(&key) else {
             return;
         };
-        if form.generating || form.broadcaster_fee_mode == fee_mode {
+        if form.generating
+            || form.selected_fee_token != form.asset.token
+            || form.broadcaster_fee_mode == fee_mode
+        {
             return;
         }
         let old_max =
             unshield_form_max_entered_amount(form, form.delivery_mode, form.broadcaster_fee_mode);
         let new_max = unshield_form_max_entered_amount(form, form.delivery_mode, fee_mode);
-        apply_amount_adjustment_for_max_change(
-            &form.amount_input,
-            &form.asset,
-            old_max,
-            new_max,
-            window,
-            cx,
-        );
+        let adjusted =
+            amount_adjustment_for_max_change(&form.amount_input, &form.asset, old_max, new_max, cx);
         form.broadcaster_fee_mode = fee_mode;
         form.error = None;
         form.result = None;
-        form.cost_estimate = None;
         form.estimate_id = 0;
         form.cost_estimate_pending = false;
         form.estimating_cost = false;
+        if let Some(adjusted) = adjusted {
+            form.pending_programmatic_amount_input = Some(adjusted.clone());
+            form.amount_input
+                .update(cx, |input, cx| input.set_value(adjusted, window, cx));
+        }
         cx.notify();
         if form.delivery_mode == DeliveryMode::PublicBroadcaster {
             self.refresh_public_broadcaster_anchor(DeliveryFormKind::Unshield, key, cx);
@@ -3761,7 +4098,7 @@ impl WalletRoot {
         self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
     }
 
-    fn clear_unshield_form_prepared_output(
+    fn clear_unshield_form_text_edit_state(
         &mut self,
         key: UnshieldAssetKey,
         cx: &mut Context<'_, Self>,
@@ -3770,18 +4107,19 @@ impl WalletRoot {
             return;
         };
         if form.generating
-            || (form.result.is_none() && form.error.is_none() && form.cost_estimate.is_none())
+            || (form.result.is_none()
+                && form.error.is_none()
+                && !form.cost_estimate_pending
+                && !form.estimating_cost)
         {
             return;
         }
         form.result = None;
         form.error = None;
-        form.cost_estimate = None;
         form.estimate_id = 0;
         form.cost_estimate_pending = false;
         form.estimating_cost = false;
         cx.notify();
-        self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
     }
 
     fn set_unshield_delivery_mode(
@@ -3800,19 +4138,18 @@ impl WalletRoot {
         let old_max =
             unshield_form_max_entered_amount(form, form.delivery_mode, form.broadcaster_fee_mode);
         let new_max = unshield_form_max_entered_amount(form, mode, form.broadcaster_fee_mode);
-        let adjusted = apply_amount_adjustment_for_max_change(
-            &form.amount_input,
-            &form.asset,
-            old_max,
-            new_max,
-            window,
-            cx,
-        );
+        let adjusted =
+            amount_adjustment_for_max_change(&form.amount_input, &form.asset, old_max, new_max, cx);
         form.delivery_mode = mode;
         form.error = None;
         form.result = None;
-        if mode == DeliveryMode::PublicBroadcaster || adjusted {
+        if mode == DeliveryMode::PublicBroadcaster || adjusted.is_some() {
             form.cost_estimate = None;
+        }
+        if let Some(adjusted) = adjusted {
+            form.pending_programmatic_amount_input = Some(adjusted.clone());
+            form.amount_input
+                .update(cx, |input, cx| input.set_value(adjusted, window, cx));
         }
         form.estimate_id = 0;
         form.cost_estimate_pending = false;
@@ -3839,7 +4176,6 @@ impl WalletRoot {
         form.broadcaster_choice = choice;
         form.error = None;
         form.result = None;
-        form.cost_estimate = None;
         form.estimate_id = 0;
         form.cost_estimate_pending = false;
         form.estimating_cost = false;
@@ -3847,19 +4183,47 @@ impl WalletRoot {
         self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
     }
 
-    fn set_unshield_allow_suspicious_broadcasters(
+    fn set_unshield_fee_token(
         &mut self,
         key: UnshieldAssetKey,
-        allow: bool,
+        fee_token: Address,
         cx: &mut Context<'_, Self>,
     ) {
+        let Some((chain_id, action_token, unwrap, current_choice, generating, allow_suspicious)) =
+            self.unshield_forms.get(&key).map(|form| {
+                (
+                    form.asset.chain_id,
+                    form.asset.token,
+                    form.unwrap,
+                    form.broadcaster_choice.clone(),
+                    form.generating,
+                    form.allow_suspicious_broadcasters,
+                )
+            })
+        else {
+            return;
+        };
+        if generating {
+            return;
+        }
+        let policy = Self::public_broadcaster_fee_policy(allow_suspicious);
+        let candidates =
+            self.current_public_broadcaster_candidates(chain_id, fee_token, unwrap, policy);
+        let reset_specific =
+            !broadcaster_choice_supported_by_candidates(&current_choice, &candidates, policy);
         let Some(form) = self.unshield_forms.get_mut(&key) else {
             return;
         };
-        if form.generating || form.allow_suspicious_broadcasters == allow {
+        if form.selected_fee_token == fee_token && !reset_specific {
             return;
         }
-        form.allow_suspicious_broadcasters = allow;
+        form.selected_fee_token = fee_token;
+        if fee_token != action_token {
+            form.broadcaster_fee_mode = PublicBroadcasterFeeMode::AddToAmount;
+        }
+        if reset_specific {
+            form.broadcaster_choice = BroadcasterChoice::Random;
+        }
         form.error = None;
         form.result = None;
         form.cost_estimate = None;
@@ -3869,6 +4233,58 @@ impl WalletRoot {
         cx.notify();
         self.refresh_public_broadcaster_anchor(DeliveryFormKind::Unshield, key, cx);
         self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
+    }
+
+    fn set_unshield_allow_suspicious_broadcasters(
+        &mut self,
+        key: UnshieldAssetKey,
+        allow: bool,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some((chain_id, fee_token, unwrap, choice, generating, current_allow)) =
+            self.unshield_forms.get(&key).map(|form| {
+                (
+                    form.asset.chain_id,
+                    form.selected_fee_token,
+                    form.unwrap,
+                    form.broadcaster_choice.clone(),
+                    form.generating,
+                    form.allow_suspicious_broadcasters,
+                )
+            })
+        else {
+            return;
+        };
+        if generating || current_allow == allow {
+            return;
+        }
+        let policy = Self::public_broadcaster_fee_policy(allow);
+        let candidates =
+            self.current_public_broadcaster_candidates(chain_id, fee_token, unwrap, policy);
+        let preserve_estimate =
+            should_preserve_estimate_after_broadcaster_policy_change(&choice, &candidates, policy);
+        let reset_specific =
+            matches!(choice, BroadcasterChoice::Specific { .. }) && !preserve_estimate;
+        let Some(form) = self.unshield_forms.get_mut(&key) else {
+            return;
+        };
+        form.allow_suspicious_broadcasters = allow;
+        if reset_specific {
+            form.broadcaster_choice = BroadcasterChoice::Random;
+        }
+        let should_reestimate = !preserve_estimate || matches!(choice, BroadcasterChoice::Random);
+        if should_reestimate {
+            form.error = None;
+            form.result = None;
+            form.estimate_id = 0;
+            form.cost_estimate_pending = false;
+            form.estimating_cost = false;
+        }
+        cx.notify();
+        if should_reestimate {
+            self.refresh_public_broadcaster_anchor(DeliveryFormKind::Unshield, key, cx);
+            self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
+        }
     }
 
     fn estimate_unshield_public_broadcaster_cost_from_form(
@@ -3890,7 +4306,12 @@ impl WalletRoot {
         let recipient_raw = form.recipient_input.read(cx).value().to_string();
         let amount_raw = form.amount_input.read(cx).value().to_string();
         let broadcaster_choice = form.broadcaster_choice.clone();
-        let fee_mode = form.broadcaster_fee_mode;
+        let fee_token = form.selected_fee_token;
+        let fee_mode = effective_public_broadcaster_fee_mode(
+            asset.token,
+            fee_token,
+            form.broadcaster_fee_mode,
+        );
         let allow_suspicious_broadcasters = form.allow_suspicious_broadcasters;
         let Ok(recipient) = recipient_raw.trim().parse::<Address>() else {
             self.clear_pending_public_broadcaster_cost_estimate(
@@ -3932,7 +4353,7 @@ impl WalletRoot {
         let fee_rows = self.monitor_fee_rows();
         let policy = Self::public_broadcaster_fee_policy(allow_suspicious_broadcasters);
         let candidates =
-            self.current_public_broadcaster_candidates(asset.chain_id, asset.token, unwrap, policy);
+            self.current_public_broadcaster_candidates(asset.chain_id, fee_token, unwrap, policy);
         let selection = Self::public_broadcaster_selection(&broadcaster_choice);
         if select_public_broadcaster_with_policy(&candidates, &selection, policy).is_err() {
             self.clear_pending_public_broadcaster_cost_estimate(
@@ -3948,7 +4369,6 @@ impl WalletRoot {
         if let Some(form) = self.unshield_forms.get_mut(&key) {
             form.cost_estimate_pending = false;
             form.estimating_cost = true;
-            form.cost_estimate = None;
             form.error = None;
             form.estimate_id = estimate_id;
         }
@@ -3958,6 +4378,7 @@ impl WalletRoot {
             chain_id: asset.chain_id,
             session,
             token: asset.token,
+            fee_token,
             amount,
             recipient,
             unwrap,
@@ -3991,7 +4412,6 @@ impl WalletRoot {
                         form.cost_estimate = Some(estimate);
                     }
                     Err(error) => {
-                        form.cost_estimate = None;
                         form.error = Some(Arc::from(error.to_string()));
                     }
                 }
@@ -4020,7 +4440,12 @@ impl WalletRoot {
         let password_input = form.password_input.clone();
         let delivery_mode = form.delivery_mode;
         let broadcaster_choice = form.broadcaster_choice.clone();
-        let broadcaster_fee_mode = form.broadcaster_fee_mode;
+        let fee_token = form.selected_fee_token;
+        let broadcaster_fee_mode = effective_public_broadcaster_fee_mode(
+            asset.token,
+            fee_token,
+            form.broadcaster_fee_mode,
+        );
         let allow_suspicious_broadcasters = form.allow_suspicious_broadcasters;
 
         let Some(view_session) = self.view_session.clone() else {
@@ -4084,7 +4509,7 @@ impl WalletRoot {
             let policy = Self::public_broadcaster_fee_policy(allow_suspicious_broadcasters);
             let candidates = self.current_public_broadcaster_candidates(
                 asset.chain_id,
-                asset.token,
+                fee_token,
                 unwrap,
                 policy,
             );
@@ -4140,6 +4565,7 @@ impl WalletRoot {
                     vault_store,
                     vault_password,
                     token,
+                    fee_token,
                     amount,
                     recipient,
                     unwrap,
@@ -4160,6 +4586,7 @@ impl WalletRoot {
                     vault_store,
                     vault_password,
                     token,
+                    fee_token,
                     amount,
                     recipient,
                     unwrap,
@@ -4944,7 +5371,7 @@ impl WalletRoot {
                                 }
                                 let chain_id = root.selected_chain;
                                 let overrides = chain_load_overrides();
-                                root.start_chain_load(chain_id, overrides, true, cx);
+                                root.start_chain_load(chain_id, &overrides, true, cx);
                             });
                         }),
                 )
@@ -5151,10 +5578,12 @@ impl WalletRoot {
             "Raw base units for this unknown token".to_string()
         };
         let delivery_root = root.clone();
+        let metrics_root = root.clone();
         let chooser_root = root.clone();
-        let fee_mode_root = root.clone();
-        let allow_root = root.clone();
+        let estimate_root = root.clone();
+        let result_root = root.clone();
         let submit_root = root;
+        let mut public_broadcaster_submit_disabled = false;
 
         let mut card =
             div()
@@ -5163,9 +5592,9 @@ impl WalletRoot {
                 .flex_col()
                 .gap_3()
                 .child(render_private_action_metrics(
+                    metrics_root,
                     key,
                     DeliveryFormKind::Send,
-                    form.amount_input.clone(),
                     asset,
                     form.generating,
                 ));
@@ -5186,26 +5615,56 @@ impl WalletRoot {
         ));
         if form.delivery_mode == DeliveryMode::PublicBroadcaster {
             let policy = Self::public_broadcaster_fee_policy(form.allow_suspicious_broadcasters);
+            let fee_token_options =
+                self.current_public_broadcaster_fee_token_options(asset.chain_id, false, policy);
+            let selected_fee_token_count = selected_fee_token_eligible_broadcaster_count(
+                &fee_token_options,
+                form.selected_fee_token,
+            )
+            .unwrap_or_default();
+            let has_eligible_fee_token = fee_token_options
+                .iter()
+                .any(|option| option.eligible_broadcaster_count > 0);
+            public_broadcaster_submit_disabled =
+                public_broadcaster_submit_disabled_for_fee_token_options(
+                    &fee_token_options,
+                    form.selected_fee_token,
+                );
             let candidates = self.current_public_broadcaster_candidates(
                 asset.chain_id,
-                asset.token,
+                form.selected_fee_token,
                 false,
                 policy,
             );
             let visible_candidates = fee_policy_eligible_public_broadcasters(&candidates, policy);
-            card = card.child(render_allow_suspicious_broadcasters_toggle(
-                allow_root,
-                key,
-                DeliveryFormKind::Send,
-                form.allow_suspicious_broadcasters,
-                form.generating,
-            ));
-            card = card.child(render_broadcaster_chooser(
+            if !has_eligible_fee_token {
+                card = card.child(
+                    Alert::warning(
+                        delivery_element_id(key, DeliveryFormKind::Send, "fee-token-warning"),
+                        "No POI-spendable wallet token currently has an eligible public broadcaster. Manual calldata remains available.",
+                    )
+                    .small(),
+                );
+            } else if selected_fee_token_count == 0 {
+                card = card.child(
+                    Alert::warning(
+                        delivery_element_id(key, DeliveryFormKind::Send, "fee-token-warning"),
+                        "Choose a fee token with at least one eligible public broadcaster before submitting.",
+                    )
+                    .small(),
+                );
+            }
+            card = card.child(render_public_broadcaster_settings(
                 chooser_root,
                 key,
                 DeliveryFormKind::Send,
+                form.allow_suspicious_broadcasters,
+                asset.token,
+                form.broadcaster_fee_mode,
                 &form.broadcaster_choice,
                 visible_candidates,
+                &fee_token_options,
+                form.selected_fee_token,
                 form.generating,
             ));
             if let Some(warning) = selected_broadcaster_fee_warning(
@@ -5221,13 +5680,6 @@ impl WalletRoot {
                     .small(),
                 );
             }
-            card = card.child(render_broadcaster_fee_mode_toggle(
-                fee_mode_root,
-                key,
-                DeliveryFormKind::Send,
-                form.broadcaster_fee_mode,
-                form.generating,
-            ));
         }
 
         card = card
@@ -5292,7 +5744,7 @@ impl WalletRoot {
                         )
                         .primary()
                         .loading(form.generating)
-                        .disabled(form.generating)
+                        .disabled(form.generating || public_broadcaster_submit_disabled)
                         .on_click(move |_event, window, cx| {
                             submit_root.update(cx, |root, cx| {
                                 root.generate_send_calldata_from_form(key, window, cx);
@@ -5302,15 +5754,27 @@ impl WalletRoot {
             );
 
         if form.delivery_mode == DeliveryMode::PublicBroadcaster && form.result.is_none() {
-            if let Some(status) =
+            if let Some(estimate) = form.cost_estimate.as_ref() {
+                let anchor_rate = self
+                    .public_broadcaster_anchor_cache
+                    .cached_rate(asset.chain_id, estimate.fee_token);
+                card = card.child(render_public_broadcaster_cost_estimate(
+                    estimate_root,
+                    key,
+                    DeliveryFormKind::Send,
+                    asset,
+                    estimate,
+                    anchor_rate,
+                    form.transaction_fee_breakdown_open,
+                    form.estimating_cost,
+                ));
+            } else if let Some(status) =
                 public_broadcaster_cost_status(form.cost_estimate_pending, form.estimating_cost)
             {
                 card = card.child(render_public_broadcaster_cost_status(
                     self.unshield_spinner_tick,
                     status,
                 ));
-            } else if let Some(estimate) = form.cost_estimate.as_ref() {
-                card = card.child(render_public_broadcaster_cost_estimate(asset, estimate));
             }
         }
 
@@ -5325,7 +5789,7 @@ impl WalletRoot {
             card = card.child(
                 Alert::error(
                     send_element_id(key, "form-error"),
-                    format_form_error_for_asset(error, asset),
+                    format_form_error_for_asset(error, asset, form.selected_fee_token),
                 )
                 .small(),
             );
@@ -5335,7 +5799,17 @@ impl WalletRoot {
             card = card.child(match result {
                 SendResult::Manual(result) => render_send_result(key, result),
                 SendResult::PublicBroadcaster(result) => {
-                    render_public_broadcaster_result(key, DeliveryFormKind::Send, result)
+                    let anchor_rate = self
+                        .public_broadcaster_anchor_cache
+                        .cached_rate(asset.chain_id, result.fee_token);
+                    render_public_broadcaster_result(
+                        result_root,
+                        key,
+                        DeliveryFormKind::Send,
+                        result,
+                        anchor_rate,
+                        form.transaction_fee_breakdown_open,
+                    )
                 }
             });
         }
@@ -5355,11 +5829,13 @@ impl WalletRoot {
             "Raw base units for this unknown token".to_string()
         };
         let delivery_root = root.clone();
+        let metrics_root = root.clone();
         let chooser_root = root.clone();
-        let fee_mode_root = root.clone();
         let output_root = root.clone();
-        let allow_root = root.clone();
+        let estimate_root = root.clone();
+        let result_root = root.clone();
         let submit_root = root;
+        let mut public_broadcaster_submit_disabled = false;
 
         let mut card =
             div()
@@ -5368,9 +5844,9 @@ impl WalletRoot {
                 .flex_col()
                 .gap_3()
                 .child(render_private_action_metrics(
+                    metrics_root,
                     key,
                     DeliveryFormKind::Unshield,
-                    form.amount_input.clone(),
                     asset,
                     form.generating,
                 ));
@@ -5391,26 +5867,59 @@ impl WalletRoot {
         ));
         if form.delivery_mode == DeliveryMode::PublicBroadcaster {
             let policy = Self::public_broadcaster_fee_policy(form.allow_suspicious_broadcasters);
+            let fee_token_options = self.current_public_broadcaster_fee_token_options(
+                asset.chain_id,
+                form.unwrap,
+                policy,
+            );
+            let selected_fee_token_count = selected_fee_token_eligible_broadcaster_count(
+                &fee_token_options,
+                form.selected_fee_token,
+            )
+            .unwrap_or_default();
+            let has_eligible_fee_token = fee_token_options
+                .iter()
+                .any(|option| option.eligible_broadcaster_count > 0);
+            public_broadcaster_submit_disabled =
+                public_broadcaster_submit_disabled_for_fee_token_options(
+                    &fee_token_options,
+                    form.selected_fee_token,
+                );
             let candidates = self.current_public_broadcaster_candidates(
                 asset.chain_id,
-                asset.token,
+                form.selected_fee_token,
                 form.unwrap,
                 policy,
             );
             let visible_candidates = fee_policy_eligible_public_broadcasters(&candidates, policy);
-            card = card.child(render_allow_suspicious_broadcasters_toggle(
-                allow_root,
-                key,
-                DeliveryFormKind::Unshield,
-                form.allow_suspicious_broadcasters,
-                form.generating,
-            ));
-            card = card.child(render_broadcaster_chooser(
+            if !has_eligible_fee_token {
+                card = card.child(
+                    Alert::warning(
+                        delivery_element_id(key, DeliveryFormKind::Unshield, "fee-token-warning"),
+                        "No POI-spendable wallet token currently has an eligible public broadcaster. Manual calldata remains available.",
+                    )
+                    .small(),
+                );
+            } else if selected_fee_token_count == 0 {
+                card = card.child(
+                    Alert::warning(
+                        delivery_element_id(key, DeliveryFormKind::Unshield, "fee-token-warning"),
+                        "Choose a fee token with at least one eligible public broadcaster before submitting.",
+                    )
+                    .small(),
+                );
+            }
+            card = card.child(render_public_broadcaster_settings(
                 chooser_root,
                 key,
                 DeliveryFormKind::Unshield,
+                form.allow_suspicious_broadcasters,
+                asset.token,
+                form.broadcaster_fee_mode,
                 &form.broadcaster_choice,
                 visible_candidates,
+                &fee_token_options,
+                form.selected_fee_token,
                 form.generating,
             ));
             if let Some(warning) = selected_broadcaster_fee_warning(
@@ -5426,13 +5935,6 @@ impl WalletRoot {
                     .small(),
                 );
             }
-            card = card.child(render_broadcaster_fee_mode_toggle(
-                fee_mode_root,
-                key,
-                DeliveryFormKind::Unshield,
-                form.broadcaster_fee_mode,
-                form.generating,
-            ));
         }
 
         card = card
@@ -5506,7 +6008,7 @@ impl WalletRoot {
                         )
                         .primary()
                         .loading(form.generating)
-                        .disabled(form.generating)
+                        .disabled(form.generating || public_broadcaster_submit_disabled)
                         .on_click(move |_event, window, cx| {
                             submit_root.update(cx, |root, cx| {
                                 root.generate_unshield_calldata_from_form(key, window, cx);
@@ -5516,15 +6018,27 @@ impl WalletRoot {
             );
 
         if form.delivery_mode == DeliveryMode::PublicBroadcaster && form.result.is_none() {
-            if let Some(status) =
+            if let Some(estimate) = form.cost_estimate.as_ref() {
+                let anchor_rate = self
+                    .public_broadcaster_anchor_cache
+                    .cached_rate(asset.chain_id, estimate.fee_token);
+                card = card.child(render_public_broadcaster_cost_estimate(
+                    estimate_root,
+                    key,
+                    DeliveryFormKind::Unshield,
+                    asset,
+                    estimate,
+                    anchor_rate,
+                    form.transaction_fee_breakdown_open,
+                    form.estimating_cost,
+                ));
+            } else if let Some(status) =
                 public_broadcaster_cost_status(form.cost_estimate_pending, form.estimating_cost)
             {
                 card = card.child(render_public_broadcaster_cost_status(
                     self.unshield_spinner_tick,
                     status,
                 ));
-            } else if let Some(estimate) = form.cost_estimate.as_ref() {
-                card = card.child(render_public_broadcaster_cost_estimate(asset, estimate));
             }
         }
 
@@ -5539,7 +6053,7 @@ impl WalletRoot {
             card = card.child(
                 Alert::error(
                     unshield_element_id(key, "form-error"),
-                    format_form_error_for_asset(error, asset),
+                    format_form_error_for_asset(error, asset, form.selected_fee_token),
                 )
                 .small(),
             );
@@ -5549,7 +6063,17 @@ impl WalletRoot {
             card = card.child(match result {
                 UnshieldResult::Manual(result) => render_unshield_result(key, result),
                 UnshieldResult::PublicBroadcaster(result) => {
-                    render_public_broadcaster_result(key, DeliveryFormKind::Unshield, result)
+                    let anchor_rate = self
+                        .public_broadcaster_anchor_cache
+                        .cached_rate(asset.chain_id, result.fee_token);
+                    render_public_broadcaster_result(
+                        result_root,
+                        key,
+                        DeliveryFormKind::Unshield,
+                        result,
+                        anchor_rate,
+                        form.transaction_fee_breakdown_open,
+                    )
                 }
             });
         }
@@ -5804,7 +6328,7 @@ impl WalletRoot {
                 DeliveryFormKind::Send => self.send_forms.get(&picker.key).map(|form| {
                     (
                         form.asset.chain_id,
-                        form.asset.token,
+                        form.selected_fee_token,
                         false,
                         form.broadcaster_choice.clone(),
                         form.generating,
@@ -5814,7 +6338,7 @@ impl WalletRoot {
                 DeliveryFormKind::Unshield => self.unshield_forms.get(&picker.key).map(|form| {
                     (
                         form.asset.chain_id,
-                        form.asset.token,
+                        form.selected_fee_token,
                         form.unwrap,
                         form.broadcaster_choice.clone(),
                         form.generating,
@@ -6688,21 +7212,14 @@ fn selected_broadcaster_label(
     candidates: &[PublicBroadcasterCandidate],
 ) -> String {
     let BroadcasterChoice::Specific { railgun_address } = choice else {
-        return "Choose specific broadcaster".to_string();
+        return "Specific broadcaster".to_string();
     };
     candidates
         .iter()
         .find(|candidate| candidate.railgun_address == *railgun_address)
         .map_or_else(
-            || "Specific broadcaster unavailable".to_string(),
-            |candidate| {
-                format!(
-                    "{} · fee {} · reliability {}",
-                    broadcaster_candidate_label(candidate),
-                    broadcaster_candidate_fee_label(candidate),
-                    broadcaster_reliability_label(candidate.reliability)
-                )
-            },
+            || "Specific unavailable".to_string(),
+            broadcaster_candidate_label,
         )
 }
 
@@ -6846,6 +7363,68 @@ fn format_exact_asset_amount_for_display(amount: U256, asset: &UnshieldAsset) ->
     )
 }
 
+fn token_display_label(chain_id: u64, token: Address) -> String {
+    lookup_token(chain_id, &token)
+        .map_or_else(|| short_address(&token), |info| info.symbol.to_owned())
+}
+
+fn format_exact_token_amount_for_display(chain_id: u64, token: Address, amount: U256) -> String {
+    lookup_token(chain_id, &token).map_or_else(
+        || format!("{} raw token units ({})", amount, short_address(&token)),
+        |info| {
+            format!(
+                "{} {}",
+                format_send_amount_input(amount, Some(info.decimals)),
+                info.symbol
+            )
+        },
+    )
+}
+
+const fn native_token_display_label(chain_id: u64) -> &'static str {
+    match native_wrapped_output_labels(chain_id) {
+        Some((native_label, _wrapped_label)) => native_label,
+        None => "base token",
+    }
+}
+
+fn format_native_token_amount_for_display(chain_id: u64, amount: U256) -> String {
+    format!(
+        "{} {}",
+        format_token_amount(amount, 18),
+        native_token_display_label(chain_id)
+    )
+}
+
+fn format_public_broadcaster_fee_margin(
+    chain_id: u64,
+    fee_token: Address,
+    margin: PublicBroadcasterFeeMargin,
+) -> String {
+    match margin {
+        PublicBroadcasterFeeMargin::Zero => {
+            format_exact_token_amount_for_display(chain_id, fee_token, U256::ZERO)
+        }
+        PublicBroadcasterFeeMargin::Positive(amount) => {
+            format_exact_token_amount_for_display(chain_id, fee_token, amount)
+        }
+        PublicBroadcasterFeeMargin::Negative(amount) => {
+            format!(
+                "-{}",
+                format_exact_token_amount_for_display(chain_id, fee_token, amount)
+            )
+        }
+    }
+}
+
+const fn broadcaster_candidate_anchor_rate(candidate: &PublicBroadcasterCandidate) -> Option<U256> {
+    match candidate.fee_policy_status {
+        BroadcasterFeePolicyStatus::Normal { anchor_rate, .. }
+        | BroadcasterFeePolicyStatus::Suspicious { anchor_rate, .. } => Some(anchor_rate),
+        BroadcasterFeePolicyStatus::UnknownAnchor => None,
+    }
+}
+
 fn should_show_distinct_amount(entered_amount: U256, amount: U256) -> bool {
     amount != entered_amount
 }
@@ -6865,6 +7444,8 @@ fn cost_estimate_max_entered_amount_for_mode(
     estimate: &PublicBroadcasterCostEstimate,
     fee_mode: PublicBroadcasterFeeMode,
 ) -> U256 {
+    let fee_mode =
+        effective_public_broadcaster_fee_mode(estimate.action_token, estimate.fee_token, fee_mode);
     public_broadcaster_max_entered_amount_for_mode(
         estimate.max_receiver_amount,
         estimate.fee_amount,
@@ -6919,31 +7500,30 @@ fn adjusted_amount_for_max_change(
     None
 }
 
-fn apply_amount_adjustment_for_max_change(
+fn amount_adjustment_for_max_change(
     input: &Entity<InputState>,
     asset: &UnshieldAsset,
     old_max: Option<U256>,
     new_max: Option<U256>,
-    window: &mut Window,
-    cx: &mut Context<'_, WalletRoot>,
-) -> bool {
-    let Some(new_max) = new_max else {
-        return false;
-    };
+    cx: &Context<'_, WalletRoot>,
+) -> Option<String> {
+    let new_max = new_max?;
     let current_value = input.read(cx).value().to_string();
     let Ok(current_amount) = parse_send_amount(current_value.as_str(), asset.decimals) else {
-        return false;
+        return None;
     };
-    let Some(adjusted_amount) = adjusted_amount_for_max_change(current_amount, old_max, new_max)
-    else {
-        return false;
-    };
-    let adjusted = format_send_amount_input(adjusted_amount, asset.decimals);
-    input.update(cx, |input, cx| input.set_value(adjusted, window, cx));
-    true
+    let adjusted_amount = adjusted_amount_for_max_change(current_amount, old_max, new_max)?;
+    Some(format_send_amount_input(adjusted_amount, asset.decimals))
 }
 
-fn format_form_error_for_asset(error: &str, asset: &UnshieldAsset) -> String {
+fn format_form_error_for_asset(error: &str, asset: &UnshieldAsset, fee_token: Address) -> String {
+    if let Some(max_spendable) = form_error_public_broadcaster_fee_token_max_spendable(error) {
+        return format!(
+            "Broadcaster fee exceeds available fee-token balance: {}. Choose a fee token with more spendable balance or a lower-fee broadcaster.",
+            format_exact_token_amount_for_display(asset.chain_id, fee_token, max_spendable)
+        );
+    }
+
     if let Some(max_spendable) = form_error_public_broadcaster_max_entered_amount(error) {
         return format!(
             "Max POI-verified entered amount for public broadcaster: {}. Try a smaller amount or switch fee mode.",
@@ -6972,6 +7552,11 @@ fn form_error_public_broadcaster_max_entered_amount(error: &str) -> Option<U256>
     form_error_decimal_after_marker(error, MARKER)
 }
 
+fn form_error_public_broadcaster_fee_token_max_spendable(error: &str) -> Option<U256> {
+    const MARKER: &str = "public broadcaster fee-token max spendable: ";
+    form_error_decimal_after_marker(error, MARKER)
+}
+
 fn form_error_max_immediately_spendable(error: &str) -> Option<U256> {
     const MARKER: &str = "max immediately spendable: ";
     form_error_decimal_after_marker(error, MARKER)
@@ -6994,20 +7579,36 @@ fn format_gwei(wei: u128) -> String {
 }
 
 fn public_broadcaster_fee_mode_summary(
+    chain_id: u64,
+    action_token: Address,
+    fee_token: Address,
     fee_mode: PublicBroadcasterFeeMode,
     entered_amount: U256,
     receiver_amount: U256,
     protocol_fee_amount: U256,
+    fee_amount: U256,
     broadcaster: &PublicBroadcasterCandidate,
 ) -> String {
+    if action_token != fee_token {
+        let fee_text = format_exact_token_amount_for_display(chain_id, fee_token, fee_amount);
+        if protocol_fee_amount.is_zero() {
+            return format!(
+                "Recipient receives the full entered amount; transaction fee is paid separately as {fee_text}."
+            );
+        }
+        return format!(
+            "Recipient receives the entered amount minus {} RAILGUN protocol fee; transaction fee is paid separately as {fee_text}.",
+            format_exact_token_amount_for_display(chain_id, action_token, protocol_fee_amount)
+        );
+    }
     match fee_mode {
         PublicBroadcasterFeeMode::AddToAmount => {
             if protocol_fee_amount.is_zero() {
-                "Recipient receives the full entered amount; broadcaster fee is added to spend."
+                "Recipient receives the full entered amount; transaction fee is added to spend."
                     .to_string()
             } else {
                 format!(
-                    "Recipient receives the entered amount minus {} RAILGUN protocol fee; broadcaster fee is added to spend.",
+                    "Recipient receives the entered amount minus {} RAILGUN protocol fee; transaction fee is added to spend.",
                     format_exact_candidate_token_amount(broadcaster, protocol_fee_amount)
                 )
             }
@@ -7019,7 +7620,7 @@ fn public_broadcaster_fee_mode_summary(
                     .to_string()
             } else if protocol_fee_amount.is_zero() {
                 format!(
-                    "Recipient amount is reduced by {} because broadcaster fee is paid from the entered amount.",
+                    "Recipient amount is reduced by {} because transaction fee is paid from the entered amount.",
                     format_exact_candidate_token_amount(broadcaster, reduction)
                 )
             } else if reduction.is_zero() {
@@ -7029,7 +7630,7 @@ fn public_broadcaster_fee_mode_summary(
                 )
             } else {
                 format!(
-                    "Recipient amount is reduced by {} broadcaster fee and {} RAILGUN protocol fee.",
+                    "Recipient amount is reduced by {} transaction fee and {} RAILGUN protocol fee.",
                     format_exact_candidate_token_amount(broadcaster, reduction),
                     format_exact_candidate_token_amount(broadcaster, protocol_fee_amount)
                 )
@@ -7064,7 +7665,7 @@ fn broadcaster_candidate_matches_query(
 
 fn render_broadcaster_picker_header(
     root: &Entity<WalletRoot>,
-    query_input: Entity<InputState>,
+    query_input: &Entity<InputState>,
     filtered_count: usize,
     total_count: usize,
     fee_bonus_popover_open: bool,
@@ -7221,6 +7822,137 @@ fn max_send_amount_from_snapshot(snapshot: &ListUtxosOutput, token: Address) -> 
     planner_max_send_amount_from_outputs(&snapshot.utxos, token)
 }
 
+fn max_broadcaster_fee_token_amount_from_snapshot(
+    snapshot: &ListUtxosOutput,
+    token: Address,
+) -> U256 {
+    planner_max_broadcaster_fee_token_amount_from_outputs(&snapshot.utxos, token)
+}
+
+fn public_broadcaster_fee_token_options_from_snapshot(
+    snapshot: &ListUtxosOutput,
+    fee_rows: &[broadcaster_monitor::FeeRow],
+    unwrap: bool,
+    policy: BroadcasterFeePolicy,
+    mut anchor_rate_for_token: impl FnMut(Address) -> Option<U256>,
+) -> Vec<PublicBroadcasterFeeTokenOption> {
+    format_private_asset_rows(snapshot.chain_id, &snapshot.totals)
+        .into_iter()
+        .filter_map(|asset| {
+            let token = asset.token?;
+            let poi_verified_total = asset.poi_verified_total?;
+            if poi_verified_total.is_zero() {
+                return None;
+            }
+            let max_spendable = max_broadcaster_fee_token_amount_from_snapshot(snapshot, token);
+            if max_spendable.is_zero() {
+                return None;
+            }
+            let candidates = public_broadcaster_candidates_for_asset(
+                fee_rows,
+                snapshot.chain_id,
+                token,
+                unwrap,
+                policy,
+                anchor_rate_for_token(token),
+            )
+            .unwrap_or_default();
+            let eligible_broadcaster_count =
+                fee_policy_eligible_public_broadcasters(&candidates, policy).len();
+            Some(PublicBroadcasterFeeTokenOption {
+                token,
+                label: asset.label,
+                decimals: asset.decimals,
+                max_spendable,
+                eligible_broadcaster_count,
+                icon_path: asset.icon_path,
+            })
+        })
+        .collect()
+}
+
+fn fee_token_option_has_eligible_broadcaster(
+    options: &[PublicBroadcasterFeeTokenOption],
+    token: Address,
+) -> bool {
+    options
+        .iter()
+        .any(|option| option.token == token && option.eligible_broadcaster_count > 0)
+}
+
+fn selected_fee_token_eligible_broadcaster_count(
+    options: &[PublicBroadcasterFeeTokenOption],
+    token: Address,
+) -> Option<usize> {
+    options
+        .iter()
+        .find(|option| option.token == token)
+        .map(|option| option.eligible_broadcaster_count)
+}
+
+fn public_broadcaster_submit_disabled_for_fee_token_options(
+    options: &[PublicBroadcasterFeeTokenOption],
+    selected_fee_token: Address,
+) -> bool {
+    selected_fee_token_eligible_broadcaster_count(options, selected_fee_token).unwrap_or_default()
+        == 0
+}
+
+fn resolve_selected_public_broadcaster_fee_token(
+    current_fee_token: Address,
+    action_token: Address,
+    options: &[PublicBroadcasterFeeTokenOption],
+) -> Address {
+    if fee_token_option_has_eligible_broadcaster(options, current_fee_token) {
+        return current_fee_token;
+    }
+    if fee_token_option_has_eligible_broadcaster(options, action_token) {
+        return action_token;
+    }
+    options
+        .iter()
+        .find(|option| option.eligible_broadcaster_count > 0)
+        .map_or(current_fee_token, |option| option.token)
+}
+
+fn broadcaster_choice_supported_by_candidates(
+    choice: &BroadcasterChoice,
+    candidates: &[PublicBroadcasterCandidate],
+    policy: BroadcasterFeePolicy,
+) -> bool {
+    let BroadcasterChoice::Specific { railgun_address } = choice else {
+        return true;
+    };
+    fee_policy_eligible_public_broadcasters(candidates, policy)
+        .iter()
+        .any(|candidate| candidate.railgun_address == *railgun_address)
+}
+
+fn should_preserve_estimate_after_broadcaster_policy_change(
+    choice: &BroadcasterChoice,
+    candidates: &[PublicBroadcasterCandidate],
+    policy: BroadcasterFeePolicy,
+) -> bool {
+    matches!(choice, BroadcasterChoice::Specific { .. })
+        && broadcaster_choice_supported_by_candidates(choice, candidates, policy)
+}
+
+fn effective_public_broadcaster_fee_mode(
+    action_token: Address,
+    fee_token: Address,
+    fee_mode: PublicBroadcasterFeeMode,
+) -> PublicBroadcasterFeeMode {
+    if action_token == fee_token {
+        fee_mode
+    } else {
+        PublicBroadcasterFeeMode::AddToAmount
+    }
+}
+
+fn should_show_broadcaster_fee_mode_toggle(action_token: Address, fee_token: Address) -> bool {
+    action_token == fee_token
+}
+
 fn format_unshield_amount_input(amount: U256, decimals: Option<u8>) -> String {
     decimals.map_or_else(
         || amount.to_string(),
@@ -7253,9 +7985,9 @@ fn private_action_metrics(asset: &UnshieldAsset) -> Vec<PrivateActionMetric> {
 }
 
 fn render_private_action_metrics(
+    root: Entity<WalletRoot>,
     key: UnshieldAssetKey,
     kind: DeliveryFormKind,
-    amount_input: Entity<InputState>,
     asset: &UnshieldAsset,
     disabled: bool,
 ) -> gpui::Div {
@@ -7265,7 +7997,9 @@ fn render_private_action_metrics(
             .into_iter()
             .map(move |metric| {
                 render_private_action_metric(
-                    amount_input.clone(),
+                    root.clone(),
+                    key,
+                    kind,
                     delivery_element_id(key, kind, private_action_metric_id_suffix(metric.label)),
                     metric,
                     decimals,
@@ -7276,14 +8010,15 @@ fn render_private_action_metrics(
 }
 
 fn render_private_action_metric(
-    amount_input: Entity<InputState>,
+    root: Entity<WalletRoot>,
+    key: UnshieldAssetKey,
+    kind: DeliveryFormKind,
     id: SharedString,
     metric: PrivateActionMetric,
     decimals: Option<u8>,
     disabled: bool,
 ) -> impl IntoElement {
     let value = format_unshield_amount_input(metric.amount, decimals);
-    let click_value = value.clone();
     div()
         .id(id)
         .flex_1()
@@ -7302,9 +8037,9 @@ fn render_private_action_metric(
             this.cursor_pointer()
                 .hover(|this| this.bg(rgb(theme::SURFACE_HOVER)))
                 .on_click(move |_event, window, cx| {
-                    let value = click_value.clone();
-                    amount_input.update(cx, |input, cx| {
-                        input.set_value(value, window, cx);
+                    let amount = metric.amount;
+                    root.update(cx, |root, cx| {
+                        root.set_private_action_metric_amount(kind, key, amount, window, cx);
                     });
                 })
         })
@@ -7416,125 +8151,225 @@ fn render_delivery_selector(
         )
 }
 
-fn render_broadcaster_chooser(
+fn render_public_broadcaster_settings(
     root: Entity<WalletRoot>,
     key: UnshieldAssetKey,
     kind: DeliveryFormKind,
+    allow_suspicious_broadcasters: bool,
+    action_token: Address,
+    broadcaster_fee_mode: PublicBroadcasterFeeMode,
     choice: &BroadcasterChoice,
     candidates: Vec<PublicBroadcasterCandidate>,
+    fee_token_options: &[PublicBroadcasterFeeTokenOption],
+    selected_fee_token: Address,
     generating: bool,
 ) -> gpui::Div {
+    let fee_token_root = root.clone();
+    let fee_mode_root = root.clone();
     let random_root = root.clone();
-    let modal_root = root;
+    let modal_root = root.clone();
+    let policy_label_root = root.clone();
+    let policy_switch_root = root;
     let sorted = sort_specific_public_broadcasters(candidates);
     let specific_label = selected_broadcaster_label(choice, &sorted);
-    let list = div()
+    let random_selected = matches!(choice, BroadcasterChoice::Random);
+    let specific_selected = matches!(choice, BroadcasterChoice::Specific { .. });
+    let selector_disabled = generating || sorted.is_empty();
+    let random_button = app_button(
+        delivery_element_id(key, kind, "random"),
+        "Random broadcaster",
+    )
+    .flex_1()
+    .min_w(px(0.0))
+    .selected(random_selected)
+    .disabled(selector_disabled);
+    let random_button = if random_selected {
+        random_button.primary()
+    } else {
+        random_button
+    };
+    let specific_button = app_button(
+        delivery_element_id(key, kind, "choose-specific"),
+        specific_label,
+    )
+    .flex_1()
+    .min_w(px(0.0))
+    .selected(specific_selected)
+    .disabled(selector_disabled);
+    let specific_button = if specific_selected {
+        specific_button.primary()
+    } else {
+        specific_button
+    };
+
+    let settings = div()
         .flex()
         .flex_col()
         .gap_2()
         .p(px(10.0))
         .rounded_md()
-        .bg(rgb(theme::SURFACE_ELEVATED))
-        .border_1()
-        .border_color(rgb(theme::BORDER))
-        .child(app_muted_text(format!(
-            "Eligible broadcasters: {}",
-            sorted.len()
-        )))
-        .child(
-            app_button(
-                delivery_element_id(key, kind, "random"),
-                "Random broadcaster",
-            )
-            .xsmall()
-            .outline()
-            .p(px(12.0))
-            .when(matches!(choice, BroadcasterChoice::Random), |button| {
-                button.primary()
-            })
-            .disabled(generating || sorted.is_empty())
-            .on_click(move |_event, _window, cx| {
-                random_root.update(cx, |root, cx| match kind {
-                    DeliveryFormKind::Send => {
-                        root.set_send_broadcaster_choice(key, BroadcasterChoice::Random, cx);
-                    }
-                    DeliveryFormKind::Unshield => {
-                        root.set_unshield_broadcaster_choice(key, BroadcasterChoice::Random, cx);
-                    }
-                });
-            }),
-        )
-        .child(
-            app_button(
-                delivery_element_id(key, kind, "choose-specific"),
-                specific_label,
-            )
-            .xsmall()
-            .outline()
-            .p(px(12.0))
-            .when(
-                matches!(choice, BroadcasterChoice::Specific { .. }),
-                ButtonVariants::primary,
-            )
-            .disabled(generating || sorted.is_empty())
-            .on_click(move |_event, window, cx| {
-                modal_root.update(cx, |root, cx| {
-                    root.open_broadcaster_picker(kind, key, window, cx);
-                });
-            }),
-        );
-
-    if sorted.is_empty() {
-        return list.child(app_muted_text(
-            "No eligible broadcaster currently advertises this token.",
-        ));
-    }
-    list
-}
-
-fn render_allow_suspicious_broadcasters_toggle(
-    root: Entity<WalletRoot>,
-    key: UnshieldAssetKey,
-    kind: DeliveryFormKind,
-    allow_suspicious_broadcasters: bool,
-    generating: bool,
-) -> gpui::Div {
-    div()
-        .flex()
-        .items_center()
-        .justify_between()
-        .gap_3()
-        .p(px(10.0))
-        .rounded_md()
-        .bg(rgb(theme::SURFACE_ELEVATED))
         .border_1()
         .border_color(rgb(theme::BORDER))
         .child(
             div()
                 .flex()
-                .flex_col()
-                .gap_1()
-                .child(app_muted_text("Broadcaster fee policy"))
-                .child(cost_estimate_detail_text(
-                    "Suspicious broadcasters advertise fees outside the anchor range.",
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(app_muted_text("Allow suspicious broadcasters"))
+                        .child(cost_estimate_detail_text(
+                            "Suspicious broadcasters advertise fees outside the anchor range.",
+                        ))
+                        .when(!generating, |this| {
+                            this.on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                                cx.stop_propagation();
+                                policy_label_root.update(cx, |root, cx| {
+                                    root.set_allow_suspicious_broadcasters(
+                                        kind,
+                                        key,
+                                        !allow_suspicious_broadcasters,
+                                        cx,
+                                    );
+                                });
+                            })
+                        }),
+                )
+                .child(render_danger_switch(
+                    delivery_element_id(key, kind, "allow-suspicious-broadcasters"),
+                    allow_suspicious_broadcasters,
+                    generating,
+                    move |checked, _window, cx| {
+                        policy_switch_root.update(cx, |root, cx| {
+                            root.set_allow_suspicious_broadcasters(kind, key, checked, cx);
+                        });
+                    },
                 )),
         )
+        .child(render_fee_token_selector(
+            fee_token_root,
+            key,
+            kind,
+            fee_token_options,
+            selected_fee_token,
+            generating,
+        ))
         .child(
-            Checkbox::new(delivery_element_id(
-                key,
-                kind,
-                "allow-suspicious-broadcasters",
-            ))
-            .label("Allow suspicious broadcasters")
-            .checked(allow_suspicious_broadcasters)
-            .xsmall()
-            .disabled(generating)
-            .on_click(move |checked, _window, cx| {
-                let checked = *checked;
-                root.update(cx, |root, cx| {
-                    root.set_allow_suspicious_broadcasters(kind, key, checked, cx);
-                });
-            }),
+            ButtonGroup::new(delivery_element_id(key, kind, "broadcaster-choice-toggle"))
+                .w_full()
+                .disabled(selector_disabled)
+                .child(random_button)
+                .child(specific_button)
+                .on_click(move |selected, window, cx| {
+                    let Some(index) = selected.first() else {
+                        return;
+                    };
+                    if *index == 0 {
+                        random_root.update(cx, |root, cx| match kind {
+                            DeliveryFormKind::Send => {
+                                root.set_send_broadcaster_choice(
+                                    key,
+                                    BroadcasterChoice::Random,
+                                    cx,
+                                );
+                            }
+                            DeliveryFormKind::Unshield => {
+                                root.set_unshield_broadcaster_choice(
+                                    key,
+                                    BroadcasterChoice::Random,
+                                    cx,
+                                );
+                            }
+                        });
+                    } else {
+                        modal_root.update(cx, |root, cx| {
+                            root.open_broadcaster_picker(kind, key, window, cx);
+                        });
+                    }
+                }),
+        )
+        .when(
+            should_show_broadcaster_fee_mode_toggle(action_token, selected_fee_token),
+            |settings| {
+                settings.child(render_broadcaster_fee_mode_toggle(
+                    fee_mode_root,
+                    key,
+                    kind,
+                    broadcaster_fee_mode,
+                    generating,
+                ))
+            },
+        );
+
+    if sorted.is_empty() {
+        return settings.child(app_muted_text(
+            "No eligible broadcaster currently advertises this token.",
+        ));
+    }
+    settings
+}
+
+fn render_danger_switch(
+    id: SharedString,
+    checked: bool,
+    disabled: bool,
+    on_toggle: impl Fn(bool, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let track_width = px(36.0);
+    let track_height = px(20.0);
+    let thumb_size = px(16.0);
+    let inset = px(2.0);
+    let max_x = track_width - thumb_size - inset * 2.0;
+    let thumb_x = if checked { max_x } else { px(0.0) };
+    let track_color = if checked {
+        theme::DANGER
+    } else {
+        theme::SURFACE_HOVER
+    };
+    let thumb_color = if checked {
+        theme::SURFACE
+    } else {
+        theme::TEXT_MUTED
+    };
+
+    div()
+        .id(id)
+        .w(track_width)
+        .h(track_height)
+        .flex()
+        .items_center()
+        .p(inset)
+        .rounded_full()
+        .bg(rgb(track_color))
+        .opacity(if disabled { 0.5 } else { 1.0 })
+        .when(!disabled, |this| {
+            this.on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                cx.stop_propagation();
+                on_toggle(!checked, window, cx);
+            })
+        })
+        .child(
+            div()
+                .size(thumb_size)
+                .rounded_full()
+                .bg(rgb(thumb_color))
+                .left(thumb_x)
+                .with_animation(
+                    ElementId::NamedInteger("danger-switch-thumb".into(), u64::from(checked)),
+                    Animation::new(Duration::from_secs_f64(0.15)),
+                    move |this, delta| {
+                        let x = if checked {
+                            max_x * delta
+                        } else {
+                            max_x - max_x * delta
+                        };
+                        this.left(x)
+                    },
+                ),
         )
 }
 
@@ -7588,6 +8423,160 @@ const fn native_wrapped_output_labels(chain_id: u64) -> Option<(&'static str, &'
     }
 }
 
+fn render_fee_token_selector(
+    root: Entity<WalletRoot>,
+    key: UnshieldAssetKey,
+    kind: DeliveryFormKind,
+    options: &[PublicBroadcasterFeeTokenOption],
+    selected_fee_token: Address,
+    generating: bool,
+) -> gpui::Div {
+    let selected_option = options
+        .iter()
+        .find(|option| option.token == selected_fee_token)
+        .cloned();
+    let options = options.to_vec();
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .child(
+            div()
+                .min_w(px(0.0))
+                .child(app_muted_text("Broadcaster fee token")),
+        )
+        .child(
+            Popover::new(delivery_element_id(key, kind, "fee-token-selector"))
+                .trigger(
+                    Button::new(delivery_element_id(key, kind, "fee-token-selector-trigger"))
+                        .outline()
+                        .child(fee_token_selector_trigger_row(
+                            selected_option.as_ref(),
+                            selected_fee_token,
+                        ))
+                        .dropdown_caret(true)
+                        .disabled(generating || options.is_empty()),
+                )
+                .content(move |_state, window, cx| {
+                    let popover = cx.entity();
+                    render_fee_token_selector_menu(
+                        &root,
+                        &popover,
+                        key,
+                        kind,
+                        &options,
+                        selected_fee_token,
+                        window,
+                    )
+                }),
+        )
+}
+
+fn render_fee_token_selector_menu(
+    root: &Entity<WalletRoot>,
+    popover: &Entity<gpui_component::popover::PopoverState>,
+    key: UnshieldAssetKey,
+    kind: DeliveryFormKind,
+    options: &[PublicBroadcasterFeeTokenOption],
+    selected_fee_token: Address,
+    _window: &mut Window,
+) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .w(px(260.0))
+        .children(options.iter().map(|option| {
+            let selector_root = root.clone();
+            let popover = popover.clone();
+            let token = option.token;
+            let selected = token == selected_fee_token;
+            let disabled = option.eligible_broadcaster_count == 0;
+            div()
+                .id(fee_token_element_id(key, kind, token))
+                .w_full()
+                .p(px(8.0))
+                .rounded_sm()
+                .text_color(rgb(if selected {
+                    theme::PRIMARY_FOREGROUND
+                } else {
+                    theme::TEXT
+                }))
+                .opacity(if disabled { 0.5 } else { 1.0 })
+                .when(selected, |this| this.bg(rgb(theme::PRIMARY)))
+                .when(!disabled && !selected, |this| {
+                    this.cursor_pointer()
+                        .hover(|this| this.bg(rgb(theme::SURFACE_HOVER)))
+                })
+                .when(!disabled, |this| {
+                    this.on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                        cx.stop_propagation();
+                        popover.update(cx, |state, cx| state.dismiss(window, cx));
+                        selector_root.update(cx, |root, cx| match kind {
+                            DeliveryFormKind::Send => root.set_send_fee_token(key, token, cx),
+                            DeliveryFormKind::Unshield => {
+                                root.set_unshield_fee_token(key, token, cx);
+                            }
+                        });
+                    })
+                })
+                .child(fee_token_option_label_row(option, px(18.0)))
+        }))
+}
+
+fn fee_token_element_id(
+    key: UnshieldAssetKey,
+    kind: DeliveryFormKind,
+    token: Address,
+) -> SharedString {
+    let action = format!("fee-token-{}", token.to_checksum(None));
+    delivery_element_id(key, kind, &action)
+}
+
+fn fee_token_option_button_label(option: &PublicBroadcasterFeeTokenOption) -> String {
+    format!(
+        "{} · {}",
+        option.label,
+        broadcaster_count_label(option.eligible_broadcaster_count)
+    )
+}
+
+fn fee_token_selector_trigger_row(
+    option: Option<&PublicBroadcasterFeeTokenOption>,
+    selected_fee_token: Address,
+) -> gpui::Div {
+    option.map_or_else(
+        || {
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(SharedString::from(short_address(&selected_fee_token)))
+        },
+        |option| fee_token_option_label_row(option, px(16.0)),
+    )
+}
+
+fn fee_token_option_label_row(
+    option: &PublicBroadcasterFeeTokenOption,
+    icon_size: Pixels,
+) -> gpui::Div {
+    token_label_row(
+        SharedString::from(fee_token_option_button_label(option)),
+        option.icon_path.clone(),
+        icon_size,
+    )
+}
+
+fn broadcaster_count_label(count: usize) -> String {
+    match count {
+        0 => "no broadcasters".to_string(),
+        1 => "1 broadcaster".to_string(),
+        count => format!("{count} broadcasters"),
+    }
+}
+
 fn render_broadcaster_fee_mode_toggle(
     root: Entity<WalletRoot>,
     key: UnshieldAssetKey,
@@ -7596,53 +8585,81 @@ fn render_broadcaster_fee_mode_toggle(
     generating: bool,
 ) -> gpui::Div {
     let selector_root = root;
-    let helper = match mode {
-        PublicBroadcasterFeeMode::DeductFromAmount => {
-            "Recipient receives the entered amount minus the broadcaster fee."
-        }
-        PublicBroadcasterFeeMode::AddToAmount => {
-            "Recipient receives the full entered amount; broadcaster fee is added to spend."
-        }
-    };
     div()
         .flex()
-        .flex_col()
-        .gap_1()
-        .child(app_muted_text("Broadcaster fee"))
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .child(div().min_w(px(0.0)).child(app_muted_text("Broadcaster fee")))
         .child(
-            ButtonGroup::new(delivery_element_id(key, kind, "fee-mode-toggle"))
-                .w_full()
-                .disabled(generating)
-                .child(private_action_segment_button(
-                    delivery_element_id(key, kind, "fee-mode-deduct"),
-                    "Deduct fee from amount",
-                    mode == PublicBroadcasterFeeMode::DeductFromAmount,
-                ))
-                .child(private_action_segment_button(
-                    delivery_element_id(key, kind, "fee-mode-add"),
-                    "Add fee on top",
-                    mode == PublicBroadcasterFeeMode::AddToAmount,
-                ))
-                .on_click(move |selected, window, cx| {
-                    let Some(index) = selected.first() else {
-                        return;
-                    };
-                    let mode = if *index == 0 {
-                        PublicBroadcasterFeeMode::DeductFromAmount
-                    } else {
-                        PublicBroadcasterFeeMode::AddToAmount
-                    };
-                    selector_root.update(cx, |root, cx| match kind {
-                        DeliveryFormKind::Send => {
-                            root.set_send_broadcaster_fee_mode(key, mode, window, cx);
-                        }
-                        DeliveryFormKind::Unshield => {
-                            root.set_unshield_broadcaster_fee_mode(key, mode, window, cx);
-                        }
-                    });
-                }),
+            div().flex_none().child(
+                ButtonGroup::new(delivery_element_id(key, kind, "fee-mode-toggle"))
+                    .outline()
+                    .compact()
+                    .disabled(generating)
+                    .child(fee_mode_segment_button(
+                        delivery_element_id(key, kind, "fee-mode-deduct"),
+                        delivery_element_id(key, kind, "fee-mode-deduct-info"),
+                        "Deduct fee from amount",
+                        "Recipient receives the entered amount minus the broadcaster fee.",
+                        mode == PublicBroadcasterFeeMode::DeductFromAmount,
+                    ))
+                    .child(fee_mode_segment_button(
+                        delivery_element_id(key, kind, "fee-mode-add"),
+                        delivery_element_id(key, kind, "fee-mode-add-info"),
+                        "Add fee on top",
+                        "Recipient receives the full entered amount; broadcaster fee is added to spend.",
+                        mode == PublicBroadcasterFeeMode::AddToAmount,
+                    ))
+                    .on_click(move |selected, window, cx| {
+                        let Some(index) = selected.first() else {
+                            return;
+                        };
+                        let mode = if *index == 0 {
+                            PublicBroadcasterFeeMode::DeductFromAmount
+                        } else {
+                            PublicBroadcasterFeeMode::AddToAmount
+                        };
+                        selector_root.update(cx, |root, cx| match kind {
+                            DeliveryFormKind::Send => {
+                                root.set_send_broadcaster_fee_mode(key, mode, window, cx);
+                            }
+                            DeliveryFormKind::Unshield => {
+                                root.set_unshield_broadcaster_fee_mode(key, mode, window, cx);
+                            }
+                        });
+                    }),
+            ),
         )
-        .child(app_muted_text(helper))
+}
+
+fn fee_mode_segment_button(
+    id: SharedString,
+    info_id: SharedString,
+    label: &'static str,
+    tooltip: &'static str,
+    selected: bool,
+) -> Button {
+    Button::new(id).selected(selected).child(
+        div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .text_size(APP_TEXT_SIZE)
+            .child(label)
+            .child(render_fee_mode_info_icon(info_id, tooltip)),
+    )
+}
+
+fn render_fee_mode_info_icon(id: SharedString, tooltip: &'static str) -> Button {
+    Button::new(id)
+        .text()
+        .xsmall()
+        .compact()
+        .icon(IconName::Info)
+        .text_color(rgb(theme::TEXT_MUTED))
+        .tooltip(tooltip)
 }
 
 fn private_action_segment_button(id: SharedString, label: &'static str, selected: bool) -> Button {
@@ -7679,10 +8696,305 @@ fn render_send_result(key: UnshieldAssetKey, result: &PreparedSendCall) -> gpui:
         ))
 }
 
+struct PublicBroadcasterCostDisplay<'a> {
+    broadcaster: &'a PublicBroadcasterCandidate,
+    chain_id: u64,
+    action_token: Address,
+    fee_token: Address,
+    entered_amount: U256,
+    receiver_amount: U256,
+    recipient_amount: U256,
+    total_private_spend: U256,
+    fee_amount: U256,
+    protocol_fee_amount: U256,
+    protocol_fee_bps: U256,
+    fee_mode: PublicBroadcasterFeeMode,
+    gas_limit: u64,
+    min_gas_price: u128,
+    fee_anchor_rate: Option<U256>,
+}
+
+impl<'a> PublicBroadcasterCostDisplay<'a> {
+    const fn from_result(
+        result: &'a PublicBroadcasterSubmissionResult,
+        fee_anchor_rate: Option<U256>,
+    ) -> Self {
+        Self {
+            broadcaster: &result.broadcaster,
+            chain_id: result.broadcaster.chain_id,
+            action_token: result.action_token,
+            fee_token: result.fee_token,
+            entered_amount: result.entered_amount,
+            receiver_amount: result.receiver_amount,
+            recipient_amount: result.recipient_amount,
+            total_private_spend: result.total_private_spend,
+            fee_amount: result.fee_amount,
+            protocol_fee_amount: result.protocol_fee_amount,
+            protocol_fee_bps: result.protocol_fee_bps,
+            fee_mode: result.fee_mode,
+            gas_limit: result.gas_limit,
+            min_gas_price: result.min_gas_price,
+            fee_anchor_rate,
+        }
+    }
+
+    const fn from_estimate(
+        asset: &UnshieldAsset,
+        estimate: &'a PublicBroadcasterCostEstimate,
+        fee_anchor_rate: Option<U256>,
+    ) -> Self {
+        Self {
+            broadcaster: &estimate.broadcaster,
+            chain_id: asset.chain_id,
+            action_token: estimate.action_token,
+            fee_token: estimate.fee_token,
+            entered_amount: estimate.entered_amount,
+            receiver_amount: estimate.receiver_amount,
+            recipient_amount: estimate.recipient_amount,
+            total_private_spend: estimate.total_private_spend,
+            fee_amount: estimate.fee_amount,
+            protocol_fee_amount: estimate.protocol_fee_amount,
+            protocol_fee_bps: estimate.protocol_fee_bps,
+            fee_mode: estimate.fee_mode,
+            gas_limit: estimate.gas_limit,
+            min_gas_price: estimate.min_gas_price,
+            fee_anchor_rate,
+        }
+    }
+
+    fn private_spend_label(&self) -> &'static str {
+        if self.action_token == self.fee_token {
+            "Total private spend"
+        } else {
+            "Action-token private spend"
+        }
+    }
+
+    fn action_amount(&self, amount: U256) -> String {
+        format_exact_token_amount_for_display(self.chain_id, self.action_token, amount)
+    }
+
+    fn fee_amount(&self) -> String {
+        format_exact_token_amount_for_display(self.chain_id, self.fee_token, self.fee_amount)
+    }
+
+    fn fee_breakdown(&self) -> PublicBroadcasterFeeBreakdown {
+        public_broadcaster_fee_breakdown(
+            self.fee_amount,
+            self.gas_limit,
+            self.min_gas_price,
+            self.fee_token_anchor_rate(),
+        )
+    }
+
+    fn fee_token_anchor_rate(&self) -> Option<U256> {
+        self.fee_anchor_rate
+            .or_else(|| broadcaster_candidate_anchor_rate(self.broadcaster))
+            .or_else(|| fixed_token_anchor_rate(self.chain_id, self.fee_token))
+    }
+
+    fn native_gas_cost_value(&self, breakdown: &PublicBroadcasterFeeBreakdown) -> String {
+        format_native_token_amount_for_display(self.chain_id, breakdown.native_gas_cost)
+    }
+
+    fn broadcaster_fee_value(&self, breakdown: &PublicBroadcasterFeeBreakdown) -> String {
+        breakdown.broadcaster_fee.map_or_else(
+            || "unavailable (no anchor)".to_string(),
+            |margin| format_public_broadcaster_fee_margin(self.chain_id, self.fee_token, margin),
+        )
+    }
+
+    fn protocol_fee_value(&self) -> String {
+        format!(
+            "{} ({} bps)",
+            self.action_amount(self.protocol_fee_amount),
+            self.protocol_fee_bps
+        )
+    }
+
+    fn gas_value(&self) -> String {
+        format!(
+            "~{} gas @ {} gwei",
+            self.gas_limit,
+            format_gwei(public_broadcaster_service_gas_price(self.min_gas_price))
+        )
+    }
+
+    fn fee_mode_summary(&self) -> String {
+        public_broadcaster_fee_mode_summary(
+            self.chain_id,
+            self.action_token,
+            self.fee_token,
+            self.fee_mode,
+            self.entered_amount,
+            self.receiver_amount,
+            self.protocol_fee_amount,
+            self.fee_amount,
+            self.broadcaster,
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PrivateSpendRowMode {
+    Always,
+    WhenDistinct,
+}
+
+struct PublicBroadcasterCostRowsOptions {
+    show_broadcaster: bool,
+    show_entered_amount: bool,
+    private_spend: PrivateSpendRowMode,
+}
+
+fn append_public_broadcaster_cost_rows(
+    mut card: gpui::Div,
+    root: Entity<WalletRoot>,
+    key: UnshieldAssetKey,
+    kind: DeliveryFormKind,
+    display: &PublicBroadcasterCostDisplay<'_>,
+    options: &PublicBroadcasterCostRowsOptions,
+    transaction_fee_breakdown_open: bool,
+) -> gpui::Div {
+    if options.show_broadcaster {
+        card = card.child(cost_estimate_row(
+            "Broadcaster",
+            broadcaster_candidate_label(display.broadcaster),
+        ));
+    }
+    if options.show_entered_amount {
+        card = card.child(cost_estimate_row(
+            "Entered amount",
+            display.action_amount(display.entered_amount),
+        ));
+    }
+    card = card
+        .child(cost_estimate_row(
+            "Recipient receives",
+            display.action_amount(display.recipient_amount),
+        ))
+        .when(
+            matches!(options.private_spend, PrivateSpendRowMode::Always)
+                || should_show_distinct_amount(display.entered_amount, display.total_private_spend),
+            |card| {
+                card.child(cost_estimate_row(
+                    display.private_spend_label(),
+                    display.action_amount(display.total_private_spend),
+                ))
+            },
+        )
+        .when(!display.protocol_fee_bps.is_zero(), |card| {
+            card.child(cost_estimate_row(
+                "RAILGUN protocol fee",
+                display.protocol_fee_value(),
+            ))
+        })
+        .child(render_transaction_fee_breakdown(
+            root,
+            key,
+            kind,
+            display,
+            transaction_fee_breakdown_open,
+        ));
+    card
+}
+
+fn render_transaction_fee_breakdown(
+    root: Entity<WalletRoot>,
+    key: UnshieldAssetKey,
+    kind: DeliveryFormKind,
+    display: &PublicBroadcasterCostDisplay<'_>,
+    open: bool,
+) -> impl IntoElement {
+    let breakdown = display.fee_breakdown();
+    let fee_amount = display.fee_amount();
+    Collapsible::new()
+        .open(open)
+        .w_full()
+        .rounded_md()
+        .overflow_hidden()
+        // .border_1()
+        // .border_color(rgb(theme::BORDER))
+        // .bg(rgb(theme::SURFACE))
+        .child(
+            div()
+                .id(delivery_element_id(key, kind, "transaction-fee-breakdown"))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                // .px(px(10.0))
+                .py(px(5.0))
+                .cursor_pointer()
+                // .hover(|this| this.bg(rgb(theme::SURFACE_HOVER)))
+                .on_click(move |_event, _window, cx| {
+                    cx.stop_propagation();
+                    root.update(cx, |root, cx| {
+                        root.set_transaction_fee_breakdown_open(kind, key, !open, cx);
+                    });
+                })
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_color(rgb(theme::TEXT))
+                        .child("Transaction fee"),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_end()
+                        .gap_2()
+                        .text_color(rgb(theme::TEXT))
+                        .child(fee_amount)
+                        .child(
+                            Icon::new(if open {
+                                IconName::ChevronUp
+                            } else {
+                                IconName::ChevronDown
+                            })
+                            .xsmall()
+                            .text_color(rgb(theme::TEXT_MUTED)),
+                        ),
+                ),
+        )
+        .content(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .px(px(10.0))
+                .py(px(8.0))
+                .border_t_1()
+                .border_color(rgb(theme::BORDER))
+                .child(transaction_fee_breakdown_row(
+                    "Gas cost",
+                    display.native_gas_cost_value(&breakdown),
+                ))
+                .child(transaction_fee_breakdown_row(
+                    "Broadcaster's fee",
+                    display.broadcaster_fee_value(&breakdown),
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .child(network_gas_breakdown_text("Network gas"))
+                        .child(network_gas_breakdown_text(display.gas_value())),
+                ),
+        )
+}
+
 fn render_public_broadcaster_result(
+    root: Entity<WalletRoot>,
     key: UnshieldAssetKey,
     kind: DeliveryFormKind,
     result: &PublicBroadcasterSubmissionResult,
+    fee_anchor_rate: Option<U256>,
+    transaction_fee_breakdown_open: bool,
 ) -> gpui::Div {
     let (title, detail, border, tx_hash) = match &result.result {
         PublicBroadcasterResultKind::Submitted { tx_hash } => (
@@ -7707,7 +9019,8 @@ fn render_public_broadcaster_result(
             None,
         ),
     };
-    let mut card = div()
+    let display = PublicBroadcasterCostDisplay::from_result(result, fee_anchor_rate);
+    let card = div()
         .flex()
         .flex_col()
         .gap_2()
@@ -7717,48 +9030,21 @@ fn render_public_broadcaster_result(
         .border_1()
         .border_color(rgb(border))
         .child(app_strong_text(title))
-        .child(app_muted_text(detail))
-        .child(cost_estimate_row(
-            "Entered amount",
-            format_exact_candidate_token_amount(&result.broadcaster, result.entered_amount),
-        ))
-        .child(cost_estimate_row(
-            "Recipient receives",
-            format_exact_candidate_token_amount(&result.broadcaster, result.recipient_amount),
-        ))
-        .child(cost_estimate_row(
-            "Total private spend",
-            format_exact_candidate_token_amount(&result.broadcaster, result.total_private_spend),
-        ))
-        .child(cost_estimate_row(
-            "Broadcaster fee",
-            format_exact_candidate_token_amount(&result.broadcaster, result.fee_amount),
-        ))
-        .when(!result.protocol_fee_bps.is_zero(), |card| {
-            card.child(cost_estimate_row(
-                "RAILGUN protocol fee",
-                format!(
-                    "{} ({} bps)",
-                    format_exact_candidate_token_amount(
-                        &result.broadcaster,
-                        result.protocol_fee_amount
-                    ),
-                    result.protocol_fee_bps
-                ),
-            ))
-        })
-        .child(app_muted_text(format!(
-            "Estimated gas: {} gas @ {} gwei",
-            result.gas_limit,
-            format_gwei(result.min_gas_price)
-        )))
-        .child(app_muted_text(public_broadcaster_fee_mode_summary(
-            result.fee_mode,
-            result.entered_amount,
-            result.receiver_amount,
-            result.protocol_fee_amount,
-            &result.broadcaster,
-        )));
+        .child(app_muted_text(detail));
+    let mut card = append_public_broadcaster_cost_rows(
+        card,
+        root,
+        key,
+        kind,
+        &display,
+        &PublicBroadcasterCostRowsOptions {
+            show_broadcaster: false,
+            show_entered_amount: true,
+            private_spend: PrivateSpendRowMode::Always,
+        },
+        transaction_fee_breakdown_open,
+    )
+    .child(app_muted_text(display.fee_mode_summary()));
     if let Some(tx_hash) = tx_hash {
         card = card.child(render_public_broadcaster_tx_hash_row(
             tx_hash,
@@ -7793,10 +9079,18 @@ fn render_public_broadcaster_tx_hash_row(tx_hash: String, button_id: SharedStrin
 }
 
 fn render_public_broadcaster_cost_estimate(
+    root: Entity<WalletRoot>,
+    key: UnshieldAssetKey,
+    kind: DeliveryFormKind,
     asset: &UnshieldAsset,
     estimate: &PublicBroadcasterCostEstimate,
+    fee_anchor_rate: Option<U256>,
+    transaction_fee_breakdown_open: bool,
+    refreshing: bool,
 ) -> gpui::Div {
-    div()
+    let refresh_root = root.clone();
+    let display = PublicBroadcasterCostDisplay::from_estimate(asset, estimate, fee_anchor_rate);
+    let card = div()
         .flex()
         .flex_col()
         .gap_2()
@@ -7805,74 +9099,91 @@ fn render_public_broadcaster_cost_estimate(
         .bg(rgb(theme::SURFACE_ELEVATED))
         .border_1()
         .border_color(rgb(theme::BORDER_STRONG))
-        .child(app_strong_text("Estimated public broadcaster cost"))
-        .child(cost_estimate_detail_text(
-            "Proof is not generated yet; the final fee may move slightly before publish.",
-        ))
-        .child(cost_estimate_row(
-            "Broadcaster",
-            broadcaster_candidate_label(&estimate.broadcaster),
-        ))
-        .child(cost_estimate_row(
-            "Recipient receives",
-            format_exact_asset_amount_for_display(estimate.recipient_amount, asset),
-        ))
-        .child(cost_estimate_row(
-            "Broadcaster fee",
-            format_exact_asset_amount_for_display(estimate.fee_amount, asset),
-        ))
-        .when(!estimate.protocol_fee_bps.is_zero(), |card| {
-            card.child(cost_estimate_row(
-                "RAILGUN protocol fee",
-                format!(
-                    "{} ({} bps)",
-                    format_exact_asset_amount_for_display(estimate.protocol_fee_amount, asset),
-                    estimate.protocol_fee_bps
-                ),
-            ))
+        .child(
+            div()
+                .flex()
+                .items_start()
+                .justify_between()
+                .gap_3()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(app_strong_text("Estimated outcome"))
+                        .child(cost_estimate_detail_text(
+                            "Proof is not generated yet; the final fee may move slightly before publish.",
+                        )),
+                )
+                .child(render_public_broadcaster_estimate_refresh_button(
+                    refresh_root,
+                    key,
+                    kind,
+                    refreshing,
+                )),
+        );
+    append_public_broadcaster_cost_rows(
+        card,
+        root,
+        key,
+        kind,
+        &display,
+        &PublicBroadcasterCostRowsOptions {
+            show_broadcaster: true,
+            show_entered_amount: false,
+            private_spend: PrivateSpendRowMode::WhenDistinct,
+        },
+        transaction_fee_breakdown_open,
+    )
+    .child(cost_estimate_detail_text(format!(
+        "Shape: {} proofs · {} inputs · {} private outputs · {} public outputs",
+        estimate.transaction_count,
+        estimate.input_count,
+        estimate.private_output_count,
+        estimate.public_output_count
+    )))
+    .child(cost_estimate_detail_text(display.fee_mode_summary()))
+}
+
+fn render_public_broadcaster_estimate_refresh_button(
+    root: Entity<WalletRoot>,
+    key: UnshieldAssetKey,
+    kind: DeliveryFormKind,
+    refreshing: bool,
+) -> impl IntoElement {
+    div()
+        .id(delivery_element_id(key, kind, "refresh-estimate"))
+        .size(px(18.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_sm()
+        .when(refreshing, |this| {
+            this.child(
+                Spinner::new()
+                    .icon(IconName::LoaderCircle)
+                    .color(rgb(theme::TEXT_MUTED).into())
+                    .with_size(px(13.0)),
+            )
         })
-        .when(
-            should_show_distinct_amount(estimate.entered_amount, estimate.total_private_spend),
-            |card| {
-                card.child(cost_estimate_row(
-                    "Total private spend",
-                    format_exact_asset_amount_for_display(estimate.total_private_spend, asset),
-                ))
-            },
-        )
-        .when(
-            should_show_distinct_amount(estimate.entered_amount, estimate.max_entered_amount),
-            |card| {
-                card.child(cost_estimate_row(
-                    "Max via broadcaster",
-                    format_exact_asset_amount_for_display(estimate.max_entered_amount, asset),
-                ))
-            },
-        )
-        .child(cost_estimate_detail_row(
-            "Network gas",
-            format!(
-                "{} gas @ {} gwei",
-                estimate.gas_limit,
-                format_gwei(estimate.min_gas_price)
-            ),
-        ))
-        .child(cost_estimate_detail_text(format!(
-            "Shape: {} proofs · {} inputs · {} private outputs · {} public outputs",
-            estimate.transaction_count,
-            estimate.input_count,
-            estimate.private_output_count,
-            estimate.public_output_count
-        )))
-        .child(cost_estimate_detail_text(
-            public_broadcaster_fee_mode_summary(
-                estimate.fee_mode,
-                estimate.entered_amount,
-                estimate.receiver_amount,
-                estimate.protocol_fee_amount,
-                &estimate.broadcaster,
-            ),
-        ))
+        .when(!refreshing, |this| {
+            this.cursor_pointer()
+                .hover(|this| this.bg(rgb(theme::SURFACE_HOVER)))
+                .tooltip(|window, cx| Tooltip::new("Refresh estimate").build(window, cx))
+                .on_click(move |_event, _window, cx| {
+                    cx.stop_propagation();
+                    root.update(cx, |root, cx| {
+                        root.schedule_public_broadcaster_cost_estimate(kind, key, cx);
+                    });
+                })
+                .child(
+                    img(icons::refresh_ccw_icon_path())
+                        .size(px(13.0))
+                        .flex_none(),
+                )
+        })
 }
 
 const fn public_broadcaster_cost_status(
@@ -7944,18 +9255,29 @@ fn cost_estimate_detail_text(text: impl Into<SharedString>) -> gpui::Div {
         .child(text.into())
 }
 
-fn cost_estimate_detail_value(text: impl Into<SharedString>) -> gpui::Div {
-    cost_estimate_detail_text(text).font_weight(gpui::FontWeight::SEMIBOLD)
+fn transaction_fee_breakdown_text(text: impl Into<SharedString>) -> gpui::Div {
+    div()
+        .text_color(rgb(theme::TEXT))
+        .text_size(COST_ESTIMATE_DETAIL_TEXT_SIZE)
+        .line_height(px(15.0))
+        .child(text.into())
+}
+fn network_gas_breakdown_text(text: impl Into<SharedString>) -> gpui::Div {
+    div()
+        .text_color(rgb(theme::TEXT_MUTED))
+        .text_size(COST_ESTIMATE_DETAIL_TEXT_SIZE)
+        .line_height(px(15.0))
+        .child(text.into())
 }
 
-fn cost_estimate_detail_row(label: &'static str, value: String) -> gpui::Div {
+fn transaction_fee_breakdown_row(label: &'static str, value: String) -> gpui::Div {
     div()
         .flex()
         .items_center()
         .justify_between()
         .gap_3()
-        .child(cost_estimate_detail_text(label))
-        .child(cost_estimate_detail_value(value))
+        .child(transaction_fee_breakdown_text(label))
+        .child(transaction_fee_breakdown_text(value))
 }
 
 fn render_unshield_result(key: UnshieldAssetKey, result: &PreparedUnshieldCall) -> gpui::Div {
@@ -8266,29 +9588,39 @@ const fn vault_error_kind(error: &VaultError) -> &'static str {
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
+    use std::time::{Duration, SystemTime};
 
     use alloy::primitives::{Address, U256};
     use alloy::uint;
+    use broadcaster_monitor::FeeRow;
     use gpui_component::select::SelectItem;
     use wallet_ops::{
-        ListUtxosOutput, SyncProgressStage, SyncProgressUpdate, TransactionGenerationStage,
-        UtxoOutput,
+        BroadcasterFeePolicy, ListUtxosOutput, PublicBroadcasterFeeMargin,
+        PublicBroadcasterFeeMode, SyncProgressStage, SyncProgressUpdate,
+        TransactionGenerationStage, UtxoOutput,
         vault::{WalletMetadataBundle, WalletSource, WalletStatus},
     };
 
     use super::{
-        Activity, ChainUtxoState, CostEstimateStatus, PrivateActionMetric, SECONDS_PER_DAY,
-        SECONDS_PER_HOUR, SECONDS_PER_MINUTE, SECONDS_PER_MONTH, SECONDS_PER_YEAR, UnshieldAsset,
-        UnshieldAssetKey, WalletSelectItem, WalletTab, adjusted_amount_for_max_change,
-        build_send_asset, build_unshield_asset, display_rows_from_output, format_compact_age,
-        format_exact_asset_amount_for_display, format_form_error_for_asset,
-        format_private_asset_rows, format_send_amount_input, format_total,
+        Activity, BroadcasterChoice, ChainUtxoState, CostEstimateStatus, PrivateActionMetric,
+        PublicBroadcasterFeeTokenOption, SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_MINUTE,
+        SECONDS_PER_MONTH, SECONDS_PER_YEAR, UnshieldAsset, UnshieldAssetKey, WalletSelectItem,
+        WalletTab, adjusted_amount_for_max_change, broadcaster_choice_supported_by_candidates,
+        build_send_asset, build_unshield_asset, display_rows_from_output,
+        effective_public_broadcaster_fee_mode, fee_token_option_has_eligible_broadcaster,
+        format_compact_age, format_exact_asset_amount_for_display, format_form_error_for_asset,
+        format_native_token_amount_for_display, format_private_asset_rows,
+        format_public_broadcaster_fee_margin, format_send_amount_input, format_total,
         format_unshield_amount_input, loading_summary, max_send_amount_from_snapshot,
-        max_unshield_amount_from_snapshot, native_wrapped_output_labels, parse_repair_cache_block,
-        private_action_metrics, progress_detail, public_broadcaster_cost_status,
-        public_broadcaster_cost_status_text, refresh_form_asset_from_snapshot,
-        repair_cache_help_text, send_asset_key_from_formatted, send_element_id,
-        send_key_matches_asset, should_focus_utxo_table, should_show_distinct_amount,
+        max_unshield_amount_from_snapshot, native_token_display_label,
+        native_wrapped_output_labels, parse_repair_cache_block, private_action_metrics,
+        progress_detail, public_broadcaster_candidates_for_asset, public_broadcaster_cost_status,
+        public_broadcaster_cost_status_text, public_broadcaster_fee_token_options_from_snapshot,
+        public_broadcaster_submit_disabled_for_fee_token_options, refresh_form_asset_from_snapshot,
+        repair_cache_help_text, resolve_selected_public_broadcaster_fee_token,
+        send_asset_key_from_formatted, send_element_id, send_key_matches_asset,
+        should_focus_utxo_table, should_preserve_estimate_after_broadcaster_policy_change,
+        should_show_broadcaster_fee_mode_toggle, should_show_distinct_amount,
         should_show_pending_poi_amount, unshield_asset_key_from_formatted, unshield_element_id,
         unshield_key_matches_asset, wallet_generation_matches, wallet_options_from_metadata,
     };
@@ -8364,6 +9696,28 @@ mod tests {
             is_spent: false,
             spent_tx_hash: None,
             spent_block_number: None,
+        }
+    }
+
+    fn fee_row(chain_id: u64, token: Address, fees_id: &str) -> FeeRow {
+        const RAILGUN_ADDRESS: &str = "0zk1qy4v02p5zkq0zfpaxhz79j5tslrv8c44d80d8jr2fuecrtxlp8lemrv7j6fe3z53ll0jm7u592n0hr8elesd0xzv6y9jpdvsyln80m95jcxhvnmagfqg5p6e9mp";
+
+        FeeRow {
+            chain_id,
+            railgun_address: Arc::from(RAILGUN_ADDRESS),
+            token_address: token,
+            fee: uint!(10_U256),
+            signature_valid: true,
+            fees_id: Arc::from(fees_id),
+            fee_expiration: SystemTime::now() + Duration::from_secs(60),
+            available_wallets: 1,
+            version: Arc::from("8.2.3"),
+            relay_adapt: Address::ZERO,
+            relay_adapt_7702: None,
+            required_poi_list_keys: Vec::new(),
+            identifier: Some(Arc::from(fees_id)),
+            last_seen: SystemTime::now(),
+            reliability: 0.9,
         }
     }
 
@@ -8560,11 +9914,43 @@ mod tests {
         let formatted = format_form_error_for_asset(
             "build public broadcaster send proof: public broadcaster max entered amount: 388585770",
             &asset,
+            asset.token,
         );
 
         assert_eq!(
             formatted,
             "Max POI-verified entered amount for public broadcaster: 388.58577 USDC. Try a smaller amount or switch fee mode."
+        );
+    }
+
+    #[test]
+    fn form_error_formats_fee_token_balance_in_selected_fee_token_units() {
+        let weth = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+            .parse::<Address>()
+            .expect("weth address");
+        let usdc = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+            .parse::<Address>()
+            .expect("usdc address");
+        let asset = UnshieldAsset {
+            chain_id: 1,
+            token: weth,
+            label: "WETH".to_string(),
+            decimals: Some(18),
+            total: U256::ZERO,
+            poi_verified_total: U256::ZERO,
+            max_batched: U256::ZERO,
+            icon_path: None,
+        };
+
+        let formatted = format_form_error_for_asset(
+            "build public broadcaster unshield proof: public broadcaster fee-token max spendable: 388585770",
+            &asset,
+            usdc,
+        );
+
+        assert_eq!(
+            formatted,
+            "Broadcaster fee exceeds available fee-token balance: 388.58577 USDC. Choose a fee token with more spendable balance or a lower-fee broadcaster."
         );
     }
 
@@ -8615,6 +10001,272 @@ mod tests {
             public_broadcaster_cost_status_text(CostEstimateStatus::Estimating).0,
             "Estimating public broadcaster cost..."
         );
+    }
+
+    #[test]
+    fn fee_token_options_use_poi_spendable_balances_and_broadcaster_counts() {
+        let token_a = Address::from([0x11; 20]);
+        let token_b = Address::from([0x22; 20]);
+        let token_c = Address::from([0x33; 20]);
+        let snapshot = ListUtxosOutput {
+            chain_id: 1,
+            cache_key: "cache".to_string(),
+            utxo_count: 2,
+            unspent_count: 2,
+            spent_count: 0,
+            utxos: vec![
+                unshield_utxo_output(token_a, 5, 0, 1),
+                unshield_utxo_output(token_b, 7, 0, 2),
+            ],
+            totals: vec![
+                wallet_ops::TokenTotal {
+                    token: token_a.to_checksum(None),
+                    total: "5".to_string(),
+                    poi_verified_total: "5".to_string(),
+                },
+                wallet_ops::TokenTotal {
+                    token: token_b.to_checksum(None),
+                    total: "7".to_string(),
+                    poi_verified_total: "7".to_string(),
+                },
+                wallet_ops::TokenTotal {
+                    token: token_c.to_checksum(None),
+                    total: "9".to_string(),
+                    poi_verified_total: "0".to_string(),
+                },
+            ],
+        };
+        let fee_rows = vec![fee_row(1, token_a, "token-a")];
+
+        let options = public_broadcaster_fee_token_options_from_snapshot(
+            &snapshot,
+            &fee_rows,
+            false,
+            BroadcasterFeePolicy::default(),
+            |_| None,
+        );
+
+        assert_eq!(options.len(), 2);
+        let option_a = options
+            .iter()
+            .find(|option| option.token == token_a)
+            .expect("token a option");
+        assert_eq!(option_a.max_spendable, uint!(5_U256));
+        assert_eq!(option_a.eligible_broadcaster_count, 1);
+        let option_b = options
+            .iter()
+            .find(|option| option.token == token_b)
+            .expect("token b option");
+        assert_eq!(option_b.max_spendable, uint!(7_U256));
+        assert_eq!(option_b.eligible_broadcaster_count, 0);
+        assert!(!options.iter().any(|option| option.token == token_c));
+    }
+
+    #[test]
+    fn fee_token_options_use_fee_only_transaction_spend_limit() {
+        let token = Address::from([0x34; 20]);
+        let snapshot = ListUtxosOutput {
+            chain_id: 1,
+            cache_key: "cache".to_string(),
+            utxo_count: 20,
+            unspent_count: 20,
+            spent_count: 0,
+            utxos: (0..20)
+                .map(|position| unshield_utxo_output(token, 1, 0, position))
+                .collect(),
+            totals: vec![wallet_ops::TokenTotal {
+                token: token.to_checksum(None),
+                total: "20".to_string(),
+                poi_verified_total: "20".to_string(),
+            }],
+        };
+        let fee_rows = vec![fee_row(1, token, "token")];
+
+        let options = public_broadcaster_fee_token_options_from_snapshot(
+            &snapshot,
+            &fee_rows,
+            false,
+            BroadcasterFeePolicy::default(),
+            |_| None,
+        );
+
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].max_spendable, uint!(13_U256));
+    }
+
+    #[test]
+    fn fee_token_options_include_known_token_icons() {
+        let token = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+            .parse::<Address>()
+            .expect("usdc address");
+        let snapshot = ListUtxosOutput {
+            chain_id: 1,
+            cache_key: "cache".to_string(),
+            utxo_count: 1,
+            unspent_count: 1,
+            spent_count: 0,
+            utxos: vec![unshield_utxo_output(token, 1, 0, 1)],
+            totals: vec![wallet_ops::TokenTotal {
+                token: token.to_checksum(None),
+                total: "1".to_string(),
+                poi_verified_total: "1".to_string(),
+            }],
+        };
+        let fee_rows = vec![fee_row(1, token, "usdc")];
+
+        let options = public_broadcaster_fee_token_options_from_snapshot(
+            &snapshot,
+            &fee_rows,
+            false,
+            BroadcasterFeePolicy::default(),
+            |_| None,
+        );
+
+        assert_eq!(options.len(), 1);
+        assert!(options[0].icon_path.is_some());
+    }
+
+    #[test]
+    fn fee_token_resolution_prefers_current_then_action_then_first_eligible() {
+        let action = Address::from([0x44; 20]);
+        let current = Address::from([0x45; 20]);
+        let fallback = Address::from([0x46; 20]);
+        let option = |token, count| PublicBroadcasterFeeTokenOption {
+            token,
+            label: format!("token-{count}"),
+            decimals: None,
+            max_spendable: U256::from(1),
+            eligible_broadcaster_count: count,
+            icon_path: None,
+        };
+
+        assert_eq!(
+            resolve_selected_public_broadcaster_fee_token(
+                current,
+                action,
+                &[option(current, 1), option(action, 1)],
+            ),
+            current
+        );
+        assert_eq!(
+            resolve_selected_public_broadcaster_fee_token(
+                current,
+                action,
+                &[option(current, 0), option(action, 1), option(fallback, 1)],
+            ),
+            action
+        );
+        assert_eq!(
+            resolve_selected_public_broadcaster_fee_token(
+                current,
+                action,
+                &[option(current, 0), option(action, 0), option(fallback, 1)],
+            ),
+            fallback
+        );
+    }
+
+    #[test]
+    fn fee_token_submit_state_requires_selected_token_broadcaster_count() {
+        let selected = Address::from([0x51; 20]);
+        let other = Address::from([0x52; 20]);
+        let options = vec![
+            PublicBroadcasterFeeTokenOption {
+                token: selected,
+                label: "selected".to_string(),
+                decimals: None,
+                max_spendable: U256::from(1),
+                eligible_broadcaster_count: 0,
+                icon_path: None,
+            },
+            PublicBroadcasterFeeTokenOption {
+                token: other,
+                label: "other".to_string(),
+                decimals: None,
+                max_spendable: U256::from(1),
+                eligible_broadcaster_count: 1,
+                icon_path: None,
+            },
+        ];
+
+        assert!(!fee_token_option_has_eligible_broadcaster(
+            &options, selected
+        ));
+        assert!(fee_token_option_has_eligible_broadcaster(&options, other));
+        assert!(public_broadcaster_submit_disabled_for_fee_token_options(
+            &options, selected
+        ));
+        assert!(!public_broadcaster_submit_disabled_for_fee_token_options(
+            &options, other
+        ));
+    }
+
+    #[test]
+    fn unsupported_specific_broadcaster_is_detected_for_fee_token_change() {
+        let token = Address::from([0x61; 20]);
+        let other = Address::from([0x62; 20]);
+        let policy = BroadcasterFeePolicy::default();
+        let row = fee_row(1, token, "supported");
+        let candidates =
+            public_broadcaster_candidates_for_asset(&[row], 1, token, false, policy, None)
+                .expect("candidates");
+        let choice = BroadcasterChoice::Specific {
+            railgun_address: candidates[0].railgun_address.clone(),
+        };
+        let unsupported =
+            public_broadcaster_candidates_for_asset(&[], 1, other, false, policy, None)
+                .expect("empty candidates");
+
+        assert!(broadcaster_choice_supported_by_candidates(
+            &choice,
+            &candidates,
+            policy
+        ));
+        assert!(!broadcaster_choice_supported_by_candidates(
+            &choice,
+            &unsupported,
+            policy
+        ));
+        assert!(should_preserve_estimate_after_broadcaster_policy_change(
+            &choice,
+            &candidates,
+            policy
+        ));
+        assert!(!should_preserve_estimate_after_broadcaster_policy_change(
+            &BroadcasterChoice::Random,
+            &candidates,
+            policy
+        ));
+        assert!(!should_preserve_estimate_after_broadcaster_policy_change(
+            &choice,
+            &unsupported,
+            policy
+        ));
+    }
+
+    #[test]
+    fn different_fee_token_forces_add_mode_and_hides_toggle() {
+        let action = Address::from([0x71; 20]);
+        let fee = Address::from([0x72; 20]);
+
+        assert_eq!(
+            effective_public_broadcaster_fee_mode(
+                action,
+                fee,
+                PublicBroadcasterFeeMode::DeductFromAmount,
+            ),
+            PublicBroadcasterFeeMode::AddToAmount
+        );
+        assert_eq!(
+            effective_public_broadcaster_fee_mode(
+                action,
+                action,
+                PublicBroadcasterFeeMode::DeductFromAmount,
+            ),
+            PublicBroadcasterFeeMode::DeductFromAmount
+        );
+        assert!(!should_show_broadcaster_fee_mode_toggle(action, fee));
+        assert!(should_show_broadcaster_fee_mode_toggle(action, action));
     }
 
     #[test]
@@ -8800,6 +10452,44 @@ mod tests {
         assert_eq!(native_wrapped_output_labels(137), Some(("MATIC", "WMATIC")));
         assert_eq!(native_wrapped_output_labels(42161), Some(("ETH", "WETH")));
         assert_eq!(native_wrapped_output_labels(999_999), None);
+    }
+
+    #[test]
+    fn native_gas_cost_display_uses_base_token_label() {
+        assert_eq!(native_token_display_label(1), "ETH");
+        assert_eq!(native_token_display_label(999_999), "base token");
+        assert_eq!(
+            format_native_token_amount_for_display(1, uint!(1_500_000_000_000_000_U256)),
+            "0.0015 ETH"
+        );
+    }
+
+    #[test]
+    fn public_broadcaster_fee_margin_display_is_signed_fee_token_amount() {
+        let usdc = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+            .parse::<Address>()
+            .expect("usdc address");
+
+        assert_eq!(
+            format_public_broadcaster_fee_margin(
+                1,
+                usdc,
+                PublicBroadcasterFeeMargin::Positive(uint!(123_456_U256))
+            ),
+            "0.123456 USDC"
+        );
+        assert_eq!(
+            format_public_broadcaster_fee_margin(
+                1,
+                usdc,
+                PublicBroadcasterFeeMargin::Negative(uint!(42_U256))
+            ),
+            "-0.000042 USDC"
+        );
+        assert_eq!(
+            format_public_broadcaster_fee_margin(1, usdc, PublicBroadcasterFeeMargin::Zero),
+            "0 USDC"
+        );
     }
 
     #[test]

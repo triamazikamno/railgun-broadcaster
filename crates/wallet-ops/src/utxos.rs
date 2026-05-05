@@ -77,6 +77,12 @@ pub fn max_send_amount_from_outputs(utxos: &[UtxoOutput], token: Address) -> U25
     max_send_spendable(&planner_utxos, token)
 }
 
+#[must_use]
+pub fn max_broadcaster_fee_token_amount_from_outputs(utxos: &[UtxoOutput], token: Address) -> U256 {
+    let planner_utxos = planner_utxos_from_outputs(utxos, token);
+    max_broadcaster_fee_token_spendable(&planner_utxos, token)
+}
+
 fn planner_utxos_from_outputs(utxos: &[UtxoOutput], token: Address) -> Vec<Utxo> {
     utxos
         .iter()

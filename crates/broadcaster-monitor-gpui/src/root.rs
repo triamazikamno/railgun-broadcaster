@@ -63,14 +63,7 @@ pub fn open_monitor_window(
 
     if let Err(error) = app.open_window(options, |window, cx| {
         let pane = cx.new(|cx| {
-            BroadcasterMonitorPane::new(
-                shared,
-                event_rx,
-                &chain_ids,
-                fee_anchor_lookup.clone(),
-                window,
-                cx,
-            )
+            BroadcasterMonitorPane::new(shared, event_rx, &chain_ids, fee_anchor_lookup, window, cx)
         });
         let logs = cx.new(|cx| LogsPane::new(logs, window, cx));
         let root = cx.new(|cx| StandaloneMonitorRoot::new(pane, logs, cx));
