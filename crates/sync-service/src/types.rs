@@ -238,6 +238,21 @@ pub trait WalletCacheStore: Send + Sync {
         wallet_id: &str,
         last_scanned_block: u64,
     ) -> Result<(), WalletCacheError>;
+
+    fn replace_wallet_cache(
+        &self,
+        wallet_id: &str,
+        utxos: &[WalletUtxo],
+        last_scanned_block: u64,
+        last_scanned_block_hash: Option<[u8; 32]>,
+    ) -> Result<(), WalletCacheError> {
+        self.store_wallet_utxos(
+            wallet_id,
+            utxos,
+            Some(last_scanned_block),
+            last_scanned_block_hash,
+        )
+    }
 }
 
 impl WalletCacheStore for DbStore {

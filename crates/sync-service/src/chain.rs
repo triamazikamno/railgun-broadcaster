@@ -156,6 +156,10 @@ impl ChainError {
             _ => false,
         }
     }
+
+    pub(crate) const fn should_mark_rpc_unhealthy(&self) -> bool {
+        !matches!(self, Self::ArchiveRpcRequired(_) | Self::NoHealthyRpc)
+    }
 }
 
 #[derive(Debug)]
@@ -814,7 +818,9 @@ impl ChainService {
         {
             Ok(logs) => logs,
             Err(err) => {
-                self.chain.rpcs.mark_bad_provider(&rpc);
+                if err.should_mark_rpc_unhealthy() {
+                    self.chain.rpcs.mark_bad_provider(&rpc);
+                }
                 return Err(err.into());
             }
         };
@@ -840,7 +846,9 @@ impl ChainService {
         {
             Ok(block_timestamps) => block_timestamps,
             Err(err) => {
-                self.chain.rpcs.mark_bad_provider(&rpc);
+                if err.should_mark_rpc_unhealthy() {
+                    self.chain.rpcs.mark_bad_provider(&rpc);
+                }
                 return Err(err.into());
             }
         };
@@ -1463,6 +1471,10 @@ fn wallet_backfill_from_block(last_scanned: u64, start_block: u64) -> u64 {
     last_scanned.saturating_add(1).max(start_block)
 }
 
+fn wallet_reorg_backfill_from_block(reset_from_block: u64, start_block: u64) -> u64 {
+    reset_from_block.max(start_block)
+}
+
 fn wallet_sync_target(safe_head: u64, sync_to_block: Option<u64>) -> u64 {
     match sync_to_block {
         Some(sync_to_block) if safe_head == 0 => sync_to_block,
@@ -1910,7 +1922,9 @@ fn spawn_live_log_loop(
                                 Ok(block_timestamps) => block_timestamps,
                                 Err(err) => {
                                     warn!(?err, "failed to fetch log block timestamps");
-                                    rpcs.mark_bad_provider(&rpc);
+                                    if err.should_mark_rpc_unhealthy() {
+                                        rpcs.mark_bad_provider(&rpc);
+                                    }
                                     continue;
                                 }
                             }
@@ -1968,7 +1982,9 @@ fn spawn_live_log_loop(
                                 "failed to fetch logs, retrying..."
                             );
                         }
-                        rpcs.mark_bad_provider(&rpc);
+                        if err.should_mark_rpc_unhealthy() {
+                            rpcs.mark_bad_provider(&rpc);
+                        }
                     }
                 }
             }
@@ -2096,7 +2112,11 @@ fn spawn_backfill_loop(
                         Ok(block_timestamps) => block_timestamps,
                         Err(err) => {
                             warn!(?err, "failed to fetch backfill log block timestamps");
-                            rpcs.mark_bad_provider(&rpc);
+                            if err.should_mark_rpc_unhealthy() {
+                                rpcs.mark_bad_provider(&rpc);
+                            } else {
+                                tokio::time::sleep(service.chain.poll_interval).await;
+                            }
                             continue;
                         }
                     };
@@ -2171,7 +2191,11 @@ fn spawn_backfill_loop(
                         rpc = rpc.url.as_str(),
                         "failed to fetch backfill logs"
                     );
-                    rpcs.mark_bad_provider(&rpc);
+                    if err.should_mark_rpc_unhealthy() {
+                        rpcs.mark_bad_provider(&rpc);
+                    } else {
+                        tokio::time::sleep(service.chain.poll_interval).await;
+                    }
                 }
             }
         }
@@ -2195,7 +2219,7 @@ impl ChainService {
         &self,
         snapshot_path: &Path,
         last_processed: u64,
-    ) -> Result<(), ChainError> {
+    ) -> Result<u64, ChainError> {
         let mut forest = self.forest.write().await;
         let mut reset_block = self.chain.deployment_block.saturating_sub(1);
 
@@ -2259,31 +2283,31 @@ impl ChainService {
             to = reset_block,
             "forest state reset"
         );
-        Ok(())
+        Ok(reset_block)
     }
 
-    async fn reset_wallets(&self, safe_head: u64) {
+    async fn reset_wallets(&self, safe_head: u64, reset_from_block: u64) {
         let wallets = self.wallets.read().await;
         for (cache_key, registration) in wallets.iter() {
+            let from_block =
+                wallet_reorg_backfill_from_block(reset_from_block, registration.start_block);
             let sync_target = wallet_sync_target(safe_head, registration.sync_to_block);
             if let Err(err) = registration
                 .backfill_sender
-                .send(BackfillEvent::Reset {
-                    from_block: registration.start_block,
-                })
+                .send(BackfillEvent::Reset { from_block })
                 .await
             {
                 debug!(
                     ?err,
                     cache_key = %cache_key,
-                    "failed to send wallet reset"
+                    "failed to send wallet rewind"
                 );
             }
             if self
                 .backfill_tx
                 .send(BackfillRequest::Add {
                     cache_key: cache_key.clone(),
-                    from_block: registration.start_block,
+                    from_block,
                     to_block: sync_target,
                     sender: registration.backfill_sender.clone(),
                 })
@@ -2324,11 +2348,13 @@ impl ChainService {
         {
             warn!(
                 last_processed,
-                "detected reorg, resetting forest and wallet caches"
+                "detected reorg, rewinding forest and wallet caches"
             );
-            self.reset_forest_state(snapshot_path, last_processed)
+            let reset_block = self
+                .reset_forest_state(snapshot_path, last_processed)
                 .await?;
-            self.reset_wallets(safe_head).await;
+            self.reset_wallets(safe_head, reset_block.saturating_add(1))
+                .await;
         }
         Ok(())
     }
@@ -2707,8 +2733,8 @@ mod tests {
         CommitmentBatch, GeneratedCommitmentBatch, IndexedWalletPageKind, Nullified, Nullifiers,
         Shield, ShieldLegacyPreMar23, Transact, combined_log_event_signatures_for_range,
         complete_stream_checkpoint, indexed_wallet_page_kind, indexed_wallet_to_block,
-        should_hedge_wallet_startup, wallet_backfill_from_block, wallet_startup_hedge_block_count,
-        wallet_sync_target,
+        should_hedge_wallet_startup, wallet_backfill_from_block, wallet_reorg_backfill_from_block,
+        wallet_startup_hedge_block_count, wallet_sync_target,
     };
 
     #[test]
@@ -2729,6 +2755,12 @@ mod tests {
     fn wallet_backfill_starts_after_indexed_checkpoint() {
         assert_eq!(wallet_backfill_from_block(99, 10), 100);
         assert_eq!(wallet_backfill_from_block(0, 10), 10);
+    }
+
+    #[test]
+    fn wallet_reorg_backfill_starts_after_forest_reset() {
+        assert_eq!(wallet_reorg_backfill_from_block(250, 100), 250);
+        assert_eq!(wallet_reorg_backfill_from_block(50, 100), 100);
     }
 
     #[test]

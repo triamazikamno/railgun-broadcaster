@@ -502,6 +502,20 @@ mod tests {
     }
 
     #[test]
+    fn embedded_artifact_list_includes_deployed_high_input_variants() {
+        let variants = ArtifactSource::default()
+            .list_variants()
+            .expect("embedded variants should parse");
+
+        for variant in ["11x02", "11x03", "12x02"] {
+            assert!(
+                variants.iter().any(|candidate| candidate == variant),
+                "missing deployed verifier variant {variant}"
+            );
+        }
+    }
+
+    #[test]
     fn poi_artifact_paths_use_poi_cache_dir() {
         let source = ArtifactSource::default().with_cache_dir(PathBuf::from("cache"));
 

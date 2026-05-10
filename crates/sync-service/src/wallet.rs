@@ -430,6 +430,25 @@ fn apply_wallet_delta_to_vec_with_outcome(
     }
 }
 
+pub(crate) fn rewind_wallet_utxos(wallet_utxos: &mut Vec<WalletUtxo>, from_block: u64) -> bool {
+    let before_len = wallet_utxos.len();
+    wallet_utxos.retain(|wallet_utxo| wallet_utxo.utxo.source.block_number < from_block);
+    let mut changed = wallet_utxos.len() != before_len;
+
+    for wallet_utxo in wallet_utxos {
+        if wallet_utxo
+            .spent
+            .as_ref()
+            .is_some_and(|spent| spent.block_number >= from_block)
+        {
+            wallet_utxo.spent = None;
+            changed = true;
+        }
+    }
+
+    changed
+}
+
 #[derive(Debug, Default)]
 struct WalletDeltaApplyOutcome {
     changed: bool,
@@ -2916,10 +2935,19 @@ pub(crate) fn spawn_wallet_worker(
                         }
                         BackfillEvent::Reset { from_block } => {
                             readiness_started = Instant::now();
-                            let mut locked = utxos.write().await;
-                            locked.clear();
                             last_scanned = from_block.saturating_sub(1);
-                            match cache_store.reset_wallet_cache(&cfg.cache_key, last_scanned) {
+                            let (changed, snapshot) = {
+                                let mut locked = utxos.write().await;
+                                let changed = rewind_wallet_utxos(&mut locked, from_block);
+                                (changed, locked.clone())
+                            };
+                            let (unspent, spent) = wallet_utxo_counts(&snapshot);
+                            match cache_store.replace_wallet_cache(
+                                &cfg.cache_key,
+                                &snapshot,
+                                last_scanned,
+                                None,
+                            ) {
                                 Ok(()) => {
                                     persist_state.needs_full_persist = false;
                                     persist_state.pending_cache_reset = None;
@@ -2928,15 +2956,24 @@ pub(crate) fn spawn_wallet_worker(
                                 Err(err) => {
                                     persist_state.needs_full_persist = true;
                                     persist_state.pending_cache_reset = Some(last_scanned);
-                                    warn!(?err, cache_key = %cfg.cache_key, "failed to reset wallet cache");
+                                    warn!(?err, cache_key = %cfg.cache_key, "failed to rewind wallet cache");
                                 }
                             }
-                            worker_handle.notify_changed();
+                            worker_handle.notify_if_changed(changed);
                             backfill_complete_block = None;
                             if let Err(err) = ready_tx.send(false) {
                                 debug!(?err, cache_key = %cfg.cache_key, "failed to send ready state");
                             }
-                            info!(cache_key = %cfg.cache_key, "wallet cache reset");
+                            info!(
+                                cache_key = %cfg.cache_key,
+                                from_block,
+                                last_scanned,
+                                total = snapshot.len(),
+                                unspent,
+                                spent,
+                                changed,
+                                "wallet cache rewound"
+                            );
                         }
                     }
                 }
@@ -3101,7 +3138,7 @@ mod tests {
         output_poi_recovery_proof_retry_after, output_start_global_position,
         pending_output_poi_submit_identity, process_pending_output_poi_observations,
         process_pending_output_poi_observations_inner, recovery_leaf_count_for_merkle_root,
-        refresh_wallet_poi_statuses_selected, spent_source_for_utxo,
+        refresh_wallet_poi_statuses_selected, rewind_wallet_utxos, spent_source_for_utxo,
         wallet_poi_status_refresh_needed, wallet_poi_status_refresh_needed_for_selection,
     };
     use crate::types::{ChainKey, WalletCacheStore, WalletConfig};
@@ -3195,6 +3232,36 @@ mod tests {
             source((position % 200) as u8 + 1),
             kind,
         ))
+    }
+
+    #[test]
+    fn rewind_wallet_utxos_preserves_pre_reorg_outputs() {
+        let kept_unspent = test_wallet_utxo(1);
+        let mut kept_spent = test_wallet_utxo(2);
+        kept_spent.spent = Some(source(4));
+        let mut reopened_spend = test_wallet_utxo(3);
+        reopened_spend.spent = Some(source(12));
+        let dropped_output = test_wallet_utxo(20);
+
+        let mut wallet_utxos = vec![kept_unspent, kept_spent, reopened_spend, dropped_output];
+        let changed = rewind_wallet_utxos(&mut wallet_utxos, 10);
+
+        assert!(changed);
+        assert_eq!(wallet_utxos.len(), 3);
+        assert!(wallet_utxos.iter().any(|utxo| utxo.utxo.position == 1));
+        assert!(wallet_utxos.iter().any(|utxo| {
+            utxo.utxo.position == 2
+                && utxo
+                    .spent
+                    .as_ref()
+                    .is_some_and(|spent| spent.block_number == 4)
+        }));
+        assert!(
+            wallet_utxos
+                .iter()
+                .any(|utxo| utxo.utxo.position == 3 && utxo.spent.is_none())
+        );
+        assert!(!wallet_utxos.iter().any(|utxo| utxo.utxo.position == 20));
     }
 
     #[derive(Default)]

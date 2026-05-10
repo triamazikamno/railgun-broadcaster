@@ -3359,7 +3359,7 @@ impl WalletRoot {
                         form.cost_estimate = Some(estimate);
                     }
                     Err(error) => {
-                        form.error = Some(Arc::from(error.to_string()));
+                        form.error = Some(Arc::from(format_report_chain(&error)));
                     }
                 }
                 cx.notify();
@@ -3857,7 +3857,7 @@ impl WalletRoot {
                     }
                     Err(error) => {
                         form.result = None;
-                        form.error = Some(Arc::from(error.to_string()));
+                        form.error = Some(Arc::from(format_report_chain(&error)));
                     }
                 }
                 cx.notify();
@@ -4412,7 +4412,7 @@ impl WalletRoot {
                         form.cost_estimate = Some(estimate);
                     }
                     Err(error) => {
-                        form.error = Some(Arc::from(error.to_string()));
+                        form.error = Some(Arc::from(format_report_chain(&error)));
                     }
                 }
                 cx.notify();
@@ -4634,7 +4634,7 @@ impl WalletRoot {
                     }
                     Err(error) => {
                         form.result = None;
-                        form.error = Some(Arc::from(error.to_string()));
+                        form.error = Some(Arc::from(format_report_chain(&error)));
                     }
                 }
                 cx.notify();
@@ -7547,6 +7547,21 @@ fn format_form_error_for_asset(error: &str, asset: &UnshieldAsset, fee_token: Ad
     }
 }
 
+fn format_report_chain(error: &eyre::Report) -> String {
+    let mut parts = error.chain().map(ToString::to_string);
+    let Some(mut message) = parts.next() else {
+        return error.to_string();
+    };
+    for part in parts {
+        if message.ends_with(&part) {
+            continue;
+        }
+        message.push_str(": ");
+        message.push_str(&part);
+    }
+    message
+}
+
 fn form_error_public_broadcaster_max_entered_amount(error: &str) -> Option<U256> {
     const MARKER: &str = "public broadcaster max entered amount: ";
     form_error_decimal_after_marker(error, MARKER)
@@ -9610,8 +9625,8 @@ mod tests {
         effective_public_broadcaster_fee_mode, fee_token_option_has_eligible_broadcaster,
         format_compact_age, format_exact_asset_amount_for_display, format_form_error_for_asset,
         format_native_token_amount_for_display, format_private_asset_rows,
-        format_public_broadcaster_fee_margin, format_send_amount_input, format_total,
-        format_unshield_amount_input, loading_summary, max_send_amount_from_snapshot,
+        format_public_broadcaster_fee_margin, format_report_chain, format_send_amount_input,
+        format_total, format_unshield_amount_input, loading_summary, max_send_amount_from_snapshot,
         max_unshield_amount_from_snapshot, native_token_display_label,
         native_wrapped_output_labels, parse_repair_cache_block, private_action_metrics,
         progress_detail, public_broadcaster_candidates_for_asset, public_broadcaster_cost_status,
@@ -9919,6 +9934,33 @@ mod tests {
 
         assert_eq!(
             formatted,
+            "Max POI-verified entered amount for public broadcaster: 388.58577 USDC. Try a smaller amount or switch fee mode."
+        );
+    }
+
+    #[test]
+    fn report_chain_preserves_wrapped_public_broadcaster_error() {
+        let asset = UnshieldAsset {
+            chain_id: 1,
+            token: Address::ZERO,
+            label: "USDC".to_string(),
+            decimals: Some(6),
+            total: U256::ZERO,
+            poi_verified_total: U256::ZERO,
+            max_batched: U256::ZERO,
+            icon_path: None,
+        };
+        let error = eyre::eyre!("public broadcaster max entered amount: 388585770")
+            .wrap_err("build public broadcaster send proof");
+
+        let chain = format_report_chain(&error);
+
+        assert_eq!(
+            chain,
+            "build public broadcaster send proof: public broadcaster max entered amount: 388585770"
+        );
+        assert_eq!(
+            format_form_error_for_asset(chain.as_str(), &asset, asset.token),
             "Max POI-verified entered amount for public broadcaster: 388.58577 USDC. Try a smaller amount or switch fee mode."
         );
     }

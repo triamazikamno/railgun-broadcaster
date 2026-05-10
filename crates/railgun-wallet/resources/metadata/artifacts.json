@@ -20,8 +20,20 @@
         "commitments": 1
     },
     {
+        "nullifiers": 11,
+        "commitments": 2
+    },
+    {
+        "nullifiers": 11,
+        "commitments": 3
+    },
+    {
         "nullifiers": 12,
         "commitments": 1
+    },
+    {
+        "nullifiers": 12,
+        "commitments": 2
     },
     {
         "nullifiers": 13,

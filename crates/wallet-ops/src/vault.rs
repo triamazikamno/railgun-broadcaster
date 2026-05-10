@@ -1332,6 +1332,70 @@ impl sync_service::WalletCacheStore for DesktopEncryptedWalletCacheStore {
         )?;
         Ok(())
     }
+
+    fn replace_wallet_cache(
+        &self,
+        _wallet_id: &str,
+        utxos: &[WalletUtxo],
+        last_scanned_block: u64,
+        last_scanned_block_hash: Option<[u8; KEY_LEN]>,
+    ) -> Result<(), WalletCacheError> {
+        let started = Instant::now();
+        let wallet_chain_uuid = self.wallet_chain_uuid()?;
+        let row_prefix = wallet_cache_row_prefix(&wallet_chain_uuid);
+        let encode_started = Instant::now();
+        let mut records = Vec::with_capacity(utxos.len() + 1);
+
+        for utxo in utxos {
+            let stable_identity = wallet_utxo_stable_identity(utxo);
+            let row_id =
+                self.cache_keys
+                    .row_id(utxo.utxo.tree, utxo.utxo.position, &stable_identity);
+            let plaintext = serialize_wallet_utxo(utxo)?;
+            let record = self
+                .cache_keys
+                .encrypt_row(&row_id, &plaintext)
+                .map_err(|_| WalletCacheError::Crypto)?;
+            let data = rmp_serde::to_vec_named(&record)?;
+            records.push((
+                wallet_cache_row_record_key(&wallet_chain_uuid, &row_id),
+                data,
+            ));
+        }
+
+        let mut metadata = self.metadata.lock().map_err(|_| WalletCacheError::Crypto)?;
+        metadata.last_scanned_block = last_scanned_block;
+        metadata.last_scanned_block_hash = last_scanned_block_hash;
+        let record = self
+            .view_session
+            .encrypt_wallet_chain_metadata(&metadata.wallet_chain_uuid, &metadata)
+            .map_err(|_| WalletCacheError::Crypto)?;
+        let data = rmp_serde::to_vec_named(&record)?;
+        records.push((
+            wallet_chain_metadata_record_key(&metadata.wallet_chain_uuid),
+            data,
+        ));
+        let encode_elapsed_ms = encode_started.elapsed().as_millis();
+        drop(metadata);
+
+        let db_started = Instant::now();
+        self.db
+            .replace_desktop_wallet_vault_prefix_with_records(&row_prefix, &records)?;
+        let (unspent, spent) = wallet_cache_counts(utxos);
+        tracing::debug!(
+            wallet_chain_uuid,
+            rows = utxos.len(),
+            records = records.len(),
+            unspent,
+            spent,
+            last_scanned_block,
+            encode_elapsed_ms,
+            db_elapsed_ms = db_started.elapsed().as_millis(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "replaced encrypted desktop wallet cache"
+        );
+        Ok(())
+    }
 }
 
 pub struct ViewUnlock {
@@ -3385,6 +3449,20 @@ mod tests {
             .load_wallet_chain_metadata(TEST_PASSWORD, &wallet_chain_uuid)
             .expect("load rewound metadata");
         assert_eq!(metadata.last_scanned_block, 149);
+        assert_eq!(metadata.last_scanned_block_hash, None);
+
+        cache_store
+            .replace_wallet_cache("ignored", std::slice::from_ref(&first), 160, None)
+            .expect("replace encrypted cache");
+        let loaded = cache_store
+            .load_wallet_utxos("ignored")
+            .expect("load replaced cache");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].utxo.position, 1);
+        let metadata = store
+            .load_wallet_chain_metadata(TEST_PASSWORD, &wallet_chain_uuid)
+            .expect("load replaced metadata");
+        assert_eq!(metadata.last_scanned_block, 160);
         assert_eq!(metadata.last_scanned_block_hash, None);
 
         store
