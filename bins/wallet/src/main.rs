@@ -1,6 +1,7 @@
 // Hex color literals are intentionally written `0xRRGGBB` style.
 #![allow(clippy::unreadable_literal)]
 
+mod assets;
 mod cli;
 mod root;
 
@@ -18,6 +19,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 use ui::logs::{DEFAULT_LOG_CAPACITY, LogStore, UiLogLayer};
 use wallet_ops::build_http_client;
 
+use crate::assets::WalletAssets;
 use crate::cli::Options;
 use crate::root::{WalletAppOptions, install_utxo_navigation_bindings, open_wallet_window};
 
@@ -66,7 +68,7 @@ fn main() -> Result<()> {
     });
 
     let wallet_options = WalletAppOptions::from(opts);
-    let application = Application::new().with_assets(gpui_component_assets::Assets);
+    let application = Application::new().with_assets(WalletAssets);
     application.run(move |app: &mut App| {
         gpui_component::init(app);
         ui::theme::apply_zenburn_component_theme(app);

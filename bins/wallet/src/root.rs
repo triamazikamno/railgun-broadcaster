@@ -27,6 +27,7 @@ use gpui_component::{
     resizable::{ResizableState, resizable_panel, v_resizable},
     scroll::ScrollableElement,
     select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState},
+    sidebar::{Sidebar, SidebarHeader, SidebarMenu, SidebarMenuItem, SidebarToggleButton},
     spinner::Spinner,
     tab::{Tab, TabBar},
     table::{Column, Table, TableDelegate, TableEvent, TableState},
@@ -76,7 +77,10 @@ use wallet_ops::{
 };
 use zeroize::Zeroizing;
 
-const ACTIVITY_RAIL_WIDTH: Pixels = px(48.0);
+use crate::assets::RailgunSidebarIcon;
+
+const SIDEBAR_WIDTH: Pixels = px(240.0);
+const SIDEBAR_AUTO_COLLAPSE_WIDTH: Pixels = px(900.0);
 const LOGS_DRAWER_HEIGHT: Pixels = px(260.0);
 const LOGS_DRAWER_MIN_HEIGHT: Pixels = px(160.0);
 const LOGS_DRAWER_MAX_HEIGHT: Pixels = px(600.0);
@@ -1049,6 +1053,7 @@ pub(crate) struct WalletRoot {
     logs: Entity<LogsPane>,
     active_activity: Activity,
     active_wallet_tab: WalletTab,
+    sidebar_manually_collapsed: bool,
     wallet_select: Entity<SelectState<SearchableVec<WalletSelectItem>>>,
     wallet_metadata: Vec<WalletMetadataBundle>,
     wallet_options: Vec<WalletOption>,
@@ -1192,6 +1197,7 @@ impl WalletRoot {
             logs,
             active_activity: Activity::Wallet,
             active_wallet_tab: WalletTab::default(),
+            sidebar_manually_collapsed: false,
             wallet_select: wallet_select.clone(),
             wallet_metadata: Vec::new(),
             wallet_options: Vec::new(),
@@ -4720,105 +4726,117 @@ impl WalletRoot {
         cx.notify();
     }
 
-    fn render_activity_rail(&self, root: Entity<Self>) -> impl IntoElement {
-        div()
-            .w(ACTIVITY_RAIL_WIDTH)
-            .h_full()
-            .flex_none()
-            .flex()
-            .flex_col()
-            .items_center()
-            .bg(rgb(theme::SURFACE))
-            .border_r_1()
-            .border_color(rgb(theme::BORDER))
-            .child(Self::render_activity_button(
-                "activity-wallet",
-                icons::wallet_icon_path(),
-                "Wallets",
-                self.active_activity == Activity::Wallet,
-                false,
-                {
-                    let root = root.clone();
-                    move |_event, _window, cx| {
-                        root.update(cx, |root, cx| {
-                            root.active_activity = Activity::Wallet;
-                            root.focus_utxo_table_on_render = should_focus_utxo_table(
-                                root.active_activity,
-                                root.active_wallet_tab,
-                                root.chain_states.get(&root.selected_chain),
-                            );
+    fn render_sidebar(&self, root: Entity<Self>, collapsed: bool) -> impl IntoElement {
+        let wallet_root = root.clone();
+        let broadcaster_root = root.clone();
+        let logs_root = root.clone();
+
+        Sidebar::left()
+            .w(SIDEBAR_WIDTH)
+            .collapsed(collapsed)
+            .header(Self::render_sidebar_header(root, collapsed))
+            .child(
+                SidebarMenu::new()
+                    .child(
+                        SidebarMenuItem::new("Wallets")
+                            .icon(RailgunSidebarIcon::Wallet)
+                            .active(self.active_activity == Activity::Wallet)
+                            .on_click(move |_event, _window, cx| {
+                                wallet_root.update(cx, |root, cx| {
+                                    root.active_activity = Activity::Wallet;
+                                    root.focus_utxo_table_on_render = should_focus_utxo_table(
+                                        root.active_activity,
+                                        root.active_wallet_tab,
+                                        root.chain_states.get(&root.selected_chain),
+                                    );
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child(
+                        SidebarMenuItem::new("Public broadcasters")
+                            .icon(RailgunSidebarIcon::Broadcaster)
+                            .active(self.active_activity == Activity::Broadcaster)
+                            .on_click(move |_event, window, cx| {
+                                broadcaster_root.update(cx, |root, cx| {
+                                    root.sync_broadcaster_monitor_chain_filter(
+                                        root.selected_chain,
+                                        window,
+                                        cx,
+                                    );
+                                    root.active_activity = Activity::Broadcaster;
+                                    cx.notify();
+                                });
+                            }),
+                    ),
+            )
+            .footer(
+                SidebarMenuItem::new("Logs")
+                    .icon(RailgunSidebarIcon::Logs)
+                    .active(self.logs_open)
+                    .collapsed(collapsed)
+                    .on_click(move |_event, _window, cx| {
+                        logs_root.update(cx, |root, cx| {
+                            root.logs_open = !root.logs_open;
                             cx.notify();
                         });
-                    }
-                },
-            ))
-            .child(Self::render_activity_button(
-                "activity-broadcaster",
-                icons::robot_icon_path(),
-                "Public broadcasters",
-                self.active_activity == Activity::Broadcaster,
-                false,
-                {
-                    let root = root.clone();
-                    move |_event, window, cx| {
-                        root.update(cx, |root, cx| {
-                            root.sync_broadcaster_monitor_chain_filter(
-                                root.selected_chain,
-                                window,
-                                cx,
-                            );
-                            root.active_activity = Activity::Broadcaster;
-                            cx.notify();
-                        });
-                    }
-                },
-            ))
-            .child(div().flex_1())
-            .child(Self::render_activity_button(
-                "activity-logs",
-                icons::logs_icon_path(),
-                if self.logs_open {
-                    "Hide logs"
-                } else {
-                    "Show logs"
-                },
-                self.logs_open,
-                true,
-                move |_event, _window, cx| {
-                    root.update(cx, |root, cx| {
-                        root.logs_open = !root.logs_open;
-                        cx.notify();
-                    });
-                },
-            ))
+                    }),
+            )
     }
 
-    fn render_activity_button(
-        id: &'static str,
-        icon: PathBuf,
-        tooltip: &'static str,
-        active: bool,
-        align_bottom: bool,
-        on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-    ) -> impl IntoElement {
-        div()
-            .id(id)
-            .when(!align_bottom, |this| this.mt(px(10.0)))
-            .when(align_bottom, |this| this.mb(px(10.0)))
-            .size(px(36.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_md()
-            .cursor_pointer()
-            .when(active, |this| this.bg(rgb(theme::SELECTED_SURFACE)))
-            .when(!active, |this| {
-                this.bg(rgb(theme::SURFACE))
-                    .hover(|this| this.bg(rgb(theme::SURFACE_HOVER)))
+    fn render_sidebar_header(root: Entity<Self>, collapsed: bool) -> impl IntoElement {
+        SidebarHeader::new()
+            .when(!collapsed, |this| {
+                this.child(
+                    div()
+                        .size(px(32.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_md()
+                        .bg(rgb(theme::SELECTED_SURFACE))
+                        .child(Icon::new(RailgunSidebarIcon::Wallet).size_4()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .flex()
+                        .flex_col()
+                        .line_height(gpui::relative(1.2))
+                        .child(
+                            div()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .child("Railgun"),
+                        )
+                        .child(
+                            div()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .text_size(px(12.0))
+                                .text_color(rgb(theme::TEXT_MUTED))
+                                .child("Wallet"),
+                        ),
+                )
+                .child(Self::render_sidebar_toggle(root.clone(), collapsed))
             })
-            .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
-            .on_click(on_click)
-            .child(img(icon).size(px(18.0)).flex_none())
+            .when(collapsed, |this| {
+                this.justify_center()
+                    .child(Self::render_sidebar_toggle(root, collapsed))
+            })
+    }
+
+    fn render_sidebar_toggle(root: Entity<Self>, collapsed: bool) -> SidebarToggleButton {
+        SidebarToggleButton::left()
+            .collapsed(collapsed)
+            .on_click(move |_event, _window, cx| {
+                root.update(cx, |root, cx| {
+                    root.sidebar_manually_collapsed = !root.sidebar_manually_collapsed;
+                    cx.notify();
+                });
+            })
     }
 
     const fn vault_dialog_title(&self) -> &'static str {
@@ -6425,6 +6443,8 @@ impl Render for WalletRoot {
                 .children(Root::render_notification_layer(window, cx));
         }
         self.vault_dialog_open = false;
+        let sidebar_auto_collapsed = window.viewport_size().width < SIDEBAR_AUTO_COLLAPSE_WIDTH;
+        let sidebar_collapsed = sidebar_auto_collapsed || self.sidebar_manually_collapsed;
 
         div()
             .relative()
@@ -6434,7 +6454,7 @@ impl Render for WalletRoot {
             .text_color(rgb(theme::TEXT))
             .font_family(APP_FONT_FAMILY)
             .text_size(APP_TEXT_SIZE)
-            .child(self.render_activity_rail(root.clone()))
+            .child(self.render_sidebar(root.clone(), sidebar_collapsed))
             .child(
                 div()
                     .flex_1()
