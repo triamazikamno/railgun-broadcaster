@@ -4,18 +4,22 @@ use gpui::{AssetSource, Result, SharedString};
 use gpui_component::IconNamed;
 
 pub(crate) const LOGO_ICON_PATH: &str = "railgun/icons/logo.svg";
+const ARROW_BIG_RIGHT_DASH_ICON_PATH: &str = "railgun/icons/arrow-big-right-dash.svg";
 const WALLET_ICON_PATH: &str = "railgun/icons/wallet.svg";
 const BROADCASTER_ICON_PATH: &str = "railgun/icons/robot.svg";
 const LOGS_ICON_PATH: &str = "railgun/icons/logs.svg";
 
 const RAILGUN_ICON_PATHS: &[&str] = &[
     LOGO_ICON_PATH,
+    ARROW_BIG_RIGHT_DASH_ICON_PATH,
     WALLET_ICON_PATH,
     BROADCASTER_ICON_PATH,
     LOGS_ICON_PATH,
 ];
 
 const LOGO_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/logo.svg");
+const ARROW_BIG_RIGHT_DASH_ICON_BYTES: &[u8] =
+    include_bytes!("../assets/icons/arrow-big-right-dash.svg");
 const WALLET_ICON_BYTES: &[u8] = include_bytes!("../../../crates/ui/assets/icons/wallet.svg");
 const BROADCASTER_ICON_BYTES: &[u8] = include_bytes!("../../../crates/ui/assets/icons/robot.svg");
 const LOGS_ICON_BYTES: &[u8] = include_bytes!("../../../crates/ui/assets/icons/logs.svg");
@@ -44,6 +48,20 @@ impl AssetSource for WalletAssets {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RailgunActionIcon {
+    Send,
+}
+
+impl IconNamed for RailgunActionIcon {
+    fn path(self) -> SharedString {
+        match self {
+            Self::Send => ARROW_BIG_RIGHT_DASH_ICON_PATH,
+        }
+        .into()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RailgunSidebarIcon {
     Wallet,
     Broadcaster,
@@ -64,6 +82,7 @@ impl IconNamed for RailgunSidebarIcon {
 fn railgun_asset(path: &str) -> Option<&'static [u8]> {
     match path {
         LOGO_ICON_PATH => Some(LOGO_ICON_BYTES),
+        ARROW_BIG_RIGHT_DASH_ICON_PATH => Some(ARROW_BIG_RIGHT_DASH_ICON_BYTES),
         WALLET_ICON_PATH => Some(WALLET_ICON_BYTES),
         BROADCASTER_ICON_PATH => Some(BROADCASTER_ICON_BYTES),
         LOGS_ICON_PATH => Some(LOGS_ICON_BYTES),

@@ -77,7 +77,7 @@ use wallet_ops::{
 };
 use zeroize::Zeroizing;
 
-use crate::assets::{LOGO_ICON_PATH, RailgunSidebarIcon};
+use crate::assets::{LOGO_ICON_PATH, RailgunActionIcon, RailgunSidebarIcon};
 
 const SIDEBAR_WIDTH: Pixels = px(220.0);
 const SIDEBAR_AUTO_COLLAPSE_WIDTH: Pixels = px(900.0);
@@ -5418,7 +5418,7 @@ impl WalletRoot {
                 this.child(
                     app_button("wallet-chain-retry-sync", "Retry sync")
                         .outline()
-                        .xsmall()
+                        .small()
                         .on_click(move |_event, _window, cx| {
                             retry_root.update(cx, |root, cx| {
                                 if root.view_session.is_none() {
@@ -5584,9 +5584,8 @@ impl WalletRoot {
                             SharedString::from(format!("wallet-asset-send-{ix}")),
                             "Send",
                         )
-                        .xsmall()
+                        .child(Icon::new(RailgunActionIcon::Send).small())
                         .outline()
-                        .p(px(12.0))
                         .disabled(!can_send)
                         .opacity(send_opacity)
                         .tooltip(send_tooltip)
@@ -5604,9 +5603,8 @@ impl WalletRoot {
                             SharedString::from(format!("wallet-asset-unshield-{ix}")),
                             "Unshield",
                         )
-                        .xsmall()
+                        .child(Icon::new(IconName::Globe).small())
                         .outline()
-                        .p(px(12.0))
                         .disabled(!can_unshield)
                         .opacity(unshield_opacity)
                         .tooltip(unshield_tooltip)
