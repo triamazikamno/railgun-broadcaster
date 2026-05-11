@@ -27,7 +27,7 @@ use gpui_component::{
     resizable::{ResizableState, resizable_panel, v_resizable},
     scroll::ScrollableElement,
     select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState},
-    sidebar::{Sidebar, SidebarHeader, SidebarMenu, SidebarMenuItem, SidebarToggleButton},
+    sidebar::{Sidebar, SidebarHeader, SidebarMenu, SidebarMenuItem},
     spinner::Spinner,
     tab::{Tab, TabBar},
     table::{Column, Table, TableDelegate, TableEvent, TableState},
@@ -77,9 +77,9 @@ use wallet_ops::{
 };
 use zeroize::Zeroizing;
 
-use crate::assets::RailgunSidebarIcon;
+use crate::assets::{LOGO_ICON_PATH, RailgunSidebarIcon};
 
-const SIDEBAR_WIDTH: Pixels = px(240.0);
+const SIDEBAR_WIDTH: Pixels = px(220.0);
 const SIDEBAR_AUTO_COLLAPSE_WIDTH: Pixels = px(900.0);
 const LOGS_DRAWER_HEIGHT: Pixels = px(260.0);
 const LOGS_DRAWER_MIN_HEIGHT: Pixels = px(160.0);
@@ -158,7 +158,7 @@ pub(crate) fn open_wallet_window(
             size: size(px(1_360.0), px(860.0)),
         })),
         titlebar: Some(gpui::TitlebarOptions {
-            title: Some(SharedString::from("Wallet")),
+            title: Some(SharedString::from("RailOxide")),
             appears_transparent: false,
             traffic_light_position: None,
         }),
@@ -1054,6 +1054,7 @@ pub(crate) struct WalletRoot {
     active_activity: Activity,
     active_wallet_tab: WalletTab,
     sidebar_manually_collapsed: bool,
+    sidebar_narrow_expanded: bool,
     wallet_select: Entity<SelectState<SearchableVec<WalletSelectItem>>>,
     wallet_metadata: Vec<WalletMetadataBundle>,
     wallet_options: Vec<WalletOption>,
@@ -1198,6 +1199,7 @@ impl WalletRoot {
             active_activity: Activity::Wallet,
             active_wallet_tab: WalletTab::default(),
             sidebar_manually_collapsed: false,
+            sidebar_narrow_expanded: false,
             wallet_select: wallet_select.clone(),
             wallet_metadata: Vec::new(),
             wallet_options: Vec::new(),
@@ -4726,7 +4728,12 @@ impl WalletRoot {
         cx.notify();
     }
 
-    fn render_sidebar(&self, root: Entity<Self>, collapsed: bool) -> impl IntoElement {
+    fn render_sidebar(
+        &self,
+        root: Entity<Self>,
+        collapsed: bool,
+        sidebar_is_narrow: bool,
+    ) -> impl IntoElement {
         let wallet_root = root.clone();
         let broadcaster_root = root.clone();
         let logs_root = root.clone();
@@ -4734,12 +4741,16 @@ impl WalletRoot {
         Sidebar::left()
             .w(SIDEBAR_WIDTH)
             .collapsed(collapsed)
-            .header(Self::render_sidebar_header(root, collapsed))
+            .header(Self::render_sidebar_header(
+                root,
+                collapsed,
+                sidebar_is_narrow,
+            ))
             .child(
                 SidebarMenu::new()
                     .child(
                         SidebarMenuItem::new("Wallets")
-                            .icon(RailgunSidebarIcon::Wallet)
+                            .icon(Icon::new(RailgunSidebarIcon::Wallet).size_4())
                             .active(self.active_activity == Activity::Wallet)
                             .on_click(move |_event, _window, cx| {
                                 wallet_root.update(cx, |root, cx| {
@@ -4755,7 +4766,7 @@ impl WalletRoot {
                     )
                     .child(
                         SidebarMenuItem::new("Public broadcasters")
-                            .icon(RailgunSidebarIcon::Broadcaster)
+                            .icon(Icon::new(RailgunSidebarIcon::Broadcaster).size_4())
                             .active(self.active_activity == Activity::Broadcaster)
                             .on_click(move |_event, window, cx| {
                                 broadcaster_root.update(cx, |root, cx| {
@@ -4772,7 +4783,7 @@ impl WalletRoot {
             )
             .footer(
                 SidebarMenuItem::new("Logs")
-                    .icon(RailgunSidebarIcon::Logs)
+                    .icon(Icon::new(RailgunSidebarIcon::Logs).size_4())
                     .active(self.logs_open)
                     .collapsed(collapsed)
                     .on_click(move |_event, _window, cx| {
@@ -4784,59 +4795,85 @@ impl WalletRoot {
             )
     }
 
-    fn render_sidebar_header(root: Entity<Self>, collapsed: bool) -> impl IntoElement {
-        SidebarHeader::new()
+    fn render_sidebar_header(
+        root: Entity<Self>,
+        collapsed: bool,
+        sidebar_is_narrow: bool,
+    ) -> impl IntoElement {
+        SidebarHeader::new().p_0().child(Self::render_sidebar_brand(
+            root,
+            collapsed,
+            sidebar_is_narrow,
+        ))
+    }
+
+    fn render_sidebar_brand(
+        root: Entity<Self>,
+        collapsed: bool,
+        sidebar_is_narrow: bool,
+    ) -> impl IntoElement {
+        div()
+            .id("sidebar-brand-toggle")
+            .w_full()
+            .p_2()
+            .flex()
+            .items_center()
+            .gap_2()
+            .cursor_pointer()
+            .on_click(move |_event, _window, cx| {
+                root.update(cx, |root, cx| {
+                    if sidebar_is_narrow {
+                        root.sidebar_narrow_expanded = !root.sidebar_narrow_expanded;
+                    } else {
+                        root.sidebar_manually_collapsed = !root.sidebar_manually_collapsed;
+                    }
+                    cx.notify();
+                });
+            })
             .when(!collapsed, |this| {
-                this.child(
-                    div()
-                        .size(px(32.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_md()
-                        .bg(rgb(theme::SELECTED_SURFACE))
-                        .child(Icon::new(RailgunSidebarIcon::Wallet).size_4()),
-                )
-                .child(
+                this.child(Self::render_sidebar_logo()).child(
                     div()
                         .flex_1()
                         .min_w(px(0.0))
                         .flex()
-                        .flex_col()
                         .line_height(gpui::relative(1.2))
-                        .child(
-                            div()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .child("Railgun"),
-                        )
-                        .child(
-                            div()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .text_size(px(12.0))
-                                .text_color(rgb(theme::TEXT_MUTED))
-                                .child("Wallet"),
-                        ),
+                        .child(Self::render_sidebar_wordmark()),
                 )
-                .child(Self::render_sidebar_toggle(root.clone(), collapsed))
             })
             .when(collapsed, |this| {
-                this.justify_center()
-                    .child(Self::render_sidebar_toggle(root, collapsed))
+                this.justify_center().child(Self::render_sidebar_logo())
             })
     }
 
-    fn render_sidebar_toggle(root: Entity<Self>, collapsed: bool) -> SidebarToggleButton {
-        SidebarToggleButton::left()
-            .collapsed(collapsed)
-            .on_click(move |_event, _window, cx| {
-                root.update(cx, |root, cx| {
-                    root.sidebar_manually_collapsed = !root.sidebar_manually_collapsed;
-                    cx.notify();
-                });
-            })
+    fn render_sidebar_logo() -> impl IntoElement {
+        img(LOGO_ICON_PATH).size(px(32.0)).flex_none()
+    }
+
+    fn render_sidebar_wordmark() -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .overflow_hidden()
+            .font_family("Menlo")
+            .font_weight(gpui::FontWeight::EXTRA_BOLD)
+            .text_size(px(18.0))
+            .line_height(gpui::relative(1.0))
+            .children(
+                [
+                    ("R", theme::TEXT),
+                    ("A", theme::TEXT),
+                    ("I", theme::TEXT),
+                    ("L", theme::TEXT),
+                    ("O", theme::WARNING_STRONG),
+                    ("X", theme::WARNING_STRONG),
+                    ("I", theme::TEXT),
+                    ("D", theme::TEXT),
+                    ("E", theme::TEXT),
+                ]
+                .into_iter()
+                .map(|(letter, color)| div().flex_none().text_color(rgb(color)).child(letter)),
+            )
     }
 
     const fn vault_dialog_title(&self) -> &'static str {
@@ -6443,8 +6480,15 @@ impl Render for WalletRoot {
                 .children(Root::render_notification_layer(window, cx));
         }
         self.vault_dialog_open = false;
-        let sidebar_auto_collapsed = window.viewport_size().width < SIDEBAR_AUTO_COLLAPSE_WIDTH;
-        let sidebar_collapsed = sidebar_auto_collapsed || self.sidebar_manually_collapsed;
+        let sidebar_is_narrow = window.viewport_size().width < SIDEBAR_AUTO_COLLAPSE_WIDTH;
+        if !sidebar_is_narrow {
+            self.sidebar_narrow_expanded = false;
+        }
+        let sidebar_collapsed = if sidebar_is_narrow {
+            !self.sidebar_narrow_expanded
+        } else {
+            self.sidebar_manually_collapsed
+        };
 
         div()
             .relative()
@@ -6454,7 +6498,7 @@ impl Render for WalletRoot {
             .text_color(rgb(theme::TEXT))
             .font_family(APP_FONT_FAMILY)
             .text_size(APP_TEXT_SIZE)
-            .child(self.render_sidebar(root.clone(), sidebar_collapsed))
+            .child(self.render_sidebar(root.clone(), sidebar_collapsed, sidebar_is_narrow))
             .child(
                 div()
                     .flex_1()

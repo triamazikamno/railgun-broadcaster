@@ -128,11 +128,11 @@ fn install_quit_behavior(app: &mut App) {
     {
         app.bind_keys([gpui::KeyBinding::new("cmd-q", Quit, None)]);
         app.set_menus(vec![gpui::Menu {
-            name: "Wallet".into(),
+            name: "RailOxide".into(),
             items: vec![
                 gpui::MenuItem::os_submenu("Services", gpui::SystemMenuType::Services),
                 gpui::MenuItem::separator(),
-                gpui::MenuItem::action("Quit Wallet", Quit),
+                gpui::MenuItem::action("Quit RailOxide", Quit),
             ],
         }]);
     }

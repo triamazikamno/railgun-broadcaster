@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="64" height="64">
+  <!-- Hematite mineral for sidebar use: all 8 facets preserved, no bg vignette, no haima edges -->
+
+  <!-- F5: Bottom shadow (deepest) -->
+  <polygon points="844,759 597,892 293,854 464,683" fill="#1F1812"/>
+
+  <!-- F4: Right shadow -->
+  <polygon points="920,474 844,759 464,683 692,550" fill="#44322A"/>
+
+  <!-- F6: Lower-left transition -->
+  <polygon points="293,854 103,607 464,683" fill="#5C4B40"/>
+
+  <!-- F3: Upper-right rust patch -->
+  <polygon points="787,189 920,474 692,550" fill="#9D6440"/>
+
+  <!-- F8: Center interior -->
+  <polygon points="445,436 692,550 464,683" fill="#74665C"/>
+
+  <!-- F2: Top face -->
+  <polygon points="445,132 787,189 692,550 445,436" fill="#A89888"/>
+
+  <!-- F7: Left face -->
+  <polygon points="103,607 164,284 445,436 464,683" fill="#948070"/>
+
+  <!-- F1: Top-left brightest -->
+  <polygon points="164,284 445,132 445,436" fill="#C2B5A5"/>
+</svg>
