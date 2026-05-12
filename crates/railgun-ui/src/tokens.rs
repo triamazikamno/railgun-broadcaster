@@ -32,6 +32,15 @@ pub struct TokenAnchorInfo {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct KnownTokenInfo {
+    pub chain_id: u64,
+    pub token: Address,
+    pub symbol: &'static str,
+    pub decimals: u8,
+    pub anchor_sources: &'static [TokenAnchorSource],
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TokenAnchorSource {
     Fixed {
         token_fee_per_unit_gas: U256,
@@ -147,7 +156,7 @@ const TOKENS: &[(u64, Address, &str, u8, &[TokenAnchorSource])] = &[
     (1, address!("0x514910771AF9Ca656af840dff83E8264EcF986CA"), "LINK", 18, NO_ANCHORS),
     (1, address!("0x6c3ea9036406852006290770BEdFcAbA0e23A0e8"), "PYUSD", 6, ETH_USD_6_ANCHOR),
     // BSC (56)
-    (56, address!("0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"), "BNB", 18, WRAPPED_NATIVE_ANCHOR),
+    (56, address!("0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"), "WBNB", 18, WRAPPED_NATIVE_ANCHOR),
     (56, address!("0x55d398326f99059ff775485246999027b3197955"), "BSC-USD", 18, BNB_USD_18_ANCHOR),
     (56, address!("0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d"), "USDC", 18, BNB_USD_18_ANCHOR),
     (56, address!("0xe9e7cea3dedca5984780bafc599bd69add087d56"), "BUSD", 18, BNB_USD_18_ANCHOR),
@@ -196,6 +205,21 @@ pub fn token_anchor_entries() -> impl Iterator<Item = TokenAnchorInfo> {
             token: *token,
             anchor_sources,
         })
+}
+
+pub fn known_tokens_for_chain(chain_id: u64) -> impl Iterator<Item = KnownTokenInfo> {
+    TOKENS
+        .iter()
+        .filter(move |(token_chain_id, _, _, _, _)| *token_chain_id == chain_id)
+        .map(
+            |(chain_id, token, symbol, decimals, anchor_sources)| KnownTokenInfo {
+                chain_id: *chain_id,
+                token: *token,
+                symbol,
+                decimals: *decimals,
+                anchor_sources,
+            },
+        )
 }
 
 #[must_use]

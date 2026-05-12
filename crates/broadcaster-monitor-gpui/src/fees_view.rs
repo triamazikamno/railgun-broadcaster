@@ -21,7 +21,7 @@ use railgun_ui::{
     lookup_token, short_address, token_icon_path,
 };
 use ui::clipboard::clipboard_with_toast;
-use ui::theme;
+use ui::theme::{self, APP_MONO_FONT_FAMILY};
 
 pub type FeeAnchorLookup = Arc<dyn Fn(u64, Address) -> Option<U256> + Send + Sync>;
 
@@ -561,6 +561,7 @@ impl TableDelegate for FeesDelegate {
                     .flex()
                     .items_center()
                     .gap_1()
+                    .font_family(APP_MONO_FONT_FAMILY)
                     .text_color(rgb(theme::PURPLE))
                     .child(SharedString::from(label))
                     .child(

@@ -18,6 +18,10 @@ pub(crate) struct SoftwareEvmSigner {
 impl SoftwareEvmSigner {
     pub(crate) fn from_private_key_hex(private_key: &str) -> Result<Self> {
         let private_key = parse_private_key(private_key)?;
+        Self::from_private_key(private_key)
+    }
+
+    pub(crate) fn from_private_key(private_key: [u8; 32]) -> Result<Self> {
         let signer = PrivateKeySigner::from(
             SigningKey::from_bytes((&private_key).into()).wrap_err("invalid signing key")?,
         );

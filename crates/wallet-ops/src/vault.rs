@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use alloy::primitives::U256;
+use alloy::primitives::{Address, U256};
+use alloy::signers::k256::ecdsa::SigningKey;
+use alloy::signers::local::{MnemonicBuilder, PrivateKeySigner};
 use argon2::{Algorithm, Argon2, Params, Version};
 use broadcaster_core::crypto::railgun::{RailgunError, ViewingKeyData};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -40,6 +42,8 @@ const WALLET_VIEW_PREFIX: &str = "wallet-view|";
 const WALLET_SPEND_PREFIX: &str = "wallet-spend|";
 const WALLET_CHAIN_METADATA_PREFIX: &str = "wallet-chain-meta|";
 const WALLET_CACHE_ROW_PREFIX: &str = "wallet-cache-row|";
+const PUBLIC_ACCOUNT_METADATA_PREFIX: &str = "public-account-meta|";
+const PUBLIC_ACCOUNT_SECRET_PREFIX: &str = "public-account-secret|";
 pub const PRIMARY_WALLET_LABEL: &str = "Primary wallet";
 const ADDITIONAL_WALLET_LABEL_PREFIX: &str = "Wallet ";
 type HmacSha256 = Hmac<Sha256>;
@@ -91,6 +95,18 @@ pub enum VaultError {
     LastActiveWallet,
     #[error("wallet display order overflow")]
     WalletDisplayOrderOverflow,
+    #[error("public account not found")]
+    PublicAccountNotFound,
+    #[error("public account address already exists")]
+    DuplicatePublicAccountAddress,
+    #[error("invalid public account operation")]
+    InvalidPublicAccountOperation,
+    #[error("public account display order overflow")]
+    PublicAccountDisplayOrderOverflow,
+    #[error("invalid public EVM private key")]
+    InvalidPublicEvmPrivateKey,
+    #[error("public EVM key derivation failed")]
+    PublicEvmKeyDerivation,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -151,6 +167,8 @@ pub enum RecordKind {
     WalletMetadata,
     WalletChainMetadata,
     WalletCacheRow,
+    PublicAccountMetadata,
+    PublicAccountSecret,
 }
 
 impl RecordKind {
@@ -164,6 +182,8 @@ impl RecordKind {
             Self::WalletMetadata => "wallet-metadata",
             Self::WalletChainMetadata => "wallet-chain-metadata",
             Self::WalletCacheRow => "wallet-cache-row",
+            Self::PublicAccountMetadata => "public-account-metadata",
+            Self::PublicAccountSecret => "public-account-secret",
         }
     }
 
@@ -252,11 +272,11 @@ pub struct DesktopEncryptedWalletCacheStore {
 }
 
 impl RailgunSpendSigner for SoftwareRailgunSpendSigner {
-    fn spending_public_key(&self) -> [alloy::primitives::U256; 2] {
+    fn spending_public_key(&self) -> [U256; 2] {
         self.wallet.spending_public_key()
     }
 
-    fn sign_spend_message(&self, msg: alloy::primitives::U256) -> [alloy::primitives::U256; 3] {
+    fn sign_spend_message(&self, msg: U256) -> [U256; 3] {
         self.wallet.sign_spend_message(msg)
     }
 }
@@ -540,6 +560,276 @@ impl DesktopVaultStore {
         let wallet =
             WalletKeys::from_bip39_entropy(&bundle.bip39_entropy, bundle.derivation_index)?;
         Ok(SoftwareRailgunSpendSigner { wallet })
+    }
+
+    pub fn list_visible_public_accounts_for_session(
+        &self,
+        view_session: &DesktopViewSession,
+    ) -> Result<Vec<PublicAccountMetadata>, VaultError> {
+        self.list_public_accounts_for_session(view_session, false)
+    }
+
+    pub fn list_public_accounts_for_session(
+        &self,
+        view_session: &DesktopViewSession,
+        include_hidden: bool,
+    ) -> Result<Vec<PublicAccountMetadata>, VaultError> {
+        let mut accounts = self.list_public_account_metadata_with_view(&view_session.view)?;
+        let wallet_id = view_session.wallet_id();
+        accounts.retain(|account| {
+            account.is_scoped_to_wallet(wallet_id)
+                && (include_hidden || account.status == PublicAccountStatus::Active)
+        });
+        sort_public_account_metadata(&mut accounts);
+        Ok(accounts)
+    }
+
+    pub fn next_derived_public_account_index_for_session(
+        &self,
+        view_session: &DesktopViewSession,
+    ) -> Result<u32, VaultError> {
+        let accounts = self.list_public_account_metadata_with_view(&view_session.view)?;
+        next_derived_public_account_index(&accounts, view_session.wallet_id())
+    }
+
+    pub fn add_derived_public_account(
+        &self,
+        password: &str,
+        view_session: &DesktopViewSession,
+        label: Option<&str>,
+    ) -> Result<PublicAccountMetadata, VaultError> {
+        let vault_metadata = self.metadata()?;
+        let view = unlock_view(&vault_metadata, password)?;
+        let spend = unlock_spend(&vault_metadata, password)?;
+        let wallet_id = view_session.wallet_id();
+        let accounts = self.list_public_account_metadata_with_view(&view)?;
+        let derivation_index = next_derived_public_account_index(&accounts, wallet_id)?;
+        let spend_record = self.encrypted_record(&wallet_spend_record_key(wallet_id))?;
+        let spend_bundle = spend.decrypt_spend_bundle(wallet_id, &spend_record)?;
+        let address =
+            derive_public_evm_address_from_entropy(&spend_bundle.bip39_entropy, derivation_index)?;
+        ensure_public_account_address_available(
+            &accounts,
+            address,
+            &PublicAccountScope::PrivateWallet {
+                wallet_uuid: wallet_id.to_owned(),
+            },
+            wallet_id,
+        )?;
+
+        let account = PublicAccountMetadata {
+            public_account_uuid: generate_opaque_id()?,
+            address,
+            label: normalize_public_account_label(label),
+            source: PublicAccountSource::Derived,
+            scope: PublicAccountScope::PrivateWallet {
+                wallet_uuid: wallet_id.to_owned(),
+            },
+            derivation_index: Some(derivation_index),
+            status: PublicAccountStatus::Active,
+            display_order: next_public_account_display_order(&accounts)?,
+        };
+        let (key, data) = public_account_metadata_record_entry(&view, &account)?;
+        self.db.put_desktop_wallet_vault_record(&key, &data)?;
+        Ok(account)
+    }
+
+    pub fn import_public_account(
+        &self,
+        password: &str,
+        view_session: &DesktopViewSession,
+        private_key_hex: &str,
+        label: Option<&str>,
+        global: bool,
+    ) -> Result<PublicAccountMetadata, VaultError> {
+        let vault_metadata = self.metadata()?;
+        let view = unlock_view(&vault_metadata, password)?;
+        let spend = unlock_spend(&vault_metadata, password)?;
+        let private_key = parse_public_evm_private_key(private_key_hex)?;
+        let address = public_evm_address_from_private_key(&private_key)?;
+        let accounts = self.list_public_account_metadata_with_view(&view)?;
+        let scope = if global {
+            PublicAccountScope::Global
+        } else {
+            PublicAccountScope::PrivateWallet {
+                wallet_uuid: view_session.wallet_id().to_owned(),
+            }
+        };
+        ensure_public_account_address_available(
+            &accounts,
+            address,
+            &scope,
+            view_session.wallet_id(),
+        )?;
+
+        let account = PublicAccountMetadata {
+            public_account_uuid: generate_opaque_id()?,
+            address,
+            label: normalize_public_account_label(label),
+            source: PublicAccountSource::Imported,
+            scope,
+            derivation_index: None,
+            status: PublicAccountStatus::Active,
+            display_order: next_public_account_display_order(&accounts)?,
+        };
+        let secret = PublicAccountSecret {
+            private_key: *private_key,
+        };
+        let metadata_entry = public_account_metadata_record_entry(&view, &account)?;
+        let secret_entry = public_account_secret_record_entry(&spend, &account, &secret)?;
+        self.db
+            .put_desktop_wallet_vault_records(&[metadata_entry, secret_entry])?;
+        Ok(account)
+    }
+
+    pub fn update_public_account_label(
+        &self,
+        view_session: &DesktopViewSession,
+        public_account_uuid: &str,
+        label: Option<&str>,
+    ) -> Result<PublicAccountMetadata, VaultError> {
+        let mut accounts = self.list_public_account_metadata_with_view(&view_session.view)?;
+        let Some(account) = accounts
+            .iter_mut()
+            .find(|account| account.public_account_uuid == public_account_uuid)
+        else {
+            return Err(VaultError::PublicAccountNotFound);
+        };
+        if !account.is_scoped_to_wallet(view_session.wallet_id()) {
+            return Err(VaultError::PublicAccountNotFound);
+        }
+        account.label = normalize_public_account_label(label);
+        let updated = account.clone();
+        let (key, data) = public_account_metadata_record_entry(&view_session.view, &updated)?;
+        self.db.put_desktop_wallet_vault_record(&key, &data)?;
+        Ok(updated)
+    }
+
+    pub fn hide_derived_public_account(
+        &self,
+        view_session: &DesktopViewSession,
+        public_account_uuid: &str,
+    ) -> Result<PublicAccountMetadata, VaultError> {
+        let mut accounts = self.list_public_account_metadata_with_view(&view_session.view)?;
+        let Some(account) = accounts
+            .iter_mut()
+            .find(|account| account.public_account_uuid == public_account_uuid)
+        else {
+            return Err(VaultError::PublicAccountNotFound);
+        };
+        if !account.is_visible_for_wallet(view_session.wallet_id()) {
+            return Err(VaultError::PublicAccountNotFound);
+        }
+        if account.source != PublicAccountSource::Derived {
+            return Err(VaultError::InvalidPublicAccountOperation);
+        }
+        account.status = PublicAccountStatus::Hidden;
+        let updated = account.clone();
+        let (key, data) = public_account_metadata_record_entry(&view_session.view, &updated)?;
+        self.db.put_desktop_wallet_vault_record(&key, &data)?;
+        Ok(updated)
+    }
+
+    pub fn show_derived_public_account(
+        &self,
+        view_session: &DesktopViewSession,
+        public_account_uuid: &str,
+    ) -> Result<PublicAccountMetadata, VaultError> {
+        let mut accounts = self.list_public_account_metadata_with_view(&view_session.view)?;
+        let Some(account_index) = accounts
+            .iter()
+            .position(|account| account.public_account_uuid == public_account_uuid)
+        else {
+            return Err(VaultError::PublicAccountNotFound);
+        };
+        let account = &accounts[account_index];
+        if !account.is_scoped_to_wallet(view_session.wallet_id()) {
+            return Err(VaultError::PublicAccountNotFound);
+        }
+        if account.source != PublicAccountSource::Derived {
+            return Err(VaultError::InvalidPublicAccountOperation);
+        }
+        if account.status == PublicAccountStatus::Hidden {
+            ensure_public_account_address_available(
+                &accounts,
+                account.address,
+                &account.scope,
+                view_session.wallet_id(),
+            )?;
+            accounts[account_index].status = PublicAccountStatus::Active;
+        }
+        let updated = accounts[account_index].clone();
+        let (key, data) = public_account_metadata_record_entry(&view_session.view, &updated)?;
+        self.db.put_desktop_wallet_vault_record(&key, &data)?;
+        Ok(updated)
+    }
+
+    pub fn delete_imported_public_account(
+        &self,
+        view_session: &DesktopViewSession,
+        public_account_uuid: &str,
+    ) -> Result<PublicAccountMetadata, VaultError> {
+        let accounts = self.list_public_account_metadata_with_view(&view_session.view)?;
+        let Some(account) = accounts
+            .into_iter()
+            .find(|account| account.public_account_uuid == public_account_uuid)
+        else {
+            return Err(VaultError::PublicAccountNotFound);
+        };
+        if !account.is_visible_for_wallet(view_session.wallet_id()) {
+            return Err(VaultError::PublicAccountNotFound);
+        }
+        if account.source != PublicAccountSource::Imported {
+            return Err(VaultError::InvalidPublicAccountOperation);
+        }
+
+        self.db
+            .delete_desktop_wallet_vault_record(&public_account_metadata_record_key(
+                &account.public_account_uuid,
+            ))?;
+        self.db
+            .delete_desktop_wallet_vault_record(&public_account_secret_record_key(
+                &account.public_account_uuid,
+            ))?;
+        Ok(account)
+    }
+
+    pub fn public_account_signing_key(
+        &self,
+        grant: &mut SpendGrant,
+        view_session: &DesktopViewSession,
+        public_account_uuid: &str,
+    ) -> Result<Zeroizing<[u8; KEY_LEN]>, VaultError> {
+        let accounts = self.list_visible_public_accounts_for_session(view_session)?;
+        let Some(account) = accounts
+            .into_iter()
+            .find(|account| account.public_account_uuid == public_account_uuid)
+        else {
+            return Err(VaultError::PublicAccountNotFound);
+        };
+        let spend = grant.take_spend_unlock()?;
+        match account.source {
+            PublicAccountSource::Derived => {
+                let Some(derivation_index) = account.derivation_index else {
+                    return Err(VaultError::InvalidPublicAccountOperation);
+                };
+                let wallet_id = view_session.wallet_id();
+                let spend_record = self.encrypted_record(&wallet_spend_record_key(wallet_id))?;
+                let spend_bundle = spend.decrypt_spend_bundle(wallet_id, &spend_record)?;
+                derive_public_evm_private_key_from_entropy(
+                    &spend_bundle.bip39_entropy,
+                    derivation_index,
+                )
+            }
+            PublicAccountSource::Imported => {
+                let record = self.encrypted_record(&public_account_secret_record_key(
+                    &account.public_account_uuid,
+                ))?;
+                let secret =
+                    spend.decrypt_public_account_secret(&account.public_account_uuid, &record)?;
+                Ok(Zeroizing::new(secret.private_key))
+            }
+        }
     }
 
     pub fn store_wallet_metadata(
@@ -1015,6 +1305,30 @@ impl DesktopVaultStore {
         Ok(())
     }
 
+    fn list_public_account_metadata_with_view(
+        &self,
+        view: &ViewUnlock,
+    ) -> Result<Vec<PublicAccountMetadata>, VaultError> {
+        let records = self
+            .db
+            .list_desktop_wallet_vault_records(PUBLIC_ACCOUNT_METADATA_PREFIX)?;
+        let mut accounts = Vec::with_capacity(records.len());
+        for stored in records {
+            let Some(public_account_uuid) = stored.key.strip_prefix(PUBLIC_ACCOUNT_METADATA_PREFIX)
+            else {
+                continue;
+            };
+            let record: EncryptedRecord = rmp_serde::from_slice(&stored.payload)?;
+            let mut account = view.decrypt_public_account_metadata(public_account_uuid, &record)?;
+            if account.public_account_uuid != public_account_uuid {
+                public_account_uuid.clone_into(&mut account.public_account_uuid);
+            }
+            accounts.push(account);
+        }
+        sort_public_account_metadata(&mut accounts);
+        Ok(accounts)
+    }
+
     fn encrypted_wallet_records_from_entropy(
         &self,
         password: &str,
@@ -1034,12 +1348,17 @@ impl DesktopVaultStore {
             bip39_language,
             bip39_entropy: entropy.to_vec(),
         };
+        let existing_public_accounts = if metadata.is_some() {
+            self.list_public_account_metadata_with_view(&view)?
+        } else {
+            Vec::new()
+        };
 
         let view_record = view.encrypt_view_bundle(wallet_id, &view_bundle)?;
         let spend_record = spend.encrypt_spend_bundle(wallet_id, &spend_bundle)?;
         let view_record_key = wallet_view_record_key(wallet_id);
         let spend_record_key = wallet_spend_record_key(wallet_id);
-        let mut records = Vec::with_capacity(2 + usize::from(metadata.is_some()));
+        let mut records = Vec::with_capacity(2 + usize::from(metadata.is_some()) * 2);
         records.push(view_record.to_record_entry(view_record_key.clone())?);
         records.push(spend_record.to_record_entry(spend_record_key.clone())?);
 
@@ -1047,6 +1366,13 @@ impl DesktopVaultStore {
             let record = view.encrypt_wallet_metadata(&metadata.wallet_uuid, metadata)?;
             records
                 .push(record.to_record_entry(wallet_metadata_record_key(&metadata.wallet_uuid))?);
+
+            let public_account =
+                initial_derived_public_account(wallet_id, entropy, &existing_public_accounts)?;
+            records.push(public_account_metadata_record_entry(
+                &view,
+                &public_account,
+            )?);
         }
 
         Ok((
@@ -1535,6 +1861,32 @@ impl ViewUnlock {
         )
     }
 
+    pub fn encrypt_public_account_metadata(
+        &self,
+        public_account_uuid: &str,
+        metadata: &PublicAccountMetadata,
+    ) -> Result<EncryptedRecord, VaultError> {
+        encrypt_serialized(
+            &self.view_dek,
+            RecordKind::PublicAccountMetadata,
+            public_account_uuid,
+            metadata,
+        )
+    }
+
+    pub fn decrypt_public_account_metadata(
+        &self,
+        public_account_uuid: &str,
+        record: &EncryptedRecord,
+    ) -> Result<PublicAccountMetadata, VaultError> {
+        decrypt_serialized(
+            &self.view_dek,
+            RecordKind::PublicAccountMetadata,
+            public_account_uuid,
+            record,
+        )
+    }
+
     pub fn derive_cache_keys(&self, wallet_chain_uuid: &str) -> Result<CacheKeys, VaultError> {
         Ok(CacheKeys {
             index: derive_context_key(
@@ -1597,6 +1949,32 @@ impl SpendUnlock {
             &self.spend_dek,
             RecordKind::WalletSpendBundle,
             wallet_id,
+            record,
+        )
+    }
+
+    pub fn encrypt_public_account_secret(
+        &self,
+        public_account_uuid: &str,
+        secret: &PublicAccountSecret,
+    ) -> Result<EncryptedRecord, VaultError> {
+        encrypt_serialized(
+            &self.spend_dek,
+            RecordKind::PublicAccountSecret,
+            public_account_uuid,
+            secret,
+        )
+    }
+
+    pub fn decrypt_public_account_secret(
+        &self,
+        public_account_uuid: &str,
+        record: &EncryptedRecord,
+    ) -> Result<PublicAccountSecret, VaultError> {
+        decrypt_serialized(
+            &self.spend_dek,
+            RecordKind::PublicAccountSecret,
+            public_account_uuid,
             record,
         )
     }
@@ -1723,8 +2101,8 @@ impl WalletViewBundle {
         ViewingKeyData {
             viewing_private_key: self.viewing_private_key,
             viewing_public_key: self.viewing_public_key,
-            nullifying_key: alloy::primitives::U256::from_be_bytes(self.nullifying_key),
-            master_public_key: alloy::primitives::U256::from_be_bytes(self.master_public_key),
+            nullifying_key: U256::from_be_bytes(self.nullifying_key),
+            master_public_key: U256::from_be_bytes(self.master_public_key),
         }
     }
 
@@ -1770,6 +2148,64 @@ pub struct WalletMetadataBundle {
     pub status: WalletStatus,
     #[serde(default)]
     pub display_order: u32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PublicAccountSource {
+    Derived,
+    Imported,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PublicAccountScope {
+    PrivateWallet { wallet_uuid: String },
+    Global,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PublicAccountStatus {
+    Active,
+    Hidden,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PublicAccountMetadata {
+    pub public_account_uuid: String,
+    pub address: Address,
+    pub label: Option<String>,
+    pub source: PublicAccountSource,
+    pub scope: PublicAccountScope,
+    pub derivation_index: Option<u32>,
+    pub status: PublicAccountStatus,
+    pub display_order: u32,
+}
+
+impl PublicAccountMetadata {
+    #[must_use]
+    pub fn is_visible_for_wallet(&self, wallet_uuid: &str) -> bool {
+        self.status == PublicAccountStatus::Active && self.is_scoped_to_wallet(wallet_uuid)
+    }
+
+    #[must_use]
+    pub fn is_scoped_to_wallet(&self, wallet_uuid: &str) -> bool {
+        match &self.scope {
+            PublicAccountScope::PrivateWallet {
+                wallet_uuid: scoped,
+            } => scoped == wallet_uuid,
+            PublicAccountScope::Global => true,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_global(&self) -> bool {
+        matches!(self.scope, PublicAccountScope::Global)
+    }
+}
+
+#[derive(Serialize, Deserialize, Zeroize)]
+#[zeroize(drop)]
+pub struct PublicAccountSecret {
+    pub private_key: [u8; KEY_LEN],
 }
 
 #[derive(Deserialize)]
@@ -2094,6 +2530,14 @@ fn wallet_cache_row_record_key(wallet_chain_uuid: &str, row_id: &[u8; KEY_LEN]) 
     )
 }
 
+fn public_account_metadata_record_key(public_account_uuid: &str) -> String {
+    format!("{PUBLIC_ACCOUNT_METADATA_PREFIX}{public_account_uuid}")
+}
+
+fn public_account_secret_record_key(public_account_uuid: &str) -> String {
+    format!("{PUBLIC_ACCOUNT_SECRET_PREFIX}{public_account_uuid}")
+}
+
 fn wallet_cache_counts(utxos: &[WalletUtxo]) -> (usize, usize) {
     let spent = utxos.iter().filter(|utxo| utxo.is_spent()).count();
     (utxos.len().saturating_sub(spent), spent)
@@ -2121,6 +2565,25 @@ fn wallet_metadata_record_entry(
 ) -> Result<(String, Vec<u8>), VaultError> {
     let key = wallet_metadata_record_key(&metadata.wallet_uuid);
     let record = view.encrypt_wallet_metadata(&metadata.wallet_uuid, metadata)?;
+    record.to_record_entry(key)
+}
+
+fn public_account_metadata_record_entry(
+    view: &ViewUnlock,
+    metadata: &PublicAccountMetadata,
+) -> Result<(String, Vec<u8>), VaultError> {
+    let key = public_account_metadata_record_key(&metadata.public_account_uuid);
+    let record = view.encrypt_public_account_metadata(&metadata.public_account_uuid, metadata)?;
+    record.to_record_entry(key)
+}
+
+fn public_account_secret_record_entry(
+    spend: &SpendUnlock,
+    metadata: &PublicAccountMetadata,
+    secret: &PublicAccountSecret,
+) -> Result<(String, Vec<u8>), VaultError> {
+    let key = public_account_secret_record_key(&metadata.public_account_uuid);
+    let record = spend.encrypt_public_account_secret(&metadata.public_account_uuid, secret)?;
     record.to_record_entry(key)
 }
 
@@ -2232,6 +2695,155 @@ pub fn sort_wallet_metadata(metadata: &mut [WalletMetadataBundle]) {
     });
 }
 
+#[must_use]
+pub fn normalize_public_account_label(label: Option<&str>) -> Option<String> {
+    label
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+pub fn sort_public_account_metadata(metadata: &mut [PublicAccountMetadata]) {
+    metadata.sort_by(|left, right| {
+        left.display_order
+            .cmp(&right.display_order)
+            .then_with(|| left.address.cmp(&right.address))
+            .then_with(|| left.public_account_uuid.cmp(&right.public_account_uuid))
+    });
+}
+
+fn next_public_account_display_order(
+    metadata: &[PublicAccountMetadata],
+) -> Result<u32, VaultError> {
+    metadata
+        .iter()
+        .map(|metadata| metadata.display_order)
+        .max()
+        .map_or(Ok(0), |max_display_order| {
+            max_display_order
+                .checked_add(1)
+                .ok_or(VaultError::PublicAccountDisplayOrderOverflow)
+        })
+}
+
+fn next_derived_public_account_index(
+    metadata: &[PublicAccountMetadata],
+    wallet_uuid: &str,
+) -> Result<u32, VaultError> {
+    metadata
+        .iter()
+        .filter(|account| account.source == PublicAccountSource::Derived)
+        .filter(|account| {
+            matches!(
+                &account.scope,
+                PublicAccountScope::PrivateWallet { wallet_uuid: scoped } if scoped == wallet_uuid
+            )
+        })
+        .filter_map(|account| account.derivation_index)
+        .max()
+        .map_or(Ok(0), |max_index| {
+            max_index
+                .checked_add(1)
+                .ok_or(VaultError::PublicAccountDisplayOrderOverflow)
+        })
+}
+
+fn ensure_public_account_address_available(
+    metadata: &[PublicAccountMetadata],
+    address: Address,
+    scope: &PublicAccountScope,
+    selected_wallet_uuid: &str,
+) -> Result<(), VaultError> {
+    let duplicates = match scope {
+        PublicAccountScope::Global => metadata.iter().any(|account| {
+            account.status == PublicAccountStatus::Active && account.address == address
+        }),
+        PublicAccountScope::PrivateWallet { .. } => metadata.iter().any(|account| {
+            account.address == address && account.is_visible_for_wallet(selected_wallet_uuid)
+        }),
+    };
+    if duplicates {
+        Err(VaultError::DuplicatePublicAccountAddress)
+    } else {
+        Ok(())
+    }
+}
+
+fn initial_derived_public_account(
+    wallet_uuid: &str,
+    entropy: &[u8],
+    existing_accounts: &[PublicAccountMetadata],
+) -> Result<PublicAccountMetadata, VaultError> {
+    let address = derive_public_evm_address_from_entropy(entropy, 0)?;
+    let scope = PublicAccountScope::PrivateWallet {
+        wallet_uuid: wallet_uuid.to_owned(),
+    };
+    ensure_public_account_address_available(existing_accounts, address, &scope, wallet_uuid)?;
+    Ok(PublicAccountMetadata {
+        public_account_uuid: generate_opaque_id()?,
+        address,
+        label: None,
+        source: PublicAccountSource::Derived,
+        scope,
+        derivation_index: Some(0),
+        status: PublicAccountStatus::Active,
+        display_order: next_public_account_display_order(existing_accounts)?,
+    })
+}
+
+pub fn derive_public_evm_private_key_from_entropy(
+    entropy: &[u8],
+    derivation_index: u32,
+) -> Result<Zeroizing<[u8; KEY_LEN]>, VaultError> {
+    let mnemonic = Zeroizing::new(bip39_mnemonic_from_entropy(entropy)?);
+    derive_public_evm_private_key_from_mnemonic(&mnemonic, derivation_index)
+}
+
+pub fn derive_public_evm_private_key_from_mnemonic(
+    mnemonic: &str,
+    derivation_index: u32,
+) -> Result<Zeroizing<[u8; KEY_LEN]>, VaultError> {
+    let signer = MnemonicBuilder::from_phrase(mnemonic)
+        .index(derivation_index)
+        .map_err(|_| VaultError::PublicEvmKeyDerivation)?
+        .build()
+        .map_err(|_| VaultError::PublicEvmKeyDerivation)?;
+    let bytes = signer.to_bytes();
+    let mut private_key = [0u8; KEY_LEN];
+    private_key.copy_from_slice(bytes.as_slice());
+    Ok(Zeroizing::new(private_key))
+}
+
+pub fn derive_public_evm_address_from_entropy(
+    entropy: &[u8],
+    derivation_index: u32,
+) -> Result<Address, VaultError> {
+    let private_key = derive_public_evm_private_key_from_entropy(entropy, derivation_index)?;
+    public_evm_address_from_private_key(&private_key)
+}
+
+pub fn parse_public_evm_private_key(
+    private_key: &str,
+) -> Result<Zeroizing<[u8; KEY_LEN]>, VaultError> {
+    let pk_hex = private_key
+        .trim()
+        .strip_prefix("0x")
+        .unwrap_or_else(|| private_key.trim());
+    let bytes =
+        alloy::hex::decode_to_array(pk_hex).map_err(|_| VaultError::InvalidPublicEvmPrivateKey)?;
+    let private_key = Zeroizing::new(bytes);
+    public_evm_address_from_private_key(&private_key)?;
+    Ok(private_key)
+}
+
+pub fn public_evm_address_from_private_key(
+    private_key: &[u8; KEY_LEN],
+) -> Result<Address, VaultError> {
+    let signing_key = SigningKey::from_bytes(private_key.into())
+        .map_err(|_| VaultError::InvalidPublicEvmPrivateKey)?;
+    Ok(PrivateKeySigner::from(signing_key).address())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2243,6 +2855,11 @@ mod tests {
 
     const TEST_PASSWORD: &str = "correct horse battery staple";
     const TEST_WALLET_ID: &str = "wallet-1";
+    const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    const IMPORT_PRIVATE_KEY_ONE: &str =
+        "0x0000000000000000000000000000000000000000000000000000000000000001";
+    const IMPORT_PRIVATE_KEY_TWO: &str =
+        "0x0000000000000000000000000000000000000000000000000000000000000002";
     static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn test_kdf() -> KdfParams {
@@ -2274,6 +2891,29 @@ mod tests {
             .put_metadata(&created.metadata)
             .expect("persist metadata");
         (root_dir, db, store)
+    }
+
+    fn import_wallet_with_metadata(
+        store: &DesktopVaultStore,
+        wallet_id: &str,
+        label: &str,
+    ) -> DesktopViewSession {
+        let metadata = store
+            .new_wallet_metadata(TEST_PASSWORD, wallet_id, 0, WalletSource::Imported, label)
+            .expect("wallet metadata");
+        store
+            .import_wallet_mnemonic_with_metadata(
+                TEST_PASSWORD,
+                wallet_id,
+                0,
+                "english",
+                TEST_MNEMONIC,
+                &metadata,
+            )
+            .expect("import wallet with metadata");
+        store
+            .load_view_session(TEST_PASSWORD, wallet_id)
+            .expect("load view session")
     }
 
     #[derive(Serialize)]
@@ -2483,6 +3123,453 @@ mod tests {
         assert_eq!(loaded.wallet_uuid, wallet_id);
         assert_eq!(loaded.label, "Primary wallet");
         assert_eq!(loaded.derivation_index, 0);
+
+        drop(store);
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn public_account_import_encrypts_secret_and_delete_removes_records() {
+        let (root_dir, db, store) = desktop_store_with_vault();
+        let view_session = import_wallet_with_metadata(&store, "public-secret-wallet", "Public A");
+        let account = store
+            .import_public_account(
+                TEST_PASSWORD,
+                &view_session,
+                IMPORT_PRIVATE_KEY_ONE,
+                Some("  Hot account  "),
+                false,
+            )
+            .expect("import public account");
+        let private_key =
+            parse_public_evm_private_key(IMPORT_PRIVATE_KEY_ONE).expect("private key");
+        let metadata_payload = db
+            .get_desktop_wallet_vault_record(&public_account_metadata_record_key(
+                &account.public_account_uuid,
+            ))
+            .expect("load public metadata record")
+            .expect("public metadata record present");
+        let secret_payload = db
+            .get_desktop_wallet_vault_record(&public_account_secret_record_key(
+                &account.public_account_uuid,
+            ))
+            .expect("load public secret record")
+            .expect("public secret record present");
+        let secret_record: EncryptedRecord =
+            rmp_serde::from_slice(&secret_payload).expect("decode secret record");
+
+        assert_eq!(account.label.as_deref(), Some("Hot account"));
+        assert!(!contains_subsequence(&metadata_payload, b"Hot account"));
+        assert!(!contains_subsequence(&metadata_payload, &*private_key));
+        assert!(!contains_subsequence(&secret_payload, &*private_key));
+        assert!(
+            view_session
+                .view
+                .decrypt_record(
+                    RecordKind::PublicAccountSecret,
+                    &account.public_account_uuid,
+                    &secret_record,
+                )
+                .is_err()
+        );
+
+        let mut grant = store
+            .create_spend_grant(TEST_PASSWORD)
+            .expect("create spend grant");
+        let signing_key = store
+            .public_account_signing_key(&mut grant, &view_session, &account.public_account_uuid)
+            .expect("imported signing key");
+        assert_eq!(&*signing_key, &*private_key);
+
+        let deleted = store
+            .delete_imported_public_account(&view_session, &account.public_account_uuid)
+            .expect("delete imported account");
+        assert_eq!(deleted.public_account_uuid, account.public_account_uuid);
+        assert!(
+            db.get_desktop_wallet_vault_record(&public_account_metadata_record_key(
+                &account.public_account_uuid,
+            ))
+            .expect("load deleted metadata")
+            .is_none()
+        );
+        assert!(
+            db.get_desktop_wallet_vault_record(&public_account_secret_record_key(
+                &account.public_account_uuid,
+            ))
+            .expect("load deleted secret")
+            .is_none()
+        );
+
+        drop(store);
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn public_account_visibility_scope_duplicates_and_next_index() {
+        let (root_dir, db, store) = desktop_store_with_vault();
+        let first_session = import_wallet_with_metadata(&store, "public-wallet-a", "Public A");
+        let second_session = import_wallet_with_metadata(&store, "public-wallet-b", "Public B");
+        let scoped = store
+            .import_public_account(
+                TEST_PASSWORD,
+                &first_session,
+                IMPORT_PRIVATE_KEY_ONE,
+                Some("Scoped"),
+                false,
+            )
+            .expect("import scoped account");
+        let global = store
+            .import_public_account(
+                TEST_PASSWORD,
+                &first_session,
+                IMPORT_PRIVATE_KEY_TWO,
+                Some("Global"),
+                true,
+            )
+            .expect("import global account");
+
+        let first_visible = store
+            .list_visible_public_accounts_for_session(&first_session)
+            .expect("first visible accounts");
+        let second_visible = store
+            .list_visible_public_accounts_for_session(&second_session)
+            .expect("second visible accounts");
+        assert!(
+            first_visible
+                .iter()
+                .any(|account| account.source == PublicAccountSource::Derived)
+        );
+        assert!(
+            first_visible
+                .iter()
+                .any(|account| account.public_account_uuid == scoped.public_account_uuid)
+        );
+        assert!(
+            first_visible
+                .iter()
+                .any(|account| account.public_account_uuid == global.public_account_uuid)
+        );
+        assert!(
+            !second_visible
+                .iter()
+                .any(|account| account.public_account_uuid == scoped.public_account_uuid)
+        );
+        assert!(
+            second_visible
+                .iter()
+                .any(|account| account.public_account_uuid == global.public_account_uuid)
+        );
+
+        assert!(matches!(
+            store.import_public_account(
+                TEST_PASSWORD,
+                &first_session,
+                IMPORT_PRIVATE_KEY_ONE,
+                Some("Duplicate scoped"),
+                false,
+            ),
+            Err(VaultError::DuplicatePublicAccountAddress)
+        ));
+        assert!(matches!(
+            store.import_public_account(
+                TEST_PASSWORD,
+                &first_session,
+                IMPORT_PRIVATE_KEY_ONE,
+                Some("Duplicate global"),
+                true,
+            ),
+            Err(VaultError::DuplicatePublicAccountAddress)
+        ));
+        assert!(matches!(
+            store.import_public_account(
+                TEST_PASSWORD,
+                &second_session,
+                IMPORT_PRIVATE_KEY_TWO,
+                Some("Duplicate visible global"),
+                false,
+            ),
+            Err(VaultError::DuplicatePublicAccountAddress)
+        ));
+
+        let derived = store
+            .add_derived_public_account(TEST_PASSWORD, &first_session, Some("Derived 1"))
+            .expect("add derived account");
+        assert_eq!(derived.derivation_index, Some(1));
+        store
+            .hide_derived_public_account(&first_session, &derived.public_account_uuid)
+            .expect("hide derived account");
+        let all_first_accounts = store
+            .list_public_accounts_for_session(&first_session, true)
+            .expect("first accounts including hidden");
+        assert!(all_first_accounts.iter().any(|account| {
+            account.public_account_uuid == derived.public_account_uuid
+                && account.status == PublicAccountStatus::Hidden
+        }));
+        let relabeled_hidden = store
+            .update_public_account_label(
+                &first_session,
+                &derived.public_account_uuid,
+                Some("Hidden derived"),
+            )
+            .expect("edit hidden derived label");
+        assert_eq!(relabeled_hidden.status, PublicAccountStatus::Hidden);
+        assert_eq!(relabeled_hidden.label.as_deref(), Some("Hidden derived"));
+        assert_eq!(
+            store
+                .next_derived_public_account_index_for_session(&first_session)
+                .expect("next derived index"),
+            2
+        );
+        let next = store
+            .add_derived_public_account(TEST_PASSWORD, &first_session, Some("Derived 2"))
+            .expect("add next derived account");
+        assert_eq!(next.derivation_index, Some(2));
+        assert!(
+            !store
+                .list_visible_public_accounts_for_session(&first_session)
+                .expect("visible after hide")
+                .iter()
+                .any(|account| account.public_account_uuid == derived.public_account_uuid)
+        );
+        let shown = store
+            .show_derived_public_account(&first_session, &derived.public_account_uuid)
+            .expect("show derived account");
+        assert_eq!(shown.status, PublicAccountStatus::Active);
+        assert!(
+            store
+                .list_visible_public_accounts_for_session(&first_session)
+                .expect("visible after show")
+                .iter()
+                .any(|account| account.public_account_uuid == derived.public_account_uuid)
+        );
+
+        drop(store);
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn hidden_derived_account_show_rejects_active_duplicate() {
+        let (root_dir, db, store) = desktop_store_with_vault();
+        let view_session = import_wallet_with_metadata(&store, "show-duplicate-wallet", "Public A");
+        let derived = store
+            .add_derived_public_account(TEST_PASSWORD, &view_session, Some("Derived 1"))
+            .expect("add derived account");
+        store
+            .hide_derived_public_account(&view_session, &derived.public_account_uuid)
+            .expect("hide derived account");
+        let derived_private_key =
+            derive_public_evm_private_key_from_mnemonic(TEST_MNEMONIC, 1).expect("derived key");
+        let derived_private_key_hex = format!("0x{}", alloy::hex::encode(derived_private_key));
+        store
+            .import_public_account(
+                TEST_PASSWORD,
+                &view_session,
+                &derived_private_key_hex,
+                Some("Imported duplicate"),
+                false,
+            )
+            .expect("import hidden derived duplicate");
+
+        assert!(matches!(
+            store.show_derived_public_account(&view_session, &derived.public_account_uuid),
+            Err(VaultError::DuplicatePublicAccountAddress)
+        ));
+        let hidden_accounts = store
+            .list_public_accounts_for_session(&view_session, true)
+            .expect("accounts including hidden");
+        assert!(hidden_accounts.iter().any(|account| {
+            account.public_account_uuid == derived.public_account_uuid
+                && account.status == PublicAccountStatus::Hidden
+        }));
+
+        drop(store);
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn derived_duplicate_address_is_rejected() {
+        let (root_dir, db, store) = desktop_store_with_vault();
+        let view_session =
+            import_wallet_with_metadata(&store, "derived-duplicate-wallet", "Public A");
+        let derived_private_key =
+            derive_public_evm_private_key_from_mnemonic(TEST_MNEMONIC, 1).expect("derived key");
+        let derived_private_key_hex = format!("0x{}", alloy::hex::encode(derived_private_key));
+        store
+            .import_public_account(
+                TEST_PASSWORD,
+                &view_session,
+                &derived_private_key_hex,
+                Some("Imported index 1"),
+                false,
+            )
+            .expect("import duplicate derived address");
+
+        assert!(matches!(
+            store.add_derived_public_account(TEST_PASSWORD, &view_session, Some("Derived 1")),
+            Err(VaultError::DuplicatePublicAccountAddress)
+        ));
+
+        drop(store);
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn public_account_signing_key_resolves_derived_and_imported_accounts() {
+        let (root_dir, db, store) = desktop_store_with_vault();
+        let view_session = import_wallet_with_metadata(&store, "public-signing-wallet", "Public A");
+        let derived = store
+            .list_visible_public_accounts_for_session(&view_session)
+            .expect("visible accounts")
+            .into_iter()
+            .find(|account| account.source == PublicAccountSource::Derived)
+            .expect("derived account");
+        assert!(
+            db.get_desktop_wallet_vault_record(&public_account_secret_record_key(
+                &derived.public_account_uuid,
+            ))
+            .expect("load derived secret record")
+            .is_none()
+        );
+
+        let mut derived_grant = store
+            .create_spend_grant(TEST_PASSWORD)
+            .expect("derived spend grant");
+        let derived_key = store
+            .public_account_signing_key(
+                &mut derived_grant,
+                &view_session,
+                &derived.public_account_uuid,
+            )
+            .expect("derived signing key");
+        assert_eq!(
+            public_evm_address_from_private_key(&derived_key).expect("derived address"),
+            derived.address
+        );
+        assert!(!derived_grant.is_valid());
+
+        let imported = store
+            .import_public_account(
+                TEST_PASSWORD,
+                &view_session,
+                IMPORT_PRIVATE_KEY_ONE,
+                Some("Imported"),
+                false,
+            )
+            .expect("import account");
+        let expected_private_key =
+            parse_public_evm_private_key(IMPORT_PRIVATE_KEY_ONE).expect("private key");
+        let mut imported_grant = store
+            .create_spend_grant(TEST_PASSWORD)
+            .expect("imported spend grant");
+        let imported_key = store
+            .public_account_signing_key(
+                &mut imported_grant,
+                &view_session,
+                &imported.public_account_uuid,
+            )
+            .expect("imported signing key");
+        assert_eq!(&*imported_key, &*expected_private_key);
+        assert!(!imported_grant.is_valid());
+
+        drop(store);
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn wallet_metadata_flows_auto_create_initial_public_account() {
+        let (root_dir, db, store) = desktop_store_with_vault();
+        let generated_seed = generate_seed_material().expect("generate seed");
+        let generated_wallet_id = "generated-public-wallet";
+        let generated_metadata = store
+            .new_wallet_metadata(
+                TEST_PASSWORD,
+                generated_wallet_id,
+                0,
+                WalletSource::Generated,
+                "Generated",
+            )
+            .expect("generated wallet metadata");
+        store
+            .store_generated_wallet_with_metadata(
+                TEST_PASSWORD,
+                generated_wallet_id,
+                0,
+                "english",
+                &generated_seed,
+                &generated_metadata,
+            )
+            .expect("store generated wallet with metadata");
+        let generated_session = store
+            .load_view_session(TEST_PASSWORD, generated_wallet_id)
+            .expect("generated view session");
+        let generated_accounts = store
+            .list_visible_public_accounts_for_session(&generated_session)
+            .expect("generated public accounts");
+        assert_eq!(generated_accounts.len(), 1);
+        assert_eq!(generated_accounts[0].source, PublicAccountSource::Derived);
+        assert_eq!(generated_accounts[0].derivation_index, Some(0));
+        assert_eq!(
+            generated_accounts[0].address,
+            derive_public_evm_address_from_entropy(generated_seed.entropy.as_slice(), 0)
+                .expect("generated public address")
+        );
+
+        let imported_wallet_id = "imported-public-wallet";
+        let imported_metadata = store
+            .new_wallet_metadata(
+                TEST_PASSWORD,
+                imported_wallet_id,
+                0,
+                WalletSource::Imported,
+                "Imported",
+            )
+            .expect("imported wallet metadata");
+        store
+            .import_wallet_mnemonic_with_metadata(
+                TEST_PASSWORD,
+                imported_wallet_id,
+                0,
+                "english",
+                TEST_MNEMONIC,
+                &imported_metadata,
+            )
+            .expect("import wallet with metadata");
+        let imported_session = store
+            .load_view_session(TEST_PASSWORD, imported_wallet_id)
+            .expect("imported view session");
+        let imported_accounts = store
+            .list_visible_public_accounts_for_session(&imported_session)
+            .expect("imported public accounts");
+        let imported_entropy =
+            bip39_entropy_from_mnemonic(TEST_MNEMONIC).expect("mnemonic entropy");
+        assert_eq!(imported_accounts.len(), 1);
+        assert_eq!(imported_accounts[0].source, PublicAccountSource::Derived);
+        assert_eq!(imported_accounts[0].derivation_index, Some(0));
+        assert_eq!(
+            imported_accounts[0].address,
+            derive_public_evm_address_from_entropy(&imported_entropy, 0)
+                .expect("imported public address")
+        );
+
+        let legacy_wallet_id = "metadata-less-public-wallet";
+        store
+            .import_wallet_mnemonic(TEST_PASSWORD, legacy_wallet_id, 0, "english", TEST_MNEMONIC)
+            .expect("import metadata-less wallet");
+        let legacy_session = store
+            .load_view_session(TEST_PASSWORD, legacy_wallet_id)
+            .expect("legacy view session");
+        assert!(
+            store
+                .list_visible_public_accounts_for_session(&legacy_session)
+                .expect("legacy public accounts")
+                .is_empty()
+        );
 
         drop(store);
         drop(db);
@@ -3031,7 +4118,7 @@ mod tests {
             .expect("load signer");
         let signature = signer.sign_spend_message(uint!(7_U256));
 
-        assert_ne!(signature, [alloy::primitives::U256::ZERO; 3]);
+        assert_ne!(signature, [U256::ZERO; 3]);
         assert!(!grant.is_valid());
         assert!(matches!(
             store.railgun_spend_signer(&mut grant, wallet_id),

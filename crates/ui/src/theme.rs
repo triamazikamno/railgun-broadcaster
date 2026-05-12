@@ -1,6 +1,12 @@
 use gpui::{App, Hsla, Pixels, px, rgb};
 
 pub const APP_FONT_FAMILY: &str = ".SystemUIFont";
+#[cfg(target_os = "macos")]
+pub const APP_MONO_FONT_FAMILY: &str = "Menlo";
+#[cfg(target_os = "windows")]
+pub const APP_MONO_FONT_FAMILY: &str = "Consolas";
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub const APP_MONO_FONT_FAMILY: &str = "DejaVu Sans Mono";
 pub const APP_TEXT_SIZE: Pixels = px(14.0);
 pub const ASSET_SYMBOL_TEXT_SIZE: Pixels = px(16.0);
 pub const BALANCE_TEXT_SIZE: Pixels = px(18.0);

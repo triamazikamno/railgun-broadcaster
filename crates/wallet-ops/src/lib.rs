@@ -63,6 +63,7 @@ mod amounts;
 mod anchors;
 mod http;
 mod poi_contexts;
+mod public_wallet;
 mod signer;
 mod utxos;
 
@@ -78,6 +79,16 @@ pub use anchors::{
     spawn_token_anchor_refresh_worker,
 };
 pub use http::{HttpContext, build_http_client};
+pub use public_wallet::{
+    PublicAccountBalance, PublicActionProgressStatus, PublicActionProgressStep,
+    PublicActionProgressUpdate, PublicAssetId, PublicBalanceAmount, PublicBalanceAsset,
+    PublicBalanceEntry, PublicBalanceRefreshCoordinator, PublicBalanceSnapshot, PublicSendRequest,
+    PublicSendResult, PublicShieldRequest, estimate_public_native_action_gas_reserve,
+    public_balance_assets_for_chain, public_balance_refresh_interval_secs,
+    public_native_action_gas_reserve, public_native_action_gas_units, refresh_public_balances,
+    submit_public_send, submit_public_send_with_progress, submit_public_shield,
+    submit_public_shield_with_progress,
+};
 pub use utxos::{
     ListUtxosOutput, TokenTotal, UtxoOutput, max_broadcaster_fee_token_amount_from_outputs,
     max_send_amount_from_outputs, max_unshield_amount_from_outputs,
@@ -3441,6 +3452,16 @@ async fn sign_send_wait(
     tx_req: TransactionRequest,
     label: &str,
 ) -> Result<TxReceiptOutput> {
+    sign_send_wait_with_sent(provider, wallet, tx_req, label, |_| {}).await
+}
+
+pub(crate) async fn sign_send_wait_with_sent(
+    provider: &(impl Provider + Clone),
+    wallet: &EthereumWallet,
+    tx_req: TransactionRequest,
+    label: &str,
+    on_sent: impl FnOnce(String) + Send,
+) -> Result<TxReceiptOutput> {
     let gas = provider
         .estimate_gas(tx_req.clone())
         .await
@@ -3470,6 +3491,8 @@ async fn sign_send_wait(
         .to_owned();
 
     tracing::info!(%tx_hash, label, "sent, waiting for confirmation...");
+    let tx_hash_string = hex::encode_prefixed(tx_hash);
+    on_sent(tx_hash_string.clone());
 
     let receipt = loop {
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -3493,7 +3516,7 @@ async fn sign_send_wait(
     }
 
     Ok(TxReceiptOutput {
-        tx_hash: hex::encode_prefixed(tx_hash),
+        tx_hash: tx_hash_string,
         status,
         block_number,
         gas_used,

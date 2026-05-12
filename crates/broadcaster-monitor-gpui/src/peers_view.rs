@@ -15,7 +15,7 @@ use gpui_component::{
 use broadcaster_monitor::{PeerRow, PeerSummary};
 use ui::clipboard::clipboard_with_toast;
 use ui::table::ColumnWidthSync;
-use ui::theme;
+use ui::theme::{self, APP_MONO_FONT_FAMILY};
 
 /// `TableDelegate` backing the peers pane. The peer summary (connected /
 /// known / dialing counts + capability tallies) is rendered outside the
@@ -104,6 +104,7 @@ impl TableDelegate for PeersDelegate {
                     .flex()
                     .items_center()
                     .gap_1()
+                    .font_family(APP_MONO_FONT_FAMILY)
                     .text_color(rgb(theme::PURPLE))
                     .child(SharedString::from(short(row.peer_id.as_ref(), 4)))
                     .child(

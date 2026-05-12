@@ -609,7 +609,6 @@ impl DbStore {
                 Some(meta) if meta.schema_version > CURRENT_SCHEMA_VERSION => {
                     drop(store);
                     backup_db(&db_path)?;
-                    continue;
                 }
                 Some(meta) if meta.schema_version < CURRENT_SCHEMA_VERSION => {
                     if let Err(err) =
@@ -636,18 +635,22 @@ impl DbStore {
         }
     }
 
+    #[must_use]
     pub fn root_dir(&self) -> &Path {
         &self.root_dir
     }
 
+    #[must_use]
     pub fn railgun_dir(&self) -> PathBuf {
         railgun_dir(&self.root_dir)
     }
 
+    #[must_use]
     pub fn db_path(&self) -> PathBuf {
         db_path(&self.root_dir)
     }
 
+    #[must_use]
     pub fn blob_dir(&self) -> PathBuf {
         blobs_dir(&self.root_dir)
     }
@@ -658,10 +661,12 @@ impl DbStore {
         Ok(dir)
     }
 
+    #[must_use]
     pub fn blob_path(&self, kind: &str, name: &str) -> PathBuf {
         self.blob_dir().join(kind).join(name)
     }
 
+    #[must_use]
     pub fn resolve_path(&self, relative_path: &str) -> PathBuf {
         let path = PathBuf::from(relative_path);
         if path.is_absolute() {
@@ -671,6 +676,7 @@ impl DbStore {
         }
     }
 
+    #[must_use]
     pub fn relative_path(&self, path: &Path) -> String {
         if let Ok(relative) = path.strip_prefix(self.railgun_dir()) {
             relative.to_string_lossy().to_string()
@@ -679,6 +685,7 @@ impl DbStore {
         }
     }
 
+    #[must_use]
     pub fn relative_blob_path(kind: &str, name: &str) -> String {
         format!("{BLOBS_DIR}/{kind}/{name}")
     }

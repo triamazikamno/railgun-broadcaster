@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -22,12 +22,13 @@ use gpui_component::{
     divider::Divider,
     input::{Input, InputEvent, InputState},
     list::{List, ListDelegate, ListItem, ListState},
+    menu::{DropdownMenu, PopupMenuItem},
     popover::Popover,
     progress::Progress as UiProgress,
     resizable::{ResizableState, resizable_panel, v_resizable},
     scroll::ScrollableElement,
     select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState},
-    sidebar::{Sidebar, SidebarHeader, SidebarMenu, SidebarMenuItem},
+    sidebar::{Sidebar, SidebarMenu, SidebarMenuItem},
     spinner::Spinner,
     tab::{Tab, TabBar},
     table::{Column, Table, TableDelegate, TableEvent, TableState},
@@ -39,45 +40,52 @@ use railgun_ui::{
     format_scaled_amount, format_token_amount, lookup_token, short_address, token_icon_path,
 };
 use tokio::runtime::Handle;
-use tokio::sync::{OnceCell, watch};
+use tokio::sync::{OnceCell, mpsc, watch};
 use ui::clipboard::clipboard_with_toast;
 use ui::controls::{app_button, app_button_base, app_input, app_muted_text, app_strong_text};
 use ui::icons;
 use ui::logs::{LogStore, LogsPane};
-use ui::theme::{self, APP_FONT_FAMILY, APP_TEXT_SIZE};
+use ui::theme::{self, APP_FONT_FAMILY, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
     BroadcasterFeePolicy, BroadcasterFeePolicyStatus, DesktopSendCalldataRequest,
     DesktopSendPublicBroadcasterEstimateRequest, DesktopSendPublicBroadcasterRequest,
     DesktopUnshieldCalldataRequest, DesktopUnshieldPublicBroadcasterEstimateRequest,
     DesktopUnshieldPublicBroadcasterRequest, DesktopWalletSyncStartPolicy, HttpContext,
-    ListUtxosOutput, PreparedSendCall, PreparedUnshieldCall, PublicBroadcasterCandidate,
+    ListUtxosOutput, PreparedSendCall, PreparedUnshieldCall, PublicActionProgressStatus,
+    PublicActionProgressStep, PublicActionProgressUpdate, PublicAssetId, PublicBalanceAmount,
+    PublicBalanceEntry, PublicBalanceSnapshot, PublicBroadcasterCandidate,
     PublicBroadcasterCostEstimate, PublicBroadcasterFeeBreakdown, PublicBroadcasterFeeMargin,
     PublicBroadcasterFeeMode, PublicBroadcasterResultKind, PublicBroadcasterSelection,
-    PublicBroadcasterSubmissionResult, PublicBroadcasterWakuClient, SyncProgressUpdate,
-    TokenAnchorRateCache, TokenAnchorRefreshHandle, TokenTotal, TransactionGenerationStage,
-    UtxoOutput, ViewWalletChainSessionRequest, WalletSessionStore,
-    estimate_desktop_send_public_broadcaster_cost,
-    estimate_desktop_unshield_public_broadcaster_cost, fee_policy_eligible_public_broadcasters,
-    fixed_token_anchor_rate, is_wrapped_native_token,
+    PublicBroadcasterSubmissionResult, PublicBroadcasterWakuClient, PublicSendRequest,
+    PublicShieldRequest, SyncProgressUpdate, TokenAnchorRateCache, TokenAnchorRefreshHandle,
+    TokenTotal, TransactionGenerationStage, UtxoOutput, ViewWalletChainSessionRequest,
+    WalletSessionStore, estimate_desktop_send_public_broadcaster_cost,
+    estimate_desktop_unshield_public_broadcaster_cost, estimate_public_native_action_gas_reserve,
+    fee_policy_eligible_public_broadcasters, fixed_token_anchor_rate, is_wrapped_native_token,
     max_broadcaster_fee_token_amount_from_outputs as planner_max_broadcaster_fee_token_amount_from_outputs,
     max_send_amount_from_outputs as planner_max_send_amount_from_outputs,
     max_unshield_amount_from_outputs as planner_max_unshield_amount_from_outputs,
     parse_railgun_recipient, parse_send_amount, parse_unshield_amount,
     prepare_desktop_send_calldata, prepare_desktop_unshield_calldata,
-    public_broadcaster_candidates_for_asset, public_broadcaster_fee_breakdown,
-    public_broadcaster_service_gas_price, select_public_broadcaster_with_policy,
+    public_balance_refresh_interval_secs, public_broadcaster_candidates_for_asset,
+    public_broadcaster_fee_breakdown, public_broadcaster_service_gas_price,
+    refresh_public_balances, select_public_broadcaster_with_policy,
     sort_specific_public_broadcasters, spawn_token_anchor_refresh_worker,
     submit_desktop_send_public_broadcaster, submit_desktop_unshield_public_broadcaster,
+    submit_public_send_with_progress, submit_public_shield_with_progress,
     vault::{
         DesktopVaultStore, DesktopViewSession, GeneratedSeedMaterial, PRIMARY_WALLET_LABEL,
-        VaultError, WalletMetadataBundle, WalletSource, WalletStatus,
-        default_wallet_label_for_metadata, generate_opaque_id, generate_seed_material,
-        sort_wallet_metadata,
+        PublicAccountMetadata, PublicAccountSource, PublicAccountStatus, VaultError,
+        WalletMetadataBundle, WalletSource, WalletStatus, default_wallet_label_for_metadata,
+        generate_opaque_id, generate_seed_material, sort_wallet_metadata,
     },
 };
 use zeroize::Zeroizing;
 
-use crate::assets::{LOGO_ICON_PATH, RailgunActionIcon, RailgunSidebarIcon};
+use crate::assets::{
+    LOGO_ICON_PATH, RailgunActionIcon, RailgunPublicAccountIcon, RailgunSidebarIcon,
+    SIDEBAR_WORDMARK_PATH,
+};
 
 const SIDEBAR_WIDTH: Pixels = px(220.0);
 const SIDEBAR_AUTO_COLLAPSE_WIDTH: Pixels = px(900.0);
@@ -88,6 +96,8 @@ const BROADCASTER_PICKER_MAX_HEIGHT: Pixels = px(680.0);
 const BROADCASTER_PICKER_LIVE_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 const PRIVATE_ACTION_FORM_MAX_HEIGHT: Pixels = px(760.0);
 const PRIVATE_ASSET_LIST_WIDTH: Pixels = px(760.0);
+const PUBLIC_ACCOUNT_DIALOG_WIDTH: Pixels = px(460.0);
+const PUBLIC_ACTION_DIALOG_WIDTH: Pixels = px(520.0);
 const DIALOG_CONTENT_HORIZONTAL_INSET: Pixels = px(56.0);
 const UNSHIELD_SPINNER_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const UTXO_AGE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -238,6 +248,28 @@ enum DeliveryFormKind {
     Unshield,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublicActionMode {
+    Shield,
+    Send,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublicActionStepStatus {
+    NotStarted,
+    Pending,
+    Done,
+    Error,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PublicActionStepState {
+    step: PublicActionProgressStep,
+    status: PublicActionStepStatus,
+    tx_hash: Option<Arc<str>>,
+    message: Option<Arc<str>>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 enum BroadcasterChoice {
     #[default]
@@ -266,6 +298,34 @@ struct PrivateActionDialogContent {
     key: UnshieldAssetKey,
 }
 
+#[derive(Clone, Copy)]
+enum PublicAccountDialogKind {
+    Derive,
+    Import,
+    EditLabel,
+}
+
+impl PublicAccountDialogKind {
+    const fn title(self) -> &'static str {
+        match self {
+            Self::Derive => "Derive from private",
+            Self::Import => "Import private key",
+            Self::EditLabel => "Edit account label",
+        }
+    }
+}
+
+struct PublicAccountDialogContent {
+    root: Entity<WalletRoot>,
+    kind: PublicAccountDialogKind,
+    content_width: Pixels,
+}
+
+struct PublicActionDialogContent {
+    root: Entity<WalletRoot>,
+    content_width: Pixels,
+}
+
 impl PrivateActionDialogContent {
     fn new(
         root: Entity<WalletRoot>,
@@ -290,6 +350,50 @@ impl Render for PrivateActionDialogContent {
                 .read(cx)
                 .render_unshield_form(self.root.clone(), self.key),
         }
+    }
+}
+
+impl PublicAccountDialogContent {
+    fn new(
+        root: Entity<WalletRoot>,
+        kind: PublicAccountDialogKind,
+        content_width: Pixels,
+        cx: &mut Context<'_, Self>,
+    ) -> Self {
+        cx.observe(&root, |_this, _root, cx| cx.notify()).detach();
+        Self {
+            root,
+            kind,
+            content_width,
+        }
+    }
+}
+
+impl Render for PublicAccountDialogContent {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        self.root.read(cx).render_public_account_dialog_content(
+            self.root.clone(),
+            self.kind,
+            self.content_width,
+        )
+    }
+}
+
+impl PublicActionDialogContent {
+    fn new(root: Entity<WalletRoot>, content_width: Pixels, cx: &mut Context<'_, Self>) -> Self {
+        cx.observe(&root, |_this, _root, cx| cx.notify()).detach();
+        Self {
+            root,
+            content_width,
+        }
+    }
+}
+
+impl Render for PublicActionDialogContent {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        self.root
+            .read(cx)
+            .render_public_action_dialog_content(self.root.clone(), self.content_width)
     }
 }
 
@@ -895,6 +999,41 @@ struct SendFormState {
     result: Option<SendResult>,
 }
 
+struct PublicAccountFormState {
+    add_label_input: Entity<InputState>,
+    add_password_input: Entity<InputState>,
+    import_label_input: Entity<InputState>,
+    import_private_key_input: Entity<InputState>,
+    import_password_input: Entity<InputState>,
+    edit_label_input: Entity<InputState>,
+    search_input: Entity<InputState>,
+    send_recipient_input: Entity<InputState>,
+    send_amount_input: Entity<InputState>,
+    send_password_input: Entity<InputState>,
+    shield_amount_input: Entity<InputState>,
+    shield_password_input: Entity<InputState>,
+    import_global: bool,
+    selected_account_uuid: Option<Arc<str>>,
+    editing_account_uuid: Option<Arc<str>>,
+    search_query: Arc<str>,
+    selected_asset: Option<PublicAssetId>,
+    action_mode: PublicActionMode,
+    action_generation: u64,
+    action_progress: Vec<PublicActionStepState>,
+    expanded_action_error_steps: BTreeSet<PublicActionProgressStep>,
+    next_derived_index: Option<u32>,
+    error: Option<Arc<str>>,
+    send_error: Option<Arc<str>>,
+    shield_error: Option<Arc<str>>,
+    adding_account: bool,
+    importing_account: bool,
+    sending: bool,
+    shielding: bool,
+    show_hidden_accounts: bool,
+    has_hidden_accounts: bool,
+    pending_global_delete_uuid: Option<Arc<str>>,
+}
+
 enum ChainUtxoState {
     Idle,
     Loading {
@@ -1071,6 +1210,12 @@ pub(crate) struct WalletRoot {
     wallet_name_input: Entity<InputState>,
     add_wallet_password_input: Entity<InputState>,
     import_mnemonic_input: Entity<InputState>,
+    public_accounts: Vec<PublicAccountMetadata>,
+    public_form: PublicAccountFormState,
+    public_balance_snapshot: Option<Arc<PublicBalanceSnapshot>>,
+    public_balance_error: Option<Arc<str>>,
+    public_balance_refreshing: bool,
+    public_balance_generation: u64,
     send_forms: BTreeMap<UnshieldAssetKey, SendFormState>,
     private_action_form: Option<PrivateActionFormState>,
     send_generation_seq: u64,
@@ -1086,6 +1231,7 @@ pub(crate) struct WalletRoot {
     utxo_table: Entity<TableState<UtxoDelegate>>,
     focus_unlock_password_on_render: bool,
     focus_utxo_table_on_render: bool,
+    focus_public_account_search_on_render: bool,
     vault_dialog_open: bool,
     logs_open: bool,
     drawer_split: Entity<ResizableState>,
@@ -1165,6 +1311,64 @@ impl WalletRoot {
                 .auto_grow(3, 6)
                 .placeholder("paste recovery phrase")
         });
+        let public_account_search_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("search accounts"));
+        let public_form = PublicAccountFormState {
+            add_label_input: cx.new(|cx| InputState::new(window, cx).placeholder("optional label")),
+            add_password_input: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("vault password")
+                    .masked(true)
+            }),
+            import_label_input: cx
+                .new(|cx| InputState::new(window, cx).placeholder("optional label")),
+            import_private_key_input: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("private key hex")
+                    .masked(true)
+            }),
+            import_password_input: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("vault password")
+                    .masked(true)
+            }),
+            edit_label_input: cx.new(|cx| InputState::new(window, cx).placeholder("account label")),
+            search_input: public_account_search_input.clone(),
+            send_recipient_input: cx
+                .new(|cx| InputState::new(window, cx).placeholder("0x recipient")),
+            send_amount_input: cx.new(|cx| InputState::new(window, cx).placeholder("amount")),
+            send_password_input: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("vault password")
+                    .masked(true)
+            }),
+            shield_amount_input: cx.new(|cx| InputState::new(window, cx).placeholder("amount")),
+            shield_password_input: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("vault password")
+                    .masked(true)
+            }),
+            import_global: false,
+            selected_account_uuid: None,
+            editing_account_uuid: None,
+            search_query: Arc::from(""),
+            selected_asset: None,
+            action_mode: PublicActionMode::Shield,
+            action_generation: 0,
+            action_progress: Vec::new(),
+            expanded_action_error_steps: BTreeSet::new(),
+            next_derived_index: None,
+            error: None,
+            send_error: None,
+            shield_error: None,
+            adding_account: false,
+            importing_account: false,
+            sending: false,
+            shielding: false,
+            show_hidden_accounts: false,
+            has_hidden_accounts: false,
+            pending_global_delete_uuid: None,
+        };
         let repair_cache_block_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("0 = deployment block"));
         let tx_search_input =
@@ -1215,6 +1419,12 @@ impl WalletRoot {
             wallet_name_input,
             add_wallet_password_input,
             import_mnemonic_input,
+            public_accounts: Vec::new(),
+            public_form,
+            public_balance_snapshot: None,
+            public_balance_error: None,
+            public_balance_refreshing: false,
+            public_balance_generation: 0,
             send_forms: BTreeMap::new(),
             private_action_form: None,
             send_generation_seq: 0,
@@ -1230,6 +1440,7 @@ impl WalletRoot {
             utxo_table,
             focus_unlock_password_on_render,
             focus_utxo_table_on_render: false,
+            focus_public_account_search_on_render: false,
             vault_dialog_open: false,
             logs_open: false,
             drawer_split: cx.new(|_| ResizableState::default()),
@@ -1242,6 +1453,17 @@ impl WalletRoot {
                 cx.notify();
             }
         })
+        .detach();
+        cx.subscribe(
+            &public_account_search_input,
+            |this, input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let query = input.read(cx).value().trim().to_ascii_lowercase();
+                    this.public_form.search_query = Arc::from(query);
+                    cx.notify();
+                }
+            },
+        )
         .detach();
         cx.subscribe_in(
             &chain_select,
@@ -1334,6 +1556,56 @@ impl WalletRoot {
             }
         })
         .detach();
+        cx.subscribe_in(
+            &root.public_form.add_password_input,
+            window,
+            |this, _input, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.add_public_derived_account_from_input(window, cx);
+                }
+            },
+        )
+        .detach();
+        cx.subscribe_in(
+            &root.public_form.import_password_input,
+            window,
+            |this, _input, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.import_public_account_from_input(window, cx);
+                }
+            },
+        )
+        .detach();
+        cx.subscribe_in(
+            &root.public_form.edit_label_input,
+            window,
+            |this, _input, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.update_selected_public_account_label(window, cx);
+                }
+            },
+        )
+        .detach();
+        cx.subscribe_in(
+            &root.public_form.send_password_input,
+            window,
+            |this, _input, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.submit_public_send_from_form(window, cx);
+                }
+            },
+        )
+        .detach();
+        cx.subscribe_in(
+            &root.public_form.shield_password_input,
+            window,
+            |this, _input, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.submit_public_shield_from_form(window, cx);
+                }
+            },
+        )
+        .detach();
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
@@ -1370,6 +1642,23 @@ impl WalletRoot {
                         }) {
                             root.unshield_spinner_tick = root.unshield_spinner_tick.wrapping_add(1);
                             cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.spawn(async move |this, cx| {
+            let interval = Duration::from_secs(public_balance_refresh_interval_secs());
+            loop {
+                cx.background_executor().timer(interval).await;
+                if this
+                    .update(cx, |root, cx| {
+                        if root.active_wallet_tab == WalletTab::Public {
+                            root.schedule_public_balance_refresh(cx);
                         }
                     })
                     .is_err()
@@ -1446,6 +1735,7 @@ impl WalletRoot {
         self.session_store = Arc::new(OnceCell::new());
         self.send_forms.clear();
         self.unshield_forms.clear();
+        self.clear_public_wallet_runtime_state();
         self.private_action_form = None;
         self.broadcaster_picker = None;
         self.active_wallet_tab = WalletTab::default();
@@ -1453,6 +1743,1103 @@ impl WalletRoot {
             *state = ChainUtxoState::Idle;
         }
         self.sync_utxo_table(cx);
+    }
+
+    fn clear_public_wallet_runtime_state(&mut self) {
+        self.public_accounts.clear();
+        self.public_balance_snapshot = None;
+        self.public_balance_error = None;
+        self.public_balance_refreshing = false;
+        self.public_balance_generation = self.public_balance_generation.wrapping_add(1);
+        self.public_form.selected_account_uuid = None;
+        self.public_form.editing_account_uuid = None;
+        self.public_form.selected_asset = None;
+        self.public_form.action_progress.clear();
+        self.public_form.expanded_action_error_steps.clear();
+        self.public_form.next_derived_index = None;
+        self.public_form.error = None;
+        self.public_form.send_error = None;
+        self.public_form.shield_error = None;
+        self.public_form.adding_account = false;
+        self.public_form.importing_account = false;
+        self.public_form.sending = false;
+        self.public_form.shielding = false;
+        self.public_form.show_hidden_accounts = false;
+        self.public_form.has_hidden_accounts = false;
+        self.public_form.pending_global_delete_uuid = None;
+    }
+
+    fn reset_public_wallet_state(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.clear_public_wallet_runtime_state();
+        for input in [
+            &self.public_form.add_label_input,
+            &self.public_form.add_password_input,
+            &self.public_form.import_label_input,
+            &self.public_form.import_private_key_input,
+            &self.public_form.import_password_input,
+            &self.public_form.edit_label_input,
+            &self.public_form.send_recipient_input,
+            &self.public_form.send_amount_input,
+            &self.public_form.send_password_input,
+            &self.public_form.shield_amount_input,
+            &self.public_form.shield_password_input,
+        ] {
+            input.update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        self.public_form.import_global = false;
+        self.public_form.action_mode = PublicActionMode::Shield;
+    }
+
+    fn clear_public_account_dialog_inputs(
+        &mut self,
+        kind: PublicAccountDialogKind,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        match kind {
+            PublicAccountDialogKind::Derive => {
+                self.public_form
+                    .add_label_input
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                self.public_form
+                    .add_password_input
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+            }
+            PublicAccountDialogKind::Import => {
+                self.public_form
+                    .import_label_input
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                self.public_form
+                    .import_private_key_input
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                self.public_form
+                    .import_password_input
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                self.public_form.import_global = false;
+            }
+            PublicAccountDialogKind::EditLabel => {
+                self.public_form.editing_account_uuid = None;
+                self.public_form
+                    .edit_label_input
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+            }
+        }
+    }
+
+    fn reload_public_accounts(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let Some(store) = self.vault_store.as_ref() else {
+            self.public_form.error = Some(Arc::from("Wallet vault storage is unavailable"));
+            return;
+        };
+        let Some(view_session) = self.view_session.as_ref() else {
+            self.public_accounts.clear();
+            self.public_form.selected_account_uuid = None;
+            self.public_form.has_hidden_accounts = false;
+            self.public_form.show_hidden_accounts = false;
+            return;
+        };
+        match store.list_public_accounts_for_session(view_session.as_ref(), true) {
+            Ok(mut accounts) => {
+                self.public_form.has_hidden_accounts = accounts
+                    .iter()
+                    .any(|account| account.status == PublicAccountStatus::Hidden);
+                if !self.public_form.has_hidden_accounts {
+                    self.public_form.show_hidden_accounts = false;
+                }
+                if !self.public_form.show_hidden_accounts {
+                    accounts.retain(|account| account.status == PublicAccountStatus::Active);
+                }
+                let selected = self
+                    .public_form
+                    .selected_account_uuid
+                    .as_ref()
+                    .filter(|selected| {
+                        accounts.iter().any(|account| {
+                            account.public_account_uuid.as_str() == selected.as_ref()
+                                && account.status == PublicAccountStatus::Active
+                        })
+                    })
+                    .cloned()
+                    .or_else(|| {
+                        accounts
+                            .iter()
+                            .find(|account| account.status == PublicAccountStatus::Active)
+                            .map(|account| Arc::from(account.public_account_uuid.as_str()))
+                    });
+                self.public_accounts = accounts;
+                self.public_form.selected_account_uuid = selected;
+                self.public_form.next_derived_index = store
+                    .next_derived_public_account_index_for_session(view_session.as_ref())
+                    .ok();
+                self.sync_public_edit_label_input(window, cx);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error_kind = vault_error_kind(&error),
+                    "load public accounts failed"
+                );
+                self.public_form.error = Some(Arc::from(error.to_string()));
+            }
+        }
+    }
+
+    fn sync_public_edit_label_input(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let account_uuid = self
+            .public_form
+            .editing_account_uuid
+            .as_ref()
+            .or(self.public_form.selected_account_uuid.as_ref());
+        let label = self
+            .public_account_for_uuid(account_uuid.map(AsRef::as_ref))
+            .and_then(|account| account.label.clone())
+            .unwrap_or_default();
+        self.public_form
+            .edit_label_input
+            .update(cx, |input, cx| input.set_value(&label, window, cx));
+    }
+
+    fn selected_public_account(&self) -> Option<&PublicAccountMetadata> {
+        self.public_account_for_uuid(
+            self.public_form
+                .selected_account_uuid
+                .as_ref()
+                .map(AsRef::as_ref),
+        )
+    }
+
+    fn public_account_for_uuid(
+        &self,
+        public_account_uuid: Option<&str>,
+    ) -> Option<&PublicAccountMetadata> {
+        let selected = public_account_uuid?;
+        self.public_accounts
+            .iter()
+            .find(|account| account.public_account_uuid == selected)
+    }
+
+    fn set_public_selected_account(
+        &mut self,
+        public_account_uuid: Arc<str>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.public_form.selected_account_uuid = Some(public_account_uuid);
+        self.public_form.pending_global_delete_uuid = None;
+        self.public_form.send_error = None;
+        self.public_form.shield_error = None;
+        self.sync_public_edit_label_input(window, cx);
+        cx.notify();
+    }
+
+    fn set_public_selected_balance(
+        &mut self,
+        public_account_uuid: Arc<str>,
+        asset: PublicAssetId,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.public_form.selected_account_uuid = Some(public_account_uuid);
+        self.public_form.selected_asset = Some(asset);
+        self.public_form.pending_global_delete_uuid = None;
+        self.public_form.send_error = None;
+        self.public_form.shield_error = None;
+        self.sync_public_edit_label_input(window, cx);
+        cx.notify();
+    }
+
+    fn clear_public_action_dialog_inputs(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        for input in [
+            &self.public_form.send_recipient_input,
+            &self.public_form.send_amount_input,
+            &self.public_form.send_password_input,
+            &self.public_form.shield_amount_input,
+            &self.public_form.shield_password_input,
+        ] {
+            input.update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        self.public_form.send_error = None;
+        self.public_form.shield_error = None;
+        if !self.public_form.sending && !self.public_form.shielding {
+            self.public_form.action_progress.clear();
+            self.public_form.expanded_action_error_steps.clear();
+        }
+    }
+
+    fn selected_public_balance_entry(&self) -> Option<PublicBalanceEntry> {
+        let public_account_uuid = self.public_form.selected_account_uuid.as_deref()?;
+        let asset = self.public_form.selected_asset?;
+        self.public_balance_entry(public_account_uuid, asset)
+    }
+
+    fn public_balance_entry(
+        &self,
+        public_account_uuid: &str,
+        asset: PublicAssetId,
+    ) -> Option<PublicBalanceEntry> {
+        public_balance_entry_for_chain(
+            self.public_balance_snapshot.as_deref(),
+            self.selected_chain,
+            public_account_uuid,
+            asset,
+        )
+    }
+
+    fn set_public_action_mode(
+        &mut self,
+        mode: PublicActionMode,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.public_form.action_mode == mode {
+            return;
+        }
+        self.public_form.action_mode = mode;
+        self.public_form.send_error = None;
+        self.public_form.shield_error = None;
+        self.public_form.action_progress.clear();
+        self.public_form.expanded_action_error_steps.clear();
+        cx.defer_in(window, |root, window, cx| {
+            root.focus_public_action_dialog_input(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn start_public_action_progress(
+        &mut self,
+        mode: PublicActionMode,
+        asset: PublicAssetId,
+    ) -> u64 {
+        self.public_form.action_generation = self.public_form.action_generation.wrapping_add(1);
+        let generation = self.public_form.action_generation;
+        self.public_form.expanded_action_error_steps.clear();
+        self.public_form.action_progress = public_action_progress_steps(mode, asset)
+            .into_iter()
+            .map(|step| PublicActionStepState {
+                step,
+                status: PublicActionStepStatus::NotStarted,
+                tx_hash: None,
+                message: None,
+            })
+            .collect();
+        if let Some(first) = self.public_form.action_progress.first_mut() {
+            first.status = PublicActionStepStatus::Pending;
+        }
+        generation
+    }
+
+    fn apply_public_action_progress_update(
+        &mut self,
+        generation: u64,
+        update: PublicActionProgressUpdate,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.public_form.action_generation != generation {
+            return;
+        }
+        let Some(step) = self
+            .public_form
+            .action_progress
+            .iter_mut()
+            .find(|step| step.step == update.step)
+        else {
+            return;
+        };
+        step.status = match update.status {
+            PublicActionProgressStatus::Pending => PublicActionStepStatus::Pending,
+            PublicActionProgressStatus::Done => PublicActionStepStatus::Done,
+            PublicActionProgressStatus::Error => PublicActionStepStatus::Error,
+        };
+        if let Some(tx_hash) = update.tx_hash {
+            step.tx_hash = Some(Arc::from(tx_hash));
+        }
+        if let Some(message) = update.message {
+            step.message = Some(Arc::from(message));
+        } else if update.status != PublicActionProgressStatus::Error {
+            step.message = None;
+        }
+        cx.notify();
+    }
+
+    fn fail_public_action_progress(
+        &mut self,
+        generation: u64,
+        message: String,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.public_form.action_generation != generation {
+            return;
+        }
+        if let Some(step) = self
+            .public_form
+            .action_progress
+            .iter_mut()
+            .find(|step| step.status == PublicActionStepStatus::Error)
+        {
+            let replace_message = match step.message.as_ref() {
+                Some(existing) => message.len() > existing.len(),
+                None => true,
+            };
+            if replace_message {
+                step.message = Some(Arc::from(message));
+            }
+            cx.notify();
+            return;
+        }
+        let step_index = self
+            .public_form
+            .action_progress
+            .iter()
+            .position(|step| step.status == PublicActionStepStatus::Pending)
+            .or_else(|| {
+                self.public_form
+                    .action_progress
+                    .iter()
+                    .position(|step| step.status == PublicActionStepStatus::NotStarted)
+            })
+            .or_else(|| self.public_form.action_progress.len().checked_sub(1));
+        if let Some(step_index) = step_index {
+            let step = &mut self.public_form.action_progress[step_index];
+            step.status = PublicActionStepStatus::Error;
+            step.message = Some(Arc::from(message));
+            cx.notify();
+        }
+    }
+
+    fn spawn_public_action_progress_listener(
+        generation: u64,
+        chain_id: u64,
+        active_wallet_id: Option<Arc<str>>,
+        mut progress_rx: mpsc::UnboundedReceiver<PublicActionProgressUpdate>,
+        cx: &Context<'_, Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            while let Some(update) = progress_rx.recv().await {
+                let _ = this.update(cx, |root, cx| {
+                    if root.selected_wallet_id != active_wallet_id
+                        || root.selected_chain != chain_id
+                    {
+                        return;
+                    }
+                    root.apply_public_action_progress_update(generation, update, cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn set_public_action_error_details_open(
+        &mut self,
+        step: PublicActionProgressStep,
+        open: bool,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if open {
+            self.public_form.expanded_action_error_steps.insert(step);
+        } else {
+            self.public_form.expanded_action_error_steps.remove(&step);
+        }
+        cx.notify();
+    }
+
+    fn set_public_action_amount_to_max(
+        &mut self,
+        mode: PublicActionMode,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(entry) = self.selected_public_balance_entry() else {
+            return;
+        };
+        let Some(amount) = entry.amount.amount() else {
+            return;
+        };
+        let decimals = entry.asset.decimals;
+        if entry.asset.id != PublicAssetId::Native {
+            self.set_public_action_amount_input(mode, amount, decimals, window, cx);
+            self.set_public_action_error(mode, None);
+            cx.notify();
+            return;
+        }
+
+        let Some(public_account_uuid) = self.public_form.selected_account_uuid.clone() else {
+            return;
+        };
+        let chain_id = self.selected_chain;
+        let selected_wallet_id = self.selected_wallet_id.clone();
+        let symbol = entry.asset.symbol;
+        let http = self.http.clone();
+        let steps = public_action_progress_steps(mode, PublicAssetId::Native);
+        let join = self.runtime.spawn(async move {
+            estimate_public_native_action_gas_reserve(chain_id, &steps, &http).await
+        });
+        self.set_public_action_error(mode, None);
+        cx.spawn_in(window, async move |this, cx| {
+            let result = join.await;
+            let _ = this.update_in(cx, |root, window, cx| {
+                if root.selected_wallet_id != selected_wallet_id
+                    || root.selected_chain != chain_id
+                    || root.public_form.action_mode != mode
+                    || root.public_form.selected_asset != Some(PublicAssetId::Native)
+                    || root.public_form.selected_account_uuid.as_deref()
+                        != Some(public_account_uuid.as_ref())
+                {
+                    return;
+                }
+                match result {
+                    Ok(Ok(reserve)) => {
+                        match public_action_max_amount_after_reserve(amount, reserve) {
+                            Some(max_amount) => {
+                                root.set_public_action_amount_input(
+                                    mode, max_amount, decimals, window, cx,
+                                );
+                                root.set_public_action_error(mode, None);
+                            }
+                            None => root.set_public_action_error(
+                                mode,
+                                Some(Arc::from(format!(
+                                    "Not enough {symbol} balance after estimated gas"
+                                ))),
+                            ),
+                        }
+                    }
+                    Ok(Err(error)) => root.set_public_action_error(
+                        mode,
+                        Some(Arc::from(format!(
+                            "Could not estimate gas reserve for Max: {}",
+                            format_report_chain(&error)
+                        ))),
+                    ),
+                    Err(error) => root.set_public_action_error(
+                        mode,
+                        Some(Arc::from(format!(
+                            "Could not estimate gas reserve for Max: {error}"
+                        ))),
+                    ),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn set_public_action_amount_input(
+        &self,
+        mode: PublicActionMode,
+        amount: U256,
+        decimals: u8,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let value = format_send_amount_input(amount, Some(decimals));
+        let input = match mode {
+            PublicActionMode::Shield => &self.public_form.shield_amount_input,
+            PublicActionMode::Send => &self.public_form.send_amount_input,
+        };
+        input.update(cx, |input, cx| input.set_value(value, window, cx));
+    }
+
+    fn set_public_action_error(&mut self, mode: PublicActionMode, message: Option<Arc<str>>) {
+        match mode {
+            PublicActionMode::Shield => self.public_form.shield_error = message,
+            PublicActionMode::Send => self.public_form.send_error = message,
+        }
+    }
+
+    fn clear_public_chain_balance_state(&mut self) {
+        self.public_balance_snapshot = None;
+        self.public_balance_error = None;
+        self.public_balance_refreshing = false;
+        self.public_balance_generation = self.public_balance_generation.wrapping_add(1);
+        self.public_form.selected_asset = None;
+        self.public_form.action_progress.clear();
+        self.public_form.expanded_action_error_steps.clear();
+        self.public_form.send_error = None;
+        self.public_form.shield_error = None;
+    }
+
+    fn set_public_hidden_visibility(
+        &mut self,
+        show_hidden: bool,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.public_form.show_hidden_accounts == show_hidden {
+            return;
+        }
+        self.public_form.show_hidden_accounts = show_hidden;
+        self.reload_public_accounts(window, cx);
+        self.schedule_public_balance_refresh(cx);
+        cx.notify();
+    }
+
+    fn schedule_public_balance_refresh(&mut self, cx: &mut Context<'_, Self>) {
+        if self.public_balance_refreshing || self.public_accounts.is_empty() {
+            return;
+        }
+        let chain_id = self.selected_chain;
+        let accounts = self.public_accounts.clone();
+        let account_ids = accounts
+            .iter()
+            .map(|account| account.public_account_uuid.clone())
+            .collect::<Vec<_>>();
+        let http = self.http.clone();
+        self.public_balance_refreshing = true;
+        self.public_balance_error = None;
+        self.public_balance_generation = self.public_balance_generation.wrapping_add(1);
+        let generation = self.public_balance_generation;
+        let active_wallet_id = self.selected_wallet_id.clone();
+        let join = self
+            .runtime
+            .spawn(async move { refresh_public_balances(chain_id, &accounts, &http).await });
+        cx.spawn(async move |this, cx| {
+            let result = join.await;
+            let _ = this.update(cx, |root, cx| {
+                if root.public_balance_generation != generation {
+                    return;
+                }
+                root.public_balance_refreshing = false;
+                let account_set_unchanged = root.public_accounts.len() == account_ids.len()
+                    && root
+                        .public_accounts
+                        .iter()
+                        .map(|account| account.public_account_uuid.as_str())
+                        .eq(account_ids.iter().map(String::as_str));
+                if root.selected_wallet_id != active_wallet_id
+                    || root.selected_chain != chain_id
+                    || !account_set_unchanged
+                {
+                    if root.active_wallet_tab == WalletTab::Public
+                        && !root.public_accounts.is_empty()
+                    {
+                        root.schedule_public_balance_refresh(cx);
+                    }
+                    cx.notify();
+                    return;
+                }
+                match result {
+                    Ok(Ok(snapshot)) => {
+                        root.public_balance_snapshot = Some(Arc::new(snapshot));
+                        root.public_balance_error = None;
+                    }
+                    Ok(Err(error)) => {
+                        root.public_balance_error = Some(Arc::from(format_report_chain(&error)));
+                    }
+                    Err(error) => {
+                        root.public_balance_error =
+                            Some(Arc::from(format!("Public balance refresh failed: {error}")));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn add_public_derived_account_from_input(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.public_form.adding_account {
+            return;
+        }
+        let Some(store) = self.vault_store.clone() else {
+            self.public_form.error = Some(Arc::from("Wallet vault storage is unavailable"));
+            cx.notify();
+            return;
+        };
+        let Some(view_session) = self.view_session.clone() else {
+            self.public_form.error = Some(Arc::from("Wallet vault is locked"));
+            cx.notify();
+            return;
+        };
+        let password = Self::read_and_clear_input(&self.public_form.add_password_input, window, cx);
+        if password.trim().is_empty() {
+            self.public_form.error = Some(Arc::from("Enter the vault password to add an account"));
+            cx.notify();
+            return;
+        }
+        let label = self
+            .public_form
+            .add_label_input
+            .read(cx)
+            .value()
+            .to_string();
+        self.public_form.adding_account = true;
+        self.public_form.error = None;
+        let result = store.add_derived_public_account(
+            password.as_str(),
+            view_session.as_ref(),
+            Some(&label),
+        );
+        self.public_form.adding_account = false;
+        match result {
+            Ok(account) => {
+                self.public_form.selected_account_uuid =
+                    Some(Arc::from(account.public_account_uuid.as_str()));
+                self.public_form
+                    .add_label_input
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                self.reload_public_accounts(window, cx);
+                self.schedule_public_balance_refresh(cx);
+                window.close_all_dialogs(cx);
+            }
+            Err(error) => {
+                self.public_form.error = Some(Arc::from(error.to_string()));
+            }
+        }
+        cx.notify();
+    }
+
+    fn import_public_account_from_input(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.public_form.importing_account {
+            return;
+        }
+        let Some(store) = self.vault_store.clone() else {
+            self.public_form.error = Some(Arc::from("Wallet vault storage is unavailable"));
+            cx.notify();
+            return;
+        };
+        let Some(view_session) = self.view_session.clone() else {
+            self.public_form.error = Some(Arc::from("Wallet vault is locked"));
+            cx.notify();
+            return;
+        };
+        let private_key =
+            Self::read_and_clear_input(&self.public_form.import_private_key_input, window, cx);
+        let password =
+            Self::read_and_clear_input(&self.public_form.import_password_input, window, cx);
+        if private_key.trim().is_empty() || password.trim().is_empty() {
+            self.public_form.error = Some(Arc::from(
+                "Enter a private key and vault password to import an account",
+            ));
+            cx.notify();
+            return;
+        }
+        let label = self
+            .public_form
+            .import_label_input
+            .read(cx)
+            .value()
+            .to_string();
+        let global = self.public_form.import_global;
+        self.public_form.importing_account = true;
+        self.public_form.error = None;
+        let result = store.import_public_account(
+            password.as_str(),
+            view_session.as_ref(),
+            private_key.as_str(),
+            Some(&label),
+            global,
+        );
+        self.public_form.importing_account = false;
+        match result {
+            Ok(account) => {
+                self.public_form.selected_account_uuid =
+                    Some(Arc::from(account.public_account_uuid.as_str()));
+                self.public_form
+                    .import_label_input
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                self.public_form.import_global = false;
+                self.reload_public_accounts(window, cx);
+                self.schedule_public_balance_refresh(cx);
+                window.close_all_dialogs(cx);
+            }
+            Err(error) => {
+                self.public_form.error = Some(Arc::from(error.to_string()));
+            }
+        }
+        cx.notify();
+    }
+
+    fn update_selected_public_account_label(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(store) = self.vault_store.clone() else {
+            return;
+        };
+        let Some(view_session) = self.view_session.clone() else {
+            return;
+        };
+        let Some(account_uuid) = self
+            .public_form
+            .editing_account_uuid
+            .clone()
+            .or_else(|| self.public_form.selected_account_uuid.clone())
+        else {
+            self.public_form.error = Some(Arc::from("Select a public account first"));
+            cx.notify();
+            return;
+        };
+        let label = self
+            .public_form
+            .edit_label_input
+            .read(cx)
+            .value()
+            .to_string();
+        match store.update_public_account_label(
+            view_session.as_ref(),
+            account_uuid.as_ref(),
+            Some(&label),
+        ) {
+            Ok(_) => {
+                self.public_form.editing_account_uuid = None;
+                self.reload_public_accounts(window, cx);
+                window.close_all_dialogs(cx);
+            }
+            Err(error) => self.public_form.error = Some(Arc::from(error.to_string())),
+        }
+        cx.notify();
+    }
+
+    fn hide_public_account(
+        &mut self,
+        public_account_uuid: &str,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(store) = self.vault_store.clone() else {
+            return;
+        };
+        let Some(view_session) = self.view_session.clone() else {
+            return;
+        };
+        match store.hide_derived_public_account(view_session.as_ref(), public_account_uuid.as_ref())
+        {
+            Ok(_) => {
+                if self.public_form.selected_account_uuid.as_deref() == Some(public_account_uuid) {
+                    self.public_form.selected_account_uuid = None;
+                }
+                self.reload_public_accounts(window, cx);
+                self.schedule_public_balance_refresh(cx);
+            }
+            Err(error) => self.public_form.error = Some(Arc::from(error.to_string())),
+        }
+        cx.notify();
+    }
+
+    fn show_public_account(
+        &mut self,
+        public_account_uuid: &str,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(store) = self.vault_store.clone() else {
+            return;
+        };
+        let Some(view_session) = self.view_session.clone() else {
+            return;
+        };
+        match store.show_derived_public_account(view_session.as_ref(), public_account_uuid.as_ref())
+        {
+            Ok(account) => {
+                self.public_form.selected_account_uuid =
+                    Some(Arc::from(account.public_account_uuid.as_str()));
+                self.reload_public_accounts(window, cx);
+                self.schedule_public_balance_refresh(cx);
+            }
+            Err(error) => self.public_form.error = Some(Arc::from(error.to_string())),
+        }
+        cx.notify();
+    }
+
+    fn delete_public_account(
+        &mut self,
+        public_account_uuid: &str,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(account) = self
+            .public_account_for_uuid(Some(public_account_uuid))
+            .cloned()
+        else {
+            return;
+        };
+        if account.is_global()
+            && self.public_form.pending_global_delete_uuid.as_deref()
+                != Some(account.public_account_uuid.as_str())
+        {
+            self.public_form.pending_global_delete_uuid =
+                Some(Arc::from(account.public_account_uuid.as_str()));
+            cx.notify();
+            return;
+        }
+        let Some(store) = self.vault_store.clone() else {
+            return;
+        };
+        let Some(view_session) = self.view_session.clone() else {
+            return;
+        };
+        match store
+            .delete_imported_public_account(view_session.as_ref(), &account.public_account_uuid)
+        {
+            Ok(_) => {
+                if self.public_form.selected_account_uuid.as_deref() == Some(public_account_uuid) {
+                    self.public_form.selected_account_uuid = None;
+                }
+                self.public_form.pending_global_delete_uuid = None;
+                self.reload_public_accounts(window, cx);
+                self.schedule_public_balance_refresh(cx);
+            }
+            Err(error) => self.public_form.error = Some(Arc::from(error.to_string())),
+        }
+        cx.notify();
+    }
+
+    fn submit_public_send_from_form(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.public_form.sending {
+            return;
+        }
+        self.public_form.action_progress.clear();
+        self.public_form.expanded_action_error_steps.clear();
+        let Some(asset) = self.public_form.selected_asset else {
+            self.public_form.send_error = Some(Arc::from("Select an asset to send"));
+            cx.notify();
+            return;
+        };
+        let Some(public_account_uuid) = self.public_form.selected_account_uuid.clone() else {
+            self.public_form.send_error = Some(Arc::from("Select a public account first"));
+            cx.notify();
+            return;
+        };
+        let Some(view_session) = self.view_session.clone() else {
+            self.public_form.send_error = Some(Arc::from("Wallet vault is locked"));
+            cx.notify();
+            return;
+        };
+        let Some(vault_store) = self.vault_store.clone() else {
+            self.public_form.send_error = Some(Arc::from("Wallet vault storage is unavailable"));
+            cx.notify();
+            return;
+        };
+        let amount_input = self
+            .public_form
+            .send_amount_input
+            .read(cx)
+            .value()
+            .to_string();
+        let amount = match parse_send_amount(
+            &amount_input,
+            public_asset_decimals(self.selected_chain, asset),
+        ) {
+            Ok(amount) if !amount.is_zero() => amount,
+            Ok(_) => {
+                self.public_form.send_error = Some(Arc::from("Amount must be greater than zero"));
+                cx.notify();
+                return;
+            }
+            Err(error) => {
+                self.public_form.send_error = Some(Arc::from(error.to_string()));
+                cx.notify();
+                return;
+            }
+        };
+        let Some(recipient) = parse_address(
+            self.public_form
+                .send_recipient_input
+                .read(cx)
+                .value()
+                .as_ref(),
+        ) else {
+            self.public_form.send_error = Some(Arc::from("Enter a valid EVM recipient address"));
+            cx.notify();
+            return;
+        };
+        let vault_password =
+            Self::read_and_clear_input(&self.public_form.send_password_input, window, cx);
+        if vault_password.trim().is_empty() {
+            self.public_form.send_error = Some(Arc::from("Enter the vault password to send"));
+            cx.notify();
+            return;
+        }
+        self.public_form.sending = true;
+        self.public_form.send_error = None;
+        let chain_id = self.selected_chain;
+        let http = self.http.clone();
+        let active_wallet_id = self.selected_wallet_id.clone();
+        let generation = self.start_public_action_progress(PublicActionMode::Send, asset);
+        let (progress_tx, progress_rx) = mpsc::unbounded_channel();
+        Self::spawn_public_action_progress_listener(
+            generation,
+            chain_id,
+            active_wallet_id.clone(),
+            progress_rx,
+            cx,
+        );
+        let request = PublicSendRequest {
+            chain_id,
+            view_session,
+            vault_store,
+            vault_password,
+            public_account_uuid: public_account_uuid.to_string(),
+            asset,
+            amount,
+            recipient,
+        };
+        let join = self.runtime.spawn(async move {
+            submit_public_send_with_progress(request, &http, move |update| {
+                let _ = progress_tx.send(update);
+            })
+            .await
+        });
+        cx.spawn(async move |this, cx| {
+            let result = join.await;
+            let _ = this.update(cx, |root, cx| {
+                if root.selected_wallet_id != active_wallet_id || root.selected_chain != chain_id {
+                    return;
+                }
+                if root.public_form.action_generation != generation {
+                    return;
+                }
+                root.public_form.sending = false;
+                match result {
+                    Ok(Ok(_result)) => {
+                        root.schedule_public_balance_refresh(cx);
+                    }
+                    Ok(Err(error)) => {
+                        let message = error.to_string();
+                        root.fail_public_action_progress(generation, message.clone(), cx);
+                        root.public_form.send_error = Some(Arc::from(message));
+                    }
+                    Err(error) => {
+                        let message = format!("Public send task failed: {error}");
+                        root.fail_public_action_progress(generation, message.clone(), cx);
+                        root.public_form.send_error = Some(Arc::from(message));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn submit_public_shield_from_form(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.public_form.shielding {
+            return;
+        }
+        self.public_form.action_progress.clear();
+        self.public_form.expanded_action_error_steps.clear();
+        let Some(asset) = self.public_form.selected_asset else {
+            self.public_form.shield_error = Some(Arc::from("Select an asset to shield"));
+            cx.notify();
+            return;
+        };
+        let Some(public_account_uuid) = self.public_form.selected_account_uuid.clone() else {
+            self.public_form.shield_error = Some(Arc::from("Select a public account first"));
+            cx.notify();
+            return;
+        };
+        let Some(view_session) = self.view_session.clone() else {
+            self.public_form.shield_error = Some(Arc::from("Wallet vault is locked"));
+            cx.notify();
+            return;
+        };
+        let Some(vault_store) = self.vault_store.clone() else {
+            self.public_form.shield_error = Some(Arc::from("Wallet vault storage is unavailable"));
+            cx.notify();
+            return;
+        };
+        let amount_input = self
+            .public_form
+            .shield_amount_input
+            .read(cx)
+            .value()
+            .to_string();
+        let amount = match parse_send_amount(
+            &amount_input,
+            public_asset_decimals(self.selected_chain, asset),
+        ) {
+            Ok(amount) if !amount.is_zero() => amount,
+            Ok(_) => {
+                self.public_form.shield_error = Some(Arc::from("Amount must be greater than zero"));
+                cx.notify();
+                return;
+            }
+            Err(error) => {
+                self.public_form.shield_error = Some(Arc::from(error.to_string()));
+                cx.notify();
+                return;
+            }
+        };
+        let vault_password =
+            Self::read_and_clear_input(&self.public_form.shield_password_input, window, cx);
+        if vault_password.trim().is_empty() {
+            self.public_form.shield_error = Some(Arc::from("Enter the vault password to shield"));
+            cx.notify();
+            return;
+        }
+        self.public_form.shielding = true;
+        self.public_form.shield_error = None;
+        let chain_id = self.selected_chain;
+        let http = self.http.clone();
+        let active_wallet_id = self.selected_wallet_id.clone();
+        let generation = self.start_public_action_progress(PublicActionMode::Shield, asset);
+        let (progress_tx, progress_rx) = mpsc::unbounded_channel();
+        Self::spawn_public_action_progress_listener(
+            generation,
+            chain_id,
+            active_wallet_id.clone(),
+            progress_rx,
+            cx,
+        );
+        let request = PublicShieldRequest {
+            chain_id,
+            view_session,
+            vault_store,
+            vault_password,
+            public_account_uuid: public_account_uuid.to_string(),
+            asset,
+            amount,
+        };
+        let join = self.runtime.spawn(async move {
+            submit_public_shield_with_progress(request, &http, move |update| {
+                let _ = progress_tx.send(update);
+            })
+            .await
+        });
+        cx.spawn(async move |this, cx| {
+            let result = join.await;
+            let _ = this.update(cx, |root, cx| {
+                if root.selected_wallet_id != active_wallet_id || root.selected_chain != chain_id {
+                    return;
+                }
+                if root.public_form.action_generation != generation {
+                    return;
+                }
+                root.public_form.shielding = false;
+                match result {
+                    Ok(Ok(_result)) => {
+                        root.schedule_public_balance_refresh(cx);
+                    }
+                    Ok(Err(error)) => {
+                        let message = error.to_string();
+                        root.fail_public_action_progress(generation, message.clone(), cx);
+                        root.public_form.shield_error = Some(Arc::from(message));
+                    }
+                    Err(error) => {
+                        let message = format!("Public shield task failed: {error}");
+                        root.fail_public_action_progress(generation, message.clone(), cx);
+                        root.public_form.shield_error = Some(Arc::from(message));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     fn ensure_chain_load(&mut self, chain_id: u64, cx: &mut Context<'_, Self>) {
@@ -1847,7 +3234,11 @@ impl WalletRoot {
         self.unshield_forms.clear();
         self.private_action_form = None;
         self.broadcaster_picker = None;
+        self.clear_public_chain_balance_state();
         self.sync_utxo_table(cx);
+        if self.active_wallet_tab == WalletTab::Public {
+            self.schedule_public_balance_refresh(cx);
+        }
         if should_focus_utxo_table(
             self.active_activity,
             self.active_wallet_tab,
@@ -1899,6 +3290,166 @@ impl WalletRoot {
             root.add_wallet_password_input
                 .update(cx, |input, cx| input.set_value("", window, cx));
         });
+    }
+
+    fn open_public_account_dialog(
+        &mut self,
+        kind: PublicAccountDialogKind,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        window.close_all_dialogs(cx);
+        self.public_form.error = None;
+        self.clear_public_account_dialog_inputs(kind, window, cx);
+        let root = cx.entity();
+        let content_root = root.clone();
+        let dialog_width = (window.viewport_size().width * 0.92).min(PUBLIC_ACCOUNT_DIALOG_WIDTH);
+        let content_width = secondary_dialog_content_width(dialog_width);
+        let content =
+            cx.new(|cx| PublicAccountDialogContent::new(content_root, kind, content_width, cx));
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            let close_root = root.clone();
+            dialog
+                .w(dialog_width)
+                .title(app_strong_text(kind.title()))
+                .on_close(move |_event, window, cx| {
+                    close_root.update(cx, |root, cx| {
+                        root.public_form.error = None;
+                        root.clear_public_account_dialog_inputs(kind, window, cx);
+                    });
+                })
+                .child(content.clone())
+        });
+        cx.defer_in(window, move |root, window, cx| {
+            root.focus_public_account_dialog_input(kind, window, cx);
+        });
+    }
+
+    fn open_public_account_edit_dialog(
+        &mut self,
+        public_account_uuid: Arc<str>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        window.close_all_dialogs(cx);
+        self.public_form.error = None;
+        self.public_form.editing_account_uuid = Some(public_account_uuid);
+        self.sync_public_edit_label_input(window, cx);
+        let root = cx.entity();
+        let content_root = root.clone();
+        let dialog_width = (window.viewport_size().width * 0.92).min(PUBLIC_ACCOUNT_DIALOG_WIDTH);
+        let content_width = secondary_dialog_content_width(dialog_width);
+        let content = cx.new(|cx| {
+            PublicAccountDialogContent::new(
+                content_root,
+                PublicAccountDialogKind::EditLabel,
+                content_width,
+                cx,
+            )
+        });
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            let close_root = root.clone();
+            dialog
+                .w(dialog_width)
+                .title(app_strong_text(PublicAccountDialogKind::EditLabel.title()))
+                .on_close(move |_event, window, cx| {
+                    close_root.update(cx, |root, cx| {
+                        root.public_form.error = None;
+                        root.clear_public_account_dialog_inputs(
+                            PublicAccountDialogKind::EditLabel,
+                            window,
+                            cx,
+                        );
+                    });
+                })
+                .child(content.clone())
+        });
+        cx.defer_in(window, |root, window, cx| {
+            root.focus_public_account_dialog_input(PublicAccountDialogKind::EditLabel, window, cx);
+        });
+    }
+
+    fn open_public_action_dialog(
+        &mut self,
+        public_account_uuid: Arc<str>,
+        asset: PublicAssetId,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        window.close_all_dialogs(cx);
+        self.set_public_selected_balance(public_account_uuid, asset, window, cx);
+        self.public_form.action_mode = PublicActionMode::Shield;
+        self.clear_public_action_dialog_inputs(window, cx);
+        let root = cx.entity();
+        let content_root = root.clone();
+        let dialog_width = (window.viewport_size().width * 0.92).min(PUBLIC_ACTION_DIALOG_WIDTH);
+        let content_width = secondary_dialog_content_width(dialog_width);
+        let content = cx.new(|cx| PublicActionDialogContent::new(content_root, content_width, cx));
+        let asset_label = public_asset_label(self.selected_chain, asset);
+        let icon_path = public_asset_icon_path(self.selected_chain, asset);
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            let close_root = root.clone();
+            dialog
+                .w(dialog_width)
+                .title(public_action_title_row(
+                    asset_label.clone(),
+                    icon_path.clone(),
+                ))
+                .on_close(move |_event, window, cx| {
+                    close_root.update(cx, |root, cx| {
+                        root.clear_public_action_dialog_inputs(window, cx);
+                    });
+                })
+                .child(content.clone())
+        });
+        cx.defer_in(window, |root, window, cx| {
+            root.focus_public_action_dialog_input(window, cx);
+        });
+    }
+
+    fn focus_public_account_dialog_input(
+        &self,
+        kind: PublicAccountDialogKind,
+        window: &mut Window,
+        cx: &Context<'_, Self>,
+    ) {
+        match kind {
+            PublicAccountDialogKind::Derive => self
+                .public_form
+                .add_password_input
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window),
+            PublicAccountDialogKind::Import => self
+                .public_form
+                .import_private_key_input
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window),
+            PublicAccountDialogKind::EditLabel => self
+                .public_form
+                .edit_label_input
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window),
+        }
+    }
+
+    fn focus_public_action_dialog_input(&self, window: &mut Window, cx: &Context<'_, Self>) {
+        match self.public_form.action_mode {
+            PublicActionMode::Shield => self
+                .public_form
+                .shield_amount_input
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window),
+            PublicActionMode::Send => self
+                .public_form
+                .send_recipient_input
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window),
+        }
     }
 
     fn switch_active_wallet(
@@ -2013,6 +3564,10 @@ impl WalletRoot {
             self.active_wallet_tab,
             self.chain_states.get(&self.selected_chain),
         );
+        if tab == WalletTab::Public {
+            self.focus_public_account_search_on_render = true;
+            self.schedule_public_balance_refresh(cx);
+        }
         cx.notify();
     }
 
@@ -2079,6 +3634,26 @@ impl WalletRoot {
 
         self.utxo_table.read(cx).focus_handle(cx).focus(window);
         self.focus_utxo_table_on_render = false;
+    }
+
+    fn focus_public_account_search_if_requested(
+        &mut self,
+        window: &mut Window,
+        cx: &Context<'_, Self>,
+    ) {
+        if !self.focus_public_account_search_on_render
+            || self.active_activity != Activity::Wallet
+            || self.active_wallet_tab != WalletTab::Public
+        {
+            return;
+        }
+
+        self.public_form
+            .search_input
+            .read(cx)
+            .focus_handle(cx)
+            .focus(window);
+        self.focus_public_account_search_on_render = false;
     }
 
     fn focus_unlock_password_if_requested(&mut self, window: &mut Window, cx: &Context<'_, Self>) {
@@ -2495,6 +4070,7 @@ impl WalletRoot {
         self.selected_wallet_id = Some(wallet_id);
         self.sync_wallet_select(window, cx);
         self.reset_wallet_scoped_state(cx);
+        self.reload_public_accounts(window, cx);
         self.setup_password = None;
         self.generated_seed = None;
         self.add_wallet_password_input
@@ -2555,6 +4131,7 @@ impl WalletRoot {
         self.sync_wallet_select(window, cx);
         self.send_forms.clear();
         self.unshield_forms.clear();
+        self.reset_public_wallet_state(window, cx);
         self.private_action_form = None;
         self.broadcaster_picker = None;
         self.active_wallet_tab = WalletTab::default();
@@ -4755,6 +6332,9 @@ impl WalletRoot {
                             .on_click(move |_event, _window, cx| {
                                 wallet_root.update(cx, |root, cx| {
                                     root.active_activity = Activity::Wallet;
+                                    if root.active_wallet_tab == WalletTab::Public {
+                                        root.focus_public_account_search_on_render = true;
+                                    }
                                     root.focus_utxo_table_on_render = should_focus_utxo_table(
                                         root.active_activity,
                                         root.active_wallet_tab,
@@ -4800,11 +6380,7 @@ impl WalletRoot {
         collapsed: bool,
         sidebar_is_narrow: bool,
     ) -> impl IntoElement {
-        SidebarHeader::new().p_0().child(Self::render_sidebar_brand(
-            root,
-            collapsed,
-            sidebar_is_narrow,
-        ))
+        Self::render_sidebar_brand(root, collapsed, sidebar_is_narrow)
     }
 
     fn render_sidebar_brand(
@@ -4815,7 +6391,6 @@ impl WalletRoot {
         div()
             .id("sidebar-brand-toggle")
             .w_full()
-            .p_2()
             .flex()
             .items_center()
             .gap_2()
@@ -4850,30 +6425,10 @@ impl WalletRoot {
     }
 
     fn render_sidebar_wordmark() -> impl IntoElement {
-        div()
-            .flex()
-            .items_center()
-            .gap_1()
-            .overflow_hidden()
-            .font_family("Menlo")
-            .font_weight(gpui::FontWeight::EXTRA_BOLD)
-            .text_size(px(18.0))
-            .line_height(gpui::relative(1.0))
-            .children(
-                [
-                    ("R", theme::TEXT),
-                    ("A", theme::TEXT),
-                    ("I", theme::TEXT),
-                    ("L", theme::TEXT),
-                    ("O", theme::WARNING_STRONG),
-                    ("X", theme::WARNING_STRONG),
-                    ("I", theme::TEXT),
-                    ("D", theme::TEXT),
-                    ("E", theme::TEXT),
-                ]
-                .into_iter()
-                .map(|(letter, color)| div().flex_none().text_color(rgb(color)).child(letter)),
-            )
+        img(SIDEBAR_WORDMARK_PATH)
+            .w(px(154.0))
+            .h(px(21.3))
+            .flex_none()
     }
 
     const fn vault_dialog_title(&self) -> &'static str {
@@ -5390,7 +6945,7 @@ impl WalletRoot {
     fn render_wallet_content(&self, root: &Entity<Self>, window: &Window) -> gpui::AnyElement {
         match self.active_wallet_tab {
             WalletTab::Private => self.render_private_assets_body(root),
-            WalletTab::Public => Self::render_public_wallet_body().into_any_element(),
+            WalletTab::Public => self.render_public_wallet_body(root),
             WalletTab::Activity => self.render_utxo_body(root, window).into_any_element(),
         }
     }
@@ -6134,32 +7689,805 @@ impl WalletRoot {
         card
     }
 
-    fn render_public_wallet_body() -> gpui::Div {
+    fn render_public_wallet_body(&self, root: &Entity<Self>) -> gpui::AnyElement {
+        let refresh_root = root.clone();
+
         div()
             .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .overflow_y_scrollbar()
             .child(
                 div()
-                    .w(px(480.0))
+                    .w(px(980.0))
                     .max_w_full()
+                    .mx_auto()
                     .flex()
                     .flex_col()
-                    .gap_2()
-                    .p(px(20.0))
-                    .rounded_lg()
-                    .bg(rgb(theme::SURFACE))
-                    .border_1()
-                    .border_color(rgb(theme::BORDER))
-                    .child(app_strong_text("Public accounts"))
+                    .gap_4()
                     .child(
-                        app_muted_text(
-                            "Public EVM account management, shielding, and related workflows will appear here.",
-                        )
-                        .line_height(px(18.0)),
-                    ),
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(div().flex_1().min_w(px(0.0)))
+                            .child(
+                                app_button(
+                                    "wallet-public-refresh",
+                                    if self.public_balance_refreshing {
+                                        "Refreshing..."
+                                    } else {
+                                        "Refresh"
+                                    },
+                                )
+                                .outline()
+                                .small()
+                                .loading(self.public_balance_refreshing)
+                                .disabled(
+                                    self.public_balance_refreshing
+                                        || self.public_accounts.is_empty(),
+                                )
+                                .on_click(
+                                    move |_event, _window, cx| {
+                                        refresh_root.update(cx, |root, cx| {
+                                            root.schedule_public_balance_refresh(cx);
+                                        });
+                                    },
+                                ),
+                            )
+                            .child(self.render_public_add_account_dropdown(root)),
+                    )
+                    .children(self.public_balance_error.as_ref().map(|message| {
+                        Alert::warning("wallet-public-balance-error", message.to_string())
+                            .title("Public balances unavailable")
+                            .small()
+                    }))
+                    .children(self.public_form.error.as_ref().map(|message| {
+                        Alert::error("wallet-public-error", message.to_string()).small()
+                    }))
+                    .child(self.render_public_account_list(root)),
             )
+            .into_any_element()
+    }
+
+    fn render_public_add_account_dropdown(&self, root: &Entity<Self>) -> impl IntoElement {
+        let derive_root = root.clone();
+        let import_root = root.clone();
+        app_button("wallet-public-add-account-trigger", "Add account")
+            .primary()
+            .small()
+            .dropdown_caret(true)
+            .disabled(
+                self.vault_store.is_none()
+                    || self.view_session.is_none()
+                    || self.public_form.adding_account
+                    || self.public_form.importing_account,
+            )
+            .dropdown_menu(move |menu, _window, _cx| {
+                let derive_root = derive_root.clone();
+                let import_root = import_root.clone();
+                menu.min_w(px(190.0))
+                    .item(PopupMenuItem::new("Derive from private").on_click(
+                        move |_event, window, cx| {
+                            derive_root.update(cx, |root, cx| {
+                                root.open_public_account_dialog(
+                                    PublicAccountDialogKind::Derive,
+                                    window,
+                                    cx,
+                                );
+                            });
+                        },
+                    ))
+                    .item(PopupMenuItem::new("Import private key").on_click(
+                        move |_event, window, cx| {
+                            import_root.update(cx, |root, cx| {
+                                root.open_public_account_dialog(
+                                    PublicAccountDialogKind::Import,
+                                    window,
+                                    cx,
+                                );
+                            });
+                        },
+                    ))
+            })
+    }
+
+    fn render_public_account_dialog_content(
+        &self,
+        root: Entity<Self>,
+        kind: PublicAccountDialogKind,
+        content_width: Pixels,
+    ) -> gpui::Div {
+        match kind {
+            PublicAccountDialogKind::Derive => {
+                let add_root = root;
+                let next_index = self.public_form.next_derived_index.map_or_else(
+                    || "Next index unavailable".to_string(),
+                    |index| format!("Next derived index: {index}"),
+                );
+                div()
+                    .w(content_width)
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(app_muted_text(
+                        "Derive a Public EVM account from the selected Private wallet mnemonic.",
+                    ))
+                    .child(app_muted_text(next_index))
+                    .child(app_input(&self.public_form.add_label_input))
+                    .child(app_input(&self.public_form.add_password_input))
+                    .children(self.public_form.error.as_ref().map(|message| {
+                        Alert::error("wallet-public-add-derived-error", message.to_string()).small()
+                    }))
+                    .child(
+                        app_button(
+                            "wallet-public-add-derived-submit",
+                            if self.public_form.adding_account {
+                                "Deriving..."
+                            } else {
+                                "Derive account"
+                            },
+                        )
+                        .primary()
+                        .small()
+                        .loading(self.public_form.adding_account)
+                        .disabled(self.public_form.adding_account)
+                        .on_click(move |_event, window, cx| {
+                            add_root.update(cx, |root, cx| {
+                                root.add_public_derived_account_from_input(window, cx);
+                            });
+                        }),
+                    )
+            }
+            PublicAccountDialogKind::Import => {
+                let import_root = root.clone();
+                let global_root = root;
+                div()
+                    .w(content_width)
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(app_muted_text(
+                        "Import an EVM private key as a vaulted Public account.",
+                    ))
+                    .child(app_input(&self.public_form.import_label_input))
+                    .child(app_input(&self.public_form.import_private_key_input))
+                    .child(app_input(&self.public_form.import_password_input))
+                    .child(
+                        Checkbox::new("wallet-public-import-global")
+                            .label("Global account")
+                            .checked(self.public_form.import_global)
+                            .small()
+                            .on_click(move |checked, _window, cx| {
+                                let checked = *checked;
+                                global_root.update(cx, |root, cx| {
+                                    root.public_form.import_global = checked;
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .children(self.public_form.error.as_ref().map(|message| {
+                        Alert::error("wallet-public-import-error", message.to_string()).small()
+                    }))
+                    .child(
+                        app_button(
+                            "wallet-public-import-submit",
+                            if self.public_form.importing_account {
+                                "Importing..."
+                            } else {
+                                "Import account"
+                            },
+                        )
+                        .primary()
+                        .small()
+                        .loading(self.public_form.importing_account)
+                        .disabled(self.public_form.importing_account)
+                        .on_click(move |_event, window, cx| {
+                            import_root.update(cx, |root, cx| {
+                                root.import_public_account_from_input(window, cx);
+                            });
+                        }),
+                    )
+            }
+            PublicAccountDialogKind::EditLabel => {
+                let save_root = root;
+                div()
+                    .w(content_width)
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(app_input(&self.public_form.edit_label_input))
+                    .children(self.public_form.error.as_ref().map(|message| {
+                        Alert::error("wallet-public-edit-label-error", message.to_string()).small()
+                    }))
+                    .child(
+                        app_button("wallet-public-save-label", "Save")
+                            .primary()
+                            .small()
+                            .on_click(move |_event, window, cx| {
+                                save_root.update(cx, |root, cx| {
+                                    root.update_selected_public_account_label(window, cx);
+                                });
+                            }),
+                    )
+            }
+        }
+    }
+
+    fn render_public_account_list(&self, root: &Entity<Self>) -> gpui::Div {
+        let accounts = self.public_accounts.clone();
+        let selected = self.public_form.selected_account_uuid.clone();
+        let search_query = self.public_form.search_query.as_ref();
+        let search_active = !search_query.is_empty();
+        let clear_search_input = self.public_form.search_input.clone();
+        let search_input =
+            app_input(&self.public_form.search_input)
+                .small()
+                .when(search_active, |input| {
+                    input.suffix(
+                        app_button_base("wallet-public-account-search-clear")
+                            .ghost()
+                            .xsmall()
+                            .tooltip("Clear search")
+                            .icon(IconName::Close)
+                            .on_click(move |_event, window, cx| {
+                                clear_search_input.update(cx, |input, cx| {
+                                    input.set_value("", window, cx);
+                                });
+                            }),
+                    )
+                });
+        let mut card = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p(px(14.0))
+            .rounded_lg()
+            .bg(rgb(theme::SURFACE))
+            .border_1()
+            .border_color(rgb(theme::BORDER));
+        let mut controls = div()
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_start()
+            .gap_2()
+            .child(div().w(px(260.0)).child(search_input));
+        if self.public_form.has_hidden_accounts {
+            let toggle_root = root.clone();
+            controls = controls.child(
+                Checkbox::new("wallet-public-show-hidden-accounts")
+                    .label("Show hidden")
+                    .checked(self.public_form.show_hidden_accounts)
+                    .xsmall()
+                    .on_click(move |checked, window, cx| {
+                        let checked = *checked;
+                        toggle_root.update(cx, |root, cx| {
+                            root.set_public_hidden_visibility(checked, window, cx);
+                        });
+                    }),
+            );
+        }
+        card = card.child(controls);
+        if accounts.is_empty() {
+            return card.child(app_muted_text(if self.public_form.has_hidden_accounts {
+                "No visible Public accounts. Enable Show hidden to manage hidden accounts."
+            } else {
+                "No Public accounts yet. Add a derived account or import a private key."
+            }));
+        }
+        let accounts = if search_active {
+            accounts
+                .into_iter()
+                .filter(|account| public_account_matches_search(account, search_query))
+                .collect::<Vec<_>>()
+        } else {
+            accounts
+        };
+        if accounts.is_empty() {
+            return card.child(app_muted_text("No Public accounts match this search."));
+        }
+
+        for account in accounts {
+            let account_uuid = Arc::from(account.public_account_uuid.as_str());
+            let row_group = SharedString::from(format!(
+                "wallet-public-account-row-{}",
+                account.public_account_uuid
+            ));
+            let account_root = root.clone();
+            let edit_root = root.clone();
+            let hide_root = root.clone();
+            let show_root = root.clone();
+            let delete_root = root.clone();
+            let selectable = account.status == PublicAccountStatus::Active;
+            let selected = selected
+                .as_ref()
+                .is_some_and(|selected| selected.as_ref() == account.public_account_uuid);
+            let address_display = short_address(&account.address);
+            let address_copy_value = format!("{:#x}", account.address);
+            let edit_uuid = Arc::clone(&account_uuid);
+            let address_copy_button = div()
+                .id(SharedString::from(format!(
+                    "wallet-public-address-copy-action-{}",
+                    account.public_account_uuid
+                )))
+                .group(row_group.clone())
+                .flex_none()
+                .opacity(0.0)
+                .group_hover(row_group.clone(), |this| this.opacity(1.0))
+                .hover(|this| this.opacity(1.0))
+                .tooltip(|window, cx| Tooltip::new("Copy address").build(window, cx))
+                .child(clipboard_with_toast(
+                    SharedString::from(format!(
+                        "wallet-public-address-copy-{}",
+                        account.public_account_uuid
+                    )),
+                    address_copy_value,
+                ));
+            let source_badge = public_account_metadata_badge(
+                SharedString::from(format!(
+                    "wallet-public-account-source-{}",
+                    account.public_account_uuid
+                )),
+                Icon::new(public_account_source_icon(account.source)),
+                public_account_source_label(account.source),
+            );
+            let mut metadata_badges = div().flex().items_center().gap_1().child(source_badge);
+            if account.is_global() {
+                metadata_badges = metadata_badges.child(public_account_metadata_badge(
+                    SharedString::from(format!(
+                        "wallet-public-account-scope-{}",
+                        account.public_account_uuid
+                    )),
+                    Icon::new(RailgunPublicAccountIcon::Global),
+                    "Available across wallets",
+                ));
+            }
+            let account_label = public_account_display_label(&account);
+            let action_buttons = div()
+                .group(row_group.clone())
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap_1()
+                .opacity(0.0)
+                .group_hover(row_group.clone(), |this| this.opacity(1.0))
+                .hover(|this| this.opacity(1.0))
+                .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                    cx.stop_propagation();
+                })
+                .child(
+                    public_account_icon_button(
+                        SharedString::from(format!(
+                            "wallet-public-edit-{}",
+                            account.public_account_uuid
+                        )),
+                        Icon::new(RailgunActionIcon::Pencil),
+                        "Edit label",
+                    )
+                    .on_click(move |_event, window, cx| {
+                        let account_uuid = Arc::clone(&edit_uuid);
+                        edit_root.update(cx, |root, cx| {
+                            root.open_public_account_edit_dialog(account_uuid, window, cx);
+                        });
+                    }),
+                );
+            let action_buttons = match account.source {
+                PublicAccountSource::Derived => {
+                    let hide_uuid = Arc::clone(&account_uuid);
+                    let hidden = account.status == PublicAccountStatus::Hidden;
+                    action_buttons.child(
+                        public_account_icon_button(
+                            SharedString::from(format!(
+                                "wallet-public-hide-{}",
+                                account.public_account_uuid
+                            )),
+                            if hidden {
+                                IconName::Eye
+                            } else {
+                                IconName::EyeOff
+                            },
+                            if hidden {
+                                "Show account"
+                            } else {
+                                "Hide account"
+                            },
+                        )
+                        .on_click(move |_event, window, cx| {
+                            let account_uuid = Arc::clone(&hide_uuid);
+                            if hidden {
+                                show_root.update(cx, |root, cx| {
+                                    root.show_public_account(&account_uuid, window, cx);
+                                });
+                            } else {
+                                hide_root.update(cx, |root, cx| {
+                                    root.hide_public_account(&account_uuid, window, cx);
+                                });
+                            }
+                        }),
+                    )
+                }
+                PublicAccountSource::Imported => {
+                    let delete_uuid = Arc::clone(&account_uuid);
+                    let confirming_global_delete = account.is_global()
+                        && self.public_form.pending_global_delete_uuid.as_deref()
+                            == Some(account.public_account_uuid.as_str());
+                    action_buttons.child(
+                        public_account_icon_button(
+                            SharedString::from(format!(
+                                "wallet-public-delete-{}",
+                                account.public_account_uuid
+                            )),
+                            Icon::new(RailgunActionIcon::Trash2),
+                            if confirming_global_delete {
+                                "Confirm global delete"
+                            } else {
+                                "Delete account"
+                            },
+                        )
+                        .danger()
+                        .on_click(move |_event, window, cx| {
+                            let account_uuid = Arc::clone(&delete_uuid);
+                            delete_root.update(cx, |root, cx| {
+                                root.delete_public_account(&account_uuid, window, cx);
+                            });
+                        }),
+                    )
+                }
+            };
+            let account_label = account_label.map_or_else(
+                || app_strong_text(" ").whitespace_nowrap().opacity(0.0),
+                |label| app_strong_text(label).whitespace_nowrap(),
+            );
+            let mut account_content = div()
+                .w_full()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(div().flex_1().min_w(px(0.0)).child(account_label))
+                        .child(action_buttons),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .min_w(px(0.0))
+                                .flex_1()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    app_muted_text(address_display)
+                                        .font_family(APP_MONO_FONT_FAMILY)
+                                        .whitespace_nowrap(),
+                                )
+                                .child(address_copy_button),
+                        )
+                        .child(metadata_badges),
+                );
+
+            let visible_balances = if selectable {
+                self.public_account_visible_balances(&account.public_account_uuid)
+            } else {
+                Vec::new()
+            };
+            if !visible_balances.is_empty() {
+                let mut balance_chips = div().w_full().flex().flex_wrap().gap_2().pt(px(2.0));
+                for (balance_index, entry) in visible_balances.iter().enumerate() {
+                    balance_chips = balance_chips.child(self.render_public_account_balance_chip(
+                        root,
+                        Arc::clone(&account_uuid),
+                        selected,
+                        balance_index,
+                        entry,
+                    ));
+                }
+                account_content = account_content.child(balance_chips);
+            }
+            let mut account_card = div()
+                .group(row_group)
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .p(px(10.0))
+                .rounded_md()
+                .border_1()
+                .border_color(if selected {
+                    rgb(theme::PRIMARY)
+                } else {
+                    rgb(theme::BORDER)
+                })
+                .bg(if selected {
+                    rgb(theme::SURFACE_HOVER_SUBTLE)
+                } else {
+                    rgb(theme::SURFACE)
+                })
+                .when(selectable, |row| {
+                    row.cursor_pointer().on_mouse_down(
+                        MouseButton::Left,
+                        move |_event, window, cx| {
+                            let account_uuid = Arc::clone(&account_uuid);
+                            account_root.update(cx, |root, cx| {
+                                root.set_public_selected_account(account_uuid, window, cx);
+                            });
+                        },
+                    )
+                })
+                .child(div().flex().items_start().gap_3().child(account_content));
+            if account.is_global()
+                && self.public_form.pending_global_delete_uuid.as_deref()
+                    == Some(account.public_account_uuid.as_str())
+            {
+                account_card = account_card.child(
+                    Alert::warning(
+                        SharedString::from(format!(
+                            "wallet-public-global-delete-warning-{}",
+                            account.public_account_uuid
+                        )),
+                        "Deleting this global account removes it from every Private wallet.",
+                    )
+                    .small(),
+                );
+            }
+            card = card.child(account_card);
+        }
+        card
+    }
+
+    fn render_public_account_balance_chip(
+        &self,
+        root: &Entity<Self>,
+        account_uuid: Arc<str>,
+        selected_account: bool,
+        index: usize,
+        entry: &PublicBalanceEntry,
+    ) -> impl IntoElement {
+        let select_root = root.clone();
+        let asset = entry.asset.id;
+        let selected = selected_account && self.public_form.selected_asset == Some(asset);
+        let icon_path = public_asset_icon_path(self.selected_chain, asset);
+        let amount_label = public_balance_amount_label(&entry.amount, entry.asset.decimals);
+        let symbol = entry.asset.symbol;
+        let tooltip = SharedString::from(format!("Use {amount_label} {symbol}"));
+        let mut asset_label = div().flex().items_center().gap_1();
+        if let Some(path) = icon_path {
+            asset_label = asset_label.child(img(path).size(px(16.0)).rounded_full().flex_none());
+        }
+        div()
+            .id(SharedString::from(format!(
+                "wallet-public-account-balance-{}-{index}",
+                account_uuid.as_ref()
+            )))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px(px(8.0))
+            .py(px(5.0))
+            .rounded_md()
+            .border_1()
+            .border_color(if selected {
+                rgb(theme::PRIMARY)
+            } else {
+                rgb(theme::BORDER_SUBTLE)
+            })
+            .bg(if selected {
+                rgb(theme::SURFACE_HOVER_SUBTLE)
+            } else {
+                rgb(theme::SURFACE_ELEVATED)
+            })
+            .text_size(APP_TEXT_SIZE)
+            .cursor_pointer()
+            .hover(|this| this.bg(rgb(theme::SURFACE_HOVER)))
+            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+            .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                cx.stop_propagation();
+            })
+            .on_click(move |_event, window, cx| {
+                let account_uuid = Arc::clone(&account_uuid);
+                select_root.update(cx, |root, cx| {
+                    root.open_public_action_dialog(account_uuid, asset, window, cx);
+                });
+            })
+            .child(
+                asset_label
+                    .flex_none()
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .child(SharedString::from(symbol)),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(rgb(theme::WARNING))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(SharedString::from(amount_label)),
+            )
+    }
+
+    fn render_public_action_dialog_content(
+        &self,
+        root: Entity<Self>,
+        content_width: Pixels,
+    ) -> gpui::Div {
+        let mode = self.public_form.action_mode;
+        let account = self.selected_public_account();
+        let selected_asset = self.public_form.selected_asset;
+        let balance_entry = self.selected_public_balance_entry();
+        let asset_label = selected_asset.map_or_else(
+            || "selected asset".to_string(),
+            |asset| public_asset_label(self.selected_chain, asset),
+        );
+        let disabled = account.is_none() || selected_asset.is_none();
+        let submitting = self.public_form.sending || self.public_form.shielding;
+        let mode_root = root.clone();
+        let submit_root = root.clone();
+        let stepper_root = root.clone();
+        let max_root = root;
+        let show_form_errors = self.public_form.action_progress.is_empty();
+        let max_label = balance_entry.as_ref().and_then(public_action_max_label);
+        let amount_hint = format!("{asset_label} amount");
+        let mut content = div()
+            .w(content_width)
+            .flex()
+            .flex_col()
+            .gap_3()
+            .children(account.map(|account| {
+                app_muted_text(format!("From {}", short_address(&account.address)))
+                    .font_family(APP_MONO_FONT_FAMILY)
+            }))
+            .child(
+                ButtonGroup::new("wallet-public-action-mode-toggle")
+                    .w_full()
+                    .outline()
+                    .disabled(submitting)
+                    .child(public_action_segment_button(
+                        "wallet-public-action-mode-shield".into(),
+                        "Shield",
+                        Icon::new(RailgunActionIcon::Shield),
+                        mode == PublicActionMode::Shield,
+                    ))
+                    .child(public_action_segment_button(
+                        "wallet-public-action-mode-send".into(),
+                        "Send",
+                        Icon::new(RailgunActionIcon::Send),
+                        mode == PublicActionMode::Send,
+                    ))
+                    .on_click(move |selected, window, cx| {
+                        let Some(index) = selected.first() else {
+                            return;
+                        };
+                        let mode = if *index == 0 {
+                            PublicActionMode::Shield
+                        } else {
+                            PublicActionMode::Send
+                        };
+                        mode_root.update(cx, |root, cx| {
+                            root.set_public_action_mode(mode, window, cx);
+                        });
+                    }),
+            );
+
+        match mode {
+            PublicActionMode::Shield => {
+                content = content
+                    .child(render_public_action_amount_input(
+                        max_root,
+                        PublicActionMode::Shield,
+                        &self.public_form.shield_amount_input,
+                        amount_hint,
+                        max_label,
+                        disabled || self.public_form.shielding,
+                    ))
+                    .child(
+                        app_input(&self.public_form.shield_password_input)
+                            .disabled(disabled || self.public_form.shielding),
+                    )
+                    .child(
+                        app_button(
+                            "wallet-public-shield",
+                            if self.public_form.shielding {
+                                "Shielding..."
+                            } else {
+                                "Shield"
+                            },
+                        )
+                        .primary()
+                        .small()
+                        .loading(self.public_form.shielding)
+                        .disabled(disabled || self.public_form.shielding)
+                        .on_click(move |_event, window, cx| {
+                            submit_root.update(cx, |root, cx| {
+                                root.submit_public_shield_from_form(window, cx);
+                            });
+                        }),
+                    );
+                if show_form_errors && let Some(error) = self.public_form.shield_error.as_ref() {
+                    content = content.child(
+                        Alert::error("wallet-public-shield-error", error.to_string()).small(),
+                    );
+                }
+            }
+            PublicActionMode::Send => {
+                content = content
+                    .child(
+                        app_input(&self.public_form.send_recipient_input)
+                            .disabled(disabled || self.public_form.sending),
+                    )
+                    .child(render_public_action_amount_input(
+                        max_root,
+                        PublicActionMode::Send,
+                        &self.public_form.send_amount_input,
+                        amount_hint,
+                        max_label,
+                        disabled || self.public_form.sending,
+                    ))
+                    .child(
+                        app_input(&self.public_form.send_password_input)
+                            .disabled(disabled || self.public_form.sending),
+                    )
+                    .child(
+                        app_button(
+                            "wallet-public-send",
+                            if self.public_form.sending {
+                                "Sending..."
+                            } else {
+                                "Send publicly"
+                            },
+                        )
+                        .primary()
+                        .small()
+                        .loading(self.public_form.sending)
+                        .disabled(disabled || self.public_form.sending)
+                        .on_click(move |_event, window, cx| {
+                            submit_root.update(cx, |root, cx| {
+                                root.submit_public_send_from_form(window, cx);
+                            });
+                        }),
+                    );
+                if show_form_errors && let Some(error) = self.public_form.send_error.as_ref() {
+                    content = content
+                        .child(Alert::error("wallet-public-send-error", error.to_string()).small());
+                }
+            }
+        }
+
+        if !self.public_form.action_progress.is_empty() {
+            let action_asset_label = selected_asset.map_or_else(
+                || asset_label.clone(),
+                |asset| public_action_asset_label(self.selected_chain, asset),
+            );
+            content = content.child(render_public_action_stepper(
+                &stepper_root,
+                &self.public_form.action_progress,
+                &self.public_form.expanded_action_error_steps,
+                &action_asset_label,
+            ));
+        }
+        content
+    }
+
+    fn public_account_visible_balances(
+        &self,
+        public_account_uuid: &str,
+    ) -> Vec<PublicBalanceEntry> {
+        public_account_visible_balances_for_chain(
+            self.public_balance_snapshot.as_deref(),
+            self.selected_chain,
+            public_account_uuid,
+        )
     }
 
     fn render_chain_selector(&self) -> impl IntoElement {
@@ -6463,6 +8791,7 @@ impl Render for WalletRoot {
         self.apply_public_broadcaster_error_amount_adjustments(window, cx);
         self.focus_unlock_password_if_requested(window, cx);
         self.focus_utxo_table_if_requested(window, cx);
+        self.focus_public_account_search_if_requested(window, cx);
 
         let root = cx.entity();
         if !matches!(self.vault_state, VaultState::ViewUnlocked) {
@@ -6807,6 +9136,7 @@ fn tx_hash_cell(
                     "wallet-{kind}-tx-copy-{row_ix}"
                 )))
                 .flex_none()
+                .font_family(APP_MONO_FONT_FAMILY)
                 .text_color(utxo_cell_text_color(row, color))
                 .child(SharedString::from(display_hash)),
         )
@@ -6885,6 +9215,97 @@ fn centered_message(message: impl Into<SharedString>) -> gpui::Div {
 
 fn private_action_input(state: &Entity<InputState>) -> Input {
     Input::new(state).px(px(12.0)).py(px(8.0))
+}
+
+fn render_public_action_amount_input(
+    root: Entity<WalletRoot>,
+    mode: PublicActionMode,
+    input: &Entity<InputState>,
+    label: String,
+    max_label: Option<String>,
+    disabled: bool,
+) -> gpui::Div {
+    let max_root = root;
+    let max_id = match mode {
+        PublicActionMode::Shield => "wallet-public-shield-max",
+        PublicActionMode::Send => "wallet-public-send-max",
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(app_muted_text(label))
+                .children(max_label.map(|label| {
+                    app_button(max_id, format!("Max: {label}"))
+                        .link()
+                        .xsmall()
+                        .compact()
+                        .disabled(disabled)
+                        .on_click(move |_event, window, cx| {
+                            max_root.update(cx, |root, cx| {
+                                root.set_public_action_amount_to_max(mode, window, cx);
+                            });
+                        })
+                })),
+        )
+        .child(app_input(input).disabled(disabled))
+}
+
+fn public_action_segment_button(
+    id: SharedString,
+    label: &'static str,
+    icon: impl Into<Icon>,
+    selected: bool,
+) -> Button {
+    let button = Button::new(id)
+        .flex_1()
+        .min_w(px(0.0))
+        .selected(selected)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap_1()
+                .text_size(APP_TEXT_SIZE)
+                .child(icon.into().small())
+                .child(label),
+        );
+    if selected { button.primary() } else { button }
+}
+
+fn public_action_title_row(label: String, icon_path: Option<PathBuf>) -> gpui::Div {
+    div().flex().items_center().gap_1().child(token_label_row(
+        SharedString::from(label),
+        icon_path,
+        px(20.0),
+    ))
+}
+
+fn public_action_max_label(entry: &PublicBalanceEntry) -> Option<String> {
+    if entry.asset.id == PublicAssetId::Native {
+        return entry
+            .amount
+            .amount()
+            .map(|_| format!("{} after est. gas", entry.asset.symbol));
+    }
+    entry.amount.amount().map(|_| {
+        format!(
+            "{} {}",
+            public_balance_amount_label(&entry.amount, entry.asset.decimals),
+            entry.asset.symbol,
+        )
+    })
+}
+
+fn public_action_max_amount_after_reserve(amount: U256, reserve: U256) -> Option<U256> {
+    (amount > reserve).then_some(amount - reserve)
 }
 
 fn secondary_dialog_content_width(dialog_width: Pixels) -> Pixels {
@@ -7861,6 +10282,7 @@ fn render_broadcaster_picker_row(row: &BroadcasterPickerRow) -> gpui::Div {
                 .child(
                     div()
                         .text_color(rgb(theme::TEXT))
+                        .font_family(APP_MONO_FONT_FAMILY)
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .child(row.label.clone()),
                 ),
@@ -9611,6 +12033,525 @@ fn short_hash(hash: &str) -> String {
     format!("{}...{}", &hash[..8], &hash[hash.len() - 6..])
 }
 
+fn public_account_icon_button(
+    id: impl Into<ElementId>,
+    icon: impl Into<Icon>,
+    tooltip: impl Into<SharedString>,
+) -> Button {
+    Button::new(id)
+        .icon(icon)
+        .ghost()
+        .xsmall()
+        .compact()
+        .tooltip(tooltip)
+}
+
+fn public_account_metadata_badge(
+    id: impl Into<ElementId>,
+    icon: impl Into<Icon>,
+    tooltip: impl Into<SharedString>,
+) -> impl IntoElement {
+    let tooltip = tooltip.into();
+    div()
+        .id(id)
+        .flex()
+        .size(px(18.0))
+        .items_center()
+        .justify_center()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(theme::BORDER_SUBTLE))
+        .bg(rgb(theme::SURFACE_HOVER_SUBTLE))
+        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+        .child(Icon::new(icon).xsmall().text_color(rgb(theme::TEXT_MUTED)))
+}
+
+fn public_account_matches_search(account: &PublicAccountMetadata, query: &str) -> bool {
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    account
+        .label
+        .as_deref()
+        .is_some_and(|label| label.to_ascii_lowercase().contains(&query))
+        || format!("{:#x}", account.address).contains(&query)
+}
+
+fn public_account_display_label(account: &PublicAccountMetadata) -> Option<String> {
+    account
+        .label
+        .as_ref()
+        .filter(|label| !label.trim().is_empty())
+        .cloned()
+}
+
+const fn public_account_source_label(source: PublicAccountSource) -> &'static str {
+    match source {
+        PublicAccountSource::Derived => "Derived",
+        PublicAccountSource::Imported => "Imported",
+    }
+}
+
+const fn public_account_source_icon(source: PublicAccountSource) -> RailgunPublicAccountIcon {
+    match source {
+        PublicAccountSource::Derived => RailgunPublicAccountIcon::Derived,
+        PublicAccountSource::Imported => RailgunPublicAccountIcon::Imported,
+    }
+}
+
+fn public_asset_label(chain_id: u64, asset: PublicAssetId) -> String {
+    match asset {
+        PublicAssetId::Native => chain_name(chain_id).map_or_else(
+            || "Native".to_string(),
+            |name| match chain_id {
+                56 => "BNB".to_string(),
+                137 => "MATIC".to_string(),
+                _ => format!("{name} native"),
+            },
+        ),
+        PublicAssetId::Erc20(token) => lookup_token(chain_id, &token)
+            .map_or_else(|| short_address(&token), |info| info.symbol.to_string()),
+    }
+}
+
+fn public_action_asset_label(chain_id: u64, asset: PublicAssetId) -> String {
+    match asset {
+        PublicAssetId::Native => native_token_display_label(chain_id).to_string(),
+        PublicAssetId::Erc20(_) => public_asset_label(chain_id, asset),
+    }
+}
+
+fn public_asset_decimals(chain_id: u64, asset: PublicAssetId) -> Option<u8> {
+    match asset {
+        PublicAssetId::Native => Some(18),
+        PublicAssetId::Erc20(token) => lookup_token(chain_id, &token).map(|info| info.decimals),
+    }
+}
+
+fn public_asset_icon_path(chain_id: u64, asset: PublicAssetId) -> Option<PathBuf> {
+    match asset {
+        PublicAssetId::Native => chain_icon_path(chain_id),
+        PublicAssetId::Erc20(token) => token_icon_path(chain_id, &token),
+    }
+}
+
+fn public_balance_amount_label(amount: &PublicBalanceAmount, decimals: u8) -> String {
+    match amount {
+        PublicBalanceAmount::Available(amount) => format_token_amount(*amount, decimals),
+        PublicBalanceAmount::Unavailable => "unavailable".to_string(),
+    }
+}
+
+fn public_balance_entry_for_chain(
+    snapshot: Option<&PublicBalanceSnapshot>,
+    chain_id: u64,
+    public_account_uuid: &str,
+    asset: PublicAssetId,
+) -> Option<PublicBalanceEntry> {
+    let snapshot = snapshot.filter(|snapshot| snapshot.chain_id == chain_id)?;
+    snapshot
+        .accounts
+        .iter()
+        .find(|account| account.account.public_account_uuid.as_str() == public_account_uuid)?
+        .balances
+        .iter()
+        .find(|entry| entry.asset.id == asset)
+        .cloned()
+}
+
+fn public_account_visible_balances_for_chain(
+    snapshot: Option<&PublicBalanceSnapshot>,
+    chain_id: u64,
+    public_account_uuid: &str,
+) -> Vec<PublicBalanceEntry> {
+    let Some(snapshot) = snapshot.filter(|snapshot| snapshot.chain_id == chain_id) else {
+        return Vec::new();
+    };
+    snapshot
+        .accounts
+        .iter()
+        .find(|account| account.account.public_account_uuid.as_str() == public_account_uuid)
+        .map_or_else(Vec::new, |account| {
+            account
+                .balances
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        &entry.amount,
+                        PublicBalanceAmount::Available(amount) if !amount.is_zero()
+                    )
+                })
+                .cloned()
+                .collect()
+        })
+}
+
+fn render_public_action_stepper(
+    root: &Entity<WalletRoot>,
+    steps: &[PublicActionStepState],
+    expanded_error_steps: &BTreeSet<PublicActionProgressStep>,
+    asset_label: &str,
+) -> gpui::Div {
+    let mut stepper = div()
+        .flex()
+        .flex_col()
+        .gap_0()
+        .p(px(10.0))
+        .rounded_md()
+        .bg(rgb(theme::SURFACE_HOVER_SUBTLE))
+        .border_1()
+        .border_color(rgb(theme::BORDER_SUBTLE));
+    let last_index = steps.len().saturating_sub(1);
+    for (index, step) in steps.iter().enumerate() {
+        stepper = stepper.child(render_public_action_step(
+            root,
+            step,
+            index == last_index,
+            expanded_error_steps.contains(&step.step),
+            asset_label,
+        ));
+    }
+    stepper
+}
+
+fn render_public_action_step(
+    root: &Entity<WalletRoot>,
+    step: &PublicActionStepState,
+    is_last: bool,
+    error_details_open: bool,
+    asset_label: &str,
+) -> gpui::Div {
+    let color = public_action_step_color(step.status);
+    let title = public_action_step_label(step.step);
+    let detail = public_action_step_detail(step.step, step.status);
+    let mut body = div()
+        .flex_1()
+        .min_w(px(0.0))
+        .flex()
+        .flex_col()
+        .gap_1()
+        .pb(if is_last { px(0.0) } else { px(12.0) })
+        .child(
+            app_strong_text(title)
+                .text_color(rgb(color))
+                .line_height(gpui::relative(1.0)),
+        );
+    if step.status == PublicActionStepStatus::Error {
+        body = body.child(render_public_action_step_error(
+            root.clone(),
+            step,
+            asset_label,
+            error_details_open,
+        ));
+    } else {
+        body = body.child(
+            app_muted_text(detail)
+                .text_color(rgb(color))
+                .line_height(gpui::relative(1.0)),
+        );
+    }
+    body = body.children(
+        step.tx_hash
+            .as_ref()
+            .map(|tx_hash| render_public_action_step_hash(step.step, tx_hash.as_ref())),
+    );
+
+    div()
+        .flex()
+        .items_start()
+        .gap_3()
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .child(render_public_action_step_marker(step.status, color))
+                .children((!is_last).then(|| {
+                    div()
+                        .w(px(2.0))
+                        .flex_1()
+                        .min_h(px(32.0))
+                        .my(px(3.0))
+                        .rounded_full()
+                        .bg(rgb(color))
+                })),
+        )
+        .child(body)
+}
+
+fn render_public_action_step_error(
+    root: Entity<WalletRoot>,
+    step: &PublicActionStepState,
+    asset_label: &str,
+    details_open: bool,
+) -> gpui::Div {
+    let summary = public_action_error_summary(step.step, step.message.as_deref(), asset_label);
+    let details = public_action_error_details(&summary, step.message.as_deref());
+    let copy_value =
+        public_action_error_copy_value(step.step, asset_label, &summary, details.as_deref());
+    let copy_id = SharedString::from(format!(
+        "wallet-public-action-{}-error-copy",
+        public_action_step_id(step.step),
+    ));
+    let mut error = div().flex().flex_col().gap_1().child(
+        div()
+            .flex()
+            .items_start()
+            .gap_1()
+            .min_w(px(0.0))
+            .child(
+                app_muted_text(summary)
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .whitespace_normal()
+                    .text_color(rgb(theme::DANGER))
+                    .line_height(gpui::relative(1.0)),
+            )
+            .child(clipboard_with_toast(copy_id, copy_value)),
+    );
+
+    if let Some(details) = details {
+        let step_kind = step.step;
+        let toggle_root = root;
+        let toggle_id = SharedString::from(format!(
+            "wallet-public-action-{}-error-details-toggle",
+            public_action_step_id(step_kind),
+        ));
+        error = error.child(
+            Collapsible::new()
+                .open(details_open)
+                .child(
+                    div()
+                        .id(toggle_id)
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .cursor_pointer()
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .on_click(move |_event, _window, cx| {
+                            toggle_root.update(cx, |root, cx| {
+                                root.set_public_action_error_details_open(
+                                    step_kind,
+                                    !details_open,
+                                    cx,
+                                );
+                            });
+                        })
+                        .child(app_muted_text(if details_open {
+                            "Hide details"
+                        } else {
+                            "Details"
+                        }))
+                        .child(
+                            Icon::new(if details_open {
+                                IconName::ChevronUp
+                            } else {
+                                IconName::ChevronDown
+                            })
+                            .xsmall()
+                            .text_color(rgb(theme::TEXT_MUTED)),
+                        ),
+                )
+                .content(
+                    div().pt(px(2.0)).min_w(px(0.0)).child(
+                        app_muted_text(details)
+                            .font_family(APP_MONO_FONT_FAMILY)
+                            .text_size(px(12.0))
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .whitespace_normal(),
+                    ),
+                ),
+        );
+    }
+    error
+}
+
+fn render_public_action_step_marker(status: PublicActionStepStatus, color: u32) -> gpui::Div {
+    div()
+        .size(px(26.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .border_1()
+        .border_color(rgb(color))
+        .bg(rgb(theme::SURFACE))
+        .text_color(rgb(color))
+        .child(match status {
+            PublicActionStepStatus::NotStarted => div()
+                .size(px(7.0))
+                .rounded_full()
+                .bg(rgb(color))
+                .into_any_element(),
+            PublicActionStepStatus::Pending => Spinner::new()
+                .icon(IconName::LoaderCircle)
+                .color(rgb(color).into())
+                .with_size(px(14.0))
+                .into_any_element(),
+            PublicActionStepStatus::Done => {
+                Icon::new(IconName::CircleCheck).small().into_any_element()
+            }
+            PublicActionStepStatus::Error => Icon::new(IconName::TriangleAlert)
+                .small()
+                .into_any_element(),
+        })
+}
+
+fn render_public_action_step_hash(step: PublicActionProgressStep, tx_hash: &str) -> gpui::Div {
+    let button_id = SharedString::from(format!(
+        "wallet-public-action-{}-tx-copy",
+        public_action_step_id(step)
+    ));
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .child(
+            app_muted_text(short_hash(tx_hash))
+                .font_family(APP_MONO_FONT_FAMILY)
+                .line_height(gpui::relative(1.0)),
+        )
+        .child(clipboard_with_toast(button_id, tx_hash.to_string()))
+}
+
+const fn public_action_step_color(status: PublicActionStepStatus) -> u32 {
+    match status {
+        PublicActionStepStatus::NotStarted => theme::TEXT,
+        PublicActionStepStatus::Pending => theme::WARNING,
+        PublicActionStepStatus::Done => theme::SUCCESS,
+        PublicActionStepStatus::Error => theme::DANGER,
+    }
+}
+
+const fn public_action_step_label(step: PublicActionProgressStep) -> &'static str {
+    match step {
+        PublicActionProgressStep::Send => "Send",
+        PublicActionProgressStep::Wrap => "Wrap",
+        PublicActionProgressStep::Approve => "Approve",
+        PublicActionProgressStep::Shield => "Shield",
+    }
+}
+
+const fn public_action_step_detail(
+    step: PublicActionProgressStep,
+    status: PublicActionStepStatus,
+) -> &'static str {
+    match status {
+        PublicActionStepStatus::NotStarted => match step {
+            PublicActionProgressStep::Send => "Waiting to broadcast the transfer.",
+            PublicActionProgressStep::Wrap => "Waiting to wrap the native token.",
+            PublicActionProgressStep::Approve => "Waiting to approve the shield contract.",
+            PublicActionProgressStep::Shield => "Waiting to shield into the Private wallet.",
+        },
+        PublicActionStepStatus::Pending => "Broadcasting and waiting for confirmation.",
+        PublicActionStepStatus::Done => "Confirmed on-chain.",
+        PublicActionStepStatus::Error => "Failed.",
+    }
+}
+
+fn public_action_error_summary(
+    step: PublicActionProgressStep,
+    details: Option<&str>,
+    asset_label: &str,
+) -> String {
+    let details = details.unwrap_or_default().to_ascii_lowercase();
+    if details.contains("estimate gas") {
+        return match step {
+            PublicActionProgressStep::Send => {
+                "Could not estimate gas. Check amount, recipient, and gas balance.".to_string()
+            }
+            PublicActionProgressStep::Wrap => format!(
+                "Could not estimate gas to wrap {asset_label}. Check amount and gas balance."
+            ),
+            PublicActionProgressStep::Approve => {
+                "Could not estimate gas for approval. Check token balance and try again."
+                    .to_string()
+            }
+            PublicActionProgressStep::Shield => {
+                "Could not estimate gas for shielding. Try again or check the RPC/network."
+                    .to_string()
+            }
+        };
+    }
+    if details.contains("revert") {
+        return match step {
+            PublicActionProgressStep::Send => "Transfer reverted on-chain.".to_string(),
+            PublicActionProgressStep::Wrap => format!("Wrapping {asset_label} reverted on-chain."),
+            PublicActionProgressStep::Approve => "Approval reverted on-chain.".to_string(),
+            PublicActionProgressStep::Shield => "Shielding reverted on-chain.".to_string(),
+        };
+    }
+    match step {
+        PublicActionProgressStep::Send => {
+            "Could not send publicly. Check amount, recipient, and gas balance.".to_string()
+        }
+        PublicActionProgressStep::Wrap => {
+            format!("Could not wrap {asset_label}. Check amount and gas balance.")
+        }
+        PublicActionProgressStep::Approve => {
+            "Could not approve the shield contract. Check token balance and try again.".to_string()
+        }
+        PublicActionProgressStep::Shield => {
+            "Could not shield into the Private wallet. Try again or check the RPC/network."
+                .to_string()
+        }
+    }
+}
+
+fn public_action_error_details(summary: &str, details: Option<&str>) -> Option<String> {
+    let details = details?.trim();
+    if details.is_empty() || details == summary {
+        None
+    } else {
+        Some(details.to_string())
+    }
+}
+
+fn public_action_error_copy_value(
+    step: PublicActionProgressStep,
+    asset_label: &str,
+    summary: &str,
+    details: Option<&str>,
+) -> String {
+    let mut value = format!(
+        "Step: {}\nAsset: {asset_label}\nSummary: {summary}",
+        public_action_step_label(step),
+    );
+    if let Some(details) = details {
+        value.push_str("\nDetails: ");
+        value.push_str(details);
+    }
+    value
+}
+
+const fn public_action_step_id(step: PublicActionProgressStep) -> &'static str {
+    match step {
+        PublicActionProgressStep::Send => "send",
+        PublicActionProgressStep::Wrap => "wrap",
+        PublicActionProgressStep::Approve => "approve",
+        PublicActionProgressStep::Shield => "shield",
+    }
+}
+
+fn public_action_progress_steps(
+    mode: PublicActionMode,
+    asset: PublicAssetId,
+) -> Vec<PublicActionProgressStep> {
+    match mode {
+        PublicActionMode::Send => vec![PublicActionProgressStep::Send],
+        PublicActionMode::Shield if asset == PublicAssetId::Native => vec![
+            PublicActionProgressStep::Wrap,
+            PublicActionProgressStep::Approve,
+            PublicActionProgressStep::Shield,
+        ],
+        PublicActionMode::Shield => vec![
+            PublicActionProgressStep::Approve,
+            PublicActionProgressStep::Shield,
+        ],
+    }
+}
+
 fn parse_address(raw: &str) -> Option<Address> {
     raw.parse().ok()
 }
@@ -9658,6 +12599,12 @@ const fn vault_error_kind(error: &VaultError) -> &'static str {
         VaultError::InvalidWalletOrder => "invalid_wallet_order",
         VaultError::LastActiveWallet => "last_active_wallet",
         VaultError::WalletDisplayOrderOverflow => "wallet_display_order_overflow",
+        VaultError::PublicAccountNotFound => "public_account_not_found",
+        VaultError::DuplicatePublicAccountAddress => "duplicate_public_account_address",
+        VaultError::InvalidPublicAccountOperation => "invalid_public_account_operation",
+        VaultError::PublicAccountDisplayOrderOverflow => "public_account_display_order_overflow",
+        VaultError::InvalidPublicEvmPrivateKey => "invalid_public_evm_private_key",
+        VaultError::PublicEvmKeyDerivation => "public_evm_key_derivation",
     }
 }
 
@@ -9672,26 +12619,35 @@ mod tests {
     use broadcaster_monitor::FeeRow;
     use gpui_component::select::SelectItem;
     use wallet_ops::{
-        BroadcasterFeePolicy, ListUtxosOutput, PublicBroadcasterFeeMargin,
-        PublicBroadcasterFeeMode, SyncProgressStage, SyncProgressUpdate,
-        TransactionGenerationStage, UtxoOutput,
-        vault::{WalletMetadataBundle, WalletSource, WalletStatus},
+        BroadcasterFeePolicy, ListUtxosOutput, PublicAccountBalance, PublicActionProgressStep,
+        PublicAssetId, PublicBalanceAmount, PublicBalanceAsset, PublicBalanceEntry,
+        PublicBalanceSnapshot, PublicBroadcasterFeeMargin, PublicBroadcasterFeeMode,
+        SyncProgressStage, SyncProgressUpdate, TransactionGenerationStage, UtxoOutput,
+        vault::{
+            PublicAccountMetadata, PublicAccountScope, PublicAccountSource, PublicAccountStatus,
+            WalletMetadataBundle, WalletSource, WalletStatus,
+        },
     };
 
     use super::{
         Activity, BroadcasterChoice, ChainUtxoState, CostEstimateStatus, PrivateActionMetric,
-        PublicBroadcasterFeeTokenOption, SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_MINUTE,
-        SECONDS_PER_MONTH, SECONDS_PER_YEAR, UnshieldAsset, UnshieldAssetKey, WalletSelectItem,
-        WalletTab, adjusted_amount_for_max_change, broadcaster_choice_supported_by_candidates,
-        build_send_asset, build_unshield_asset, display_rows_from_output,
-        effective_public_broadcaster_fee_mode, fee_token_option_has_eligible_broadcaster,
-        format_compact_age, format_exact_asset_amount_for_display, format_form_error_for_asset,
+        PublicActionMode, PublicBroadcasterFeeTokenOption, SECONDS_PER_DAY, SECONDS_PER_HOUR,
+        SECONDS_PER_MINUTE, SECONDS_PER_MONTH, SECONDS_PER_YEAR, UnshieldAsset, UnshieldAssetKey,
+        WalletSelectItem, WalletTab, adjusted_amount_for_max_change,
+        broadcaster_choice_supported_by_candidates, build_send_asset, build_unshield_asset,
+        display_rows_from_output, effective_public_broadcaster_fee_mode,
+        fee_token_option_has_eligible_broadcaster, format_compact_age,
+        format_exact_asset_amount_for_display, format_form_error_for_asset,
         format_native_token_amount_for_display, format_private_asset_rows,
         format_public_broadcaster_fee_margin, format_report_chain, format_send_amount_input,
         format_total, format_unshield_amount_input, loading_summary, max_send_amount_from_snapshot,
         max_unshield_amount_from_snapshot, native_token_display_label,
         native_wrapped_output_labels, parse_repair_cache_block, private_action_metrics,
-        progress_detail, public_broadcaster_candidates_for_asset, public_broadcaster_cost_status,
+        progress_detail, public_account_matches_search, public_account_visible_balances_for_chain,
+        public_action_asset_label, public_action_error_copy_value, public_action_error_details,
+        public_action_error_summary, public_action_max_amount_after_reserve,
+        public_action_max_label, public_action_progress_steps, public_balance_entry_for_chain,
+        public_broadcaster_candidates_for_asset, public_broadcaster_cost_status,
         public_broadcaster_cost_status_text, public_broadcaster_fee_token_options_from_snapshot,
         public_broadcaster_submit_disabled_for_fee_token_options, refresh_form_asset_from_snapshot,
         repair_cache_help_text, resolve_selected_public_broadcaster_fee_token,
@@ -10861,6 +13817,222 @@ mod tests {
         assert_ne!(
             unshield_element_id(first, "copy-to").as_ref(),
             unshield_element_id(first, "copy-data").as_ref()
+        );
+    }
+
+    fn public_account_for_search(label: Option<&str>, address: Address) -> PublicAccountMetadata {
+        PublicAccountMetadata {
+            public_account_uuid: "public-account".to_string(),
+            address,
+            label: label.map(str::to_string),
+            source: PublicAccountSource::Imported,
+            scope: PublicAccountScope::Global,
+            derivation_index: None,
+            status: PublicAccountStatus::Active,
+            display_order: 0,
+        }
+    }
+
+    #[test]
+    fn public_account_search_matches_empty_query() {
+        let account = public_account_for_search(Some("Main account"), Address::from([0x11; 20]));
+
+        assert!(public_account_matches_search(&account, ""));
+        assert!(public_account_matches_search(&account, "   "));
+    }
+
+    #[test]
+    fn public_account_search_matches_label_partial_case_insensitive() {
+        let account =
+            public_account_for_search(Some("Primary Spending"), Address::from([0x22; 20]));
+
+        assert!(public_account_matches_search(&account, "spend"));
+        assert!(public_account_matches_search(&account, "PRIMARY"));
+    }
+
+    #[test]
+    fn public_account_search_matches_address_partial_case_insensitive() {
+        let account = public_account_for_search(None, Address::from([0xab; 20]));
+
+        assert!(public_account_matches_search(&account, "0xabab"));
+        assert!(public_account_matches_search(&account, "ABABAB"));
+    }
+
+    #[test]
+    fn public_account_search_rejects_non_matches() {
+        let account = public_account_for_search(Some("Primary"), Address::from([0xcd; 20]));
+
+        assert!(!public_account_matches_search(&account, "savings"));
+    }
+
+    fn public_balance_snapshot_for_test(chain_id: u64) -> PublicBalanceSnapshot {
+        let account = public_account_for_search(Some("Main account"), Address::from([0x11; 20]));
+        PublicBalanceSnapshot {
+            chain_id,
+            refreshed_at: SystemTime::UNIX_EPOCH,
+            accounts: vec![PublicAccountBalance {
+                account,
+                balances: vec![PublicBalanceEntry {
+                    asset: PublicBalanceAsset {
+                        id: PublicAssetId::Native,
+                        symbol: "ETH",
+                        decimals: 18,
+                    },
+                    amount: PublicBalanceAmount::Available(U256::from(5_u64)),
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn public_balance_helpers_ignore_stale_chain_snapshot() {
+        let snapshot = public_balance_snapshot_for_test(1);
+
+        assert_eq!(
+            public_account_visible_balances_for_chain(Some(&snapshot), 1, "public-account").len(),
+            1,
+        );
+        assert!(
+            public_balance_entry_for_chain(
+                Some(&snapshot),
+                1,
+                "public-account",
+                PublicAssetId::Native
+            )
+            .is_some(),
+        );
+        assert!(
+            public_account_visible_balances_for_chain(Some(&snapshot), 56, "public-account")
+                .is_empty(),
+        );
+        assert!(
+            public_balance_entry_for_chain(
+                Some(&snapshot),
+                56,
+                "public-account",
+                PublicAssetId::Native
+            )
+            .is_none(),
+        );
+    }
+
+    #[test]
+    fn public_action_native_max_subtracts_estimated_gas_reserve() {
+        assert_eq!(
+            public_action_max_amount_after_reserve(U256::from(100_u64), U256::from(40_u64)),
+            Some(U256::from(60_u64)),
+        );
+        assert_eq!(
+            public_action_max_amount_after_reserve(U256::from(100_u64), U256::from(100_u64)),
+            None,
+        );
+        assert_eq!(
+            public_action_max_amount_after_reserve(U256::from(100_u64), U256::from(101_u64)),
+            None,
+        );
+    }
+
+    #[test]
+    fn public_action_max_label_notes_native_gas_estimate() {
+        let native = PublicBalanceEntry {
+            asset: PublicBalanceAsset {
+                id: PublicAssetId::Native,
+                symbol: "ETH",
+                decimals: 18,
+            },
+            amount: PublicBalanceAmount::Available(U256::from(1_000_000_000_000_000_000_u128)),
+        };
+        let token = PublicBalanceEntry {
+            asset: PublicBalanceAsset {
+                id: PublicAssetId::Erc20(Address::from([0x22; 20])),
+                symbol: "USDC",
+                decimals: 6,
+            },
+            amount: PublicBalanceAmount::Available(U256::from(1_500_000_u64)),
+        };
+
+        assert_eq!(
+            public_action_max_label(&native),
+            Some("ETH after est. gas".to_string()),
+        );
+        assert_eq!(
+            public_action_max_label(&token),
+            Some("1.5 USDC".to_string()),
+        );
+    }
+
+    #[test]
+    fn public_action_progress_steps_use_single_send_step() {
+        assert_eq!(
+            public_action_progress_steps(PublicActionMode::Send, PublicAssetId::Native),
+            vec![PublicActionProgressStep::Send],
+        );
+    }
+
+    #[test]
+    fn public_action_progress_steps_include_wrap_for_native_shield() {
+        assert_eq!(
+            public_action_progress_steps(PublicActionMode::Shield, PublicAssetId::Native),
+            vec![
+                PublicActionProgressStep::Wrap,
+                PublicActionProgressStep::Approve,
+                PublicActionProgressStep::Shield,
+            ],
+        );
+    }
+
+    #[test]
+    fn public_action_progress_steps_skip_wrap_for_erc20_shield() {
+        assert_eq!(
+            public_action_progress_steps(
+                PublicActionMode::Shield,
+                PublicAssetId::Erc20(Address::from([0xef; 20])),
+            ),
+            vec![
+                PublicActionProgressStep::Approve,
+                PublicActionProgressStep::Shield,
+            ],
+        );
+    }
+
+    #[test]
+    fn public_action_error_summary_explains_wrap_gas_estimate() {
+        assert_eq!(
+            public_action_error_summary(
+                PublicActionProgressStep::Wrap,
+                Some("public-shield-wrap: estimate gas"),
+                "ETH",
+            ),
+            "Could not estimate gas to wrap ETH. Check amount and gas balance.",
+        );
+    }
+
+    #[test]
+    fn public_action_asset_label_uses_native_symbol() {
+        assert_eq!(public_action_asset_label(1, PublicAssetId::Native), "ETH");
+    }
+
+    #[test]
+    fn public_action_error_details_hide_duplicate_summary() {
+        let summary = "Could not send publicly.";
+
+        assert_eq!(public_action_error_details(summary, Some(summary)), None);
+        assert_eq!(
+            public_action_error_details(summary, Some("public-send: estimate gas")),
+            Some("public-send: estimate gas".to_string()),
+        );
+    }
+
+    #[test]
+    fn public_action_error_copy_value_includes_context_and_details() {
+        assert_eq!(
+            public_action_error_copy_value(
+                PublicActionProgressStep::Wrap,
+                "ETH",
+                "Could not estimate gas to wrap ETH.",
+                Some("public-shield-wrap: estimate gas: insufficient funds"),
+            ),
+            "Step: Wrap\nAsset: ETH\nSummary: Could not estimate gas to wrap ETH.\nDetails: public-shield-wrap: estimate gas: insufficient funds",
         );
     }
 
