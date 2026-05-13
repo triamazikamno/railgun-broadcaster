@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use broadcaster_monitor::{DEFAULT_EVENT_CAPACITY, event_channel, shared};
 use broadcaster_monitor_waku::{
-    DEFAULT_CLUSTER_ID, DEFAULT_SHARD_ID, WakuViewerConfig, spawn_workers,
+    DEFAULT_CLUSTER_ID, DEFAULT_SHARD_ID, RelayNetworkConfig, WakuViewerConfig, spawn_workers,
 };
 use eyre::{Result, WrapErr};
 use gpui::{App, Application};
@@ -61,6 +61,7 @@ fn main() -> Result<()> {
         max_peers: opts.max_peers,
         peer_connection_timeout: opts.peer_connection_timeout,
         nwaku_url: opts.nwaku_url.clone(),
+        network: RelayNetworkConfig::default(),
     };
 
     tracing::info!(

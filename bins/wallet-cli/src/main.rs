@@ -11,10 +11,12 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 use wallet_ops::{
     ListUtxosRequest, ShieldRequest, ShieldResult, UnshieldRequest, UnshieldResult,
-    build_http_client, list_utxos, shield, unshield,
+    WalletNetworkConfig, WalletNetworkMode, build_wallet_network_context, list_utxos, shield,
+    unshield,
 };
 
 const DEFAULT_DB_PATH: &str = "db";
+const SHIELD_NETWORK_DATA_DIR: &str = "railgun-wallet-cli";
 
 #[derive(StructOpt)]
 #[structopt(name = "wallet-cli")]
@@ -25,8 +27,21 @@ struct Options {
     /// Route all HTTP traffic through a proxy (e.g. socks5h://127.0.0.1:9050 for Tor)
     #[structopt(long, global = true)]
     proxy: Option<Url>,
+    /// Wallet network mode: tor (default), proxy, or direct.
+    #[structopt(long, global = true, possible_values = &["tor", "proxy", "direct"])]
+    network_mode: Option<WalletNetworkMode>,
     #[structopt(subcommand)]
     command: Command,
+}
+
+impl Options {
+    fn network_data_path(&self) -> PathBuf {
+        match &self.command {
+            Command::ListUtxos(opts) => opts.db_path.clone(),
+            Command::Unshield(opts) => opts.db_path.clone(),
+            Command::Shield(_) => std::env::temp_dir().join(SHIELD_NETWORK_DATA_DIR),
+        }
+    }
 }
 
 #[derive(StructOpt)]
@@ -114,8 +129,20 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    let network_data_path = options.network_data_path();
     let rpc_url_override = options.rpc_url;
-    let http_client = build_http_client(options.proxy.as_ref())?;
+    let http_client = build_wallet_network_context(WalletNetworkConfig {
+        network_mode: options.network_mode,
+        proxy: options.proxy.as_ref(),
+        data_dir: &network_data_path,
+    })
+    .await?;
+    tracing::info!(
+        network_mode = %http_client.network_mode(),
+        network_status = http_client.network_status_label(),
+        network_detail = %http_client.network_status_detail(),
+        "wallet-cli network context ready"
+    );
     match options.command {
         Command::ListUtxos(opts) => {
             let output = list_utxos(opts.into(), rpc_url_override, &http_client).await?;
@@ -186,5 +213,56 @@ impl From<ShieldOptions> for ShieldRequest {
             wrap: value.wrap,
             send: value.send,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shield_options() -> ShieldOptions {
+        ShieldOptions {
+            chain_id: 1,
+            token: Address::ZERO,
+            amount: "1".to_string(),
+            recipient: "0zk-test".to_string(),
+            private_key: "0x00".to_string(),
+            wrap: false,
+            send: false,
+        }
+    }
+
+    #[test]
+    fn shield_network_data_path_uses_temp_dir_not_cwd_db() {
+        let options = Options {
+            rpc_url: None,
+            proxy: None,
+            network_mode: None,
+            command: Command::Shield(shield_options()),
+        };
+
+        assert_eq!(
+            options.network_data_path(),
+            std::env::temp_dir().join(SHIELD_NETWORK_DATA_DIR)
+        );
+        assert_ne!(options.network_data_path(), PathBuf::from(DEFAULT_DB_PATH));
+    }
+
+    #[test]
+    fn wallet_sync_commands_use_configured_db_for_network_data() {
+        let db_path = PathBuf::from("custom-db");
+        let options = Options {
+            rpc_url: None,
+            proxy: None,
+            network_mode: None,
+            command: Command::ListUtxos(ListUtxosOptions {
+                mnemonic: "test".to_string(),
+                chain_id: 1,
+                db_path: db_path.clone(),
+                init_block_number: None,
+            }),
+        };
+
+        assert_eq!(options.network_data_path(), db_path);
     }
 }

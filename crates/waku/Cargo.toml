@@ -5,7 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+arti-client = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync"] }
+tor-rtcompat = { workspace = true }
 tracing = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }

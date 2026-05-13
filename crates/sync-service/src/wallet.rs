@@ -2229,9 +2229,14 @@ fn blinded_commitment_type(kind: UtxoCommitmentKind) -> BlindedCommitmentType {
     }
 }
 
-pub(crate) fn wallet_poi_status_client() -> Option<PoiRpcClient> {
+pub(crate) fn wallet_poi_status_client(
+    http_client: Option<&reqwest::Client>,
+) -> Option<PoiRpcClient> {
     let url = Url::parse(DEFAULT_WALLET_POI_RPC_URL).ok()?;
-    Some(PoiRpcClient::new(url))
+    Some(match http_client {
+        Some(http_client) => PoiRpcClient::with_http_client(url, http_client.clone()),
+        None => PoiRpcClient::new(url),
+    })
 }
 
 pub(crate) struct WalletWorkerServices {
@@ -2596,7 +2601,7 @@ pub(crate) fn spawn_wallet_worker(
         let mut backfill_complete_block: Option<u64> = None;
         let mut persist_state = WalletPersistState::default();
         let mut live_metadata_flush = WalletLiveMetadataFlush::new(last_scanned, worker_started);
-        let poi_status_client = wallet_poi_status_client();
+        let poi_status_client = wallet_poi_status_client(http_client.as_ref());
         let active_poi_list_keys = default_active_poi_list_keys();
 
         if poi_status_client.is_some() {

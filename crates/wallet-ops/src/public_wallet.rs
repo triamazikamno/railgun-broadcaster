@@ -990,10 +990,7 @@ mod tests {
             .build()
             .expect("build runtime");
         let (root_dir, db, store, view_session) = public_action_request_parts();
-        let http = HttpContext {
-            client: reqwest::Client::new(),
-            proxy_url: None,
-        };
+        let http = HttpContext::direct_for_tests();
         let recipient = address!("0x2222222222222222222222222222222222222222");
 
         let send_result = runtime.block_on(submit_public_send(

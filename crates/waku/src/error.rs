@@ -41,4 +41,6 @@ pub enum TransportInitError {
     Noise(#[from] noise::Error),
     #[error("failed to wrap transport with DNS: {0}")]
     Dns(#[from] std::io::Error),
+    #[error("Tor transport profile requires an Arti client")]
+    MissingTorClient,
 }

@@ -250,7 +250,17 @@ pub(crate) fn render_pane(
                 .flex_none()
                 .px_2()
                 .text_color(rgb(theme::TEXT_MUTED))
-                .child(SharedString::from(subtitle)),
+                .child(SharedString::from(subtitle))
+                .child(
+                    div()
+                        .mt(px(2.0))
+                        .text_color(if summary.network_degraded {
+                            rgb(theme::WARNING)
+                        } else {
+                            rgb(theme::SUCCESS)
+                        })
+                        .child(SharedString::from(summary.network_label.to_string())),
+                ),
         )
         .child(div().flex_1().min_h_0().child(Table::new(state)))
 }

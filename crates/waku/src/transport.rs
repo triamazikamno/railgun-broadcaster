@@ -1,10 +1,15 @@
-use crate::config::NodeConfig;
+use crate::config::{NodeConfig, WakuNetworkConfig, WakuTorClient, WakuTransportProfile};
 use crate::error::TransportInitError;
 use crate::proto;
 use crate::protocols;
 use crate::protocols::codec::ProstLengthDelimitedCodec;
 use futures::StreamExt;
+use futures::future::{BoxFuture, FutureExt};
+use libp2p::core::multiaddr::Protocol;
 use libp2p::core::transport::Boxed;
+use libp2p::core::transport::{
+    DialOpts, ListenerId, TransportError, TransportEvent as CoreTransportEvent,
+};
 use libp2p::core::upgrade;
 use libp2p::dns;
 use libp2p::identify;
@@ -19,6 +24,9 @@ use libp2p::yamux;
 use libp2p::{Multiaddr, PeerId, StreamProtocol, Transport as _};
 use libp2p_mplex as mplex;
 use std::collections::HashMap;
+use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error};
@@ -147,11 +155,14 @@ pub(crate) struct Transport {
 
 impl Transport {
     /// Create a new transport.
-    pub(crate) fn new(config: &NodeConfig) -> Result<Self, TransportInitError> {
+    pub(crate) fn new(
+        config: &NodeConfig,
+        network: &WakuNetworkConfig,
+    ) -> Result<Self, TransportInitError> {
         let local_key = identity::Keypair::generate_ed25519();
         let local_peer_id = PeerId::from(local_key.public());
 
-        let transport = build_transport(&local_key)?;
+        let transport = build_transport(&local_key, network)?;
 
         let behaviour = Behaviour {
             identify: identify::Behaviour::new(
@@ -500,6 +511,16 @@ async fn handle_filter_push_stream(
 
 fn build_transport(
     local_key: &identity::Keypair,
+    network: &WakuNetworkConfig,
+) -> Result<Boxed<(PeerId, libp2p::core::muxing::StreamMuxerBox)>, TransportInitError> {
+    match network.transport_profile {
+        WakuTransportProfile::Direct => build_direct_transport(local_key),
+        WakuTransportProfile::Tor => build_tor_transport(local_key, network),
+    }
+}
+
+fn build_direct_transport(
+    local_key: &identity::Keypair,
 ) -> Result<Boxed<(PeerId, libp2p::core::muxing::StreamMuxerBox)>, TransportInitError> {
     let tcp_transport = dns::tokio::Transport::system(tcp::tokio::Transport::new(
         tcp::Config::default().nodelay(true),
@@ -548,4 +569,150 @@ fn build_transport(
         });
 
     Ok(transport.boxed())
+}
+
+fn build_tor_transport(
+    local_key: &identity::Keypair,
+    network: &WakuNetworkConfig,
+) -> Result<Boxed<(PeerId, libp2p::core::muxing::StreamMuxerBox)>, TransportInitError> {
+    let tor_client = network
+        .tor_client
+        .clone()
+        .ok_or(TransportInitError::MissingTorClient)?;
+    let arti_transport = ArtiTcpTransport::new(tor_client);
+
+    let tcp_transport = arti_transport
+        .clone()
+        .upgrade(upgrade::Version::V1)
+        .authenticate(noise::Config::new(local_key)?)
+        .multiplex(upgrade::SelectUpgrade::new(
+            yamux::Config::default(),
+            mplex::Config::new(),
+        ))
+        .timeout(Duration::from_secs(20))
+        .boxed();
+
+    let ws_transport = websocket::Config::new(arti_transport)
+        .upgrade(upgrade::Version::V1)
+        .authenticate(noise::Config::new(local_key)?)
+        .multiplex(upgrade::SelectUpgrade::new(
+            yamux::Config::default(),
+            mplex::Config::new(),
+        ))
+        .timeout(Duration::from_secs(20))
+        .boxed();
+
+    Ok(ws_transport
+        .or_transport(tcp_transport)
+        .map(|either, _| match either {
+            futures::future::Either::Left(v) | futures::future::Either::Right(v) => v,
+        })
+        .boxed())
+}
+
+#[derive(Clone)]
+struct ArtiTcpTransport {
+    tor_client: WakuTorClient,
+}
+
+impl ArtiTcpTransport {
+    const fn new(tor_client: WakuTorClient) -> Self {
+        Self { tor_client }
+    }
+}
+
+impl libp2p::Transport for ArtiTcpTransport {
+    type Output = arti_client::DataStream;
+    type Error = io::Error;
+    type ListenerUpgrade = std::future::Pending<Result<Self::Output, Self::Error>>;
+    type Dial = BoxFuture<'static, Result<Self::Output, Self::Error>>;
+
+    fn listen_on(
+        &mut self,
+        _id: ListenerId,
+        addr: Multiaddr,
+    ) -> Result<(), TransportError<Self::Error>> {
+        Err(TransportError::MultiaddrNotSupported(addr))
+    }
+
+    fn remove_listener(&mut self, _id: ListenerId) -> bool {
+        false
+    }
+
+    fn dial(
+        &mut self,
+        addr: Multiaddr,
+        _opts: DialOpts,
+    ) -> Result<Self::Dial, TransportError<Self::Error>> {
+        let target = ArtiDialTarget::from_multiaddr(&addr)?;
+        let tor_client = self.tor_client.clone();
+        Ok(async move {
+            tor_client
+                .connect((target.host.as_str(), target.port))
+                .await
+                .map_err(io::Error::other)
+        }
+        .boxed())
+    }
+
+    fn poll(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<CoreTransportEvent<Self::ListenerUpgrade, Self::Error>> {
+        Poll::Pending
+    }
+}
+
+struct ArtiDialTarget {
+    host: String,
+    port: u16,
+}
+
+impl ArtiDialTarget {
+    fn from_multiaddr(addr: &Multiaddr) -> Result<Self, TransportError<io::Error>> {
+        let mut protocols = addr.iter();
+        let host = match protocols.next() {
+            Some(Protocol::Dns(host) | Protocol::Dns4(host) | Protocol::Dns6(host)) => {
+                host.to_string()
+            }
+            Some(Protocol::Ip4(host)) => host.to_string(),
+            Some(Protocol::Ip6(host)) => host.to_string(),
+            _ => return Err(TransportError::MultiaddrNotSupported(addr.clone())),
+        };
+        let Some(Protocol::Tcp(port)) = protocols.next() else {
+            return Err(TransportError::MultiaddrNotSupported(addr.clone()));
+        };
+        Ok(Self { host, port })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dial_target(value: &str) -> Result<ArtiDialTarget, TransportError<io::Error>> {
+        let addr = value.parse().expect("valid multiaddr");
+        ArtiDialTarget::from_multiaddr(&addr)
+    }
+
+    #[test]
+    fn arti_dial_target_accepts_dns_and_ip_tcp_addrs() {
+        let dns = dial_target("/dns4/support-4.rootedinprivacy.com/tcp/30304/p2p/12D3KooWPZAXp2aXSq7hh5iy8pxziTv1bxU8cg4pc4YEgkFiiixv")
+            .expect("dns target");
+        assert_eq!(dns.host, "support-4.rootedinprivacy.com");
+        assert_eq!(dns.port, 30304);
+
+        let ip4 = dial_target("/ip4/203.0.113.10/tcp/30304").expect("ip4 target");
+        assert_eq!(ip4.host, "203.0.113.10");
+        assert_eq!(ip4.port, 30304);
+
+        let ip6 = dial_target("/ip6/2001:db8::1/tcp/30304").expect("ip6 target");
+        assert_eq!(ip6.host, "2001:db8::1");
+        assert_eq!(ip6.port, 30304);
+    }
+
+    #[test]
+    fn arti_dial_target_rejects_non_tcp_addrs() {
+        assert!(dial_target("/ip4/203.0.113.10/udp/30304/quic-v1").is_err());
+    }
 }

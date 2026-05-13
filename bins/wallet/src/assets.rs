@@ -5,6 +5,9 @@ use gpui_component::IconNamed;
 
 pub(crate) const LOGO_ICON_PATH: &str = "railgun/icons/logo.svg";
 pub(crate) const SIDEBAR_WORDMARK_PATH: &str = "railgun/icons/wordmark.svg";
+pub(crate) const HERO_WORDMARK_PATH: &str = "railgun/icons/hero-wordmark.svg";
+pub(crate) const HEMATITE_HERO_PATH: &str = "railgun/backgrounds/hematite-hero.svg";
+pub(crate) const WARM_GLOW_PATH: &str = "railgun/backgrounds/warm-glow.svg";
 const ARROW_BIG_RIGHT_DASH_ICON_PATH: &str = "railgun/icons/arrow-big-right-dash.svg";
 const SHIELD_ICON_PATH: &str = "railgun/icons/shield.svg";
 const WALLET_ICON_PATH: &str = "railgun/icons/wallet.svg";
@@ -15,10 +18,14 @@ const TRASH_2_ICON_PATH: &str = "railgun/icons/trash-2.svg";
 const KEY_ROUND_ICON_PATH: &str = "railgun/icons/key-round.svg";
 const NETWORK_ICON_PATH: &str = "railgun/icons/network.svg";
 const PIN_ICON_PATH: &str = "railgun/icons/pin.svg";
+const TOR_STATUS_ICON_PATH: &str = "railgun/icons/tor-status.svg";
 
-const RAILGUN_ICON_PATHS: &[&str] = &[
+const RAILGUN_ASSET_PATHS: &[&str] = &[
     LOGO_ICON_PATH,
     SIDEBAR_WORDMARK_PATH,
+    HERO_WORDMARK_PATH,
+    HEMATITE_HERO_PATH,
+    WARM_GLOW_PATH,
     ARROW_BIG_RIGHT_DASH_ICON_PATH,
     SHIELD_ICON_PATH,
     WALLET_ICON_PATH,
@@ -29,10 +36,14 @@ const RAILGUN_ICON_PATHS: &[&str] = &[
     KEY_ROUND_ICON_PATH,
     NETWORK_ICON_PATH,
     PIN_ICON_PATH,
+    TOR_STATUS_ICON_PATH,
 ];
 
 const LOGO_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/logo.svg");
 const SIDEBAR_WORDMARK_BYTES: &[u8] = include_bytes!("../assets/icons/wordmark.svg");
+const HERO_WORDMARK_BYTES: &[u8] = include_bytes!("../assets/icons/hero-wordmark.svg");
+const HEMATITE_HERO_BYTES: &[u8] = include_bytes!("../assets/backgrounds/hematite-hero.svg");
+const WARM_GLOW_BYTES: &[u8] = include_bytes!("../assets/backgrounds/warm-glow.svg");
 const ARROW_BIG_RIGHT_DASH_ICON_BYTES: &[u8] =
     include_bytes!("../assets/icons/arrow-big-right-dash.svg");
 const SHIELD_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/shield.svg");
@@ -44,6 +55,7 @@ const TRASH_2_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/trash-2.svg");
 const KEY_ROUND_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/key-round.svg");
 const NETWORK_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/network.svg");
 const PIN_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/pin.svg");
+const TOR_STATUS_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/tor-status.svg");
 
 pub(crate) struct WalletAssets;
 
@@ -59,7 +71,7 @@ impl AssetSource for WalletAssets {
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         let mut assets = gpui_component_assets::Assets.list(path)?;
         assets.extend(
-            RAILGUN_ICON_PATHS
+            RAILGUN_ASSET_PATHS
                 .iter()
                 .filter(|asset| asset.starts_with(path))
                 .map(|asset| SharedString::from(*asset)),
@@ -124,10 +136,27 @@ impl IconNamed for RailgunSidebarIcon {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RailgunNetworkStatusIcon {
+    Tor,
+}
+
+impl IconNamed for RailgunNetworkStatusIcon {
+    fn path(self) -> SharedString {
+        match self {
+            Self::Tor => TOR_STATUS_ICON_PATH,
+        }
+        .into()
+    }
+}
+
 fn railgun_asset(path: &str) -> Option<&'static [u8]> {
     match path {
         LOGO_ICON_PATH => Some(LOGO_ICON_BYTES),
         SIDEBAR_WORDMARK_PATH => Some(SIDEBAR_WORDMARK_BYTES),
+        HERO_WORDMARK_PATH => Some(HERO_WORDMARK_BYTES),
+        HEMATITE_HERO_PATH => Some(HEMATITE_HERO_BYTES),
+        WARM_GLOW_PATH => Some(WARM_GLOW_BYTES),
         ARROW_BIG_RIGHT_DASH_ICON_PATH => Some(ARROW_BIG_RIGHT_DASH_ICON_BYTES),
         SHIELD_ICON_PATH => Some(SHIELD_ICON_BYTES),
         WALLET_ICON_PATH => Some(WALLET_ICON_BYTES),
@@ -138,6 +167,7 @@ fn railgun_asset(path: &str) -> Option<&'static [u8]> {
         KEY_ROUND_ICON_PATH => Some(KEY_ROUND_ICON_BYTES),
         NETWORK_ICON_PATH => Some(NETWORK_ICON_BYTES),
         PIN_ICON_PATH => Some(PIN_ICON_BYTES),
+        TOR_STATUS_ICON_PATH => Some(TOR_STATUS_ICON_BYTES),
         _ => None,
     }
 }

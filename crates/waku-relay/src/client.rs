@@ -10,8 +10,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use waku::proto::{HashKey, WakuMessage};
 use waku::{
-    DiscoveredPeer, PeerSnapshot, PeerStats, StoreQueryOptions, WakuConfig, WakuNode,
-    parse_multiaddr, parse_peer_id,
+    DiscoveredPeer, PeerSnapshot, PeerStats, StoreQueryOptions, WakuConfig, WakuNetworkConfig,
+    WakuNode, WakuTorClient, parse_multiaddr, parse_peer_id,
 };
 
 pub const DEFAULT_CLUSTER_ID: u32 = 5;
@@ -23,6 +23,65 @@ const CACHE_SIZE: NonZeroUsize = match NonZeroUsize::new(500) {
     None => panic!("cache size must be non-zero"),
 };
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum RelayNetworkMode {
+    Direct,
+    Tor,
+    Proxy,
+}
+
+#[derive(Clone)]
+pub struct RelayNetworkConfig {
+    pub mode: RelayNetworkMode,
+    pub http_client: Option<reqwest::Client>,
+    pub tor_client: Option<WakuTorClient>,
+}
+
+impl RelayNetworkConfig {
+    #[must_use]
+    pub const fn direct() -> Self {
+        Self {
+            mode: RelayNetworkMode::Direct,
+            http_client: None,
+            tor_client: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn tor(tor_client: WakuTorClient, http_client: reqwest::Client) -> Self {
+        Self {
+            mode: RelayNetworkMode::Tor,
+            http_client: Some(http_client),
+            tor_client: Some(tor_client),
+        }
+    }
+
+    #[must_use]
+    pub const fn proxy(http_client: reqwest::Client) -> Self {
+        Self {
+            mode: RelayNetworkMode::Proxy,
+            http_client: Some(http_client),
+            tor_client: None,
+        }
+    }
+}
+
+impl Default for RelayNetworkConfig {
+    fn default() -> Self {
+        Self::direct()
+    }
+}
+
+impl std::fmt::Debug for RelayNetworkConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayNetworkConfig")
+            .field("mode", &self.mode)
+            .field("http_client", &self.http_client.is_some())
+            .field("tor_client", &self.tor_client.is_some())
+            .finish()
+    }
+}
+
 enum RelayMessageOutcome {
     Delivered,
     Duplicate,
@@ -33,38 +92,69 @@ pub struct Client {
     http_client: reqwest::Client,
     nwaku_url: Option<String>,
     pubsub_path: String,
-    waku_fleet: Arc<WakuNode>,
+    waku_fleet: Option<Arc<WakuNode>>,
+    network_mode: RelayNetworkMode,
+    disabled_reason: Option<Arc<str>>,
 }
 
 impl Client {
     pub fn new(cfg: &config::Waku) -> Result<Self, ClientError> {
+        Self::new_with_network(cfg, RelayNetworkConfig::direct())
+    }
+
+    pub fn new_with_network(
+        cfg: &config::Waku,
+        network: RelayNetworkConfig,
+    ) -> Result<Self, ClientError> {
+        let RelayNetworkConfig {
+            mode,
+            http_client,
+            tor_client,
+        } = network;
         let cluster_id = configured_cluster_id(cfg);
         let shard_id = configured_shard_id(cfg);
-        let config = Self::build_waku_config(cfg);
-        let waku = Arc::new(WakuNode::spawn(config).map_err(ClientError::SpawnNode)?);
-        waku.add_additional_peers(
-            cfg.direct_peers
-                .iter()
-                .map(|peer| {
-                    Ok(DiscoveredPeer {
-                        peer_id: parse_peer_id(&peer.peer_id)
-                            .map_err(|_| ClientError::ParsePeerId)?,
-                        addrs: peer
-                            .addrs
-                            .iter()
-                            .map(|addr| {
-                                parse_multiaddr(addr).map_err(|_| ClientError::ParseMultiaddr)
-                            })
-                            .collect::<Result<Vec<_>, ClientError>>()?,
+        let http_client = http_client.unwrap_or_default();
+        let disabled_reason = (mode == RelayNetworkMode::Proxy)
+            .then(|| Arc::<str>::from("proxy mode does not support Waku libp2p transports"));
+        let waku = if let Some(reason) = disabled_reason.as_ref() {
+            tracing::warn!(%reason, "Waku disabled by network policy");
+            None
+        } else {
+            let mut config = Self::build_waku_config(cfg);
+            if mode == RelayNetworkMode::Tor {
+                let tor_client = tor_client.ok_or_else(|| {
+                    ClientError::Disabled("Tor Waku profile requires an Arti client".to_string())
+                })?;
+                config.network = WakuNetworkConfig::tor(tor_client, http_client.clone());
+            }
+            let waku = Arc::new(WakuNode::spawn(config).map_err(ClientError::SpawnNode)?);
+            waku.add_additional_peers(
+                cfg.direct_peers
+                    .iter()
+                    .map(|peer| {
+                        Ok(DiscoveredPeer {
+                            peer_id: parse_peer_id(&peer.peer_id)
+                                .map_err(|_| ClientError::ParsePeerId)?,
+                            addrs: peer
+                                .addrs
+                                .iter()
+                                .map(|addr| {
+                                    parse_multiaddr(addr).map_err(|_| ClientError::ParseMultiaddr)
+                                })
+                                .collect::<Result<Vec<_>, ClientError>>()?,
+                        })
                     })
-                })
-                .collect::<Result<Vec<_>, ClientError>>()?,
-        );
+                    .collect::<Result<Vec<_>, ClientError>>()?,
+            );
+            Some(waku)
+        };
         Ok(Self {
-            http_client: reqwest::Client::new(),
+            http_client,
             nwaku_url: cfg.nwaku_url.clone(),
             pubsub_path: relay_shard_pubsub_path(cluster_id, shard_id),
             waku_fleet: waku,
+            network_mode: mode,
+            disabled_reason,
         })
     }
 
@@ -92,16 +182,42 @@ impl Client {
         &self.pubsub_path
     }
 
+    #[must_use]
+    pub const fn network_mode(&self) -> RelayNetworkMode {
+        self.network_mode
+    }
+
+    #[must_use]
+    pub const fn network_status_label(&self) -> &'static str {
+        if self.disabled_reason.is_some() {
+            return "Waku disabled";
+        }
+        match self.network_mode {
+            RelayNetworkMode::Tor => "Tor-safe Waku",
+            RelayNetworkMode::Proxy => "Waku disabled",
+            RelayNetworkMode::Direct => "Direct Waku",
+        }
+    }
+
+    #[must_use]
+    pub fn disabled_reason(&self) -> Option<&str> {
+        self.disabled_reason.as_deref()
+    }
+
     /// Current aggregate peer statistics from the underlying Waku node.
     #[must_use]
     pub fn peer_stats(&self) -> PeerStats {
-        self.waku_fleet.get_stats()
+        self.waku_fleet
+            .as_ref()
+            .map_or_else(PeerStats::default, |waku| waku.get_stats())
     }
 
     /// Read-only per-peer snapshot rows from the underlying Waku node.
     #[must_use]
     pub fn peer_snapshots(&self) -> Vec<PeerSnapshot> {
-        self.waku_fleet.peer_snapshots()
+        self.waku_fleet
+            .as_ref()
+            .map_or_else(Vec::new, |waku| waku.peer_snapshots())
     }
 
     pub async fn subscribe(
@@ -136,8 +252,14 @@ impl Client {
         content_topics: Vec<String>,
         history_lookback: Option<Duration>,
     ) -> Result<mpsc::Receiver<WakuMessage>, ClientError> {
-        let mut rx = self
-            .waku_fleet
+        let Some(waku_fleet) = self.waku_fleet.as_ref() else {
+            let reason = self
+                .disabled_reason
+                .as_deref()
+                .unwrap_or("Waku is unavailable for the selected network mode");
+            return Err(ClientError::Disabled(reason.to_string()));
+        };
+        let mut rx = waku_fleet
             .filter_subscribe(self.pubsub_path.clone(), content_topics.clone())
             .await
             .map_err(ClientError::FleetSubscribe)?;
@@ -164,14 +286,14 @@ impl Client {
 
                 let pubsub_path = self.pubsub_path.clone();
                 let nwaku_url = self.nwaku_url.clone();
-                let waku_fleet = Arc::clone(&self.waku_fleet);
+                let waku_fleet = Arc::clone(waku_fleet);
+                let http = self.http_client.clone();
                 tokio::spawn(async move {
                     let mut tick = tokio::time::interval(Duration::from_secs(2));
                     let encoded_pubsub_path = urlencoding::encode(&pubsub_path);
                     let nwaku_messages_url = nwaku_url.as_ref().map(|nwaku_url| {
                         format!("{nwaku_url}/relay/v1/messages/{encoded_pubsub_path}")
                     });
-                    let http = reqwest::Client::new();
                     let mut store_peer_rx =
                         history_lookback.map(|_| waku_fleet.subscribe_store_peers());
                     let mut pending_store_peers: VecDeque<_> = if history_lookback.is_some() {
@@ -350,8 +472,14 @@ impl Client {
             content_topic,
             "publishing Waku message to fleet"
         );
-        if let Err(error) = self
-            .waku_fleet
+        let Some(waku_fleet) = self.waku_fleet.as_ref() else {
+            let reason = self
+                .disabled_reason
+                .as_deref()
+                .unwrap_or("Waku is unavailable for the selected network mode");
+            return Err(ClientError::Disabled(reason.to_string()));
+        };
+        if let Err(error) = waku_fleet
             .lightpush_all(
                 self.pubsub_path.clone(),
                 content_topic.to_string(),

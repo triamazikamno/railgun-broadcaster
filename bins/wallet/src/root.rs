@@ -1,16 +1,20 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, U256};
-use broadcaster_monitor::{EventRx, Shared};
+use broadcaster_monitor::{EventRx, EventTx, Shared};
+use broadcaster_monitor_waku::{RelayNetworkConfig, WakuViewerConfig, spawn_workers};
 use chrono::{DateTime, Local, Utc};
+use eyre::WrapErr;
+use gpui::ObjectFit;
 use gpui::{
     Animation, AnimationExt as _, App, AppContext, Bounds, Context, ElementId, Entity, Focusable,
     InteractiveElement, IntoElement, KeyBinding, MouseButton, ParentElement, Pixels, Point, Render,
-    SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window, WindowBounds,
-    WindowOptions, div, img, prelude::FluentBuilder as _, px, rgb, size,
+    SharedString, StatefulInteractiveElement, Styled, StyledImage as _, WeakEntity, Window,
+    WindowBounds, WindowOptions, div, img, prelude::FluentBuilder as _, px, rgb, size,
 };
 use gpui_component::{
     Disableable, Icon, IconName, IndexPath, Root, Selectable, Sizable, StyledExt, WindowExt,
@@ -59,7 +63,9 @@ use wallet_ops::{
     PublicBroadcasterSubmissionResult, PublicBroadcasterWakuClient, PublicSendRequest,
     PublicShieldRequest, SyncProgressUpdate, TokenAnchorRateCache, TokenAnchorRefreshHandle,
     TokenTotal, TransactionGenerationStage, UtxoOutput, ViewWalletChainSessionRequest,
-    WalletSessionStore, estimate_desktop_send_public_broadcaster_cost,
+    WalletNetworkConfig, WalletNetworkHealth, WalletNetworkHealthState, WalletNetworkMode,
+    WalletNetworkProgress, WalletSessionStore, build_wallet_network_context_with_progress,
+    estimate_desktop_send_public_broadcaster_cost,
     estimate_desktop_unshield_public_broadcaster_cost, estimate_public_native_action_gas_reserve,
     fee_policy_eligible_public_broadcasters, fixed_token_anchor_rate, is_wrapped_native_token,
     max_broadcaster_fee_token_amount_from_outputs as planner_max_broadcaster_fee_token_amount_from_outputs,
@@ -69,7 +75,7 @@ use wallet_ops::{
     prepare_desktop_send_calldata, prepare_desktop_unshield_calldata,
     public_balance_refresh_interval_secs, public_broadcaster_candidates_for_asset,
     public_broadcaster_fee_breakdown, public_broadcaster_service_gas_price,
-    refresh_public_balances, select_public_broadcaster_with_policy,
+    refresh_public_balances, request_tor_state_reset, select_public_broadcaster_with_policy,
     sort_specific_public_broadcasters, spawn_token_anchor_refresh_worker,
     submit_desktop_send_public_broadcaster, submit_desktop_unshield_public_broadcaster,
     submit_public_send_with_progress, submit_public_shield_with_progress,
@@ -83,8 +89,9 @@ use wallet_ops::{
 use zeroize::Zeroizing;
 
 use crate::assets::{
-    LOGO_ICON_PATH, RailgunActionIcon, RailgunPublicAccountIcon, RailgunSidebarIcon,
-    SIDEBAR_WORDMARK_PATH,
+    HEMATITE_HERO_PATH, HERO_WORDMARK_PATH, LOGO_ICON_PATH, RailgunActionIcon,
+    RailgunNetworkStatusIcon, RailgunPublicAccountIcon, RailgunSidebarIcon, SIDEBAR_WORDMARK_PATH,
+    WARM_GLOW_PATH,
 };
 
 const SIDEBAR_WIDTH: Pixels = px(220.0);
@@ -98,7 +105,15 @@ const PRIVATE_ACTION_FORM_MAX_HEIGHT: Pixels = px(760.0);
 const PRIVATE_ASSET_LIST_WIDTH: Pixels = px(760.0);
 const PUBLIC_ACCOUNT_DIALOG_WIDTH: Pixels = px(460.0);
 const PUBLIC_ACTION_DIALOG_WIDTH: Pixels = px(520.0);
+const HERO_STAGE_MAX_WIDTH: Pixels = px(1440.0);
+const HERO_WIDE_BREAKPOINT: Pixels = px(1280.0);
+const HERO_MEDIUM_BREAKPOINT: Pixels = px(720.0);
+const HERO_CARD_MAX_WIDTH: Pixels = px(520.0);
 const DIALOG_CONTENT_HORIZONTAL_INSET: Pixels = px(56.0);
+const NETWORK_HEALTH_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const TOR_HEALTH_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
+const TOR_EXIT_IP_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+const TOR_EXIT_IP_QUERY_URL: &str = "https://ifconfig.me/ip";
 const UNSHIELD_SPINNER_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const UTXO_AGE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const COST_ESTIMATE_DEBOUNCE: Duration = Duration::from_secs(1);
@@ -139,12 +154,16 @@ pub(crate) fn install_utxo_navigation_bindings(app: &mut App) {
 #[derive(Clone)]
 pub(crate) struct WalletAppOptions {
     db_path: PathBuf,
+    proxy: Option<reqwest::Url>,
+    network_mode: Option<WalletNetworkMode>,
 }
 
 impl From<crate::cli::Options> for WalletAppOptions {
     fn from(value: crate::cli::Options) -> Self {
         Self {
             db_path: value.db_path,
+            proxy: value.proxy,
+            network_mode: value.network_mode,
         }
     }
 }
@@ -152,10 +171,9 @@ impl From<crate::cli::Options> for WalletAppOptions {
 pub(crate) fn open_wallet_window(
     app: &mut App,
     options: WalletAppOptions,
-    http: HttpContext,
     runtime: Handle,
     monitor: Shared,
-    waku: Arc<PublicBroadcasterWakuClient>,
+    event_tx: EventTx,
     event_rx: EventRx,
     chain_ids: &[u64],
     logs: LogStore,
@@ -176,13 +194,574 @@ pub(crate) fn open_wallet_window(
     };
 
     if let Err(error) = app.open_window(window_options, |window, cx| {
-        let monitor_state = monitor.clone();
+        let root = cx.new(|cx| {
+            WalletStartupRoot::new(
+                options, runtime, monitor, event_tx, event_rx, &chain_ids, logs, window, cx,
+            )
+        });
+        cx.new(|cx| Root::new(root, window, cx))
+    }) {
+        tracing::error!(%error, "failed to open wallet window");
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum WalletHeroLayout {
+    Wide,
+    Medium,
+    Narrow,
+}
+
+fn wallet_hero_layout(window: &Window) -> WalletHeroLayout {
+    let viewport = window.viewport_size();
+    if viewport.width >= HERO_WIDE_BREAKPOINT && viewport.width >= viewport.height * 1.4 {
+        WalletHeroLayout::Wide
+    } else if viewport.width >= HERO_MEDIUM_BREAKPOINT {
+        WalletHeroLayout::Medium
+    } else {
+        WalletHeroLayout::Narrow
+    }
+}
+
+fn render_wallet_hero_screen(window: &Window, card: gpui::AnyElement) -> gpui::Div {
+    let viewport = window.viewport_size();
+    let layout = wallet_hero_layout(window);
+    let stage_width = (viewport.width - px(96.0))
+        .max(px(0.0))
+        .min(HERO_STAGE_MAX_WIDTH);
+    let card_width = (viewport.width - px(48.0))
+        .max(px(0.0))
+        .min(HERO_CARD_MAX_WIDTH);
+
+    let stage = if layout == WalletHeroLayout::Wide {
+        div()
+            .w(stage_width)
+            .flex()
+            .items_center()
+            .gap_6()
+            .child(
+                render_wallet_brand_block(window, layout)
+                    .w(px(560.0))
+                    .flex_none(),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .flex()
+                    .justify_end()
+                    .child(div().w(card_width).child(card)),
+            )
+    } else {
+        div()
+            .w(card_width)
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_6()
+            .child(render_wallet_brand_block(window, layout).w_full())
+            .child(div().w_full().child(card))
+    };
+
+    div()
+        .relative()
+        .size_full()
+        .overflow_hidden()
+        .bg(rgb(theme::BACKGROUND))
+        .text_color(rgb(theme::TEXT))
+        .font_family(APP_FONT_FAMILY)
+        .text_size(APP_TEXT_SIZE)
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .px(px(24.0))
+                .child(stage),
+        )
+}
+
+fn render_wallet_brand_block(window: &Window, layout: WalletHeroLayout) -> gpui::Div {
+    let viewport = window.viewport_size();
+    let show_mineral = layout != WalletHeroLayout::Narrow;
+    let mineral_size = match layout {
+        WalletHeroLayout::Wide => (viewport.height * 0.42).min(px(500.0)).max(px(360.0)),
+        WalletHeroLayout::Medium => (viewport.width * 0.24).min(px(320.0)).max(px(210.0)),
+        WalletHeroLayout::Narrow => px(0.0),
+    };
+    let wordmark_width = match layout {
+        WalletHeroLayout::Wide => px(400.0),
+        WalletHeroLayout::Medium => (viewport.width * 0.44).min(px(360.0)).max(px(260.0)),
+        WalletHeroLayout::Narrow => (viewport.width * 0.66).min(px(360.0)).max(px(220.0)),
+    };
+    let wordmark_height = wordmark_width * (23.0 / 166.0);
+    let art_size = mineral_size * 1.5;
+    let horizontal_mineral_offset = (art_size - mineral_size) / 2.0;
+    let vertical_glow_offset = (mineral_size - art_size) / 2.0;
+
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap_6()
+        .when(show_mineral, |this| {
+            this.child(
+                div()
+                    .relative()
+                    .w(art_size)
+                    .h(mineral_size)
+                    .child(
+                        img(WARM_GLOW_PATH)
+                            .absolute()
+                            .top(vertical_glow_offset)
+                            .left_0()
+                            .size(art_size)
+                            .object_fit(ObjectFit::Fill),
+                    )
+                    .child(
+                        img(HEMATITE_HERO_PATH)
+                            .absolute()
+                            .top_0()
+                            .left(horizontal_mineral_offset)
+                            .size(mineral_size)
+                            .object_fit(ObjectFit::Contain),
+                    ),
+            )
+        })
+        .child(
+            img(HERO_WORDMARK_PATH)
+                .w(wordmark_width)
+                .h(wordmark_height)
+                .object_fit(ObjectFit::Contain),
+        )
+}
+
+fn rgb_with_alpha(hex: u32, alpha: f32) -> gpui::Rgba {
+    let mut color = rgb(hex);
+    color.a = alpha;
+    color
+}
+
+const fn network_health_color(health: &WalletNetworkHealth) -> u32 {
+    match (health.mode, health.state) {
+        (WalletNetworkMode::Tor, WalletNetworkHealthState::Ready) => theme::SUCCESS,
+        (WalletNetworkMode::Tor, WalletNetworkHealthState::Reconnecting) => theme::WARNING,
+        (WalletNetworkMode::Tor, WalletNetworkHealthState::Degraded) => theme::DANGER,
+        (WalletNetworkMode::Proxy, _) => theme::PRIMARY,
+        (WalletNetworkMode::Direct, _) => theme::TEXT_MUTED,
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+enum TorExitIpQueryState {
+    #[default]
+    Idle,
+    Querying,
+    Success(IpAddr),
+    Error(Arc<str>),
+}
+
+fn render_network_status_popover_content(
+    root: Entity<WalletRoot>,
+    health: &WalletNetworkHealth,
+    color: u32,
+    error: Option<Arc<str>>,
+    exit_ip_query: TorExitIpQueryState,
+    reset_confirming: bool,
+) -> gpui::Div {
+    let session_root = root.clone();
+    let query_root = root.clone();
+    let reset_root = root.clone();
+    let cancel_reset_root = root.clone();
+    let confirm_reset_root = root;
+    let exit_ip_querying = matches!(exit_ip_query, TorExitIpQueryState::Querying);
+    div()
+        .w(px(300.0))
+        .flex()
+        .flex_col()
+        .gap_3()
+        .text_size(APP_TEXT_SIZE)
+        .text_color(rgb(theme::TEXT))
+        .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+            cx.stop_propagation();
+        })
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    Icon::new(RailgunNetworkStatusIcon::Tor)
+                        .small()
+                        .text_color(rgb(color)),
+                )
+                .child(
+                    app_strong_text(health.label())
+                        .text_size(px(14.0))
+                        .text_color(rgb(color)),
+                ),
+        )
+        .child(
+            div()
+                .text_size(px(12.0))
+                .line_height(px(18.0))
+                .text_color(rgb(theme::TEXT_MUTED))
+                .child(health.detail.to_string()),
+        )
+        .when_some(error, |this, error| {
+            this.child(
+                div()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(theme::DANGER))
+                    .bg(rgb_with_alpha(theme::DANGER, 0.08))
+                    .p(px(10.0))
+                    .text_size(px(12.0))
+                    .line_height(px(17.0))
+                    .text_color(rgb(theme::DANGER))
+                    .child(error.to_string()),
+            )
+        })
+        .when(health.mode == WalletNetworkMode::Tor, |this| {
+            this.child(
+                div()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(theme::BORDER))
+                    .bg(rgb(theme::SURFACE))
+                    .p(px(10.0))
+                    .text_size(px(12.0))
+                    .line_height(px(17.0))
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .child(
+                        "Future wallet HTTP/RPC requests use the active Tor session. Waku peer connections stay on their current Tor session until wallet restart.",
+                    ),
+            )
+            .child(
+                app_button("wallet-network-new-tor-session", "New Tor session")
+                    .outline()
+                    .small()
+                    .on_click(move |_event, _window, cx| {
+                        cx.stop_propagation();
+                        session_root.update(cx, |root, cx| {
+                            root.start_new_tor_session(cx);
+                        });
+                    }),
+            )
+            .child(
+                div()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(theme::BORDER))
+                    .bg(rgb(theme::SURFACE))
+                    .p(px(10.0))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .line_height(px(17.0))
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .child(
+                                "Contacts https://ifconfig.me/ip through Tor.",
+                            ),
+                    )
+                    .child(
+                        app_button(
+                            "wallet-network-query-exit-ip",
+                            if exit_ip_querying {
+                                "Querying..."
+                            } else {
+                                "Query exit IP"
+                            },
+                        )
+                        .outline()
+                        .small()
+                        .loading(exit_ip_querying)
+                        .disabled(exit_ip_querying)
+                        .on_click(move |_event, _window, cx| {
+                            cx.stop_propagation();
+                            query_root.update(cx, |root, cx| {
+                                root.query_tor_exit_ip(cx);
+                            });
+                        }),
+                    )
+                    .when(!matches!(exit_ip_query, TorExitIpQueryState::Idle), |this| {
+                        this.child(match exit_ip_query {
+                            TorExitIpQueryState::Idle => div().into_any_element(),
+                            TorExitIpQueryState::Querying => div()
+                                .text_size(px(12.0))
+                                .line_height(px(17.0))
+                                .text_color(rgb(theme::TEXT_MUTED))
+                                .child("Querying exit IP through Tor...")
+                                .into_any_element(),
+                            TorExitIpQueryState::Success(ip) => div()
+                                .text_size(px(12.0))
+                                .line_height(px(17.0))
+                                .text_color(rgb(theme::SUCCESS))
+                                .child(format!("Exit IP: {ip}"))
+                                .into_any_element(),
+                            TorExitIpQueryState::Error(error) => div()
+                                .text_size(px(12.0))
+                                .line_height(px(17.0))
+                                .text_color(rgb(theme::DANGER))
+                                .child(error.to_string())
+                                .into_any_element(),
+                        })
+                    }),
+            )
+            .child(
+                div()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(if reset_confirming {
+                        theme::DANGER
+                    } else {
+                        theme::BORDER
+                    }))
+                    .bg(if reset_confirming {
+                        rgb_with_alpha(theme::DANGER, 0.08)
+                    } else {
+                        rgb(theme::SURFACE)
+                    })
+                    .p(px(10.0))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .line_height(px(17.0))
+                            .text_color(rgb(if reset_confirming {
+                                theme::DANGER
+                            } else {
+                                theme::TEXT_MUTED
+                            }))
+                            .child(if reset_confirming {
+                                "Clears Tor cache and guard state only. Wallet data is not deleted. The wallet will quit, and Tor state will be reset on next startup."
+                            } else {
+                                "If Tor hidden-service connectivity gets stuck, reset only Tor cache and guard state on next startup. Wallet data is not deleted."
+                            }),
+                    )
+                    .when(!reset_confirming, |this| {
+                        this.child(
+                            app_button("wallet-network-reset-tor-state", "Reset Tor state")
+                                .outline()
+                                .small()
+                                .danger()
+                                .on_click(move |_event, _window, cx| {
+                                    cx.stop_propagation();
+                                    reset_root.update(cx, |root, cx| {
+                                        root.begin_tor_state_reset_confirmation(cx);
+                                    });
+                                }),
+                        )
+                    })
+                    .when(reset_confirming, |this| {
+                        this.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    app_button("wallet-network-cancel-tor-reset", "Cancel")
+                                        .outline()
+                                        .small()
+                                        .on_click(move |_event, _window, cx| {
+                                            cx.stop_propagation();
+                                            cancel_reset_root.update(cx, |root, cx| {
+                                                root.cancel_tor_state_reset_confirmation(cx);
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    app_button("wallet-network-confirm-tor-reset", "Quit and reset")
+                                        .small()
+                                        .danger()
+                                        .on_click(move |_event, _window, cx| {
+                                            cx.stop_propagation();
+                                            confirm_reset_root.update(cx, |root, cx| {
+                                                root.quit_and_reset_tor_state(cx);
+                                            });
+                                        }),
+                                ),
+                        )
+                    }),
+            )
+        })
+}
+
+async fn query_exit_ip_through_tor(proxy_url: reqwest::Url) -> eyre::Result<IpAddr> {
+    let proxy = reqwest::Proxy::all(proxy_url.as_str())
+        .wrap_err_with(|| format!("invalid Tor proxy URL {proxy_url}"))?;
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .pool_max_idle_per_host(0)
+        .build()
+        .wrap_err("build one-shot Tor exit IP query client")?;
+    let response = client
+        .get(TOR_EXIT_IP_QUERY_URL)
+        .timeout(TOR_EXIT_IP_QUERY_TIMEOUT)
+        .send()
+        .await
+        .wrap_err("query Tor exit IP")?
+        .error_for_status()
+        .wrap_err("ifconfig.me returned an error status")?;
+    let body = response
+        .text()
+        .await
+        .wrap_err("read Tor exit IP response")?;
+    let value = body.trim();
+    value
+        .parse::<IpAddr>()
+        .wrap_err_with(|| format!("ifconfig.me returned a non-IP response: {value:?}"))
+}
+
+async fn retry_tor_bootstrap(http: &HttpContext, runtime: &Handle) {
+    let Some(arti_client) = http.arti_client() else {
+        return;
+    };
+
+    let retry = runtime.spawn(async move {
+        tokio::time::timeout(TOR_HEALTH_RETRY_TIMEOUT, arti_client.bootstrap()).await
+    });
+    match retry.await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(error))) => {
+            tracing::debug!(%error, "Tor bootstrap retry failed during health check");
+        }
+        Ok(Err(_elapsed)) => {
+            tracing::debug!(
+                timeout_secs = TOR_HEALTH_RETRY_TIMEOUT.as_secs(),
+                "Tor bootstrap retry still pending during health check"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(%error, "Tor bootstrap retry task failed during health check");
+        }
+    }
+}
+
+struct WalletStartupReady {
+    http: HttpContext,
+    waku: Arc<PublicBroadcasterWakuClient>,
+}
+
+struct WalletStartupRoot {
+    options: WalletAppOptions,
+    runtime: Handle,
+    monitor_state: Shared,
+    event_rx: Option<EventRx>,
+    chain_ids: Vec<u64>,
+    logs: Option<LogStore>,
+    progress: WalletNetworkProgress,
+    error: Option<Arc<str>>,
+    wallet_root: Option<Entity<WalletRoot>>,
+}
+
+impl WalletStartupRoot {
+    fn new(
+        options: WalletAppOptions,
+        runtime: Handle,
+        monitor_state: Shared,
+        event_tx: EventTx,
+        event_rx: EventRx,
+        chain_ids: &[u64],
+        logs: LogStore,
+        window: &Window,
+        cx: &Context<'_, Self>,
+    ) -> Self {
+        let chain_ids = chain_ids.to_vec();
+        let progress = WalletNetworkProgress::initial();
+        let (progress_tx, progress_rx) = watch::channel(progress.clone());
+        let root = Self {
+            options,
+            runtime,
+            monitor_state,
+            event_rx: Some(event_rx),
+            chain_ids,
+            logs: Some(logs),
+            progress,
+            error: None,
+            wallet_root: None,
+        };
+        root.spawn_startup_tasks(event_tx, progress_tx, progress_rx, window, cx);
+        root
+    }
+
+    fn spawn_startup_tasks(
+        &self,
+        event_tx: EventTx,
+        progress_tx: watch::Sender<WalletNetworkProgress>,
+        mut progress_rx: watch::Receiver<WalletNetworkProgress>,
+        window: &Window,
+        cx: &Context<'_, Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            while progress_rx.changed().await.is_ok() {
+                let progress = progress_rx.borrow().clone();
+                if this
+                    .update(cx, |root, cx| {
+                        root.progress = progress;
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        let options = self.options.clone();
+        let chain_ids = self.chain_ids.clone();
+        let monitor_state = self.monitor_state.clone();
+        let startup = self.runtime.spawn(async move {
+            build_wallet_startup(options, chain_ids, monitor_state, event_tx, progress_tx).await
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = startup.await;
+            let _ = this.update_in(cx, |root, window, cx| match result {
+                Ok(Ok(ready)) => root.finish_startup(ready, window, cx),
+                Ok(Err(error)) => root.fail_startup(format_report_chain(&error), cx),
+                Err(error) => root.fail_startup(format!("Wallet startup task failed: {error}"), cx),
+            });
+        })
+        .detach();
+    }
+
+    fn finish_startup(
+        &mut self,
+        ready: WalletStartupReady,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(event_rx) = self.event_rx.take() else {
+            self.fail_startup(
+                "Wallet startup event receiver was already consumed".to_string(),
+                cx,
+            );
+            return;
+        };
+        let Some(logs) = self.logs.take() else {
+            self.fail_startup(
+                "Wallet startup log store was already consumed".to_string(),
+                cx,
+            );
+            return;
+        };
+        let monitor_state = self.monitor_state.clone();
         let public_broadcaster_anchor_cache = Arc::new(TokenAnchorRateCache::new());
         let public_broadcaster_anchor_refresh = spawn_token_anchor_refresh_worker(
-            &runtime,
+            &self.runtime,
             Arc::clone(&public_broadcaster_anchor_cache),
-            chain_ids.clone(),
-            http.clone(),
+            self.chain_ids.clone(),
+            ready.http.clone(),
         );
         let fee_anchor_lookup: broadcaster_monitor_gpui::FeeAnchorLookup = Arc::new({
             let public_broadcaster_anchor_cache = Arc::clone(&public_broadcaster_anchor_cache);
@@ -190,9 +769,9 @@ pub(crate) fn open_wallet_window(
         });
         let monitor = cx.new(|cx| {
             broadcaster_monitor_gpui::BroadcasterMonitorPane::new(
-                monitor,
+                self.monitor_state.clone(),
                 event_rx,
-                &chain_ids,
+                &self.chain_ids,
                 fee_anchor_lookup,
                 window,
                 cx,
@@ -201,11 +780,11 @@ pub(crate) fn open_wallet_window(
         let logs = cx.new(|cx| LogsPane::new(logs, window, cx));
         let root = cx.new(|cx| {
             WalletRoot::new(
-                options,
-                http,
-                runtime,
+                self.options.clone(),
+                ready.http,
+                self.runtime.clone(),
                 monitor_state,
-                waku,
+                ready.waku,
                 public_broadcaster_anchor_cache,
                 public_broadcaster_anchor_refresh,
                 monitor,
@@ -214,10 +793,199 @@ pub(crate) fn open_wallet_window(
                 cx,
             )
         });
-        cx.new(|cx| Root::new(root, window, cx))
-    }) {
-        tracing::error!(%error, "failed to open wallet window");
+        self.error = None;
+        self.wallet_root = Some(root);
+        cx.notify();
     }
+
+    fn fail_startup(&mut self, message: String, cx: &mut Context<'_, Self>) {
+        tracing::error!(error = %message, "wallet startup failed");
+        self.error = Some(Arc::from(message));
+        cx.notify();
+    }
+
+    fn render_splash(&self, window: &mut Window, cx: &mut Context<'_, Self>) -> gpui::AnyElement {
+        let has_error = self.error.is_some();
+        let accent = if has_error {
+            theme::DANGER
+        } else {
+            theme::INFO
+        };
+        let percent = self.progress.percent.unwrap_or(0);
+        let stage = if has_error {
+            "Network startup failed"
+        } else {
+            self.progress.stage.label()
+        };
+        let detail = self
+            .error
+            .as_ref()
+            .map_or_else(|| self.progress.detail.to_string(), ToString::to_string);
+        let card = div()
+            .w_full()
+            .p(px(24.0))
+            .flex()
+            .flex_col()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(theme::BORDER_STRONG))
+            .bg(rgb_with_alpha(theme::SURFACE_ELEVATED, 0.86))
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .size(px(34.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .bg(rgb(theme::SURFACE))
+                            .border_1()
+                            .border_color(rgb(accent))
+                            .when(!has_error, |this| {
+                                this.child(
+                                    Spinner::new()
+                                        .icon(IconName::LoaderCircle)
+                                        .color(rgb(accent).into())
+                                        .with_size(px(18.0)),
+                                )
+                            })
+                            .when(has_error, |this| {
+                                this.child(img(icons::globe_icon_path()).size(px(17.0)))
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(rgb(accent))
+                                    .child(stage),
+                            )
+                            .child(
+                                div()
+                                    .text_color(rgb(theme::TEXT_MUTED))
+                                    .child(SharedString::from(detail)),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .mt(px(16.0))
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        UiProgress::new()
+                            .flex_1()
+                            .h(px(7.0))
+                            .value(f32::from(percent)),
+                    )
+                    .child(
+                        div()
+                            .w(px(42.0))
+                            .text_color(rgb(accent))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(SharedString::from(format!("{percent}%"))),
+                    ),
+            )
+            .when(has_error, |this| {
+                this.child(
+                    div()
+                        .mt(px(14.0))
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(theme::DANGER))
+                        .bg(rgb(theme::SURFACE))
+                        .p(px(12.0))
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .child(
+                            "Wallet networking failed closed. No direct network fallback was started.",
+                        ),
+                )
+            })
+            .into_any_element();
+
+        render_wallet_hero_screen(window, card)
+            .children(Root::render_notification_layer(window, cx))
+            .into_any_element()
+    }
+}
+
+impl Render for WalletStartupRoot {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        if let Some(root) = self.wallet_root.as_ref() {
+            return div().size_full().child(root.clone()).into_any_element();
+        }
+        self.render_splash(window, cx)
+    }
+}
+
+async fn build_wallet_startup(
+    options: WalletAppOptions,
+    chain_ids: Vec<u64>,
+    monitor_state: Shared,
+    event_tx: EventTx,
+    progress_tx: watch::Sender<WalletNetworkProgress>,
+) -> eyre::Result<WalletStartupReady> {
+    let http = build_wallet_network_context_with_progress(
+        WalletNetworkConfig {
+            network_mode: options.network_mode,
+            proxy: options.proxy.as_ref(),
+            data_dir: &options.db_path,
+        },
+        progress_tx,
+    )
+    .await?;
+
+    let waku_network = match http.network_mode() {
+        WalletNetworkMode::Tor => RelayNetworkConfig::tor(
+            http.arti_client()
+                .ok_or_else(|| eyre::eyre!("Tor Waku profile requires an Arti client"))?,
+            http.client.clone(),
+        ),
+        WalletNetworkMode::Proxy => RelayNetworkConfig::proxy(http.client.clone()),
+        WalletNetworkMode::Direct => RelayNetworkConfig::direct(),
+    };
+    let waku_config = WakuViewerConfig {
+        chain_ids: chain_ids.clone(),
+        cluster_id: None,
+        shard_id: None,
+        doh_endpoint: None,
+        max_peers: None,
+        peer_connection_timeout: None,
+        nwaku_url: None,
+        network: waku_network,
+    };
+
+    tracing::info!(
+        chains = ?chain_ids,
+        network_mode = %http.network_mode(),
+        network_status = http.network_status_label(),
+        network_detail = %http.network_status_detail(),
+        "starting wallet"
+    );
+
+    let waku = waku_config
+        .build_client()
+        .wrap_err("construct wallet Waku client")?;
+    let worker_waku = Arc::clone(&waku);
+    tokio::spawn(async move {
+        if let Err(error) = spawn_workers(waku_config, worker_waku, monitor_state, event_tx).await {
+            tracing::error!(%error, "wallet broadcaster monitor workers failed to start");
+        }
+    });
+
+    Ok(WalletStartupReady { http, waku })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -518,42 +1286,6 @@ impl Render for RepairCacheDialogContent {
         self.root
             .read(cx)
             .render_repair_cache_dialog_content(self.content_width)
-    }
-}
-
-struct VaultDialogTitleContent {
-    root: Entity<WalletRoot>,
-}
-
-impl VaultDialogTitleContent {
-    fn new(root: Entity<WalletRoot>, cx: &mut Context<'_, Self>) -> Self {
-        cx.observe(&root, |_this, _root, cx| cx.notify()).detach();
-        Self { root }
-    }
-}
-
-impl Render for VaultDialogTitleContent {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        app_strong_text(self.root.read(cx).vault_dialog_title())
-    }
-}
-
-struct VaultDialogContent {
-    root: Entity<WalletRoot>,
-}
-
-impl VaultDialogContent {
-    fn new(root: Entity<WalletRoot>, cx: &mut Context<'_, Self>) -> Self {
-        cx.observe(&root, |_this, _root, cx| cx.notify()).detach();
-        Self { root }
-    }
-}
-
-impl Render for VaultDialogContent {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        self.root
-            .read(cx)
-            .render_vault_dialog_content(self.root.clone())
     }
 }
 
@@ -1183,6 +1915,11 @@ pub(crate) struct WalletRoot {
     view_session: Option<Arc<DesktopViewSession>>,
     generated_seed: Option<GeneratedSeedMaterial>,
     http: HttpContext,
+    network_health: WalletNetworkHealth,
+    network_status_popover_open: bool,
+    network_status_error: Option<Arc<str>>,
+    tor_exit_ip_query: TorExitIpQueryState,
+    tor_state_reset_confirming: bool,
     runtime: Handle,
     monitor_state: Shared,
     waku: Arc<PublicBroadcasterWakuClient>,
@@ -1229,10 +1966,9 @@ pub(crate) struct WalletRoot {
     tx_search_query: Arc<str>,
     show_spent_utxos: bool,
     utxo_table: Entity<TableState<UtxoDelegate>>,
-    focus_unlock_password_on_render: bool,
+    focus_vault_input_on_render: bool,
     focus_utxo_table_on_render: bool,
     focus_public_account_search_on_render: bool,
-    vault_dialog_open: bool,
     logs_open: bool,
     drawer_split: Entity<ResizableState>,
 }
@@ -1284,7 +2020,10 @@ impl WalletRoot {
                 None,
             ),
         };
-        let focus_unlock_password_on_render = matches!(vault_state, VaultState::UnlockVault);
+        let focus_vault_input_on_render = matches!(
+            vault_state,
+            VaultState::CreateVault | VaultState::UnlockVault
+        );
         let unlock_password_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("vault password")
@@ -1380,6 +2119,7 @@ impl WalletRoot {
         });
         let utxo_table =
             cx.new(|cx| TableState::new(UtxoDelegate::new(tx_search_input.clone()), window, cx));
+        let network_health = http.network_health();
         let root = Self {
             selected_chain: initial_chain_id,
             options,
@@ -1393,6 +2133,11 @@ impl WalletRoot {
             view_session: None,
             generated_seed: None,
             http,
+            network_health,
+            network_status_popover_open: false,
+            network_status_error: None,
+            tor_exit_ip_query: TorExitIpQueryState::Idle,
+            tor_state_reset_confirming: false,
             runtime,
             monitor_state,
             waku,
@@ -1438,10 +2183,9 @@ impl WalletRoot {
             tx_search_query: Arc::from(""),
             show_spent_utxos: false,
             utxo_table,
-            focus_unlock_password_on_render,
+            focus_vault_input_on_render,
             focus_utxo_table_on_render: false,
             focus_public_account_search_on_render: false,
-            vault_dialog_open: false,
             logs_open: false,
             drawer_split: cx.new(|_| ResizableState::default()),
         };
@@ -1668,7 +2412,153 @@ impl WalletRoot {
             }
         })
         .detach();
+        root.spawn_network_health_monitor(cx);
         root
+    }
+
+    fn spawn_network_health_monitor(&self, cx: &Context<'_, Self>) {
+        if self.http.network_mode() != WalletNetworkMode::Tor {
+            return;
+        }
+
+        let http = self.http.clone();
+        let runtime = self.runtime.clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(NETWORK_HEALTH_REFRESH_INTERVAL)
+                    .await;
+                let health = http.network_health();
+                let Ok(should_retry) = this.update(cx, |root, cx| {
+                    let should_retry = health.state != WalletNetworkHealthState::Ready;
+                    root.set_network_health(health, cx);
+                    should_retry
+                }) else {
+                    break;
+                };
+
+                if should_retry {
+                    retry_tor_bootstrap(&http, &runtime).await;
+                    let health = http.network_health();
+                    if this
+                        .update(cx, |root, cx| root.set_network_health(health, cx))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn set_network_health(&mut self, health: WalletNetworkHealth, cx: &mut Context<'_, Self>) {
+        if self.network_health != health {
+            self.network_health = health;
+            cx.notify();
+        }
+    }
+
+    fn set_network_status_popover_open(&mut self, open: bool, cx: &mut Context<'_, Self>) {
+        if !open {
+            self.network_status_error = None;
+            self.tor_exit_ip_query = TorExitIpQueryState::Idle;
+            self.tor_state_reset_confirming = false;
+        }
+        if self.network_status_popover_open != open {
+            self.network_status_popover_open = open;
+            cx.notify();
+        } else if !open {
+            cx.notify();
+        }
+    }
+
+    fn start_new_tor_session(&mut self, cx: &mut Context<'_, Self>) {
+        match self.http.start_new_tor_session() {
+            Ok(generation) => {
+                tracing::info!(
+                    tor_session_generation = generation,
+                    "started new Tor session"
+                );
+                self.network_status_error = None;
+                self.tor_exit_ip_query = TorExitIpQueryState::Idle;
+                self.network_health = self.http.network_health();
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to start new Tor session");
+                self.network_status_error = Some(Arc::from(format_report_chain(&error)));
+            }
+        }
+        cx.notify();
+    }
+
+    fn query_tor_exit_ip(&mut self, cx: &mut Context<'_, Self>) {
+        if self.http.network_mode() != WalletNetworkMode::Tor
+            || matches!(self.tor_exit_ip_query, TorExitIpQueryState::Querying)
+        {
+            return;
+        }
+
+        self.network_status_error = None;
+        self.tor_exit_ip_query = TorExitIpQueryState::Querying;
+        cx.notify();
+
+        let Some(proxy_url) = self.http.proxy_url.clone() else {
+            self.tor_exit_ip_query = TorExitIpQueryState::Error(Arc::from(
+                "Exit IP query requires the built-in Tor SOCKS bridge",
+            ));
+            cx.notify();
+            return;
+        };
+        let query = self
+            .runtime
+            .spawn(async move { query_exit_ip_through_tor(proxy_url).await });
+        cx.spawn(async move |this, cx| {
+            let state = match query.await {
+                Ok(Ok(ip)) => TorExitIpQueryState::Success(ip),
+                Ok(Err(error)) => {
+                    TorExitIpQueryState::Error(Arc::from(format_report_chain(&error)))
+                }
+                Err(error) => TorExitIpQueryState::Error(Arc::from(format!(
+                    "Exit IP query task failed: {error}"
+                ))),
+            };
+            let _ = this.update(cx, |root, cx| {
+                root.tor_exit_ip_query = state;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn begin_tor_state_reset_confirmation(&mut self, cx: &mut Context<'_, Self>) {
+        self.network_status_error = None;
+        self.tor_exit_ip_query = TorExitIpQueryState::Idle;
+        self.tor_state_reset_confirming = true;
+        cx.notify();
+    }
+
+    fn cancel_tor_state_reset_confirmation(&mut self, cx: &mut Context<'_, Self>) {
+        self.tor_state_reset_confirming = false;
+        cx.notify();
+    }
+
+    fn quit_and_reset_tor_state(&mut self, cx: &mut Context<'_, Self>) {
+        match request_tor_state_reset(&self.options.db_path) {
+            Ok(marker_path) => {
+                tracing::warn!(
+                    marker_path = %marker_path.display(),
+                    "requested Tor state reset on next wallet startup; quitting wallet"
+                );
+                cx.quit();
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to request Tor state reset");
+                self.network_status_error = Some(Arc::from(format_report_chain(&error)));
+                self.tor_state_reset_confirming = false;
+                cx.notify();
+            }
+        }
     }
 
     fn set_wallet_name_input(&self, value: &str, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -3656,18 +4546,30 @@ impl WalletRoot {
         self.focus_public_account_search_on_render = false;
     }
 
-    fn focus_unlock_password_if_requested(&mut self, window: &mut Window, cx: &Context<'_, Self>) {
-        if !self.focus_unlock_password_on_render
-            || !matches!(self.vault_state, VaultState::UnlockVault)
-        {
+    fn focus_vault_input_if_requested(&mut self, window: &mut Window, cx: &Context<'_, Self>) {
+        if !self.focus_vault_input_on_render {
             return;
         }
 
-        self.unlock_password_input
-            .read(cx)
-            .focus_handle(cx)
-            .focus(window);
-        self.focus_unlock_password_on_render = false;
+        match self.vault_state {
+            VaultState::CreateVault => self
+                .new_password_input
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window),
+            VaultState::UnlockVault => self
+                .unlock_password_input
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window),
+            VaultState::SetupWallet if self.wallet_setup_mode == WalletSetupMode::Import => self
+                .import_mnemonic_input
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window),
+            VaultState::SetupWallet | VaultState::ViewUnlocked | VaultState::Error(_) => {}
+        }
+        self.focus_vault_input_on_render = false;
     }
 
     fn apply_public_broadcaster_error_amount_adjustments(
@@ -3813,7 +4715,7 @@ impl WalletRoot {
             }
             Err(VaultError::VaultAlreadyExists) => {
                 self.vault_state = VaultState::UnlockVault;
-                self.focus_unlock_password_on_render = true;
+                self.focus_vault_input_on_render = true;
                 self.set_vault_error("A wallet vault already exists. Unlock it to continue.", cx);
             }
             Err(error) => self.handle_vault_error(&error, cx),
@@ -3865,12 +4767,12 @@ impl WalletRoot {
                         cx.notify();
                     }
                     Ok(Err(error)) => {
-                        root.focus_unlock_password_on_render = true;
+                        root.focus_vault_input_on_render = true;
                         root.handle_vault_error(&error, cx);
                     }
                     Err(error) => {
                         tracing::warn!(%error, "desktop wallet vault unlock task failed");
-                        root.focus_unlock_password_on_render = true;
+                        root.focus_vault_input_on_render = true;
                         root.set_vault_error(
                             "Unlock failed. Check the password and try again.",
                             cx,
@@ -4062,7 +4964,6 @@ impl WalletRoot {
         let session = Arc::new(session);
         let wallet_id: Arc<str> = Arc::from(session.wallet_id().to_owned());
         window.close_all_dialogs(cx);
-        self.vault_dialog_open = false;
         self.active_wallet_generation = self.active_wallet_generation.wrapping_add(1);
         self.view_session = Some(session);
         self.wallet_metadata = metadata;
@@ -4122,7 +5023,6 @@ impl WalletRoot {
             });
         }
         window.close_all_dialogs(cx);
-        self.vault_dialog_open = false;
         self.view_session = None;
         self.wallet_metadata.clear();
         self.wallet_options.clear();
@@ -4142,7 +5042,7 @@ impl WalletRoot {
         self.vault_state = VaultState::UnlockVault;
         self.wallet_setup_mode = WalletSetupMode::Choose;
         self.session_store = Arc::new(OnceCell::new());
-        self.focus_unlock_password_on_render = true;
+        self.focus_vault_input_on_render = true;
         for state in self.chain_states.values_mut() {
             *state = ChainUtxoState::Idle;
         }
@@ -4228,61 +5128,6 @@ impl WalletRoot {
                 })
                 .child(content.clone())
         });
-    }
-
-    #[allow(clippy::needless_pass_by_ref_mut)]
-    fn ensure_vault_dialog_open(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if matches!(self.vault_state, VaultState::ViewUnlocked) || self.vault_dialog_open {
-            return;
-        }
-        self.vault_dialog_open = true;
-        cx.defer_in(window, |root, window, cx| {
-            if matches!(root.vault_state, VaultState::ViewUnlocked) {
-                root.vault_dialog_open = false;
-                return;
-            }
-            Self::open_vault_dialog(window, cx);
-            root.focus_vault_dialog_input(window, cx);
-        });
-    }
-
-    fn open_vault_dialog(window: &mut Window, cx: &mut Context<'_, Self>) {
-        let root = cx.entity();
-        let title_root = root.clone();
-        let content_root = root;
-        let title = cx.new(|cx| VaultDialogTitleContent::new(title_root, cx));
-        let content = cx.new(|cx| VaultDialogContent::new(content_root, cx));
-        window.open_dialog(cx, move |dialog, window, _cx| {
-            let dialog_width = (window.viewport_size().width * 0.92).min(px(520.0));
-            dialog
-                .w(dialog_width)
-                .title(title.clone())
-                .close_button(false)
-                .keyboard(false)
-                .overlay_closable(false)
-                .child(content.clone())
-        });
-    }
-
-    fn focus_vault_dialog_input(&self, window: &mut Window, cx: &Context<'_, Self>) {
-        match self.vault_state {
-            VaultState::CreateVault => self
-                .new_password_input
-                .read(cx)
-                .focus_handle(cx)
-                .focus(window),
-            VaultState::UnlockVault => self
-                .unlock_password_input
-                .read(cx)
-                .focus_handle(cx)
-                .focus(window),
-            VaultState::SetupWallet if self.wallet_setup_mode == WalletSetupMode::Import => self
-                .import_mnemonic_input
-                .read(cx)
-                .focus_handle(cx)
-                .focus(window),
-            VaultState::SetupWallet | VaultState::ViewUnlocked | VaultState::Error(_) => {}
-        }
     }
 
     fn open_send_form(
@@ -6314,6 +7159,7 @@ impl WalletRoot {
         let wallet_root = root.clone();
         let broadcaster_root = root.clone();
         let logs_root = root.clone();
+        let network_root = root.clone();
 
         Sidebar::left()
             .w(SIDEBAR_WIDTH)
@@ -6362,17 +7208,124 @@ impl WalletRoot {
                     ),
             )
             .footer(
-                SidebarMenuItem::new("Logs")
-                    .icon(Icon::new(RailgunSidebarIcon::Logs).size_4())
-                    .active(self.logs_open)
-                    .collapsed(collapsed)
-                    .on_click(move |_event, _window, cx| {
-                        logs_root.update(cx, |root, cx| {
-                            root.logs_open = !root.logs_open;
-                            cx.notify();
-                        });
-                    }),
+                div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .gap_1()
+                    .when(!collapsed, gpui::Styled::items_start)
+                    .when(collapsed, gpui::Styled::items_center)
+                    .child(self.render_network_status_pill(&network_root, collapsed))
+                    .child(
+                        SidebarMenuItem::new("Logs")
+                            .icon(Icon::new(RailgunSidebarIcon::Logs).size_4())
+                            .active(self.logs_open)
+                            .collapsed(collapsed)
+                            .on_click(move |_event, _window, cx| {
+                                logs_root.update(cx, |root, cx| {
+                                    root.logs_open = !root.logs_open;
+                                    cx.notify();
+                                });
+                            }),
+                    ),
             )
+    }
+
+    fn render_network_status_pill(&self, root: &Entity<Self>, collapsed: bool) -> impl IntoElement {
+        let health = self.network_health.clone();
+        let color = network_health_color(&health);
+        let label = health.label();
+        let tooltip = health.detail.to_string();
+        let popover_root = root.clone();
+        let content_root = root.clone();
+        let network_status_error = self.network_status_error.clone();
+        let tor_exit_ip_query = self.tor_exit_ip_query.clone();
+        let tor_state_reset_confirming = self.tor_state_reset_confirming;
+
+        let trigger = Button::new("wallet-network-status-pill-trigger")
+            .text()
+            .tab_stop(false)
+            .tooltip(tooltip)
+            .child(Self::render_network_status_chip(collapsed, color, label));
+
+        Popover::new("wallet-network-status-popover")
+            .open(self.network_status_popover_open)
+            .on_open_change(move |open, _window, cx| {
+                popover_root.update(cx, |root, cx| {
+                    root.set_network_status_popover_open(*open, cx);
+                });
+            })
+            .trigger(trigger)
+            .content(move |_state, _window, _cx| {
+                render_network_status_popover_content(
+                    content_root.clone(),
+                    &health,
+                    color,
+                    network_status_error.clone(),
+                    tor_exit_ip_query.clone(),
+                    tor_state_reset_confirming,
+                )
+            })
+    }
+
+    fn render_network_status_chip(
+        collapsed: bool,
+        color: u32,
+        label: &'static str,
+    ) -> gpui::AnyElement {
+        if collapsed {
+            return div()
+                .id("wallet-network-status-pill-collapsed")
+                .h(px(32.0))
+                .px_2()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(color))
+                .bg(rgb_with_alpha(color, 0.08))
+                .text_color(rgb(color))
+                .cursor_pointer()
+                .hover(|this| this.bg(rgb_with_alpha(color, 0.14)))
+                .child(
+                    Icon::new(RailgunNetworkStatusIcon::Tor)
+                        .small()
+                        .text_color(rgb(color)),
+                )
+                .into_any_element();
+        }
+
+        div()
+            .id("wallet-network-status-pill")
+            .h_7()
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_2()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(color))
+            .bg(rgb_with_alpha(color, 0.08))
+            .text_color(rgb(color))
+            .cursor_pointer()
+            .hover(|this| this.bg(rgb_with_alpha(color, 0.14)))
+            .child(
+                Icon::new(RailgunNetworkStatusIcon::Tor)
+                    .small()
+                    .text_color(rgb(color)),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(13.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .line_height(gpui::relative(1.0))
+                    .text_color(rgb(color))
+                    .child(label),
+            )
+            .into_any_element()
     }
 
     fn render_sidebar_header(
@@ -6434,7 +7387,7 @@ impl WalletRoot {
     const fn vault_dialog_title(&self) -> &'static str {
         match &self.vault_state {
             VaultState::CreateVault => "Create wallet vault",
-            VaultState::UnlockVault => "Unlock wallet vault",
+            VaultState::UnlockVault => "Unlock wallet",
             VaultState::SetupWallet => match self.wallet_setup_mode {
                 WalletSetupMode::Choose => "Add your first wallet",
                 WalletSetupMode::GeneratedReview => "Save recovery phrase",
@@ -6453,6 +7406,31 @@ impl WalletRoot {
             VaultState::ViewUnlocked => div().into_any_element(),
             VaultState::Error(message) => self.render_vault_fatal(message).into_any_element(),
         }
+    }
+
+    fn render_locked_vault_screen(&self, root: Entity<Self>, window: &Window) -> gpui::Div {
+        let card = self.render_vault_card(root);
+        render_wallet_hero_screen(window, card)
+    }
+
+    fn render_vault_card(&self, root: Entity<Self>) -> gpui::AnyElement {
+        div()
+            .w_full()
+            .p(px(28.0))
+            .flex()
+            .flex_col()
+            .gap_5()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(theme::BORDER_STRONG))
+            .bg(rgb_with_alpha(theme::SURFACE_ELEVATED, 0.86))
+            .child(
+                app_strong_text(self.vault_dialog_title())
+                    .text_size(px(22.0))
+                    .line_height(px(28.0)),
+            )
+            .child(self.render_vault_dialog_content(root))
+            .into_any_element()
     }
 
     fn render_add_wallet_dialog_content(
@@ -6515,12 +7493,6 @@ impl WalletRoot {
                             root.unlock_vault_from_input(window, cx);
                         });
                     }),
-            )
-            .child(
-                div()
-                    .text_size(APP_TEXT_SIZE)
-                    .text_color(rgb(theme::TEXT_MUTED))
-                    .child("Unlocking view mode does not decrypt spend material."),
             )
     }
 
@@ -8789,24 +9761,16 @@ impl WalletRoot {
 impl Render for WalletRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         self.apply_public_broadcaster_error_amount_adjustments(window, cx);
-        self.focus_unlock_password_if_requested(window, cx);
+        self.focus_vault_input_if_requested(window, cx);
         self.focus_utxo_table_if_requested(window, cx);
         self.focus_public_account_search_if_requested(window, cx);
 
         let root = cx.entity();
         if !matches!(self.vault_state, VaultState::ViewUnlocked) {
-            self.ensure_vault_dialog_open(window, cx);
-            return div()
-                .relative()
-                .size_full()
-                .bg(rgb(theme::BACKGROUND))
-                .text_color(rgb(theme::TEXT))
-                .font_family(APP_FONT_FAMILY)
-                .text_size(APP_TEXT_SIZE)
-                .children(Root::render_dialog_layer(window, cx))
+            return self
+                .render_locked_vault_screen(root, window)
                 .children(Root::render_notification_layer(window, cx));
         }
-        self.vault_dialog_open = false;
         let sidebar_is_narrow = window.viewport_size().width < SIDEBAR_AUTO_COLLAPSE_WIDTH;
         if !sidebar_is_narrow {
             self.sidebar_narrow_expanded = false;

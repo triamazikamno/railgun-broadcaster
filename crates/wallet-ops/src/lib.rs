@@ -78,7 +78,12 @@ pub use anchors::{
     known_token_anchor_sources, oracle_answer_to_anchor_rate, refresh_token_anchor_rates,
     spawn_token_anchor_refresh_worker,
 };
-pub use http::{HttpContext, build_http_client};
+pub use http::{
+    HttpContext, WalletNetworkConfig, WalletNetworkHealth, WalletNetworkHealthState,
+    WalletNetworkMode, WalletNetworkProgress, WalletNetworkProgressStage, WalletTorClient,
+    build_http_client, build_wallet_network_context, build_wallet_network_context_with_progress,
+    request_tor_state_reset, resolve_wallet_network_mode,
+};
 pub use public_wallet::{
     PublicAccountBalance, PublicActionProgressStatus, PublicActionProgressStep,
     PublicActionProgressUpdate, PublicAssetId, PublicBalanceAmount, PublicBalanceAsset,

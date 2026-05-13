@@ -5,10 +5,7 @@ mod assets;
 mod cli;
 mod root;
 
-use std::sync::Arc;
-
 use broadcaster_monitor::{DEFAULT_EVENT_CAPACITY, event_channel, shared};
-use broadcaster_monitor_waku::{WakuViewerConfig, spawn_workers};
 use eyre::{Result, WrapErr};
 use gpui::{App, Application};
 use railgun_ui::DEFAULT_CHAINS;
@@ -17,7 +14,6 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 use ui::logs::{DEFAULT_LOG_CAPACITY, LogStore, UiLogLayer};
-use wallet_ops::build_http_client;
 
 use crate::assets::WalletAssets;
 use crate::cli::Options;
@@ -29,8 +25,6 @@ struct Quit;
 
 fn main() -> Result<()> {
     let opts = Options::from_args();
-    let http = build_http_client(opts.proxy.as_ref())?;
-
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("wallet-worker")
@@ -45,28 +39,7 @@ fn main() -> Result<()> {
     install_tracing(logs.clone())?;
 
     let chain_ids = DEFAULT_CHAINS.to_vec();
-    let waku_config = WakuViewerConfig {
-        chain_ids: chain_ids.clone(),
-        cluster_id: None,
-        shard_id: None,
-        doh_endpoint: None,
-        max_peers: None,
-        peer_connection_timeout: None,
-        nwaku_url: None,
-    };
-
-    tracing::info!(chains = ?chain_ids, "starting wallet");
-
     let runtime_guard = runtime.enter();
-    let waku = waku_config.build_client()?;
-    let wallet_waku = Arc::clone(&waku);
-    let worker_monitor = monitor.clone();
-    runtime.spawn(async move {
-        if let Err(error) = spawn_workers(waku_config, waku, worker_monitor, event_tx).await {
-            tracing::error!(%error, "wallet broadcaster monitor workers failed to start");
-        }
-    });
-
     let wallet_options = WalletAppOptions::from(opts);
     let application = Application::new().with_assets(WalletAssets);
     application.run(move |app: &mut App| {
@@ -77,10 +50,9 @@ fn main() -> Result<()> {
         open_wallet_window(
             app,
             wallet_options.clone(),
-            http.clone(),
             runtime_handle.clone(),
             monitor.clone(),
-            wallet_waku.clone(),
+            event_tx,
             event_rx,
             &chain_ids,
             logs,

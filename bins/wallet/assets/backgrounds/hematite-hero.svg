@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- Transparent hematite hero, matching the sidebar logo geometry. -->
+  <polygon points="844,759 597,892 293,854 464,683" fill="#1F1812"/>
+  <polygon points="920,474 844,759 464,683 692,550" fill="#44322A"/>
+  <polygon points="293,854 103,607 464,683" fill="#5C4B40"/>
+  <polygon points="787,189 920,474 692,550" fill="#9D6440"/>
+  <polygon points="445,436 692,550 464,683" fill="#74665C"/>
+  <polygon points="445,132 787,189 692,550 445,436" fill="#A89888"/>
+  <polygon points="103,607 164,284 445,436 464,683" fill="#948070"/>
+  <polygon points="164,284 445,132 445,436" fill="#C2B5A5"/>
+
+  <line x1="164" y1="284" x2="445" y2="132" stroke="#E5B891" stroke-width="5" stroke-opacity="0.62"/>
+  <line x1="445" y1="132" x2="787" y2="189" stroke="#DFAF8F" stroke-width="5" stroke-opacity="0.52"/>
+  <line x1="445" y1="132" x2="445" y2="436" stroke="#DFAF8F" stroke-width="3" stroke-opacity="0.42"/>
+  <line x1="103" y1="607" x2="164" y2="284" stroke="#B5824E" stroke-width="4" stroke-opacity="0.38"/>
+  <line x1="164" y1="284" x2="445" y2="436" stroke="#C58860" stroke-width="3" stroke-opacity="0.30"/>
+  <line x1="787" y1="189" x2="692" y2="550" stroke="#C58860" stroke-width="3" stroke-opacity="0.34"/>
+</svg>

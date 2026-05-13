@@ -14,6 +14,8 @@ pub enum ClientError {
 
     #[error("nwaku returned error status: {body}")]
     NwakuStatus { body: String },
+    #[error("waku networking disabled: {0}")]
+    Disabled(String),
     #[error("failed to parse PeerId")]
     ParsePeerId,
     #[error("failed to parse multiaddr")]

@@ -13,8 +13,16 @@ pub enum DnsResolveError {
     },
     #[error("DoH request failed: {0}")]
     DohRequest(#[source] reqwest::Error),
-    #[error("DoH JSON parse failed: {0}")]
-    DohParse(#[source] reqwest::Error),
+    #[error("DoH returned HTTP {0}")]
+    DohStatus(reqwest::StatusCode),
+    #[error("DoH DNS query encode failed: {0}")]
+    DohEncode(#[source] hickory_resolver::proto::ProtoError),
+    #[error("DoH response body read failed: {0}")]
+    DohBody(#[source] reqwest::Error),
+    #[error("DoH DNS message parse failed: {0}")]
+    DohParse(#[source] hickory_resolver::proto::ProtoError),
+    #[error("DoH returned DNS response code {0:?}")]
+    DohResponseCode(hickory_resolver::proto::op::ResponseCode),
 }
 
 /// Errors that can occur when decoding an ENR record.

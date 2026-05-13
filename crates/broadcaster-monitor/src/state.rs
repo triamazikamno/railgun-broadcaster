@@ -47,6 +47,8 @@ pub struct PeerSummary {
     pub dialing: usize,
     pub lightpush_capable: usize,
     pub peer_exchange_capable: usize,
+    pub network_label: Arc<str>,
+    pub network_degraded: bool,
 }
 
 /// Read-only per-peer row derived from Waku peer state for the peers pane.

@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use reqwest::Url;
 use structopt::StructOpt;
+use wallet_ops::WalletNetworkMode;
 
 const DEFAULT_DB_PATH: &str = "db";
 
@@ -14,6 +15,10 @@ pub(crate) struct Options {
     /// Route wallet operation HTTP traffic through a proxy.
     #[structopt(long)]
     pub(crate) proxy: Option<Url>,
+
+    /// Wallet network mode: tor (default), proxy, or direct.
+    #[structopt(long, possible_values = &["tor", "proxy", "direct"])]
+    pub(crate) network_mode: Option<WalletNetworkMode>,
 }
 
 impl Options {

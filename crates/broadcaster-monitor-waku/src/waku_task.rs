@@ -5,13 +5,13 @@ use eyre::{Result, WrapErr};
 use tokio::sync::mpsc;
 use waku::PeerSnapshot;
 use waku::proto::WakuMessage;
-use waku_relay::client::Client;
+pub use waku::{DEFAULT_CLEARNET_DOH_ENDPOINT as DEFAULT_DOH_ENDPOINT, DEFAULT_TOR_DOH_ENDPOINT};
+use waku_relay::client::{Client, RelayNetworkConfig, RelayNetworkMode};
 pub use waku_relay::client::{DEFAULT_CLUSTER_ID, DEFAULT_SHARD_ID};
 use waku_relay::msg::ContentTopic;
 
 use broadcaster_monitor::{EventTx, FeeRow, PeerRow, PeerSummary, Shared};
 
-pub const DEFAULT_DOH_ENDPOINT: &str = "https://cloudflare-dns.com/dns-query";
 pub const DEFAULT_MAX_PEERS: usize = 10;
 pub const DEFAULT_PEER_CONNECTION_TIMEOUT_SECS: u64 = 10;
 
@@ -24,6 +24,7 @@ pub struct WakuViewerConfig {
     pub max_peers: Option<usize>,
     pub peer_connection_timeout: Option<Duration>,
     pub nwaku_url: Option<String>,
+    pub network: RelayNetworkConfig,
 }
 
 impl WakuViewerConfig {
@@ -34,7 +35,7 @@ impl WakuViewerConfig {
         let doh = self
             .doh_endpoint
             .clone()
-            .unwrap_or_else(|| DEFAULT_DOH_ENDPOINT.to_string());
+            .unwrap_or_else(|| default_doh_endpoint(self.network.mode).to_string());
         let timeout = self
             .peer_connection_timeout
             .unwrap_or_else(|| Duration::from_secs(DEFAULT_PEER_CONNECTION_TIMEOUT_SECS));
@@ -54,8 +55,16 @@ impl WakuViewerConfig {
     /// Construct and start a Waku client from monitor settings.
     pub fn build_client(&self) -> Result<Arc<Client>> {
         let cfg = self.to_waku_config();
-        let client = Client::new(&cfg).wrap_err("construct waku relay client")?;
+        let client = Client::new_with_network(&cfg, self.network.clone())
+            .wrap_err("construct waku relay client")?;
         Ok(Arc::new(client))
+    }
+}
+
+const fn default_doh_endpoint(network_mode: RelayNetworkMode) -> &'static str {
+    match network_mode {
+        RelayNetworkMode::Tor => DEFAULT_TOR_DOH_ENDPOINT,
+        RelayNetworkMode::Direct | RelayNetworkMode::Proxy => DEFAULT_DOH_ENDPOINT,
     }
 }
 
@@ -81,6 +90,13 @@ pub async fn spawn_workers(
         "subscribing to broadcaster fees content topics"
     );
 
+    spawn_peer_poll_worker(Arc::clone(&waku), shared.clone(), events.clone());
+
+    if let Some(reason) = waku.disabled_reason() {
+        tracing::warn!(%reason, "Waku fee subscription disabled by network policy");
+        return Ok(());
+    }
+
     let msg_rx = waku
         .subscribe_with_fee_history(content_topics)
         .await
@@ -95,17 +111,13 @@ pub async fn spawn_workers(
         });
     }
 
-    // Periodic peer snapshot poller.
-    {
-        let shared = shared.clone();
-        let events = events.clone();
-        let waku = waku.clone();
-        tokio::spawn(async move {
-            run_peer_poll_loop(waku, shared, events).await;
-        });
-    }
-
     Ok(())
+}
+
+fn spawn_peer_poll_worker(waku: Arc<Client>, shared: Shared, events: EventTx) {
+    tokio::spawn(async move {
+        run_peer_poll_loop(waku, shared, events).await;
+    });
 }
 
 async fn run_fees_loop(mut msg_rx: mpsc::Receiver<WakuMessage>, shared: Shared, events: EventTx) {
@@ -195,21 +207,43 @@ async fn run_peer_poll_loop(waku: Arc<Client>, shared: Shared, events: EventTx) 
     let mut ticker = tokio::time::interval(PEER_POLL_INTERVAL);
     loop {
         ticker.tick().await;
-        let stats = waku.peer_stats();
-        let snapshots = waku.peer_snapshots();
-        let summary = PeerSummary {
-            connected: stats.connected_peers.len(),
-            known: stats.known_peers,
-            dialing: stats.dialing_count,
-            lightpush_capable: stats.lightpush_capable,
-            peer_exchange_capable: stats.peer_exchange_capable,
-        };
-        let rows: Vec<PeerRow> = snapshots.iter().map(peer_row_from_snapshot).collect();
-
-        if let Some(rev) = shared.write().set_peers(summary, rows) {
-            let _ = events.send(rev);
-        }
+        publish_peer_summary(&waku, &shared, &events);
     }
+}
+
+fn publish_peer_summary(waku: &Client, shared: &Shared, events: &EventTx) {
+    let (summary, rows) = peer_state_for_client(waku);
+    if let Some(rev) = shared.write().set_peers(summary, rows) {
+        let _ = events.send(rev);
+    }
+}
+
+fn peer_state_for_client(waku: &Client) -> (PeerSummary, Vec<PeerRow>) {
+    let stats = waku.peer_stats();
+    let snapshots = waku.peer_snapshots();
+    let network_degraded = match waku.network_mode() {
+        RelayNetworkMode::Tor => stats.connected_peers.is_empty(),
+        RelayNetworkMode::Proxy => true,
+        RelayNetworkMode::Direct => false,
+    } || waku.disabled_reason().is_some();
+    let network_label: Arc<str> = if let Some(reason) = waku.disabled_reason() {
+        Arc::from(format!("{}: {reason}", waku.network_status_label()))
+    } else if waku.network_mode() == RelayNetworkMode::Tor && stats.connected_peers.is_empty() {
+        Arc::from("Tor-safe Waku: degraded (no safe peers)")
+    } else {
+        Arc::from(waku.network_status_label())
+    };
+    let summary = PeerSummary {
+        connected: stats.connected_peers.len(),
+        known: stats.known_peers,
+        dialing: stats.dialing_count,
+        lightpush_capable: stats.lightpush_capable,
+        peer_exchange_capable: stats.peer_exchange_capable,
+        network_label,
+        network_degraded,
+    };
+    let rows: Vec<PeerRow> = snapshots.iter().map(peer_row_from_snapshot).collect();
+    (summary, rows)
 }
 
 #[must_use]
@@ -297,6 +331,20 @@ mod tests {
     }
 
     #[test]
+    fn waku_config_uses_tor_doh_default_in_tor_mode() {
+        let opts = WakuViewerConfig {
+            network: RelayNetworkConfig {
+                mode: RelayNetworkMode::Tor,
+                http_client: None,
+                tor_client: None,
+            },
+            ..WakuViewerConfig::default()
+        };
+        let cfg = opts.to_waku_config();
+        assert_eq!(cfg.doh_endpoint.as_deref(), Some(DEFAULT_TOR_DOH_ENDPOINT));
+    }
+
+    #[test]
     fn waku_config_overrides_apply_when_flags_present() {
         let opts = WakuViewerConfig {
             chain_ids: Vec::new(),
@@ -306,6 +354,7 @@ mod tests {
             doh_endpoint: Some("https://example.invalid/dns-query".to_string()),
             peer_connection_timeout: Some(Duration::from_secs(3)),
             nwaku_url: Some("http://127.0.0.1:8645".to_string()),
+            network: RelayNetworkConfig::direct(),
         };
         let cfg = opts.to_waku_config();
         assert_eq!(cfg.cluster_id, Some(7));
@@ -321,6 +370,52 @@ mod tests {
             Some(Duration::from_secs(3))
         );
         assert_eq!(cfg.nwaku_url.as_deref(), Some("http://127.0.0.1:8645"));
+    }
+
+    #[test]
+    fn waku_config_doh_override_wins_in_tor_mode() {
+        let opts = WakuViewerConfig {
+            doh_endpoint: Some("https://example.invalid/dns-query".to_string()),
+            network: RelayNetworkConfig {
+                mode: RelayNetworkMode::Tor,
+                http_client: None,
+                tor_client: None,
+            },
+            ..WakuViewerConfig::default()
+        };
+        let cfg = opts.to_waku_config();
+        assert_eq!(
+            cfg.doh_endpoint.as_deref(),
+            Some("https://example.invalid/dns-query")
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_mode_worker_publishes_disabled_waku_status() {
+        let opts = WakuViewerConfig {
+            chain_ids: vec![1],
+            network: RelayNetworkConfig::proxy(reqwest::Client::new()),
+            ..WakuViewerConfig::default()
+        };
+        let waku = opts.build_client().expect("proxy Waku client");
+        let shared = shared();
+        let (events, mut event_rx) = event_channel(16);
+
+        spawn_workers(opts, Arc::clone(&waku), shared.clone(), events)
+            .await
+            .expect("proxy workers start");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let summary = shared.read().peer_summary();
+                if summary.network_degraded && summary.network_label.contains("Waku disabled") {
+                    break;
+                }
+                event_rx.changed().await.expect("peer summary event");
+            }
+        })
+        .await
+        .expect("disabled Waku status published");
     }
 
     #[test]

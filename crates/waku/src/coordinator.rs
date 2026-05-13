@@ -1,4 +1,5 @@
-use crate::config::{NodeConfig, WakuConfig};
+use crate::address_policy::retain_tor_safe_addrs;
+use crate::config::{NodeConfig, WakuConfig, WakuTransportProfile};
 use crate::discovery;
 use crate::discovery::DiscoveryConfig;
 use crate::error::WakuError;
@@ -347,6 +348,7 @@ fn store_status_ok(response: &proto::store::StoreQueryResponse) -> bool {
 struct NodeInner {
     config: NodeConfig,
     discovery_config: DiscoveryConfig,
+    network_profile: WakuTransportProfile,
     peer_book: Arc<RwLock<PeerBook>>,
     ops: OpTracker,
     transport_tx: mpsc::Sender<TransportCmd>,
@@ -358,6 +360,18 @@ struct NodeInner {
 }
 
 impl NodeInner {
+    const fn uses_tor_profile(&self) -> bool {
+        matches!(self.network_profile, WakuTransportProfile::Tor)
+    }
+
+    fn apply_addr_policy(&self, addrs: &mut Vec<Multiaddr>) {
+        if self.uses_tor_profile() {
+            retain_tor_safe_addrs(addrs);
+        } else {
+            addrs.sort();
+        }
+    }
+
     fn maybe_dial(&self) {
         let book = self.peer_book.read();
 
@@ -423,17 +437,26 @@ impl NodeInner {
 
     fn apply_discovered_peers(&self, peers: Vec<discovery::DiscoveredPeer>) -> usize {
         let discovered = peers.len();
+        let mut usable = 0;
+        let known;
 
         {
             let mut book = self.peer_book.write();
-            for peer in peers {
+            for mut peer in peers {
+                self.apply_addr_policy(&mut peer.addrs);
+                if peer.addrs.is_empty() {
+                    continue;
+                }
+                usable += 1;
                 let entry = book.peers.entry(peer.peer_id).or_default();
                 entry.addrs.extend(peer.addrs);
-                entry.addrs.sort();
+                self.apply_addr_policy(&mut entry.addrs);
                 entry.addrs.dedup();
             }
+            known = book.peers.len();
         }
 
+        debug!(discovered, usable, known, "applied discovered peers");
         self.maybe_dial();
         discovered
     }
@@ -515,7 +538,12 @@ impl NodeInner {
                     continue;
                 }
 
-                let addrs = state.addrs.clone();
+                let mut addrs = state.addrs.clone();
+                self.apply_addr_policy(&mut addrs);
+                if addrs.is_empty() {
+                    debug!(%peer_id, "peer has no Tor-safe addrs, dropping dial request");
+                    continue;
+                }
                 book.dialing.insert(peer_id);
                 addrs
             };
@@ -649,9 +677,10 @@ impl NodeInner {
             TransportEvent::IdentifyReceived {
                 peer_id,
                 protocols,
-                addrs,
+                mut addrs,
             } => {
                 trace!(%peer_id, ?addrs, ?protocols, "received identify");
+                self.apply_addr_policy(&mut addrs);
                 let supports_lightpush = protocols
                     .iter()
                     .any(|p| p == protocols::lightpush::LIGHTPUSH_V3_CODEC);
@@ -675,7 +704,7 @@ impl NodeInner {
                     entry.supports_filter = supports_filter;
                     entry.supports_store = supports_store;
                     entry.addrs.extend(addrs);
-                    entry.addrs.sort();
+                    self.apply_addr_policy(&mut entry.addrs);
                     entry.addrs.dedup();
                     became_store_capable
                 };
@@ -956,10 +985,14 @@ impl NodeInner {
         {
             let mut book = self.peer_book.write();
             for enr_rlp in enrs {
-                if let Ok(peer) = discovery::enr::decode_enr_rlp(&enr_rlp) {
+                if let Ok(mut peer) = discovery::enr::decode_enr_rlp(&enr_rlp) {
+                    self.apply_addr_policy(&mut peer.addrs);
+                    if peer.addrs.is_empty() {
+                        continue;
+                    }
                     let entry = book.peers.entry(peer.peer_id).or_default();
                     entry.addrs.extend(peer.addrs);
-                    entry.addrs.sort();
+                    self.apply_addr_policy(&mut entry.addrs);
                     entry.addrs.dedup();
                 }
             }
@@ -1234,7 +1267,7 @@ pub struct WakuNode {
 impl WakuNode {
     /// Spawn the node and transport tasks.
     pub fn spawn(config: WakuConfig) -> Result<Self, WakuError> {
-        let transport = Transport::new(&config.node)?;
+        let transport = Transport::new(&config.node, &config.network)?;
         let (transport_tx, transport_cmd_rx) = mpsc::channel(64);
         let (transport_event_tx, transport_event_rx) = mpsc::channel(64);
         let (dial_tx, dial_rx) = mpsc::channel(64);
@@ -1248,9 +1281,18 @@ impl WakuNode {
 
         let (store_peer_tx, _) = broadcast::channel(STORE_PEER_EVENT_CAPACITY);
 
+        let mut discovery_config = config.discovery;
+        if config.network.transport_profile == WakuTransportProfile::Tor {
+            discovery_config
+                .http_client
+                .clone_from(&config.network.http_client);
+            discovery_config.allow_system_dns = false;
+        }
+
         let inner = Arc::new(NodeInner {
             config: config.node,
-            discovery_config: config.discovery,
+            discovery_config,
+            network_profile: config.network.transport_profile,
             peer_book: Arc::new(RwLock::new(PeerBook::default())),
             ops: OpTracker::new(),
             transport_tx,
