@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="tileGradient" x1="168" y1="88" x2="856" y2="936" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#33241D"/>
+      <stop offset="0.48" stop-color="#18110E"/>
+      <stop offset="1" stop-color="#070504"/>
+    </linearGradient>
+    <radialGradient id="tileGlow" cx="41%" cy="27%" r="68%">
+      <stop offset="0" stop-color="#B98662" stop-opacity="0.30"/>
+      <stop offset="0.42" stop-color="#7B4D34" stop-opacity="0.12"/>
+      <stop offset="1" stop-color="#000000" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="tileStroke" x1="168" y1="88" x2="856" y2="936" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#E4B98F" stop-opacity="0.40"/>
+      <stop offset="0.55" stop-color="#8D5B3C" stop-opacity="0.17"/>
+      <stop offset="1" stop-color="#000000" stop-opacity="0.45"/>
+    </linearGradient>
+    <filter id="tileShadow" x="16" y="16" width="992" height="992" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="20" stdDeviation="34" flood-color="#000000" flood-opacity="0.42"/>
+    </filter>
+    <filter id="gemShadow" x="40" y="56" width="944" height="896" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="22" stdDeviation="22" flood-color="#000000" flood-opacity="0.44"/>
+      <feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#E9BE95" flood-opacity="0.18"/>
+    </filter>
+  </defs>
+
+  <g filter="url(#tileShadow)">
+    <rect x="64" y="64" width="896" height="896" rx="212" fill="url(#tileGradient)"/>
+    <rect x="64" y="64" width="896" height="896" rx="212" fill="url(#tileGlow)"/>
+    <rect x="82" y="82" width="860" height="860" rx="196" fill="none" stroke="url(#tileStroke)" stroke-width="10"/>
+  </g>
+
+  <!-- Hematite hero geometry, scaled for app icon legibility on a dark rounded tile. -->
+  <g filter="url(#gemShadow)" transform="translate(512 526) scale(0.94) translate(-512 -512)">
+    <polygon points="844,759 597,892 293,854 464,683" fill="#1F1812"/>
+    <polygon points="920,474 844,759 464,683 692,550" fill="#44322A"/>
+    <polygon points="293,854 103,607 464,683" fill="#5C4B40"/>
+    <polygon points="787,189 920,474 692,550" fill="#9D6440"/>
+    <polygon points="445,436 692,550 464,683" fill="#74665C"/>
+    <polygon points="445,132 787,189 692,550 445,436" fill="#A89888"/>
+    <polygon points="103,607 164,284 445,436 464,683" fill="#948070"/>
+    <polygon points="164,284 445,132 445,436" fill="#C2B5A5"/>
+
+    <line x1="164" y1="284" x2="445" y2="132" stroke="#E5B891" stroke-width="5" stroke-opacity="0.62"/>
+    <line x1="445" y1="132" x2="787" y2="189" stroke="#DFAF8F" stroke-width="5" stroke-opacity="0.52"/>
+    <line x1="445" y1="132" x2="445" y2="436" stroke="#DFAF8F" stroke-width="3" stroke-opacity="0.42"/>
+    <line x1="103" y1="607" x2="164" y2="284" stroke="#B5824E" stroke-width="4" stroke-opacity="0.38"/>
+    <line x1="164" y1="284" x2="445" y2="436" stroke="#C58860" stroke-width="3" stroke-opacity="0.30"/>
+    <line x1="787" y1="189" x2="692" y2="550" stroke="#C58860" stroke-width="3" stroke-opacity="0.34"/>
+  </g>
+</svg>

@@ -10,8 +10,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use waku::proto::{HashKey, WakuMessage};
 use waku::{
-    DiscoveredPeer, PeerSnapshot, PeerStats, StoreQueryOptions, WakuConfig, WakuNetworkConfig,
-    WakuNode, WakuTorClientProvider, parse_multiaddr, parse_peer_id,
+    DEFAULT_CLEARNET_DOH_ENDPOINT, DiscoveredPeer, PeerSnapshot, PeerStats, StoreQueryOptions,
+    WakuConfig, WakuNetworkConfig, WakuNode, WakuTorClientProvider, parse_multiaddr, parse_peer_id,
 };
 
 pub const DEFAULT_CLUSTER_ID: u32 = 5;
@@ -128,6 +128,7 @@ impl Client {
                 let tor_client = tor_client.ok_or_else(|| {
                     ClientError::Disabled("Tor Waku profile requires an Arti client".to_string())
                 })?;
+                add_tor_doh_fallback(&mut config);
                 config.network =
                     WakuNetworkConfig::tor_with_client_provider(tor_client, http_client.clone());
             }
@@ -601,11 +602,28 @@ fn configured_shard_id(cfg: &config::Waku) -> u32 {
     cfg.shard_id.unwrap_or(DEFAULT_SHARD_ID)
 }
 
+fn add_tor_doh_fallback(config: &mut WakuConfig) {
+    if config.discovery.doh_endpoint != DEFAULT_CLEARNET_DOH_ENDPOINT
+        && !config
+            .discovery
+            .doh_fallback_endpoints
+            .iter()
+            .any(|endpoint| endpoint == DEFAULT_CLEARNET_DOH_ENDPOINT)
+    {
+        config
+            .discovery
+            .doh_fallback_endpoints
+            .push(DEFAULT_CLEARNET_DOH_ENDPOINT.to_string());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_CLUSTER_ID, DEFAULT_SHARD_ID, is_fee_content_topic, relay_shard_pubsub_path,
+        DEFAULT_CLUSTER_ID, DEFAULT_SHARD_ID, add_tor_doh_fallback, is_fee_content_topic,
+        relay_shard_pubsub_path,
     };
+    use waku::{DEFAULT_CLEARNET_DOH_ENDPOINT, DEFAULT_TOR_DOH_ENDPOINT};
 
     #[test]
     fn relay_shard_pubsub_path_uses_static_sharding_format() {
@@ -666,5 +684,19 @@ mod tests {
 
         assert_eq!(waku.cluster_id, DEFAULT_CLUSTER_ID);
         assert_eq!(waku.shard_id, DEFAULT_SHARD_ID);
+    }
+
+    #[test]
+    fn tor_doh_fallback_adds_clearnet_endpoint() {
+        let mut waku = waku::WakuConfig::default();
+        waku.discovery.doh_endpoint = DEFAULT_TOR_DOH_ENDPOINT.to_string();
+
+        add_tor_doh_fallback(&mut waku);
+
+        assert_eq!(waku.discovery.doh_endpoint, DEFAULT_TOR_DOH_ENDPOINT);
+        assert_eq!(
+            waku.discovery.doh_fallback_endpoints,
+            vec![DEFAULT_CLEARNET_DOH_ENDPOINT.to_string()]
+        );
     }
 }

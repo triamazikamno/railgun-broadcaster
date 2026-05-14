@@ -11,10 +11,12 @@ path = "src/main.rs"
 [dependencies]
 alloy = { workspace = true }
 chrono = { workspace = true }
+directories = "6"
 eyre = { workspace = true }
 gpui = { workspace = true }
 gpui-component = { workspace = true }
 gpui-component-assets = { workspace = true }
+qrcodegen = { workspace = true }
 reqwest = { workspace = true }
 structopt = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }

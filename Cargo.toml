@@ -63,6 +63,7 @@ k256 = { version = "0.13", features = ["ecdsa"] }
 libp2p = "0.56"
 lru = "0.18"
 parking_lot = "0.12"
+qrcodegen = "1.8"
 rand = "0.10"
 redb = "4.1"
 reqwest = { version = "0.13", features = ["socks", "gzip", "deflate", "brotli", "json"] }

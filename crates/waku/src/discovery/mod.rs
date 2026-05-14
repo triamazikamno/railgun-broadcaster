@@ -31,6 +31,7 @@ pub struct DiscoveryConfig {
     pub max_txt_queries_per_tree: usize,
     pub max_enrs_per_tree: usize,
     pub doh_endpoint: String,
+    pub doh_fallback_endpoints: Vec<String>,
     pub http_client: Option<reqwest::Client>,
     pub allow_system_dns: bool,
     pub dns_discovery_interval: Duration,
@@ -47,6 +48,7 @@ impl std::fmt::Debug for DiscoveryConfig {
             .field("max_txt_queries_per_tree", &self.max_txt_queries_per_tree)
             .field("max_enrs_per_tree", &self.max_enrs_per_tree)
             .field("doh_endpoint", &self.doh_endpoint)
+            .field("doh_fallback_endpoints", &self.doh_fallback_endpoints)
             .field("http_client", &self.http_client.is_some())
             .field("allow_system_dns", &self.allow_system_dns)
             .field("dns_discovery_interval", &self.dns_discovery_interval)
@@ -71,6 +73,7 @@ impl Default for DiscoveryConfig {
             max_txt_queries_per_tree: 400,
             max_enrs_per_tree: 200,
             doh_endpoint: DEFAULT_CLEARNET_DOH_ENDPOINT.to_string(),
+            doh_fallback_endpoints: Vec::new(),
             http_client: None,
             allow_system_dns: true,
             dns_discovery_interval: Duration::from_secs(1800),
@@ -83,10 +86,21 @@ impl Default for DiscoveryConfig {
 }
 
 impl DiscoveryConfig {
+    fn doh_endpoints(&self) -> Vec<String> {
+        let mut endpoints = Vec::with_capacity(1 + self.doh_fallback_endpoints.len());
+        endpoints.push(self.doh_endpoint.clone());
+        for endpoint in &self.doh_fallback_endpoints {
+            if !endpoints.iter().any(|existing| existing == endpoint) {
+                endpoints.push(endpoint.clone());
+            }
+        }
+        endpoints
+    }
+
     /// Discover peers from DNS ENR trees.
     pub(crate) async fn discover_all(&self) -> Result<Vec<DiscoveredPeer>, DiscoveryError> {
-        let resolver = txt::TxtResolver::new(
-            self.doh_endpoint.clone(),
+        let resolver = txt::TxtResolver::new_with_endpoints(
+            self.doh_endpoints(),
             self.http_client.clone(),
             self.allow_system_dns,
         )?;

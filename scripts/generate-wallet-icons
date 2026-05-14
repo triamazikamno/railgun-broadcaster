@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "$script_dir/.." && pwd)"
+icon_root="$repo_root/bins/wallet/packaging/icons"
+source_svg="$icon_root/railoxide-icon.svg"
+png_dir="$icon_root/png"
+macos_dir="$icon_root/macos"
+windows_dir="$icon_root/windows"
+iconset_dir="$macos_dir/RailOxide.iconset"
+
+require_tool() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    printf 'missing required tool: %s\n' "$1" >&2
+    exit 1
+  fi
+}
+
+require_tool rsvg-convert
+require_tool magick
+
+mkdir -p "$png_dir" "$macos_dir" "$windows_dir" "$iconset_dir"
+
+sizes=(16 24 32 48 64 128 256 512 1024)
+for size in "${sizes[@]}"; do
+  rsvg-convert \
+    --width "$size" \
+    --height "$size" \
+    --output "$png_dir/${size}x${size}.png" \
+    "$source_svg"
+done
+
+cp "$png_dir/16x16.png" "$iconset_dir/icon_16x16.png"
+cp "$png_dir/32x32.png" "$iconset_dir/icon_16x16@2x.png"
+cp "$png_dir/32x32.png" "$iconset_dir/icon_32x32.png"
+cp "$png_dir/64x64.png" "$iconset_dir/icon_32x32@2x.png"
+cp "$png_dir/128x128.png" "$iconset_dir/icon_128x128.png"
+cp "$png_dir/256x256.png" "$iconset_dir/icon_128x128@2x.png"
+cp "$png_dir/256x256.png" "$iconset_dir/icon_256x256.png"
+cp "$png_dir/512x512.png" "$iconset_dir/icon_256x256@2x.png"
+cp "$png_dir/512x512.png" "$iconset_dir/icon_512x512.png"
+cp "$png_dir/1024x1024.png" "$iconset_dir/icon_512x512@2x.png"
+
+if command -v iconutil >/dev/null 2>&1; then
+  iconutil --convert icns --output "$macos_dir/RailOxide.icns" "$iconset_dir"
+else
+  printf 'skipping macOS .icns generation: missing iconutil\n' >&2
+fi
+
+magick \
+  "$png_dir/16x16.png" \
+  "$png_dir/24x24.png" \
+  "$png_dir/32x32.png" \
+  "$png_dir/48x48.png" \
+  "$png_dir/64x64.png" \
+  "$png_dir/128x128.png" \
+  "$png_dir/256x256.png" \
+  "$windows_dir/RailOxide.ico"
+
+printf 'generated wallet icons under %s\n' "$icon_root"

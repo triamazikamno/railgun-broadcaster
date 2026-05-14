@@ -17,7 +17,8 @@ use gpui::{
     WindowBounds, WindowOptions, div, img, prelude::FluentBuilder as _, px, rgb, size,
 };
 use gpui_component::{
-    Disableable, Icon, IconName, IndexPath, Root, Selectable, Sizable, StyledExt, WindowExt,
+    Disableable, Icon, IconName, IndexPath, Root, Selectable, Sizable, StyledExt, TitleBar,
+    WindowExt,
     alert::Alert,
     button::{Button, ButtonGroup, ButtonVariants},
     checkbox::Checkbox,
@@ -39,13 +40,14 @@ use gpui_component::{
     tag::Tag,
     tooltip::Tooltip,
 };
+use qrcodegen::{QrCode, QrCodeEcc};
 use railgun_ui::{
     DEFAULT_CHAINS, chain_icon_path, chain_name, format_broadcaster_address_label,
     format_scaled_amount, format_token_amount, lookup_token, short_address, token_icon_path,
 };
 use tokio::runtime::Handle;
 use tokio::sync::{OnceCell, mpsc, watch};
-use ui::clipboard::clipboard_with_toast;
+use ui::clipboard::{clipboard_with_toast, copy_to_clipboard_with_toast};
 use ui::controls::{app_button, app_button_base, app_input, app_muted_text, app_strong_text};
 use ui::icons;
 use ui::logs::{LogStore, LogsPane};
@@ -105,9 +107,14 @@ const BROADCASTER_PICKER_LIVE_UPDATE_INTERVAL: Duration = Duration::from_secs(1)
 const PRIVATE_ACTION_FORM_MAX_HEIGHT: Pixels = px(760.0);
 const PRIVATE_ASSET_LIST_WIDTH: Pixels = px(760.0);
 const PUBLIC_ACCOUNT_DIALOG_WIDTH: Pixels = px(460.0);
+const PUBLIC_ADDRESS_QR_DIALOG_WIDTH: Pixels = px(440.0);
 const PUBLIC_ACTION_DIALOG_WIDTH: Pixels = px(520.0);
 const PUBLIC_ACCOUNT_IDENTICON_SIZE: Pixels = px(40.0);
 const PUBLIC_ACCOUNT_IDENTICON_CELL_SIZE: Pixels = px(8.0);
+const PUBLIC_ADDRESS_QR_MODULE_SIZE: Pixels = px(6.0);
+const PUBLIC_ADDRESS_QR_QUIET_ZONE_MODULES: i32 = 4;
+const PUBLIC_ADDRESS_QR_FOREGROUND: u32 = 0x1e3c67;
+const PUBLIC_ADDRESS_QR_BACKGROUND: u32 = 0xffffff;
 const PUBLIC_BALANCE_CHIP_MIN_WIDTH: Pixels = px(184.0);
 const PUBLIC_BALANCE_CHIP_ACTION_SLOT_SIZE: Pixels = px(24.0);
 const PUBLIC_BALANCE_CHIP_ACTION_ICON_SIZE: Pixels = px(20.0);
@@ -181,7 +188,7 @@ pub(crate) struct WalletAppOptions {
 impl From<crate::cli::Options> for WalletAppOptions {
     fn from(value: crate::cli::Options) -> Self {
         Self {
-            db_path: value.db_path,
+            db_path: value.db_path.unwrap_or_else(crate::cli::default_db_path),
             proxy: value.proxy,
             network_mode: value.network_mode,
         }
@@ -205,11 +212,8 @@ pub(crate) fn open_wallet_window(
             origin: Point::default(),
             size: size(px(1_360.0), px(860.0)),
         })),
-        titlebar: Some(gpui::TitlebarOptions {
-            title: Some(SharedString::from("RailOxide")),
-            appears_transparent: false,
-            traffic_light_position: None,
-        }),
+        titlebar: Some(wallet_titlebar_options()),
+        window_decorations: Some(gpui::WindowDecorations::Client),
         ..Default::default()
     };
 
@@ -223,6 +227,61 @@ pub(crate) fn open_wallet_window(
     }) {
         tracing::error!(%error, "failed to open wallet window");
     }
+}
+
+fn wallet_titlebar_options() -> gpui::TitlebarOptions {
+    let mut options = TitleBar::title_bar_options();
+    options.title = Some(SharedString::from("RailOxide"));
+    options
+}
+
+fn render_wallet_window_frame(
+    content: gpui::AnyElement,
+    window: &Window,
+    titlebar_color: u32,
+) -> gpui::Div {
+    div()
+        .relative()
+        .size_full()
+        .flex()
+        .flex_col()
+        .bg(rgb(theme::SURFACE_ELEVATED))
+        .text_color(rgb(theme::TEXT))
+        .font_family(APP_FONT_FAMILY)
+        .text_size(APP_TEXT_SIZE)
+        .when(should_render_wallet_title_bar(window), |this| {
+            this.child(render_wallet_title_bar(titlebar_color))
+        })
+        .child(div().flex_1().min_w(px(0.0)).min_h(px(0.0)).child(content))
+}
+
+fn should_render_wallet_title_bar(window: &Window) -> bool {
+    !cfg!(any(target_os = "linux", target_os = "freebsd"))
+        || matches!(
+            window.window_decorations(),
+            gpui::Decorations::Client { .. }
+        )
+}
+
+fn render_wallet_title_bar(titlebar_color: u32) -> TitleBar {
+    TitleBar::new()
+        .bg(rgb(titlebar_color))
+        .border_color(rgb(titlebar_color))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .min_w(px(0.0))
+                .child(img(LOGO_ICON_PATH).size(px(16.0)))
+                .child(
+                    div()
+                        .text_color(rgb(theme::TEXT))
+                        .text_size(px(13.0))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .child("RailOxide"),
+                ),
+        )
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -943,10 +1002,17 @@ impl WalletStartupRoot {
 
 impl Render for WalletStartupRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        if let Some(root) = self.wallet_root.as_ref() {
-            return div().size_full().child(root.clone()).into_any_element();
-        }
-        self.render_splash(window, cx)
+        let titlebar_color = self
+            .wallet_root
+            .as_ref()
+            .map_or(theme::BACKGROUND, |root| root.read(cx).titlebar_color());
+        let content = if let Some(root) = self.wallet_root.as_ref() {
+            div().size_full().child(root.clone()).into_any_element()
+        } else {
+            self.render_splash(window, cx)
+        };
+
+        render_wallet_window_frame(content, window, titlebar_color)
     }
 }
 
@@ -4426,6 +4492,39 @@ impl WalletRoot {
         });
     }
 
+    fn open_public_address_qr_dialog(
+        &self,
+        public_account_uuid: &str,
+        label: Option<String>,
+        address: Address,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        window.close_all_dialogs(cx);
+        let dialog_width =
+            (window.viewport_size().width * 0.92).min(PUBLIC_ADDRESS_QR_DIALOG_WIDTH);
+        let content_width = secondary_dialog_content_width(dialog_width);
+        let address_text = SharedString::from(public_address_qr_payload(address));
+        let account_label = label.map(SharedString::from);
+        let chain_label = chain_name(self.selected_chain)
+            .map_or_else(|| format!("chain {}", self.selected_chain), str::to_owned);
+        let copy_id = SharedString::from(format!(
+            "wallet-public-address-qr-copy-{public_account_uuid}"
+        ));
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            dialog
+                .w(dialog_width)
+                .title(app_strong_text("Public account address"))
+                .child(render_public_address_qr_dialog_content(
+                    account_label.clone(),
+                    address_text.clone(),
+                    &chain_label,
+                    copy_id.clone(),
+                    content_width,
+                ))
+        });
+    }
+
     fn open_public_action_dialog(
         &mut self,
         public_account_uuid: Arc<str>,
@@ -7580,6 +7679,14 @@ impl WalletRoot {
         render_wallet_hero_screen(window, card)
     }
 
+    const fn titlebar_color(&self) -> u32 {
+        if matches!(self.vault_state, VaultState::ViewUnlocked) {
+            theme::SURFACE
+        } else {
+            theme::BACKGROUND
+        }
+    }
+
     fn render_vault_card(&self, root: Entity<Self>) -> gpui::AnyElement {
         div()
             .w_full()
@@ -9289,30 +9396,14 @@ impl WalletRoot {
             account.public_account_uuid
         ));
         let edit_root = root.clone();
+        let address_dialog_root = root.clone();
         let deactivate_root = root.clone();
         let activate_root = root.clone();
         let delete_root = root.clone();
         let address_display = short_address(&account.address);
-        let address_copy_value = format!("{:#x}", account.address);
         let edit_uuid = Arc::clone(&account_uuid);
-        let address_copy_button = div()
-            .id(SharedString::from(format!(
-                "wallet-public-address-copy-action-{}",
-                account.public_account_uuid
-            )))
-            .group(row_group.clone())
-            .flex_none()
-            .opacity(0.0)
-            .group_hover(row_group.clone(), |this| this.opacity(1.0))
-            .hover(|this| this.opacity(1.0))
-            .tooltip(|window, cx| Tooltip::new("Copy address").build(window, cx))
-            .child(clipboard_with_toast(
-                SharedString::from(format!(
-                    "wallet-public-address-copy-{}",
-                    account.public_account_uuid
-                )),
-                address_copy_value,
-            ));
+        let address_dialog_uuid = Arc::clone(&account_uuid);
+        let address_dialog_address = account.address;
         let source_badge = public_account_metadata_badge(
             SharedString::from(format!(
                 "wallet-public-account-source-{}",
@@ -9333,6 +9424,7 @@ impl WalletRoot {
             ));
         }
         let account_label = public_account_display_label(account);
+        let address_dialog_label = account_label.clone();
         let action_buttons = div()
             .group(row_group.clone())
             .flex()
@@ -9469,13 +9561,61 @@ impl WalletRoot {
                             .items_center()
                             .gap_1()
                             .child(
-                                app_muted_text(address_display)
-                                    .font_family(APP_MONO_FONT_FAMILY)
-                                    .text_size(theme::ACCOUNT_ADDRESS_TEXT_SIZE)
-                                    .text_color(rgb(theme::TEXT_SUBTLE))
-                                    .whitespace_nowrap(),
-                            )
-                            .child(address_copy_button),
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "wallet-public-address-qr-action-{}",
+                                        account.public_account_uuid
+                                    )))
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .rounded_sm()
+                                    .px(px(2.0))
+                                    .py(px(1.0))
+                                    .cursor_pointer()
+                                    .hover(|this| this.bg(rgb(theme::SURFACE_HOVER_SUBTLE)))
+                                    .tooltip(|window, cx| {
+                                        Tooltip::new("Show address QR code").build(window, cx)
+                                    })
+                                    .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                                        cx.stop_propagation();
+                                    })
+                                    .on_click(move |_event, window, cx| {
+                                        cx.stop_propagation();
+                                        let account_uuid = Arc::clone(&address_dialog_uuid);
+                                        let label = address_dialog_label.clone();
+                                        address_dialog_root.update(cx, |root, cx| {
+                                            root.open_public_address_qr_dialog(
+                                                account_uuid.as_ref(),
+                                                label,
+                                                address_dialog_address,
+                                                window,
+                                                cx,
+                                            );
+                                        });
+                                    })
+                                    .child(
+                                        app_muted_text(address_display)
+                                            .font_family(APP_MONO_FONT_FAMILY)
+                                            .text_size(theme::ACCOUNT_ADDRESS_TEXT_SIZE)
+                                            .text_color(rgb(theme::TEXT_SUBTLE))
+                                            .whitespace_nowrap(),
+                                    )
+                                    .child(
+                                        div()
+                                            .group(row_group.clone())
+                                            .flex_none()
+                                            .opacity(0.0)
+                                            .group_hover(row_group.clone(), |this| {
+                                                this.opacity(1.0)
+                                            })
+                                            .child(
+                                                Icon::new(RailgunActionIcon::QrCode)
+                                                    .xsmall()
+                                                    .text_color(rgb(theme::TEXT)),
+                                            ),
+                                    ),
+                            ),
                     )
                     .child(metadata_badges),
             );
@@ -10685,6 +10825,122 @@ fn public_account_identicon_color(address: &Address) -> u32 {
 
 fn secondary_dialog_content_width(dialog_width: Pixels) -> Pixels {
     (dialog_width - DIALOG_CONTENT_HORIZONTAL_INSET).max(px(0.0))
+}
+
+fn render_public_address_qr_dialog_content(
+    label: Option<SharedString>,
+    address: SharedString,
+    chain_label: &str,
+    copy_id: SharedString,
+    content_width: Pixels,
+) -> gpui::Div {
+    let receive_warning = SharedString::from(format!(
+        "Send only public {chain_label} assets to this address."
+    ));
+    let address_copy_value = address.clone();
+    let copy_row_id = SharedString::from(format!("{}-row", copy_id.as_ref()));
+    div()
+        .w(content_width)
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap_4()
+        .child(
+            div()
+                .w_full()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(theme::BORDER))
+                .bg(rgb_with_alpha(theme::PRIMARY, 0.08))
+                .p(px(10.0))
+                .text_color(rgb(theme::TEXT_MUTED))
+                .text_size(APP_TEXT_SIZE)
+                .line_height(px(18.0))
+                .child(receive_warning),
+        )
+        .children(label.map(|label| {
+            div()
+                .text_color(rgb(theme::TEXT))
+                .text_size(theme::ACCOUNT_LABEL_TEXT_SIZE)
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child(label)
+        }))
+        .child(render_public_address_qr_code(address.as_ref()))
+        .child(
+            div()
+                .id(copy_row_id)
+                .w_full()
+                .flex()
+                .items_center()
+                .gap_2()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(theme::BORDER))
+                .bg(rgb(theme::SURFACE_ELEVATED))
+                .px(px(10.0))
+                .py(px(8.0))
+                .cursor_pointer()
+                .hover(|this| {
+                    this.bg(rgb(theme::SURFACE_HOVER_SUBTLE))
+                        .border_color(rgb(theme::BORDER_STRONG))
+                })
+                .tooltip(|window, cx| Tooltip::new("Copy address").build(window, cx))
+                .on_click(move |_event, window, cx| {
+                    copy_to_clipboard_with_toast(address_copy_value.clone(), window, cx);
+                })
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_color(rgb(theme::TEXT))
+                        .text_size(px(12.0))
+                        .font_family(APP_MONO_FONT_FAMILY)
+                        .line_height(px(17.0))
+                        .child(address.clone()),
+                )
+                .child(clipboard_with_toast(copy_id, address)),
+        )
+}
+
+fn render_public_address_qr_code(payload: &str) -> gpui::Div {
+    let Ok(qr) = QrCode::encode_text(payload, QrCodeEcc::Medium) else {
+        return div()
+            .p(px(14.0))
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(theme::DANGER))
+            .bg(rgb(theme::SURFACE_ELEVATED))
+            .text_color(rgb(theme::DANGER))
+            .child("QR code unavailable");
+    };
+    let mut grid = div()
+        .flex()
+        .flex_col()
+        .flex_none()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(theme::BORDER_STRONG))
+        .bg(rgb(PUBLIC_ADDRESS_QR_BACKGROUND))
+        .p(px(6.0));
+    let module_range = public_address_qr_module_range(qr.size());
+    for y in module_range.clone() {
+        let mut row = div().flex().flex_none();
+        for x in module_range.clone() {
+            let active = x >= 0 && y >= 0 && x < qr.size() && y < qr.size() && qr.get_module(x, y);
+            row = row.child(
+                div()
+                    .size(PUBLIC_ADDRESS_QR_MODULE_SIZE)
+                    .flex_none()
+                    .bg(rgb(if active {
+                        PUBLIC_ADDRESS_QR_FOREGROUND
+                    } else {
+                        PUBLIC_ADDRESS_QR_BACKGROUND
+                    })),
+            );
+        }
+        grid = grid.child(row);
+    }
+    grid
 }
 
 fn vault_dialog_body(subtitle: impl Into<SharedString>) -> gpui::Div {
@@ -13459,6 +13715,14 @@ fn public_account_display_label(account: &PublicAccountMetadata) -> Option<Strin
         .cloned()
 }
 
+fn public_address_qr_payload(address: Address) -> String {
+    format!("{address:#x}")
+}
+
+const fn public_address_qr_module_range(qr_size: i32) -> std::ops::Range<i32> {
+    -PUBLIC_ADDRESS_QR_QUIET_ZONE_MODULES..qr_size + PUBLIC_ADDRESS_QR_QUIET_ZONE_MODULES
+}
+
 fn next_public_account_label_number(account_count: usize) -> u32 {
     u32::try_from(account_count)
         .ok()
@@ -14057,13 +14321,13 @@ mod tests {
     use super::{
         Activity, BroadcasterChoice, ChainUtxoState, CostEstimateStatus,
         PUBLIC_ACCOUNT_IDENTICON_CELL_COUNT, PUBLIC_ACCOUNT_IDENTICON_GRID_SIZE,
-        PrivateActionMetric, PublicActionMode, PublicBroadcasterFeeTokenOption, SECONDS_PER_DAY,
-        SECONDS_PER_HOUR, SECONDS_PER_MINUTE, SECONDS_PER_MONTH, SECONDS_PER_YEAR, UnshieldAsset,
-        UnshieldAssetKey, WalletSelectItem, WalletTab, adjusted_amount_for_max_change,
-        broadcaster_choice_supported_by_candidates, build_send_asset, build_unshield_asset,
-        display_rows_from_output, effective_public_broadcaster_fee_mode,
-        fee_token_option_has_eligible_broadcaster, format_compact_age,
-        format_exact_asset_amount_for_display, format_form_error_for_asset,
+        PUBLIC_ADDRESS_QR_QUIET_ZONE_MODULES, PrivateActionMetric, PublicActionMode,
+        PublicBroadcasterFeeTokenOption, SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_MINUTE,
+        SECONDS_PER_MONTH, SECONDS_PER_YEAR, UnshieldAsset, UnshieldAssetKey, WalletSelectItem,
+        WalletTab, adjusted_amount_for_max_change, broadcaster_choice_supported_by_candidates,
+        build_send_asset, build_unshield_asset, display_rows_from_output,
+        effective_public_broadcaster_fee_mode, fee_token_option_has_eligible_broadcaster,
+        format_compact_age, format_exact_asset_amount_for_display, format_form_error_for_asset,
         format_native_token_amount_for_display, format_private_asset_rows,
         format_public_broadcaster_fee_margin, format_report_chain, format_send_amount_input,
         format_total, format_unshield_amount_input, loading_summary, max_send_amount_from_snapshot,
@@ -14074,7 +14338,8 @@ mod tests {
         public_account_matches_search, public_account_visible_balances_for_chain,
         public_action_asset_label, public_action_error_copy_value, public_action_error_details,
         public_action_error_summary, public_action_max_amount_after_reserve,
-        public_action_max_label, public_action_progress_steps, public_balance_entry_for_chain,
+        public_action_max_label, public_action_progress_steps, public_address_qr_module_range,
+        public_address_qr_payload, public_balance_entry_for_chain,
         public_broadcaster_candidates_for_asset, public_broadcaster_cost_status,
         public_broadcaster_cost_status_text, public_broadcaster_fee_token_options_from_snapshot,
         public_broadcaster_submit_disabled_for_fee_token_options, refresh_form_asset_from_snapshot,
@@ -15298,6 +15563,33 @@ mod tests {
         let account = public_account_for_search(Some("Primary"), Address::from([0xcd; 20]));
 
         assert!(!public_account_matches_search(&account, "savings"));
+    }
+
+    #[test]
+    fn public_address_qr_payload_is_plain_address() {
+        let address = Address::from([0xab; 20]);
+        let payload = public_address_qr_payload(address);
+
+        assert_eq!(payload, format!("{address:#x}"));
+        assert!(!payload.starts_with("ethereum:"));
+    }
+
+    #[test]
+    fn public_address_qr_payload_fits_qr_with_quiet_zone() {
+        let address = Address::from([0x42; 20]);
+        let payload = public_address_qr_payload(address);
+        let qr = qrcodegen::QrCode::encode_text(&payload, qrcodegen::QrCodeEcc::Medium)
+            .expect("public address should fit in QR code");
+        let module_range = public_address_qr_module_range(qr.size());
+
+        assert!(qr.size() > 0);
+        assert_eq!(PUBLIC_ADDRESS_QR_QUIET_ZONE_MODULES, 4);
+        assert_eq!(
+            module_range.clone().count(),
+            usize::try_from(qr.size() + 8).unwrap()
+        );
+        assert!(module_range.contains(&-PUBLIC_ADDRESS_QR_QUIET_ZONE_MODULES));
+        assert!(module_range.contains(&qr.size()));
     }
 
     #[test]

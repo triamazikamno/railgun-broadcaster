@@ -11,6 +11,8 @@ pub enum DnsResolveError {
         #[source]
         source: hickory_resolver::ResolveError,
     },
+    #[error("no DoH endpoints configured")]
+    NoDohEndpoints,
     #[error("DoH request failed: {0}")]
     DohRequest(#[source] reqwest::Error),
     #[error("DoH returned HTTP {0}")]

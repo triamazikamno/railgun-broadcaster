@@ -11,18 +11,22 @@ const DNS_MESSAGE_CONTENT_TYPE: &str = "application/dns-message";
 
 #[derive(Clone)]
 pub(super) struct TxtResolver {
-    doh_endpoint: String,
+    doh_endpoints: Vec<String>,
     http: Client,
     system: Option<hickory_resolver::TokioResolver>,
     cache: Arc<Mutex<HashMap<String, Vec<String>>>>,
 }
 
 impl TxtResolver {
-    pub(super) fn new(
-        doh_endpoint: String,
+    pub(super) fn new_with_endpoints(
+        doh_endpoints: Vec<String>,
         http: Option<Client>,
         allow_system_dns: bool,
     ) -> Result<Self, DnsResolveError> {
+        if doh_endpoints.is_empty() {
+            return Err(DnsResolveError::NoDohEndpoints);
+        }
+
         let http = match http {
             Some(http) => http,
             None => Client::builder()
@@ -38,7 +42,7 @@ impl TxtResolver {
         };
 
         Ok(Self {
-            doh_endpoint,
+            doh_endpoints,
             http,
             system,
             cache: Arc::new(Mutex::new(HashMap::new())),
@@ -87,10 +91,29 @@ impl TxtResolver {
 
     async fn resolve_txt_doh(&self, domain: &str) -> Result<Vec<String>, DnsResolveError> {
         let request = build_txt_query(domain)?;
+        let mut last_error = None;
 
+        for endpoint in &self.doh_endpoints {
+            match self
+                .resolve_txt_doh_endpoint(endpoint, request.clone())
+                .await
+            {
+                Ok(records) => return Ok(records),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        Err(last_error.unwrap_or(DnsResolveError::NoDohEndpoints))
+    }
+
+    async fn resolve_txt_doh_endpoint(
+        &self,
+        endpoint: &str,
+        request: Vec<u8>,
+    ) -> Result<Vec<String>, DnsResolveError> {
         let resp = self
             .http
-            .post(&self.doh_endpoint)
+            .post(endpoint)
             .header(reqwest::header::CONTENT_TYPE, DNS_MESSAGE_CONTENT_TYPE)
             .header(reqwest::header::ACCEPT, DNS_MESSAGE_CONTENT_TYPE)
             .body(request)
@@ -187,8 +210,12 @@ mod tests {
 
     #[test]
     fn no_system_dns_skips_system_resolver_initialization() {
-        let resolver = TxtResolver::new("http://127.0.0.1:9/dns-query".to_string(), None, false)
-            .expect("resolver");
+        let resolver = TxtResolver::new_with_endpoints(
+            vec!["http://127.0.0.1:9/dns-query".to_string()],
+            None,
+            false,
+        )
+        .expect("resolver");
         assert!(resolver.system.is_none());
     }
 
@@ -201,7 +228,8 @@ mod tests {
                 vec!["part1".to_string(), "part2".to_string()],
             ),
         );
-        let resolver = TxtResolver::new(endpoint, None, false).expect("resolver");
+        let resolver =
+            TxtResolver::new_with_endpoints(vec![endpoint], None, false).expect("resolver");
         let records = resolver
             .resolve_txt("example.invalid")
             .await
@@ -212,11 +240,31 @@ mod tests {
     #[tokio::test]
     async fn no_system_dns_reports_doh_failure() {
         let endpoint = spawn_doh_response("503 Service Unavailable", Vec::new());
-        let resolver = TxtResolver::new(endpoint, None, false).expect("resolver");
+        let resolver =
+            TxtResolver::new_with_endpoints(vec![endpoint], None, false).expect("resolver");
         let err = resolver
             .resolve_txt("example.invalid")
             .await
             .expect_err("DoH failure should not fall back to system DNS");
         assert!(matches!(err, DnsResolveError::DohStatus(_)));
+    }
+
+    #[tokio::test]
+    async fn doh_fallback_is_tried_immediately() {
+        let failing_endpoint = spawn_doh_response("503 Service Unavailable", Vec::new());
+        let fallback_endpoint = spawn_doh_response(
+            "200 OK",
+            txt_response_body("example.invalid", vec!["fallback".to_string()]),
+        );
+        let resolver =
+            TxtResolver::new_with_endpoints(vec![failing_endpoint, fallback_endpoint], None, false)
+                .expect("resolver");
+
+        let records = resolver
+            .resolve_txt("example.invalid")
+            .await
+            .expect("fallback DoH TXT lookup");
+
+        assert_eq!(records, vec!["fallback"]);
     }
 }
