@@ -562,7 +562,7 @@ impl DesktopVaultStore {
         Ok(SoftwareRailgunSpendSigner { wallet })
     }
 
-    pub fn list_visible_public_accounts_for_session(
+    pub fn list_active_public_accounts_for_session(
         &self,
         view_session: &DesktopViewSession,
     ) -> Result<Vec<PublicAccountMetadata>, VaultError> {
@@ -572,13 +572,13 @@ impl DesktopVaultStore {
     pub fn list_public_accounts_for_session(
         &self,
         view_session: &DesktopViewSession,
-        include_hidden: bool,
+        include_inactive: bool,
     ) -> Result<Vec<PublicAccountMetadata>, VaultError> {
         let mut accounts = self.list_public_account_metadata_with_view(&view_session.view)?;
         let wallet_id = view_session.wallet_id();
         accounts.retain(|account| {
             account.is_scoped_to_wallet(wallet_id)
-                && (include_hidden || account.status == PublicAccountStatus::Active)
+                && (include_inactive || account.status == PublicAccountStatus::Active)
         });
         sort_public_account_metadata(&mut accounts);
         Ok(accounts)
@@ -705,7 +705,7 @@ impl DesktopVaultStore {
         Ok(updated)
     }
 
-    pub fn hide_derived_public_account(
+    pub fn deactivate_derived_public_account(
         &self,
         view_session: &DesktopViewSession,
         public_account_uuid: &str,
@@ -717,20 +717,20 @@ impl DesktopVaultStore {
         else {
             return Err(VaultError::PublicAccountNotFound);
         };
-        if !account.is_visible_for_wallet(view_session.wallet_id()) {
+        if !account.is_active_for_wallet(view_session.wallet_id()) {
             return Err(VaultError::PublicAccountNotFound);
         }
         if account.source != PublicAccountSource::Derived {
             return Err(VaultError::InvalidPublicAccountOperation);
         }
-        account.status = PublicAccountStatus::Hidden;
+        account.status = PublicAccountStatus::Inactive;
         let updated = account.clone();
         let (key, data) = public_account_metadata_record_entry(&view_session.view, &updated)?;
         self.db.put_desktop_wallet_vault_record(&key, &data)?;
         Ok(updated)
     }
 
-    pub fn show_derived_public_account(
+    pub fn activate_derived_public_account(
         &self,
         view_session: &DesktopViewSession,
         public_account_uuid: &str,
@@ -749,7 +749,7 @@ impl DesktopVaultStore {
         if account.source != PublicAccountSource::Derived {
             return Err(VaultError::InvalidPublicAccountOperation);
         }
-        if account.status == PublicAccountStatus::Hidden {
+        if account.status == PublicAccountStatus::Inactive {
             ensure_public_account_address_available(
                 &accounts,
                 account.address,
@@ -776,7 +776,7 @@ impl DesktopVaultStore {
         else {
             return Err(VaultError::PublicAccountNotFound);
         };
-        if !account.is_visible_for_wallet(view_session.wallet_id()) {
+        if !account.is_active_for_wallet(view_session.wallet_id()) {
             return Err(VaultError::PublicAccountNotFound);
         }
         if account.source != PublicAccountSource::Imported {
@@ -800,7 +800,7 @@ impl DesktopVaultStore {
         view_session: &DesktopViewSession,
         public_account_uuid: &str,
     ) -> Result<Zeroizing<[u8; KEY_LEN]>, VaultError> {
-        let accounts = self.list_visible_public_accounts_for_session(view_session)?;
+        let accounts = self.list_public_accounts_for_session(view_session, true)?;
         let Some(account) = accounts
             .into_iter()
             .find(|account| account.public_account_uuid == public_account_uuid)
@@ -2165,7 +2165,8 @@ pub enum PublicAccountScope {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PublicAccountStatus {
     Active,
-    Hidden,
+    #[serde(alias = "Hidden")]
+    Inactive,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2182,7 +2183,7 @@ pub struct PublicAccountMetadata {
 
 impl PublicAccountMetadata {
     #[must_use]
-    pub fn is_visible_for_wallet(&self, wallet_uuid: &str) -> bool {
+    pub fn is_active_for_wallet(&self, wallet_uuid: &str) -> bool {
         self.status == PublicAccountStatus::Active && self.is_scoped_to_wallet(wallet_uuid)
     }
 
@@ -2703,6 +2704,11 @@ pub fn normalize_public_account_label(label: Option<&str>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+#[must_use]
+pub fn public_account_default_label(label_number: u32) -> String {
+    format!("Account #{label_number}")
+}
+
 pub fn sort_public_account_metadata(metadata: &mut [PublicAccountMetadata]) {
     metadata.sort_by(|left, right| {
         left.display_order
@@ -2759,7 +2765,7 @@ fn ensure_public_account_address_available(
             account.status == PublicAccountStatus::Active && account.address == address
         }),
         PublicAccountScope::PrivateWallet { .. } => metadata.iter().any(|account| {
-            account.address == address && account.is_visible_for_wallet(selected_wallet_uuid)
+            account.address == address && account.is_active_for_wallet(selected_wallet_uuid)
         }),
     };
     if duplicates {
@@ -2782,13 +2788,27 @@ fn initial_derived_public_account(
     Ok(PublicAccountMetadata {
         public_account_uuid: generate_opaque_id()?,
         address,
-        label: None,
+        label: Some(public_account_default_label(
+            next_public_account_label_number(existing_accounts, wallet_uuid),
+        )),
         source: PublicAccountSource::Derived,
         scope,
         derivation_index: Some(0),
         status: PublicAccountStatus::Active,
         display_order: next_public_account_display_order(existing_accounts)?,
     })
+}
+
+fn next_public_account_label_number(metadata: &[PublicAccountMetadata], wallet_uuid: &str) -> u32 {
+    u32::try_from(
+        metadata
+            .iter()
+            .filter(|account| account.is_scoped_to_wallet(wallet_uuid))
+            .count(),
+    )
+    .ok()
+    .and_then(|count| count.checked_add(1))
+    .unwrap_or(u32::MAX)
 }
 
 pub fn derive_public_evm_private_key_from_entropy(
@@ -3230,34 +3250,34 @@ mod tests {
             )
             .expect("import global account");
 
-        let first_visible = store
-            .list_visible_public_accounts_for_session(&first_session)
-            .expect("first visible accounts");
-        let second_visible = store
-            .list_visible_public_accounts_for_session(&second_session)
-            .expect("second visible accounts");
+        let first_active = store
+            .list_active_public_accounts_for_session(&first_session)
+            .expect("first active accounts");
+        let second_active = store
+            .list_active_public_accounts_for_session(&second_session)
+            .expect("second active accounts");
         assert!(
-            first_visible
+            first_active
                 .iter()
                 .any(|account| account.source == PublicAccountSource::Derived)
         );
         assert!(
-            first_visible
+            first_active
                 .iter()
                 .any(|account| account.public_account_uuid == scoped.public_account_uuid)
         );
         assert!(
-            first_visible
+            first_active
                 .iter()
                 .any(|account| account.public_account_uuid == global.public_account_uuid)
         );
         assert!(
-            !second_visible
+            !second_active
                 .iter()
                 .any(|account| account.public_account_uuid == scoped.public_account_uuid)
         );
         assert!(
-            second_visible
+            second_active
                 .iter()
                 .any(|account| account.public_account_uuid == global.public_account_uuid)
         );
@@ -3287,7 +3307,7 @@ mod tests {
                 TEST_PASSWORD,
                 &second_session,
                 IMPORT_PRIVATE_KEY_TWO,
-                Some("Duplicate visible global"),
+                Some("Duplicate active global"),
                 false,
             ),
             Err(VaultError::DuplicatePublicAccountAddress)
@@ -3298,24 +3318,27 @@ mod tests {
             .expect("add derived account");
         assert_eq!(derived.derivation_index, Some(1));
         store
-            .hide_derived_public_account(&first_session, &derived.public_account_uuid)
-            .expect("hide derived account");
+            .deactivate_derived_public_account(&first_session, &derived.public_account_uuid)
+            .expect("deactivate derived account");
         let all_first_accounts = store
             .list_public_accounts_for_session(&first_session, true)
-            .expect("first accounts including hidden");
+            .expect("first accounts including inactive");
         assert!(all_first_accounts.iter().any(|account| {
             account.public_account_uuid == derived.public_account_uuid
-                && account.status == PublicAccountStatus::Hidden
+                && account.status == PublicAccountStatus::Inactive
         }));
-        let relabeled_hidden = store
+        let relabeled_inactive = store
             .update_public_account_label(
                 &first_session,
                 &derived.public_account_uuid,
-                Some("Hidden derived"),
+                Some("Inactive derived"),
             )
-            .expect("edit hidden derived label");
-        assert_eq!(relabeled_hidden.status, PublicAccountStatus::Hidden);
-        assert_eq!(relabeled_hidden.label.as_deref(), Some("Hidden derived"));
+            .expect("edit inactive derived label");
+        assert_eq!(relabeled_inactive.status, PublicAccountStatus::Inactive);
+        assert_eq!(
+            relabeled_inactive.label.as_deref(),
+            Some("Inactive derived")
+        );
         assert_eq!(
             store
                 .next_derived_public_account_index_for_session(&first_session)
@@ -3328,19 +3351,19 @@ mod tests {
         assert_eq!(next.derivation_index, Some(2));
         assert!(
             !store
-                .list_visible_public_accounts_for_session(&first_session)
-                .expect("visible after hide")
+                .list_active_public_accounts_for_session(&first_session)
+                .expect("active after deactivate")
                 .iter()
                 .any(|account| account.public_account_uuid == derived.public_account_uuid)
         );
-        let shown = store
-            .show_derived_public_account(&first_session, &derived.public_account_uuid)
-            .expect("show derived account");
-        assert_eq!(shown.status, PublicAccountStatus::Active);
+        let activated = store
+            .activate_derived_public_account(&first_session, &derived.public_account_uuid)
+            .expect("activate derived account");
+        assert_eq!(activated.status, PublicAccountStatus::Active);
         assert!(
             store
-                .list_visible_public_accounts_for_session(&first_session)
-                .expect("visible after show")
+                .list_active_public_accounts_for_session(&first_session)
+                .expect("active after activate")
                 .iter()
                 .any(|account| account.public_account_uuid == derived.public_account_uuid)
         );
@@ -3351,15 +3374,16 @@ mod tests {
     }
 
     #[test]
-    fn hidden_derived_account_show_rejects_active_duplicate() {
+    fn inactive_derived_account_activate_rejects_active_duplicate() {
         let (root_dir, db, store) = desktop_store_with_vault();
-        let view_session = import_wallet_with_metadata(&store, "show-duplicate-wallet", "Public A");
+        let view_session =
+            import_wallet_with_metadata(&store, "activate-duplicate-wallet", "Public A");
         let derived = store
             .add_derived_public_account(TEST_PASSWORD, &view_session, Some("Derived 1"))
             .expect("add derived account");
         store
-            .hide_derived_public_account(&view_session, &derived.public_account_uuid)
-            .expect("hide derived account");
+            .deactivate_derived_public_account(&view_session, &derived.public_account_uuid)
+            .expect("deactivate derived account");
         let derived_private_key =
             derive_public_evm_private_key_from_mnemonic(TEST_MNEMONIC, 1).expect("derived key");
         let derived_private_key_hex = format!("0x{}", alloy::hex::encode(derived_private_key));
@@ -3371,23 +3395,35 @@ mod tests {
                 Some("Imported duplicate"),
                 false,
             )
-            .expect("import hidden derived duplicate");
+            .expect("import inactive derived duplicate");
 
         assert!(matches!(
-            store.show_derived_public_account(&view_session, &derived.public_account_uuid),
+            store.activate_derived_public_account(&view_session, &derived.public_account_uuid),
             Err(VaultError::DuplicatePublicAccountAddress)
         ));
-        let hidden_accounts = store
+        let inactive_accounts = store
             .list_public_accounts_for_session(&view_session, true)
-            .expect("accounts including hidden");
-        assert!(hidden_accounts.iter().any(|account| {
+            .expect("accounts including inactive");
+        assert!(inactive_accounts.iter().any(|account| {
             account.public_account_uuid == derived.public_account_uuid
-                && account.status == PublicAccountStatus::Hidden
+                && account.status == PublicAccountStatus::Inactive
         }));
 
         drop(store);
         drop(db);
         fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn public_account_status_reads_legacy_hidden_as_inactive() {
+        let status: PublicAccountStatus =
+            serde_json::from_str("\"Hidden\"").expect("legacy hidden status");
+
+        assert_eq!(status, PublicAccountStatus::Inactive);
+        assert_eq!(
+            serde_json::to_string(&status).expect("serialize inactive status"),
+            "\"Inactive\"",
+        );
     }
 
     #[test]
@@ -3423,8 +3459,8 @@ mod tests {
         let (root_dir, db, store) = desktop_store_with_vault();
         let view_session = import_wallet_with_metadata(&store, "public-signing-wallet", "Public A");
         let derived = store
-            .list_visible_public_accounts_for_session(&view_session)
-            .expect("visible accounts")
+            .list_active_public_accounts_for_session(&view_session)
+            .expect("active accounts")
             .into_iter()
             .find(|account| account.source == PublicAccountSource::Derived)
             .expect("derived account");
@@ -3451,6 +3487,25 @@ mod tests {
             derived.address
         );
         assert!(!derived_grant.is_valid());
+
+        let inactive = store
+            .deactivate_derived_public_account(&view_session, &derived.public_account_uuid)
+            .expect("deactivate derived account");
+        let mut inactive_grant = store
+            .create_spend_grant(TEST_PASSWORD)
+            .expect("inactive derived spend grant");
+        let inactive_key = store
+            .public_account_signing_key(
+                &mut inactive_grant,
+                &view_session,
+                &inactive.public_account_uuid,
+            )
+            .expect("inactive derived signing key");
+        assert_eq!(
+            public_evm_address_from_private_key(&inactive_key).expect("inactive derived address"),
+            inactive.address
+        );
+        assert!(!inactive_grant.is_valid());
 
         let imported = store
             .import_public_account(
@@ -3509,10 +3564,11 @@ mod tests {
             .load_view_session(TEST_PASSWORD, generated_wallet_id)
             .expect("generated view session");
         let generated_accounts = store
-            .list_visible_public_accounts_for_session(&generated_session)
+            .list_active_public_accounts_for_session(&generated_session)
             .expect("generated public accounts");
         assert_eq!(generated_accounts.len(), 1);
         assert_eq!(generated_accounts[0].source, PublicAccountSource::Derived);
+        assert_eq!(generated_accounts[0].label.as_deref(), Some("Account #1"));
         assert_eq!(generated_accounts[0].derivation_index, Some(0));
         assert_eq!(
             generated_accounts[0].address,
@@ -3544,12 +3600,13 @@ mod tests {
             .load_view_session(TEST_PASSWORD, imported_wallet_id)
             .expect("imported view session");
         let imported_accounts = store
-            .list_visible_public_accounts_for_session(&imported_session)
+            .list_active_public_accounts_for_session(&imported_session)
             .expect("imported public accounts");
         let imported_entropy =
             bip39_entropy_from_mnemonic(TEST_MNEMONIC).expect("mnemonic entropy");
         assert_eq!(imported_accounts.len(), 1);
         assert_eq!(imported_accounts[0].source, PublicAccountSource::Derived);
+        assert_eq!(imported_accounts[0].label.as_deref(), Some("Account #1"));
         assert_eq!(imported_accounts[0].derivation_index, Some(0));
         assert_eq!(
             imported_accounts[0].address,
@@ -3566,7 +3623,7 @@ mod tests {
             .expect("legacy view session");
         assert!(
             store
-                .list_visible_public_accounts_for_session(&legacy_session)
+                .list_active_public_accounts_for_session(&legacy_session)
                 .expect("legacy public accounts")
                 .is_empty()
         );

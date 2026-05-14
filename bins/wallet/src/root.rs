@@ -83,7 +83,8 @@ use wallet_ops::{
         DesktopVaultStore, DesktopViewSession, GeneratedSeedMaterial, PRIMARY_WALLET_LABEL,
         PublicAccountMetadata, PublicAccountSource, PublicAccountStatus, VaultError,
         WalletMetadataBundle, WalletSource, WalletStatus, default_wallet_label_for_metadata,
-        generate_opaque_id, generate_seed_material, sort_wallet_metadata,
+        generate_opaque_id, generate_seed_material, public_account_default_label,
+        sort_wallet_metadata,
     },
 };
 use zeroize::Zeroizing;
@@ -105,6 +106,25 @@ const PRIVATE_ACTION_FORM_MAX_HEIGHT: Pixels = px(760.0);
 const PRIVATE_ASSET_LIST_WIDTH: Pixels = px(760.0);
 const PUBLIC_ACCOUNT_DIALOG_WIDTH: Pixels = px(460.0);
 const PUBLIC_ACTION_DIALOG_WIDTH: Pixels = px(520.0);
+const PUBLIC_ACCOUNT_IDENTICON_SIZE: Pixels = px(40.0);
+const PUBLIC_ACCOUNT_IDENTICON_CELL_SIZE: Pixels = px(8.0);
+const PUBLIC_BALANCE_CHIP_MIN_WIDTH: Pixels = px(184.0);
+const PUBLIC_BALANCE_CHIP_ACTION_SLOT_SIZE: Pixels = px(24.0);
+const PUBLIC_BALANCE_CHIP_ACTION_ICON_SIZE: Pixels = px(20.0);
+const PUBLIC_ACCOUNT_IDENTICON_GRID_SIZE: usize = 5;
+const PUBLIC_ACCOUNT_IDENTICON_SOURCE_COLUMNS: usize = 3;
+const PUBLIC_ACCOUNT_IDENTICON_CELL_COUNT: usize =
+    PUBLIC_ACCOUNT_IDENTICON_GRID_SIZE * PUBLIC_ACCOUNT_IDENTICON_GRID_SIZE;
+const PUBLIC_ACCOUNT_IDENTICON_COLORS: [u32; 8] = [
+    theme::PRIMARY,
+    theme::SUCCESS,
+    theme::WARNING_STRONG,
+    theme::WARNING,
+    theme::DANGER,
+    theme::PURPLE,
+    theme::BLUE,
+    theme::OLIVE,
+];
 const HERO_STAGE_MAX_WIDTH: Pixels = px(1440.0);
 const HERO_WIDE_BREAKPOINT: Pixels = px(1280.0);
 const HERO_MEDIUM_BREAKPOINT: Pixels = px(720.0);
@@ -1754,6 +1774,7 @@ struct PublicAccountFormState {
     action_progress: Vec<PublicActionStepState>,
     expanded_action_error_steps: BTreeSet<PublicActionProgressStep>,
     next_derived_index: Option<u32>,
+    next_account_label_number: u32,
     error: Option<Arc<str>>,
     send_error: Option<Arc<str>>,
     shield_error: Option<Arc<str>>,
@@ -1761,8 +1782,8 @@ struct PublicAccountFormState {
     importing_account: bool,
     sending: bool,
     shielding: bool,
-    show_hidden_accounts: bool,
-    has_hidden_accounts: bool,
+    active_accounts_open: bool,
+    inactive_accounts_open: bool,
     pending_global_delete_uuid: Option<Arc<str>>,
 }
 
@@ -1953,6 +1974,9 @@ pub(crate) struct WalletRoot {
     public_balance_error: Option<Arc<str>>,
     public_balance_refreshing: bool,
     public_balance_generation: u64,
+    public_inactive_balance_error: Option<Arc<str>>,
+    public_inactive_balance_refreshing: bool,
+    public_inactive_balance_generation: u64,
     send_forms: BTreeMap<UnshieldAssetKey, SendFormState>,
     private_action_form: Option<PrivateActionFormState>,
     send_generation_seq: u64,
@@ -2053,14 +2077,14 @@ impl WalletRoot {
         let public_account_search_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("search accounts"));
         let public_form = PublicAccountFormState {
-            add_label_input: cx.new(|cx| InputState::new(window, cx).placeholder("optional label")),
+            add_label_input: cx.new(|cx| InputState::new(window, cx).placeholder("account label")),
             add_password_input: cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder("vault password")
                     .masked(true)
             }),
             import_label_input: cx
-                .new(|cx| InputState::new(window, cx).placeholder("optional label")),
+                .new(|cx| InputState::new(window, cx).placeholder("account label")),
             import_private_key_input: cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder("private key hex")
@@ -2097,6 +2121,7 @@ impl WalletRoot {
             action_progress: Vec::new(),
             expanded_action_error_steps: BTreeSet::new(),
             next_derived_index: None,
+            next_account_label_number: 1,
             error: None,
             send_error: None,
             shield_error: None,
@@ -2104,8 +2129,8 @@ impl WalletRoot {
             importing_account: false,
             sending: false,
             shielding: false,
-            show_hidden_accounts: false,
-            has_hidden_accounts: false,
+            active_accounts_open: true,
+            inactive_accounts_open: false,
             pending_global_delete_uuid: None,
         };
         let repair_cache_block_input =
@@ -2170,6 +2195,9 @@ impl WalletRoot {
             public_balance_error: None,
             public_balance_refreshing: false,
             public_balance_generation: 0,
+            public_inactive_balance_error: None,
+            public_inactive_balance_refreshing: false,
+            public_inactive_balance_generation: 0,
             send_forms: BTreeMap::new(),
             private_action_form: None,
             send_generation_seq: 0,
@@ -2641,12 +2669,17 @@ impl WalletRoot {
         self.public_balance_error = None;
         self.public_balance_refreshing = false;
         self.public_balance_generation = self.public_balance_generation.wrapping_add(1);
+        self.public_inactive_balance_error = None;
+        self.public_inactive_balance_refreshing = false;
+        self.public_inactive_balance_generation =
+            self.public_inactive_balance_generation.wrapping_add(1);
         self.public_form.selected_account_uuid = None;
         self.public_form.editing_account_uuid = None;
         self.public_form.selected_asset = None;
         self.public_form.action_progress.clear();
         self.public_form.expanded_action_error_steps.clear();
         self.public_form.next_derived_index = None;
+        self.public_form.next_account_label_number = 1;
         self.public_form.error = None;
         self.public_form.send_error = None;
         self.public_form.shield_error = None;
@@ -2654,8 +2687,8 @@ impl WalletRoot {
         self.public_form.importing_account = false;
         self.public_form.sending = false;
         self.public_form.shielding = false;
-        self.public_form.show_hidden_accounts = false;
-        self.public_form.has_hidden_accounts = false;
+        self.public_form.active_accounts_open = true;
+        self.public_form.inactive_accounts_open = false;
         self.public_form.pending_global_delete_uuid = None;
     }
 
@@ -2686,11 +2719,13 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let default_label =
+            public_account_default_label(self.public_form.next_account_label_number);
         match kind {
             PublicAccountDialogKind::Derive => {
                 self.public_form
                     .add_label_input
-                    .update(cx, |input, cx| input.set_value("", window, cx));
+                    .update(cx, |input, cx| input.set_value(&default_label, window, cx));
                 self.public_form
                     .add_password_input
                     .update(cx, |input, cx| input.set_value("", window, cx));
@@ -2698,7 +2733,7 @@ impl WalletRoot {
             PublicAccountDialogKind::Import => {
                 self.public_form
                     .import_label_input
-                    .update(cx, |input, cx| input.set_value("", window, cx));
+                    .update(cx, |input, cx| input.set_value(&default_label, window, cx));
                 self.public_form
                     .import_private_key_input
                     .update(cx, |input, cx| input.set_value("", window, cx));
@@ -2724,21 +2759,12 @@ impl WalletRoot {
         let Some(view_session) = self.view_session.as_ref() else {
             self.public_accounts.clear();
             self.public_form.selected_account_uuid = None;
-            self.public_form.has_hidden_accounts = false;
-            self.public_form.show_hidden_accounts = false;
             return;
         };
         match store.list_public_accounts_for_session(view_session.as_ref(), true) {
-            Ok(mut accounts) => {
-                self.public_form.has_hidden_accounts = accounts
-                    .iter()
-                    .any(|account| account.status == PublicAccountStatus::Hidden);
-                if !self.public_form.has_hidden_accounts {
-                    self.public_form.show_hidden_accounts = false;
-                }
-                if !self.public_form.show_hidden_accounts {
-                    accounts.retain(|account| account.status == PublicAccountStatus::Active);
-                }
+            Ok(accounts) => {
+                self.public_form.next_account_label_number =
+                    next_public_account_label_number(accounts.len());
                 let selected = self
                     .public_form
                     .selected_account_uuid
@@ -2746,7 +2772,6 @@ impl WalletRoot {
                     .filter(|selected| {
                         accounts.iter().any(|account| {
                             account.public_account_uuid.as_str() == selected.as_ref()
-                                && account.status == PublicAccountStatus::Active
                         })
                     })
                     .cloned()
@@ -2807,20 +2832,6 @@ impl WalletRoot {
             .find(|account| account.public_account_uuid == selected)
     }
 
-    fn set_public_selected_account(
-        &mut self,
-        public_account_uuid: Arc<str>,
-        window: &mut Window,
-        cx: &mut Context<'_, Self>,
-    ) {
-        self.public_form.selected_account_uuid = Some(public_account_uuid);
-        self.public_form.pending_global_delete_uuid = None;
-        self.public_form.send_error = None;
-        self.public_form.shield_error = None;
-        self.sync_public_edit_label_input(window, cx);
-        cx.notify();
-    }
-
     fn set_public_selected_balance(
         &mut self,
         public_account_uuid: Arc<str>,
@@ -2862,19 +2873,24 @@ impl WalletRoot {
     fn selected_public_balance_entry(&self) -> Option<PublicBalanceEntry> {
         let public_account_uuid = self.public_form.selected_account_uuid.as_deref()?;
         let asset = self.public_form.selected_asset?;
-        self.public_balance_entry(public_account_uuid, asset)
+        let status = self
+            .public_account_for_uuid(Some(public_account_uuid))?
+            .status;
+        self.public_balance_entry(public_account_uuid, asset, status)
     }
 
     fn public_balance_entry(
         &self,
         public_account_uuid: &str,
         asset: PublicAssetId,
+        status: PublicAccountStatus,
     ) -> Option<PublicBalanceEntry> {
         public_balance_entry_for_chain(
             self.public_balance_snapshot.as_deref(),
             self.selected_chain,
             public_account_uuid,
             asset,
+            status,
         )
     }
 
@@ -3145,6 +3161,10 @@ impl WalletRoot {
         self.public_balance_error = None;
         self.public_balance_refreshing = false;
         self.public_balance_generation = self.public_balance_generation.wrapping_add(1);
+        self.public_inactive_balance_error = None;
+        self.public_inactive_balance_refreshing = false;
+        self.public_inactive_balance_generation =
+            self.public_inactive_balance_generation.wrapping_add(1);
         self.public_form.selected_asset = None;
         self.public_form.action_progress.clear();
         self.public_form.expanded_action_error_steps.clear();
@@ -3152,27 +3172,39 @@ impl WalletRoot {
         self.public_form.shield_error = None;
     }
 
-    fn set_public_hidden_visibility(
+    fn set_public_account_section_open(
         &mut self,
-        show_hidden: bool,
-        window: &mut Window,
+        status: PublicAccountStatus,
+        open: bool,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.public_form.show_hidden_accounts == show_hidden {
-            return;
+        let current = match status {
+            PublicAccountStatus::Active => &mut self.public_form.active_accounts_open,
+            PublicAccountStatus::Inactive => &mut self.public_form.inactive_accounts_open,
+        };
+        if *current != open {
+            *current = open;
+            cx.notify();
         }
-        self.public_form.show_hidden_accounts = show_hidden;
-        self.reload_public_accounts(window, cx);
-        self.schedule_public_balance_refresh(cx);
-        cx.notify();
+    }
+
+    fn has_active_public_accounts(&self) -> bool {
+        self.public_accounts
+            .iter()
+            .any(|account| account.status == PublicAccountStatus::Active)
     }
 
     fn schedule_public_balance_refresh(&mut self, cx: &mut Context<'_, Self>) {
-        if self.public_balance_refreshing || self.public_accounts.is_empty() {
+        let accounts = self
+            .public_accounts
+            .iter()
+            .filter(|account| account.status == PublicAccountStatus::Active)
+            .cloned()
+            .collect::<Vec<_>>();
+        if self.public_balance_refreshing || accounts.is_empty() {
             return;
         }
         let chain_id = self.selected_chain;
-        let accounts = self.public_accounts.clone();
         let account_ids = accounts
             .iter()
             .map(|account| account.public_account_uuid.clone())
@@ -3193,18 +3225,22 @@ impl WalletRoot {
                     return;
                 }
                 root.public_balance_refreshing = false;
-                let account_set_unchanged = root.public_accounts.len() == account_ids.len()
-                    && root
-                        .public_accounts
-                        .iter()
-                        .map(|account| account.public_account_uuid.as_str())
+                let current_account_ids = root
+                    .public_accounts
+                    .iter()
+                    .filter(|account| account.status == PublicAccountStatus::Active)
+                    .map(|account| account.public_account_uuid.as_str())
+                    .collect::<Vec<_>>();
+                let account_set_unchanged = current_account_ids.len() == account_ids.len()
+                    && current_account_ids
+                        .into_iter()
                         .eq(account_ids.iter().map(String::as_str));
                 if root.selected_wallet_id != active_wallet_id
                     || root.selected_chain != chain_id
                     || !account_set_unchanged
                 {
                     if root.active_wallet_tab == WalletTab::Public
-                        && !root.public_accounts.is_empty()
+                        && root.has_active_public_accounts()
                     {
                         root.schedule_public_balance_refresh(cx);
                     }
@@ -3213,7 +3249,12 @@ impl WalletRoot {
                 }
                 match result {
                     Ok(Ok(snapshot)) => {
-                        root.public_balance_snapshot = Some(Arc::new(snapshot));
+                        root.public_balance_snapshot =
+                            Some(Arc::new(merge_public_balance_snapshot(
+                                root.public_balance_snapshot.as_deref(),
+                                snapshot,
+                                PublicAccountStatus::Active,
+                            )));
                         root.public_balance_error = None;
                     }
                     Ok(Err(error)) => {
@@ -3222,6 +3263,91 @@ impl WalletRoot {
                     Err(error) => {
                         root.public_balance_error =
                             Some(Arc::from(format!("Public balance refresh failed: {error}")));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn schedule_inactive_public_balance_refresh(&mut self, cx: &mut Context<'_, Self>) {
+        let accounts = self
+            .public_accounts
+            .iter()
+            .filter(|account| account.status == PublicAccountStatus::Inactive)
+            .cloned()
+            .collect::<Vec<_>>();
+        if self.public_inactive_balance_refreshing || accounts.is_empty() {
+            return;
+        }
+        let chain_id = self.selected_chain;
+        let account_ids = accounts
+            .iter()
+            .map(|account| account.public_account_uuid.clone())
+            .collect::<Vec<_>>();
+        let http = self.http.clone();
+        self.public_inactive_balance_refreshing = true;
+        self.public_inactive_balance_error = None;
+        self.public_inactive_balance_generation =
+            self.public_inactive_balance_generation.wrapping_add(1);
+        let generation = self.public_inactive_balance_generation;
+        let active_wallet_id = self.selected_wallet_id.clone();
+        let join = self
+            .runtime
+            .spawn(async move { refresh_public_balances(chain_id, &accounts, &http).await });
+        cx.spawn(async move |this, cx| {
+            let result = join.await;
+            let _ = this.update(cx, |root, cx| {
+                if root.public_inactive_balance_generation != generation {
+                    return;
+                }
+                root.public_inactive_balance_refreshing = false;
+                let current_account_ids = root
+                    .public_accounts
+                    .iter()
+                    .filter(|account| account.status == PublicAccountStatus::Inactive)
+                    .map(|account| account.public_account_uuid.as_str())
+                    .collect::<Vec<_>>();
+                let account_set_unchanged = current_account_ids.len() == account_ids.len()
+                    && current_account_ids
+                        .into_iter()
+                        .eq(account_ids.iter().map(String::as_str));
+                if root.selected_wallet_id != active_wallet_id
+                    || root.selected_chain != chain_id
+                    || !account_set_unchanged
+                {
+                    if root.active_wallet_tab == WalletTab::Public
+                        && root.public_form.inactive_accounts_open
+                        && root
+                            .public_accounts
+                            .iter()
+                            .any(|account| account.status == PublicAccountStatus::Inactive)
+                    {
+                        root.schedule_inactive_public_balance_refresh(cx);
+                    }
+                    cx.notify();
+                    return;
+                }
+                match result {
+                    Ok(Ok(snapshot)) => {
+                        root.public_balance_snapshot =
+                            Some(Arc::new(merge_public_balance_snapshot(
+                                root.public_balance_snapshot.as_deref(),
+                                snapshot,
+                                PublicAccountStatus::Inactive,
+                            )));
+                        root.public_inactive_balance_error = None;
+                    }
+                    Ok(Err(error)) => {
+                        root.public_inactive_balance_error =
+                            Some(Arc::from(format_report_chain(&error)));
+                    }
+                    Err(error) => {
+                        root.public_inactive_balance_error = Some(Arc::from(format!(
+                            "Inactive public balance refresh failed: {error}"
+                        )));
                     }
                 }
                 cx.notify();
@@ -3249,18 +3375,24 @@ impl WalletRoot {
             cx.notify();
             return;
         };
+        let label = self
+            .public_form
+            .add_label_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        if label.is_empty() {
+            self.public_form.error = Some(Arc::from("Enter an account label"));
+            cx.notify();
+            return;
+        }
         let password = Self::read_and_clear_input(&self.public_form.add_password_input, window, cx);
         if password.trim().is_empty() {
             self.public_form.error = Some(Arc::from("Enter the vault password to add an account"));
             cx.notify();
             return;
         }
-        let label = self
-            .public_form
-            .add_label_input
-            .read(cx)
-            .value()
-            .to_string();
         self.public_form.adding_account = true;
         self.public_form.error = None;
         let result = store.add_derived_public_account(
@@ -3305,6 +3437,18 @@ impl WalletRoot {
             cx.notify();
             return;
         };
+        let label = self
+            .public_form
+            .import_label_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        if label.is_empty() {
+            self.public_form.error = Some(Arc::from("Enter an account label"));
+            cx.notify();
+            return;
+        }
         let private_key =
             Self::read_and_clear_input(&self.public_form.import_private_key_input, window, cx);
         let password =
@@ -3316,12 +3460,6 @@ impl WalletRoot {
             cx.notify();
             return;
         }
-        let label = self
-            .public_form
-            .import_label_input
-            .read(cx)
-            .value()
-            .to_string();
         let global = self.public_form.import_global;
         self.public_form.importing_account = true;
         self.public_form.error = None;
@@ -3378,7 +3516,13 @@ impl WalletRoot {
             .edit_label_input
             .read(cx)
             .value()
+            .trim()
             .to_string();
+        if label.is_empty() {
+            self.public_form.error = Some(Arc::from("Enter an account label"));
+            cx.notify();
+            return;
+        }
         match store.update_public_account_label(
             view_session.as_ref(),
             account_uuid.as_ref(),
@@ -3394,7 +3538,7 @@ impl WalletRoot {
         cx.notify();
     }
 
-    fn hide_public_account(
+    fn deactivate_public_account(
         &mut self,
         public_account_uuid: &str,
         window: &mut Window,
@@ -3406,7 +3550,8 @@ impl WalletRoot {
         let Some(view_session) = self.view_session.clone() else {
             return;
         };
-        match store.hide_derived_public_account(view_session.as_ref(), public_account_uuid.as_ref())
+        match store
+            .deactivate_derived_public_account(view_session.as_ref(), public_account_uuid.as_ref())
         {
             Ok(_) => {
                 if self.public_form.selected_account_uuid.as_deref() == Some(public_account_uuid) {
@@ -3420,7 +3565,7 @@ impl WalletRoot {
         cx.notify();
     }
 
-    fn show_public_account(
+    fn activate_public_account(
         &mut self,
         public_account_uuid: &str,
         window: &mut Window,
@@ -3432,7 +3577,8 @@ impl WalletRoot {
         let Some(view_session) = self.view_session.clone() else {
             return;
         };
-        match store.show_derived_public_account(view_session.as_ref(), public_account_uuid.as_ref())
+        match store
+            .activate_derived_public_account(view_session.as_ref(), public_account_uuid.as_ref())
         {
             Ok(account) => {
                 self.public_form.selected_account_uuid =
@@ -3578,6 +3724,7 @@ impl WalletRoot {
             amount,
             recipient,
         };
+        let submitted_public_account_uuid = Arc::clone(&public_account_uuid);
         let join = self.runtime.spawn(async move {
             submit_public_send_with_progress(request, &http, move |update| {
                 let _ = progress_tx.send(update);
@@ -3596,7 +3743,15 @@ impl WalletRoot {
                 root.public_form.sending = false;
                 match result {
                     Ok(Ok(_result)) => {
-                        root.schedule_public_balance_refresh(cx);
+                        match root
+                            .public_account_for_uuid(Some(submitted_public_account_uuid.as_ref()))
+                            .map(|account| account.status)
+                        {
+                            Some(PublicAccountStatus::Inactive) => {
+                                root.schedule_inactive_public_balance_refresh(cx);
+                            }
+                            _ => root.schedule_public_balance_refresh(cx),
+                        }
                     }
                     Ok(Err(error)) => {
                         let message = error.to_string();
@@ -3694,6 +3849,7 @@ impl WalletRoot {
             asset,
             amount,
         };
+        let submitted_public_account_uuid = Arc::clone(&public_account_uuid);
         let join = self.runtime.spawn(async move {
             submit_public_shield_with_progress(request, &http, move |update| {
                 let _ = progress_tx.send(update);
@@ -3712,7 +3868,15 @@ impl WalletRoot {
                 root.public_form.shielding = false;
                 match result {
                     Ok(Ok(_result)) => {
-                        root.schedule_public_balance_refresh(cx);
+                        match root
+                            .public_account_for_uuid(Some(submitted_public_account_uuid.as_ref()))
+                            .map(|account| account.status)
+                        {
+                            Some(PublicAccountStatus::Inactive) => {
+                                root.schedule_inactive_public_balance_refresh(cx);
+                            }
+                            _ => root.schedule_public_balance_refresh(cx),
+                        }
                     }
                     Ok(Err(error)) => {
                         let message = error.to_string();
@@ -7213,8 +7377,8 @@ impl WalletRoot {
                     .flex_col()
                     .w_full()
                     .gap_1()
-                    .when(!collapsed, gpui::Styled::items_start)
-                    .when(collapsed, gpui::Styled::items_center)
+                    .when(!collapsed, Styled::items_start)
+                    .when(collapsed, Styled::items_center)
                     .child(self.render_network_status_pill(&network_root, collapsed))
                     .child(
                         SidebarMenuItem::new("Logs")
@@ -8697,7 +8861,7 @@ impl WalletRoot {
                                 .loading(self.public_balance_refreshing)
                                 .disabled(
                                     self.public_balance_refreshing
-                                        || self.public_accounts.is_empty(),
+                                        || !self.has_active_public_accounts(),
                                 )
                                 .on_click(
                                     move |_event, _window, cx| {
@@ -8887,8 +9051,6 @@ impl WalletRoot {
     }
 
     fn render_public_account_list(&self, root: &Entity<Self>) -> gpui::Div {
-        let accounts = self.public_accounts.clone();
-        let selected = self.public_form.selected_account_uuid.clone();
         let search_query = self.public_form.search_query.as_ref();
         let search_active = !search_query.is_empty();
         let clear_search_input = self.public_form.search_input.clone();
@@ -8909,315 +9071,463 @@ impl WalletRoot {
                             }),
                     )
                 });
-        let mut card = div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .p(px(14.0))
-            .rounded_lg()
-            .bg(rgb(theme::SURFACE))
-            .border_1()
-            .border_color(rgb(theme::BORDER));
-        let mut controls = div()
+        let mut card = div().w_full().flex().flex_col().gap_4();
+        let controls = div()
             .w_full()
             .flex()
             .items_center()
             .justify_start()
             .gap_2()
             .child(div().w(px(260.0)).child(search_input));
-        if self.public_form.has_hidden_accounts {
-            let toggle_root = root.clone();
-            controls = controls.child(
-                Checkbox::new("wallet-public-show-hidden-accounts")
-                    .label("Show hidden")
-                    .checked(self.public_form.show_hidden_accounts)
-                    .xsmall()
-                    .on_click(move |checked, window, cx| {
-                        let checked = *checked;
-                        toggle_root.update(cx, |root, cx| {
-                            root.set_public_hidden_visibility(checked, window, cx);
-                        });
-                    }),
-            );
-        }
         card = card.child(controls);
-        if accounts.is_empty() {
-            return card.child(app_muted_text(if self.public_form.has_hidden_accounts {
-                "No visible Public accounts. Enable Show hidden to manage hidden accounts."
-            } else {
-                "No Public accounts yet. Add a derived account or import a private key."
-            }));
+        if self.public_accounts.is_empty() {
+            return card.child(app_muted_text(
+                "No Public accounts yet. Add a derived account or import a private key.",
+            ));
         }
         let accounts = if search_active {
-            accounts
-                .into_iter()
+            self.public_accounts
+                .iter()
                 .filter(|account| public_account_matches_search(account, search_query))
+                .cloned()
                 .collect::<Vec<_>>()
         } else {
-            accounts
+            self.public_accounts.clone()
         };
         if accounts.is_empty() {
             return card.child(app_muted_text("No Public accounts match this search."));
         }
 
-        for account in accounts {
-            let account_uuid = Arc::from(account.public_account_uuid.as_str());
-            let row_group = SharedString::from(format!(
-                "wallet-public-account-row-{}",
-                account.public_account_uuid
+        let active_accounts = accounts
+            .iter()
+            .filter(|account| account.status == PublicAccountStatus::Active)
+            .cloned()
+            .collect::<Vec<_>>();
+        let inactive_accounts = accounts
+            .into_iter()
+            .filter(|account| account.status == PublicAccountStatus::Inactive)
+            .collect::<Vec<_>>();
+        let active_open =
+            self.public_form.active_accounts_open || (search_active && !active_accounts.is_empty());
+        let inactive_open = self.public_form.inactive_accounts_open
+            || (search_active && !inactive_accounts.is_empty());
+        card = card
+            .child(self.render_public_account_section(
+                root,
+                PublicAccountStatus::Active,
+                "Active",
+                &active_accounts,
+                active_open,
+            ))
+            .child(self.render_public_account_section(
+                root,
+                PublicAccountStatus::Inactive,
+                "Inactive",
+                &inactive_accounts,
+                inactive_open,
             ));
-            let account_root = root.clone();
-            let edit_root = root.clone();
-            let hide_root = root.clone();
-            let show_root = root.clone();
-            let delete_root = root.clone();
-            let selectable = account.status == PublicAccountStatus::Active;
-            let selected = selected
-                .as_ref()
-                .is_some_and(|selected| selected.as_ref() == account.public_account_uuid);
-            let address_display = short_address(&account.address);
-            let address_copy_value = format!("{:#x}", account.address);
-            let edit_uuid = Arc::clone(&account_uuid);
-            let address_copy_button = div()
-                .id(SharedString::from(format!(
-                    "wallet-public-address-copy-action-{}",
-                    account.public_account_uuid
-                )))
-                .group(row_group.clone())
-                .flex_none()
-                .opacity(0.0)
-                .group_hover(row_group.clone(), |this| this.opacity(1.0))
-                .hover(|this| this.opacity(1.0))
-                .tooltip(|window, cx| Tooltip::new("Copy address").build(window, cx))
-                .child(clipboard_with_toast(
-                    SharedString::from(format!(
-                        "wallet-public-address-copy-{}",
-                        account.public_account_uuid
-                    )),
-                    address_copy_value,
-                ));
-            let source_badge = public_account_metadata_badge(
-                SharedString::from(format!(
-                    "wallet-public-account-source-{}",
-                    account.public_account_uuid
-                )),
-                Icon::new(public_account_source_icon(account.source)),
-                public_account_source_label(account.source),
-            );
-            let mut metadata_badges = div().flex().items_center().gap_1().child(source_badge);
-            if account.is_global() {
-                metadata_badges = metadata_badges.child(public_account_metadata_badge(
-                    SharedString::from(format!(
-                        "wallet-public-account-scope-{}",
-                        account.public_account_uuid
-                    )),
-                    Icon::new(RailgunPublicAccountIcon::Global),
-                    "Available across wallets",
-                ));
-            }
-            let account_label = public_account_display_label(&account);
-            let action_buttons = div()
-                .group(row_group.clone())
-                .flex()
-                .flex_none()
-                .items_center()
-                .gap_1()
-                .opacity(0.0)
-                .group_hover(row_group.clone(), |this| this.opacity(1.0))
-                .hover(|this| this.opacity(1.0))
+        card
+    }
+
+    fn render_public_account_section(
+        &self,
+        root: &Entity<Self>,
+        status: PublicAccountStatus,
+        title: &'static str,
+        accounts: &[PublicAccountMetadata],
+        open: bool,
+    ) -> impl IntoElement {
+        let section_id = public_account_status_id(status);
+        let toggle_root = root.clone();
+        let fetch_root = root.clone();
+        let toggle_button_root = root.clone();
+        let count = accounts.len();
+        let mut header_actions = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_end()
+            .gap_2();
+        if status == PublicAccountStatus::Inactive && open && count > 0 {
+            header_actions = header_actions.child(
+                app_button(
+                    "wallet-public-inactive-fetch-balances",
+                    if self.public_inactive_balance_refreshing {
+                        "Fetching..."
+                    } else {
+                        "Fetch balances"
+                    },
+                )
+                .outline()
+                .xsmall()
+                .loading(self.public_inactive_balance_refreshing)
+                .disabled(self.public_inactive_balance_refreshing)
                 .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
                     cx.stop_propagation();
                 })
-                .child(
+                .on_click(move |_event, _window, cx| {
+                    cx.stop_propagation();
+                    fetch_root.update(cx, |root, cx| {
+                        root.schedule_inactive_public_balance_refresh(cx);
+                    });
+                }),
+            );
+        }
+        header_actions = header_actions.child(
+            app_button_base(SharedString::from(format!(
+                "wallet-public-{section_id}-accounts-toggle"
+            )))
+            .ghost()
+            .xsmall()
+            .text_color(rgb(theme::PRIMARY))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(if open { "Hide" } else { "Show" })
+                    .child(
+                        Icon::new(if open {
+                            IconName::ChevronUp
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .xsmall()
+                        .text_color(rgb(theme::PRIMARY)),
+                    ),
+            )
+            .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                cx.stop_propagation();
+            })
+            .on_click(move |_event, _window, cx| {
+                cx.stop_propagation();
+                toggle_button_root.update(cx, |root, cx| {
+                    root.set_public_account_section_open(status, !open, cx);
+                });
+            }),
+        );
+        let header = div()
+            .id(SharedString::from(format!(
+                "wallet-public-{section_id}-accounts-header"
+            )))
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .px(px(10.0))
+            .py(px(3.0))
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(theme::BORDER))
+            .bg(rgb(theme::SURFACE))
+            .cursor_pointer()
+            .on_click(move |_event, _window, cx| {
+                toggle_root.update(cx, |root, cx| {
+                    root.set_public_account_section_open(status, !open, cx);
+                });
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(12.0))
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(SharedString::from(format!(
+                        "{} · {count}",
+                        title.to_ascii_uppercase()
+                    ))),
+            )
+            .child(header_actions);
+
+        let mut content = div().w_full().flex().flex_col().gap_3().pt(px(4.0));
+        if status == PublicAccountStatus::Inactive {
+            content =
+                content.children(self.public_inactive_balance_error.as_ref().map(|message| {
+                    Alert::warning("wallet-public-inactive-balance-error", message.to_string())
+                        .title("Inactive balances unavailable")
+                        .small()
+                }));
+        }
+        if accounts.is_empty() {
+            content = content.child(app_muted_text(if status == PublicAccountStatus::Active {
+                "No active Public accounts."
+            } else {
+                "No inactive Public accounts."
+            }));
+        } else {
+            for account in accounts {
+                content = content.child(self.render_public_account_card(root, account));
+            }
+        }
+
+        Collapsible::new()
+            .open(open)
+            .w_full()
+            .child(header)
+            .content(content)
+    }
+
+    fn render_public_account_card(
+        &self,
+        root: &Entity<Self>,
+        account: &PublicAccountMetadata,
+    ) -> gpui::Div {
+        let selected = self
+            .public_form
+            .selected_account_uuid
+            .as_ref()
+            .is_some_and(|selected| selected.as_ref() == account.public_account_uuid);
+        let account_uuid = Arc::from(account.public_account_uuid.as_str());
+        let row_group = SharedString::from(format!(
+            "wallet-public-account-row-{}",
+            account.public_account_uuid
+        ));
+        let edit_root = root.clone();
+        let deactivate_root = root.clone();
+        let activate_root = root.clone();
+        let delete_root = root.clone();
+        let address_display = short_address(&account.address);
+        let address_copy_value = format!("{:#x}", account.address);
+        let edit_uuid = Arc::clone(&account_uuid);
+        let address_copy_button = div()
+            .id(SharedString::from(format!(
+                "wallet-public-address-copy-action-{}",
+                account.public_account_uuid
+            )))
+            .group(row_group.clone())
+            .flex_none()
+            .opacity(0.0)
+            .group_hover(row_group.clone(), |this| this.opacity(1.0))
+            .hover(|this| this.opacity(1.0))
+            .tooltip(|window, cx| Tooltip::new("Copy address").build(window, cx))
+            .child(clipboard_with_toast(
+                SharedString::from(format!(
+                    "wallet-public-address-copy-{}",
+                    account.public_account_uuid
+                )),
+                address_copy_value,
+            ));
+        let source_badge = public_account_metadata_badge(
+            SharedString::from(format!(
+                "wallet-public-account-source-{}",
+                account.public_account_uuid
+            )),
+            Icon::new(public_account_source_icon(account.source)),
+            public_account_source_label(account.source),
+        );
+        let mut metadata_badges = div().flex().items_center().gap_1().child(source_badge);
+        if account.is_global() {
+            metadata_badges = metadata_badges.child(public_account_metadata_badge(
+                SharedString::from(format!(
+                    "wallet-public-account-scope-{}",
+                    account.public_account_uuid
+                )),
+                Icon::new(RailgunPublicAccountIcon::Global),
+                "Available across wallets",
+            ));
+        }
+        let account_label = public_account_display_label(account);
+        let action_buttons = div()
+            .group(row_group.clone())
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .opacity(0.0)
+            .group_hover(row_group.clone(), |this| this.opacity(1.0))
+            .hover(|this| this.opacity(1.0))
+            .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                cx.stop_propagation();
+            })
+            .child(
+                public_account_icon_button(
+                    SharedString::from(format!(
+                        "wallet-public-edit-{}",
+                        account.public_account_uuid
+                    )),
+                    Icon::new(RailgunActionIcon::Pencil),
+                    "Edit label",
+                )
+                .on_click(move |_event, window, cx| {
+                    let account_uuid = Arc::clone(&edit_uuid);
+                    edit_root.update(cx, |root, cx| {
+                        root.open_public_account_edit_dialog(account_uuid, window, cx);
+                    });
+                }),
+            );
+        let action_buttons = match account.source {
+            PublicAccountSource::Derived => {
+                let status_uuid = Arc::clone(&account_uuid);
+                let inactive = account.status == PublicAccountStatus::Inactive;
+                action_buttons.child(
                     public_account_icon_button(
                         SharedString::from(format!(
-                            "wallet-public-edit-{}",
+                            "wallet-public-{}-{}",
+                            if inactive { "activate" } else { "deactivate" },
                             account.public_account_uuid
                         )),
-                        Icon::new(RailgunActionIcon::Pencil),
-                        "Edit label",
-                    )
-                    .on_click(move |_event, window, cx| {
-                        let account_uuid = Arc::clone(&edit_uuid);
-                        edit_root.update(cx, |root, cx| {
-                            root.open_public_account_edit_dialog(account_uuid, window, cx);
-                        });
-                    }),
-                );
-            let action_buttons = match account.source {
-                PublicAccountSource::Derived => {
-                    let hide_uuid = Arc::clone(&account_uuid);
-                    let hidden = account.status == PublicAccountStatus::Hidden;
-                    action_buttons.child(
-                        public_account_icon_button(
-                            SharedString::from(format!(
-                                "wallet-public-hide-{}",
-                                account.public_account_uuid
-                            )),
-                            if hidden {
-                                IconName::Eye
-                            } else {
-                                IconName::EyeOff
-                            },
-                            if hidden {
-                                "Show account"
-                            } else {
-                                "Hide account"
-                            },
-                        )
-                        .on_click(move |_event, window, cx| {
-                            let account_uuid = Arc::clone(&hide_uuid);
-                            if hidden {
-                                show_root.update(cx, |root, cx| {
-                                    root.show_public_account(&account_uuid, window, cx);
-                                });
-                            } else {
-                                hide_root.update(cx, |root, cx| {
-                                    root.hide_public_account(&account_uuid, window, cx);
-                                });
-                            }
-                        }),
-                    )
-                }
-                PublicAccountSource::Imported => {
-                    let delete_uuid = Arc::clone(&account_uuid);
-                    let confirming_global_delete = account.is_global()
-                        && self.public_form.pending_global_delete_uuid.as_deref()
-                            == Some(account.public_account_uuid.as_str());
-                    action_buttons.child(
-                        public_account_icon_button(
-                            SharedString::from(format!(
-                                "wallet-public-delete-{}",
-                                account.public_account_uuid
-                            )),
-                            Icon::new(RailgunActionIcon::Trash2),
-                            if confirming_global_delete {
-                                "Confirm global delete"
-                            } else {
-                                "Delete account"
-                            },
-                        )
-                        .danger()
-                        .on_click(move |_event, window, cx| {
-                            let account_uuid = Arc::clone(&delete_uuid);
-                            delete_root.update(cx, |root, cx| {
-                                root.delete_public_account(&account_uuid, window, cx);
-                            });
-                        }),
-                    )
-                }
-            };
-            let account_label = account_label.map_or_else(
-                || app_strong_text(" ").whitespace_nowrap().opacity(0.0),
-                |label| app_strong_text(label).whitespace_nowrap(),
-            );
-            let mut account_content = div()
-                .w_full()
-                .flex_1()
-                .min_w(px(0.0))
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(
-                    div()
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(div().flex_1().min_w(px(0.0)).child(account_label))
-                        .child(action_buttons),
-                )
-                .child(
-                    div()
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_2()
-                        .child(
-                            div()
-                                .min_w(px(0.0))
-                                .flex_1()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .child(
-                                    app_muted_text(address_display)
-                                        .font_family(APP_MONO_FONT_FAMILY)
-                                        .whitespace_nowrap(),
-                                )
-                                .child(address_copy_button),
-                        )
-                        .child(metadata_badges),
-                );
-
-            let visible_balances = if selectable {
-                self.public_account_visible_balances(&account.public_account_uuid)
-            } else {
-                Vec::new()
-            };
-            if !visible_balances.is_empty() {
-                let mut balance_chips = div().w_full().flex().flex_wrap().gap_2().pt(px(2.0));
-                for (balance_index, entry) in visible_balances.iter().enumerate() {
-                    balance_chips = balance_chips.child(self.render_public_account_balance_chip(
-                        root,
-                        Arc::clone(&account_uuid),
-                        selected,
-                        balance_index,
-                        entry,
-                    ));
-                }
-                account_content = account_content.child(balance_chips);
-            }
-            let mut account_card = div()
-                .group(row_group)
-                .w_full()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .p(px(10.0))
-                .rounded_md()
-                .border_1()
-                .border_color(if selected {
-                    rgb(theme::PRIMARY)
-                } else {
-                    rgb(theme::BORDER)
-                })
-                .bg(if selected {
-                    rgb(theme::SURFACE_HOVER_SUBTLE)
-                } else {
-                    rgb(theme::SURFACE)
-                })
-                .when(selectable, |row| {
-                    row.cursor_pointer().on_mouse_down(
-                        MouseButton::Left,
-                        move |_event, window, cx| {
-                            let account_uuid = Arc::clone(&account_uuid);
-                            account_root.update(cx, |root, cx| {
-                                root.set_public_selected_account(account_uuid, window, cx);
-                            });
+                        if inactive {
+                            IconName::Eye
+                        } else {
+                            IconName::EyeOff
+                        },
+                        if inactive {
+                            "Activate account"
+                        } else {
+                            "Deactivate account"
                         },
                     )
-                })
-                .child(div().flex().items_start().gap_3().child(account_content));
-            if account.is_global()
-                && self.public_form.pending_global_delete_uuid.as_deref()
-                    == Some(account.public_account_uuid.as_str())
-            {
-                account_card = account_card.child(
-                    Alert::warning(
+                    .on_click(move |_event, window, cx| {
+                        let account_uuid = Arc::clone(&status_uuid);
+                        if inactive {
+                            activate_root.update(cx, |root, cx| {
+                                root.activate_public_account(&account_uuid, window, cx);
+                            });
+                        } else {
+                            deactivate_root.update(cx, |root, cx| {
+                                root.deactivate_public_account(&account_uuid, window, cx);
+                            });
+                        }
+                    }),
+                )
+            }
+            PublicAccountSource::Imported => {
+                let delete_uuid = Arc::clone(&account_uuid);
+                let confirming_global_delete = account.is_global()
+                    && self.public_form.pending_global_delete_uuid.as_deref()
+                        == Some(account.public_account_uuid.as_str());
+                action_buttons.child(
+                    public_account_icon_button(
                         SharedString::from(format!(
-                            "wallet-public-global-delete-warning-{}",
+                            "wallet-public-delete-{}",
                             account.public_account_uuid
                         )),
-                        "Deleting this global account removes it from every Private wallet.",
+                        Icon::new(RailgunActionIcon::Trash2),
+                        if confirming_global_delete {
+                            "Confirm global delete"
+                        } else {
+                            "Delete account"
+                        },
                     )
-                    .small(),
-                );
+                    .danger()
+                    .on_click(move |_event, window, cx| {
+                        let account_uuid = Arc::clone(&delete_uuid);
+                        delete_root.update(cx, |root, cx| {
+                            root.delete_public_account(&account_uuid, window, cx);
+                        });
+                    }),
+                )
             }
-            card = card.child(account_card);
+        };
+        let account_label = account_label.map_or_else(
+            || {
+                app_strong_text(" ")
+                    .text_size(theme::ACCOUNT_LABEL_TEXT_SIZE)
+                    .whitespace_nowrap()
+                    .opacity(0.0)
+            },
+            |label| {
+                app_strong_text(label)
+                    .text_size(theme::ACCOUNT_LABEL_TEXT_SIZE)
+                    .whitespace_nowrap()
+            },
+        );
+        let mut account_content = div()
+            .w_full()
+            .flex_1()
+            .min_w(px(0.0))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_1().min_w(px(0.0)).child(account_label))
+                    .child(action_buttons),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .flex_1()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                app_muted_text(address_display)
+                                    .font_family(APP_MONO_FONT_FAMILY)
+                                    .text_size(theme::ACCOUNT_ADDRESS_TEXT_SIZE)
+                                    .text_color(rgb(theme::TEXT_SUBTLE))
+                                    .whitespace_nowrap(),
+                            )
+                            .child(address_copy_button),
+                    )
+                    .child(metadata_badges),
+            );
+
+        let visible_balances =
+            self.public_account_visible_balances(&account.public_account_uuid, account.status);
+        if !visible_balances.is_empty() {
+            let mut balance_chips = div().w_full().flex().flex_wrap().gap_2().pt(px(2.0));
+            for (balance_index, entry) in visible_balances.iter().enumerate() {
+                balance_chips = balance_chips.child(self.render_public_account_balance_chip(
+                    root,
+                    Arc::clone(&account_uuid),
+                    selected,
+                    balance_index,
+                    entry,
+                ));
+            }
+            account_content = account_content.child(balance_chips);
         }
-        card
+        let mut account_card = div()
+            .group(row_group)
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p(px(14.0))
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(theme::BORDER))
+            .bg(rgb(theme::SURFACE))
+            .hover(|row| row.border_color(rgb(theme::PRIMARY)))
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_4()
+                    .child(render_public_account_identicon(&account.address))
+                    .child(account_content),
+            );
+        if account.is_global()
+            && self.public_form.pending_global_delete_uuid.as_deref()
+                == Some(account.public_account_uuid.as_str())
+        {
+            account_card = account_card.child(
+                Alert::warning(
+                    SharedString::from(format!(
+                        "wallet-public-global-delete-warning-{}",
+                        account.public_account_uuid
+                    )),
+                    "Deleting this global account removes it from every Private wallet.",
+                )
+                .small(),
+            );
+        }
+        account_card
     }
 
     fn render_public_account_balance_chip(
@@ -9234,16 +9544,24 @@ impl WalletRoot {
         let icon_path = public_asset_icon_path(self.selected_chain, asset);
         let amount_label = public_balance_amount_label(&entry.amount, entry.asset.decimals);
         let symbol = entry.asset.symbol;
-        let tooltip = SharedString::from(format!("Use {amount_label} {symbol}"));
+        let tooltip = SharedString::from(format!("Shield/send {symbol}"));
+        let balance_id = SharedString::from(format!(
+            "wallet-public-account-balance-{}-{index}",
+            account_uuid.as_ref()
+        ));
+        let balance_group = SharedString::from(format!(
+            "wallet-public-account-balance-group-{}-{index}",
+            account_uuid.as_ref()
+        ));
         let mut asset_label = div().flex().items_center().gap_1();
         if let Some(path) = icon_path {
             asset_label = asset_label.child(img(path).size(px(16.0)).rounded_full().flex_none());
         }
         div()
-            .id(SharedString::from(format!(
-                "wallet-public-account-balance-{}-{index}",
-                account_uuid.as_ref()
-            )))
+            .id(balance_id)
+            .group(balance_group.clone())
+            .min_w(PUBLIC_BALANCE_CHIP_MIN_WIDTH)
+            .flex_none()
             .flex()
             .items_center()
             .gap_2()
@@ -9259,11 +9577,18 @@ impl WalletRoot {
             .bg(if selected {
                 rgb(theme::SURFACE_HOVER_SUBTLE)
             } else {
-                rgb(theme::SURFACE_ELEVATED)
+                rgb(theme::SURFACE)
             })
             .text_size(APP_TEXT_SIZE)
             .cursor_pointer()
-            .hover(|this| this.bg(rgb(theme::SURFACE_HOVER)))
+            .hover(|this| {
+                this.bg(rgb(theme::SURFACE_ELEVATED))
+                    .border_color(if selected {
+                        rgb(theme::PRIMARY)
+                    } else {
+                        rgb(theme::BORDER)
+                    })
+            })
             .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
             .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
                 cx.stop_propagation();
@@ -9286,6 +9611,24 @@ impl WalletRoot {
                     .text_color(rgb(theme::WARNING))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .child(SharedString::from(amount_label)),
+            )
+            .child(div().flex_1())
+            .child(
+                div()
+                    .group(balance_group.clone())
+                    .size(PUBLIC_BALANCE_CHIP_ACTION_SLOT_SIZE)
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .opacity(0.0)
+                    .group_hover(balance_group, |this| this.opacity(1.0))
+                    .hover(|this| this.opacity(1.0))
+                    .child(
+                        Icon::new(RailgunActionIcon::Shield)
+                            .with_size(PUBLIC_BALANCE_CHIP_ACTION_ICON_SIZE)
+                            .text_color(rgb(theme::WARNING_STRONG)),
+                    ),
             )
     }
 
@@ -9454,11 +9797,13 @@ impl WalletRoot {
     fn public_account_visible_balances(
         &self,
         public_account_uuid: &str,
+        status: PublicAccountStatus,
     ) -> Vec<PublicBalanceEntry> {
         public_account_visible_balances_for_chain(
             self.public_balance_snapshot.as_deref(),
             self.selected_chain,
             public_account_uuid,
+            status,
         )
     }
 
@@ -10270,6 +10615,69 @@ fn public_action_max_label(entry: &PublicBalanceEntry) -> Option<String> {
 
 fn public_action_max_amount_after_reserve(amount: U256, reserve: U256) -> Option<U256> {
     (amount > reserve).then_some(amount - reserve)
+}
+
+fn render_public_account_identicon(address: &Address) -> gpui::Div {
+    let pattern = public_account_identicon_pattern(address);
+    let foreground = public_account_identicon_color(address);
+    let mut icon = div()
+        .size(PUBLIC_ACCOUNT_IDENTICON_SIZE)
+        .flex_none()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap_0();
+    for row in pattern.chunks_exact(PUBLIC_ACCOUNT_IDENTICON_GRID_SIZE) {
+        let mut row_div = div().flex().gap_0();
+        for active in row {
+            let cell = div().size(PUBLIC_ACCOUNT_IDENTICON_CELL_SIZE);
+            row_div = row_div.child(if *active {
+                cell.bg(rgb(foreground))
+            } else {
+                cell
+            });
+        }
+        icon = icon.child(row_div);
+    }
+    icon
+}
+
+fn public_account_identicon_pattern(
+    address: &Address,
+) -> [bool; PUBLIC_ACCOUNT_IDENTICON_CELL_COUNT] {
+    let mut pattern = [false; PUBLIC_ACCOUNT_IDENTICON_CELL_COUNT];
+    let mut has_foreground = false;
+    for (row_index, row) in pattern
+        .chunks_exact_mut(PUBLIC_ACCOUNT_IDENTICON_GRID_SIZE)
+        .enumerate()
+    {
+        for column in 0..PUBLIC_ACCOUNT_IDENTICON_SOURCE_COLUMNS {
+            let bit_index = row_index * PUBLIC_ACCOUNT_IDENTICON_SOURCE_COLUMNS + column;
+            let active = public_account_identicon_bit(address, bit_index);
+            has_foreground |= active;
+            row[column] = active;
+            row[PUBLIC_ACCOUNT_IDENTICON_GRID_SIZE - column - 1] = active;
+        }
+    }
+    if !has_foreground {
+        pattern[PUBLIC_ACCOUNT_IDENTICON_CELL_COUNT / 2] = true;
+    }
+    pattern
+}
+
+fn public_account_identicon_bit(address: &Address, bit_index: usize) -> bool {
+    let bytes = address.as_slice();
+    let byte = bytes[(bit_index * 7) % bytes.len()];
+    let shift = (bit_index * 5) % u8::BITS as usize;
+    ((byte >> shift) & 1) == 1
+}
+
+fn public_account_identicon_color(address: &Address) -> u32 {
+    let bytes = address.as_slice();
+    let color_index = usize::from(bytes[3] ^ bytes[7] ^ bytes[11] ^ bytes[15] ^ bytes[19])
+        % PUBLIC_ACCOUNT_IDENTICON_COLORS.len();
+    PUBLIC_ACCOUNT_IDENTICON_COLORS[color_index]
 }
 
 fn secondary_dialog_content_width(dialog_width: Pixels) -> Pixels {
@@ -13023,9 +13431,7 @@ fn public_account_metadata_badge(
         .items_center()
         .justify_center()
         .rounded_sm()
-        .border_1()
-        .border_color(rgb(theme::BORDER_SUBTLE))
-        .bg(rgb(theme::SURFACE_HOVER_SUBTLE))
+        .bg(rgb(theme::SURFACE))
         .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
         .child(Icon::new(icon).xsmall().text_color(rgb(theme::TEXT_MUTED)))
 }
@@ -13048,6 +13454,13 @@ fn public_account_display_label(account: &PublicAccountMetadata) -> Option<Strin
         .as_ref()
         .filter(|label| !label.trim().is_empty())
         .cloned()
+}
+
+fn next_public_account_label_number(account_count: usize) -> u32 {
+    u32::try_from(account_count)
+        .ok()
+        .and_then(|count| count.checked_add(1))
+        .unwrap_or(u32::MAX)
 }
 
 const fn public_account_source_label(source: PublicAccountSource) -> &'static str {
@@ -13100,6 +13513,43 @@ fn public_asset_icon_path(chain_id: u64, asset: PublicAssetId) -> Option<PathBuf
     }
 }
 
+const fn public_account_status_id(status: PublicAccountStatus) -> &'static str {
+    match status {
+        PublicAccountStatus::Active => "active",
+        PublicAccountStatus::Inactive => "inactive",
+    }
+}
+
+fn merge_public_balance_snapshot(
+    current: Option<&PublicBalanceSnapshot>,
+    refreshed: PublicBalanceSnapshot,
+    refreshed_status: PublicAccountStatus,
+) -> PublicBalanceSnapshot {
+    let Some(current) = current.filter(|current| current.chain_id == refreshed.chain_id) else {
+        return refreshed;
+    };
+    let refreshed_ids = refreshed
+        .accounts
+        .iter()
+        .map(|account| account.account.public_account_uuid.clone())
+        .collect::<BTreeSet<_>>();
+    let mut accounts = current
+        .accounts
+        .iter()
+        .filter(|account| {
+            account.account.status != refreshed_status
+                && !refreshed_ids.contains(account.account.public_account_uuid.as_str())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    accounts.extend(refreshed.accounts);
+    PublicBalanceSnapshot {
+        chain_id: refreshed.chain_id,
+        refreshed_at: refreshed.refreshed_at,
+        accounts,
+    }
+}
+
 fn public_balance_amount_label(amount: &PublicBalanceAmount, decimals: u8) -> String {
     match amount {
         PublicBalanceAmount::Available(amount) => format_token_amount(*amount, decimals),
@@ -13112,12 +13562,16 @@ fn public_balance_entry_for_chain(
     chain_id: u64,
     public_account_uuid: &str,
     asset: PublicAssetId,
+    status: PublicAccountStatus,
 ) -> Option<PublicBalanceEntry> {
     let snapshot = snapshot.filter(|snapshot| snapshot.chain_id == chain_id)?;
     snapshot
         .accounts
         .iter()
-        .find(|account| account.account.public_account_uuid.as_str() == public_account_uuid)?
+        .find(|account| {
+            account.account.public_account_uuid.as_str() == public_account_uuid
+                && account.account.status == status
+        })?
         .balances
         .iter()
         .find(|entry| entry.asset.id == asset)
@@ -13128,6 +13582,7 @@ fn public_account_visible_balances_for_chain(
     snapshot: Option<&PublicBalanceSnapshot>,
     chain_id: u64,
     public_account_uuid: &str,
+    status: PublicAccountStatus,
 ) -> Vec<PublicBalanceEntry> {
     let Some(snapshot) = snapshot.filter(|snapshot| snapshot.chain_id == chain_id) else {
         return Vec::new();
@@ -13135,7 +13590,10 @@ fn public_account_visible_balances_for_chain(
     snapshot
         .accounts
         .iter()
-        .find(|account| account.account.public_account_uuid.as_str() == public_account_uuid)
+        .find(|account| {
+            account.account.public_account_uuid.as_str() == public_account_uuid
+                && account.account.status == status
+        })
         .map_or_else(Vec::new, |account| {
             account
                 .balances
@@ -13594,10 +14052,11 @@ mod tests {
     };
 
     use super::{
-        Activity, BroadcasterChoice, ChainUtxoState, CostEstimateStatus, PrivateActionMetric,
-        PublicActionMode, PublicBroadcasterFeeTokenOption, SECONDS_PER_DAY, SECONDS_PER_HOUR,
-        SECONDS_PER_MINUTE, SECONDS_PER_MONTH, SECONDS_PER_YEAR, UnshieldAsset, UnshieldAssetKey,
-        WalletSelectItem, WalletTab, adjusted_amount_for_max_change,
+        Activity, BroadcasterChoice, ChainUtxoState, CostEstimateStatus,
+        PUBLIC_ACCOUNT_IDENTICON_CELL_COUNT, PUBLIC_ACCOUNT_IDENTICON_GRID_SIZE,
+        PrivateActionMetric, PublicActionMode, PublicBroadcasterFeeTokenOption, SECONDS_PER_DAY,
+        SECONDS_PER_HOUR, SECONDS_PER_MINUTE, SECONDS_PER_MONTH, SECONDS_PER_YEAR, UnshieldAsset,
+        UnshieldAssetKey, WalletSelectItem, WalletTab, adjusted_amount_for_max_change,
         broadcaster_choice_supported_by_candidates, build_send_asset, build_unshield_asset,
         display_rows_from_output, effective_public_broadcaster_fee_mode,
         fee_token_option_has_eligible_broadcaster, format_compact_age,
@@ -13605,9 +14064,11 @@ mod tests {
         format_native_token_amount_for_display, format_private_asset_rows,
         format_public_broadcaster_fee_margin, format_report_chain, format_send_amount_input,
         format_total, format_unshield_amount_input, loading_summary, max_send_amount_from_snapshot,
-        max_unshield_amount_from_snapshot, native_token_display_label,
-        native_wrapped_output_labels, parse_repair_cache_block, private_action_metrics,
-        progress_detail, public_account_matches_search, public_account_visible_balances_for_chain,
+        max_unshield_amount_from_snapshot, merge_public_balance_snapshot,
+        native_token_display_label, native_wrapped_output_labels, next_public_account_label_number,
+        parse_repair_cache_block, private_action_metrics, progress_detail,
+        public_account_identicon_color, public_account_identicon_pattern,
+        public_account_matches_search, public_account_visible_balances_for_chain,
         public_action_asset_label, public_action_error_copy_value, public_action_error_details,
         public_action_error_summary, public_action_max_amount_after_reserve,
         public_action_max_label, public_action_progress_steps, public_balance_entry_for_chain,
@@ -14489,6 +14950,13 @@ mod tests {
     }
 
     #[test]
+    fn public_account_default_label_number_uses_account_count() {
+        assert_eq!(next_public_account_label_number(0), 1);
+        assert_eq!(next_public_account_label_number(2), 3);
+        assert_eq!(next_public_account_label_number(usize::MAX), u32::MAX);
+    }
+
+    #[test]
     fn public_broadcaster_fee_margin_display_is_signed_fee_token_amount() {
         let usdc = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
             .parse::<Address>()
@@ -14829,6 +15297,43 @@ mod tests {
         assert!(!public_account_matches_search(&account, "savings"));
     }
 
+    #[test]
+    fn public_account_identicon_pattern_is_deterministic_and_symmetric() {
+        let address = Address::from([0x42; 20]);
+        let pattern = public_account_identicon_pattern(&address);
+
+        assert_eq!(pattern, public_account_identicon_pattern(&address));
+        assert!(pattern.iter().any(|active| *active));
+        for row in pattern.chunks_exact(PUBLIC_ACCOUNT_IDENTICON_GRID_SIZE) {
+            assert_eq!(row[0], row[4]);
+            assert_eq!(row[1], row[3]);
+        }
+    }
+
+    #[test]
+    fn public_account_identicon_differs_for_different_addresses() {
+        let first = Address::from([0x11; 20]);
+        let second = Address::from([0x22; 20]);
+
+        assert_ne!(
+            public_account_identicon_pattern(&first),
+            public_account_identicon_pattern(&second),
+        );
+        assert_ne!(
+            public_account_identicon_color(&first),
+            public_account_identicon_color(&second),
+        );
+    }
+
+    #[test]
+    fn public_account_identicon_zero_address_is_not_blank() {
+        let pattern = public_account_identicon_pattern(&Address::from([0; 20]));
+        let active_count = pattern.iter().filter(|active| **active).count();
+
+        assert_eq!(active_count, 1);
+        assert!(pattern[PUBLIC_ACCOUNT_IDENTICON_CELL_COUNT / 2]);
+    }
+
     fn public_balance_snapshot_for_test(chain_id: u64) -> PublicBalanceSnapshot {
         let account = public_account_for_search(Some("Main account"), Address::from([0x11; 20]));
         PublicBalanceSnapshot {
@@ -14853,7 +15358,13 @@ mod tests {
         let snapshot = public_balance_snapshot_for_test(1);
 
         assert_eq!(
-            public_account_visible_balances_for_chain(Some(&snapshot), 1, "public-account").len(),
+            public_account_visible_balances_for_chain(
+                Some(&snapshot),
+                1,
+                "public-account",
+                PublicAccountStatus::Active,
+            )
+            .len(),
             1,
         );
         assert!(
@@ -14861,23 +15372,59 @@ mod tests {
                 Some(&snapshot),
                 1,
                 "public-account",
-                PublicAssetId::Native
+                PublicAssetId::Native,
+                PublicAccountStatus::Active,
             )
             .is_some(),
         );
         assert!(
-            public_account_visible_balances_for_chain(Some(&snapshot), 56, "public-account")
-                .is_empty(),
+            public_account_visible_balances_for_chain(
+                Some(&snapshot),
+                56,
+                "public-account",
+                PublicAccountStatus::Active,
+            )
+            .is_empty(),
         );
         assert!(
             public_balance_entry_for_chain(
                 Some(&snapshot),
                 56,
                 "public-account",
-                PublicAssetId::Native
+                PublicAssetId::Native,
+                PublicAccountStatus::Active,
             )
             .is_none(),
         );
+        assert!(
+            public_account_visible_balances_for_chain(
+                Some(&snapshot),
+                1,
+                "public-account",
+                PublicAccountStatus::Inactive,
+            )
+            .is_empty(),
+        );
+    }
+
+    #[test]
+    fn public_balance_merge_preserves_other_account_status_group() {
+        let active = public_balance_snapshot_for_test(1);
+        let mut inactive = public_balance_snapshot_for_test(1);
+        inactive.accounts[0].account.public_account_uuid = "inactive-account".to_string();
+        inactive.accounts[0].account.status = PublicAccountStatus::Inactive;
+
+        let merged =
+            merge_public_balance_snapshot(Some(&active), inactive, PublicAccountStatus::Inactive);
+
+        assert!(merged.accounts.iter().any(|account| {
+            account.account.public_account_uuid == "public-account"
+                && account.account.status == PublicAccountStatus::Active
+        }));
+        assert!(merged.accounts.iter().any(|account| {
+            account.account.public_account_uuid == "inactive-account"
+                && account.account.status == PublicAccountStatus::Inactive
+        }));
     }
 
     #[test]

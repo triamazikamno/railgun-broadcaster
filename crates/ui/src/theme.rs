@@ -8,6 +8,8 @@ pub const APP_MONO_FONT_FAMILY: &str = "Consolas";
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub const APP_MONO_FONT_FAMILY: &str = "DejaVu Sans Mono";
 pub const APP_TEXT_SIZE: Pixels = px(14.0);
+pub const ACCOUNT_LABEL_TEXT_SIZE: Pixels = px(20.0);
+pub const ACCOUNT_ADDRESS_TEXT_SIZE: Pixels = px(13.0);
 pub const ASSET_SYMBOL_TEXT_SIZE: Pixels = px(16.0);
 pub const BALANCE_TEXT_SIZE: Pixels = px(18.0);
 pub const APP_TEXT_COLOR: u32 = TEXT;
@@ -40,6 +42,8 @@ pub const DANGER: u32 = 0xcc9393;
 pub const DANGER_BG: u32 = 0x4f2f2f;
 pub const PURPLE: u32 = 0xdc8cc3;
 pub const TEAL: u32 = 0x8cd0d3;
+pub const BLUE: u32 = 0x94bff3;
+pub const OLIVE: u32 = 0xbfcf9f;
 
 pub const SPENT_ROW_BG: u32 = 0x464646;
 pub const SPENT_TEXT: u32 = TEXT_MUTED;
