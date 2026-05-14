@@ -38,6 +38,7 @@ const TOR_BOOTSTRAP_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 const SOCKS_ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 pub type WalletTorClient = TorClient<PreferredRuntime>;
+pub type WalletTorClientProvider = Arc<dyn Fn() -> Option<WalletTorClient> + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WalletNetworkMode {
@@ -304,6 +305,19 @@ impl HttpContext {
             }
         }
         self.arti_client.clone()
+    }
+
+    #[must_use]
+    pub fn arti_client_provider(&self) -> Option<WalletTorClientProvider> {
+        if let Some(socks_bridge) = self.socks_bridge.as_ref() {
+            let active_client = Arc::clone(&socks_bridge.active_client);
+            return Some(Arc::new(move || {
+                active_client.read().ok().map(|client| client.clone())
+            }));
+        }
+
+        let arti_client = self.arti_client.clone()?;
+        Some(Arc::new(move || Some(arti_client.clone())))
     }
 
     pub fn start_new_tor_session(&self) -> Result<u64> {

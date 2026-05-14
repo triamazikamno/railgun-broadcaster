@@ -9,7 +9,10 @@ mod transport;
 mod types;
 
 pub use address_policy::is_tor_safe_addr;
-pub use config::{NodeConfig, WakuConfig, WakuNetworkConfig, WakuTorClient, WakuTransportProfile};
+pub use config::{
+    NodeConfig, WakuConfig, WakuNetworkConfig, WakuTorClient, WakuTorClientProvider,
+    WakuTransportProfile,
+};
 pub use coordinator::{
     LightPushResult, PeerBook, PeerSnapshot, PeerStats, StoreQueryOptions, SubId, WakuNode,
 };

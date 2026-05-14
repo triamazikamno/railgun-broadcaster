@@ -1,4 +1,4 @@
-use crate::config::{NodeConfig, WakuNetworkConfig, WakuTorClient, WakuTransportProfile};
+use crate::config::{NodeConfig, WakuNetworkConfig, WakuTorClientProvider, WakuTransportProfile};
 use crate::error::TransportInitError;
 use crate::proto;
 use crate::protocols;
@@ -33,6 +33,7 @@ use tracing::{debug, error};
 
 /// Internal request ID used by the coordinator to correlate responses.
 pub(crate) type ReqId = u64;
+type WakuBoxedTransport = Boxed<(PeerId, libp2p::core::muxing::StreamMuxerBox)>;
 
 /// Commands sent from coordinator to transport.
 #[derive(Debug)]
@@ -41,6 +42,9 @@ pub(crate) enum TransportCmd {
     Dial {
         peer_id: PeerId,
         addrs: Vec<Multiaddr>,
+    },
+    DisconnectPeers {
+        peers: Vec<PeerId>,
     },
     SendLightPush {
         req_id: ReqId,
@@ -224,7 +228,7 @@ impl Transport {
                         error!("transport command channel closed, stopping transport loop");
                         break;
                     };
-                    self.handle_cmd(cmd);
+                    self.handle_cmd(cmd, &event_tx).await;
                 }
                 ev = self.swarm.select_next_some() => {
                     if let Some(te) = self.map_event(ev)
@@ -238,7 +242,7 @@ impl Transport {
         }
     }
 
-    fn handle_cmd(&mut self, cmd: TransportCmd) {
+    async fn handle_cmd(&mut self, cmd: TransportCmd, event_tx: &mpsc::Sender<TransportEvent>) {
         match cmd {
             TransportCmd::Dial { peer_id, addrs } => {
                 let opts = libp2p::swarm::dial_opts::DialOpts::peer_id(peer_id)
@@ -246,6 +250,27 @@ impl Transport {
                     .build();
                 if let Err(e) = self.swarm.dial(opts) {
                     debug!(?peer_id, error=?e, "dial failed");
+                    if event_tx
+                        .send(TransportEvent::DialError { peer_id })
+                        .await
+                        .is_err()
+                    {
+                        error!(%peer_id, "transport event channel closed after dial failure");
+                    }
+                }
+            }
+            TransportCmd::DisconnectPeers { peers } => {
+                for peer_id in peers {
+                    if self.swarm.disconnect_peer_id(peer_id).is_err() {
+                        debug!(%peer_id, "peer already disconnected");
+                        if event_tx
+                            .send(TransportEvent::ConnectionClosed { peer_id })
+                            .await
+                            .is_err()
+                        {
+                            error!(%peer_id, "transport event channel closed after disconnect");
+                        }
+                    }
                 }
             }
             TransportCmd::SendLightPush {
@@ -512,7 +537,7 @@ async fn handle_filter_push_stream(
 fn build_transport(
     local_key: &identity::Keypair,
     network: &WakuNetworkConfig,
-) -> Result<Boxed<(PeerId, libp2p::core::muxing::StreamMuxerBox)>, TransportInitError> {
+) -> Result<WakuBoxedTransport, TransportInitError> {
     match network.transport_profile {
         WakuTransportProfile::Direct => build_direct_transport(local_key),
         WakuTransportProfile::Tor => build_tor_transport(local_key, network),
@@ -521,7 +546,7 @@ fn build_transport(
 
 fn build_direct_transport(
     local_key: &identity::Keypair,
-) -> Result<Boxed<(PeerId, libp2p::core::muxing::StreamMuxerBox)>, TransportInitError> {
+) -> Result<WakuBoxedTransport, TransportInitError> {
     let tcp_transport = dns::tokio::Transport::system(tcp::tokio::Transport::new(
         tcp::Config::default().nodelay(true),
     ))?
@@ -555,26 +580,15 @@ fn build_direct_transport(
             .boxed()
     };
 
-    let ws_quic = ws_transport
-        .or_transport(quic_transport)
-        .map(|either, _| match either {
-            futures::future::Either::Left(v) | futures::future::Either::Right(v) => v,
-        })
-        .boxed();
+    let ws_quic = combine_transports(ws_transport, quic_transport);
 
-    let transport = ws_quic
-        .or_transport(tcp_transport)
-        .map(|either, _| match either {
-            futures::future::Either::Left(v) | futures::future::Either::Right(v) => v,
-        });
-
-    Ok(transport.boxed())
+    Ok(combine_transports(ws_quic, tcp_transport))
 }
 
 fn build_tor_transport(
     local_key: &identity::Keypair,
     network: &WakuNetworkConfig,
-) -> Result<Boxed<(PeerId, libp2p::core::muxing::StreamMuxerBox)>, TransportInitError> {
+) -> Result<WakuBoxedTransport, TransportInitError> {
     let tor_client = network
         .tor_client
         .clone()
@@ -602,21 +616,24 @@ fn build_tor_transport(
         .timeout(Duration::from_secs(20))
         .boxed();
 
-    Ok(ws_transport
-        .or_transport(tcp_transport)
+    Ok(combine_transports(ws_transport, tcp_transport))
+}
+
+fn combine_transports(left: WakuBoxedTransport, right: WakuBoxedTransport) -> WakuBoxedTransport {
+    left.or_transport(right)
         .map(|either, _| match either {
             futures::future::Either::Left(v) | futures::future::Either::Right(v) => v,
         })
-        .boxed())
+        .boxed()
 }
 
 #[derive(Clone)]
 struct ArtiTcpTransport {
-    tor_client: WakuTorClient,
+    tor_client: WakuTorClientProvider,
 }
 
 impl ArtiTcpTransport {
-    const fn new(tor_client: WakuTorClient) -> Self {
+    const fn new(tor_client: WakuTorClientProvider) -> Self {
         Self { tor_client }
     }
 }
@@ -647,6 +664,8 @@ impl libp2p::Transport for ArtiTcpTransport {
         let target = ArtiDialTarget::from_multiaddr(&addr)?;
         let tor_client = self.tor_client.clone();
         Ok(async move {
+            let tor_client = tor_client()
+                .ok_or_else(|| io::Error::other("Tor client is unavailable for Waku dial"))?;
             tor_client
                 .connect((target.host.as_str(), target.port))
                 .await

@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use arti_client::TorClient;
@@ -6,6 +7,7 @@ use tor_rtcompat::PreferredRuntime;
 use crate::discovery::DiscoveryConfig;
 
 pub type WakuTorClient = TorClient<PreferredRuntime>;
+pub type WakuTorClientProvider = Arc<dyn Fn() -> Option<WakuTorClient> + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum WakuTransportProfile {
@@ -28,7 +30,7 @@ impl WakuTransportProfile {
 pub struct WakuNetworkConfig {
     pub transport_profile: WakuTransportProfile,
     pub http_client: Option<reqwest::Client>,
-    pub tor_client: Option<WakuTorClient>,
+    pub tor_client: Option<WakuTorClientProvider>,
 }
 
 impl WakuNetworkConfig {
@@ -42,7 +44,10 @@ impl WakuNetworkConfig {
     }
 
     #[must_use]
-    pub const fn tor(tor_client: WakuTorClient, http_client: reqwest::Client) -> Self {
+    pub fn tor_with_client_provider(
+        tor_client: WakuTorClientProvider,
+        http_client: reqwest::Client,
+    ) -> Self {
         Self {
             transport_profile: WakuTransportProfile::Tor,
             http_client: Some(http_client),

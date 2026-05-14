@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use waku::proto::{HashKey, WakuMessage};
 use waku::{
     DiscoveredPeer, PeerSnapshot, PeerStats, StoreQueryOptions, WakuConfig, WakuNetworkConfig,
-    WakuNode, WakuTorClient, parse_multiaddr, parse_peer_id,
+    WakuNode, WakuTorClientProvider, parse_multiaddr, parse_peer_id,
 };
 
 pub const DEFAULT_CLUSTER_ID: u32 = 5;
@@ -34,7 +34,7 @@ pub enum RelayNetworkMode {
 pub struct RelayNetworkConfig {
     pub mode: RelayNetworkMode,
     pub http_client: Option<reqwest::Client>,
-    pub tor_client: Option<WakuTorClient>,
+    pub tor_client: Option<WakuTorClientProvider>,
 }
 
 impl RelayNetworkConfig {
@@ -48,7 +48,10 @@ impl RelayNetworkConfig {
     }
 
     #[must_use]
-    pub const fn tor(tor_client: WakuTorClient, http_client: reqwest::Client) -> Self {
+    pub fn tor_with_client_provider(
+        tor_client: WakuTorClientProvider,
+        http_client: reqwest::Client,
+    ) -> Self {
         Self {
             mode: RelayNetworkMode::Tor,
             http_client: Some(http_client),
@@ -125,7 +128,8 @@ impl Client {
                 let tor_client = tor_client.ok_or_else(|| {
                     ClientError::Disabled("Tor Waku profile requires an Arti client".to_string())
                 })?;
-                config.network = WakuNetworkConfig::tor(tor_client, http_client.clone());
+                config.network =
+                    WakuNetworkConfig::tor_with_client_provider(tor_client, http_client.clone());
             }
             let waku = Arc::new(WakuNode::spawn(config).map_err(ClientError::SpawnNode)?);
             waku.add_additional_peers(
@@ -202,6 +206,18 @@ impl Client {
     #[must_use]
     pub fn disabled_reason(&self) -> Option<&str> {
         self.disabled_reason.as_deref()
+    }
+
+    #[must_use]
+    pub fn refresh_network_session(&self) -> bool {
+        if self.network_mode != RelayNetworkMode::Tor {
+            return false;
+        }
+        let Some(waku_fleet) = self.waku_fleet.as_ref() else {
+            return false;
+        };
+        waku_fleet.refresh_network_session();
+        true
     }
 
     /// Current aggregate peer statistics from the underlying Waku node.

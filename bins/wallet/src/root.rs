@@ -458,7 +458,7 @@ fn render_network_status_popover_content(
                     .line_height(px(17.0))
                     .text_color(rgb(theme::TEXT_MUTED))
                     .child(
-                        "Future wallet HTTP/RPC requests use the active Tor session. Waku peer connections stay on their current Tor session until wallet restart.",
+                        "Future wallet HTTP/RPC requests use the active Tor session. Waku peers reconnect and rediscover using the new Tor session.",
                     ),
             )
             .child(
@@ -968,11 +968,12 @@ async fn build_wallet_startup(
     .await?;
 
     let waku_network = match http.network_mode() {
-        WalletNetworkMode::Tor => RelayNetworkConfig::tor(
-            http.arti_client()
-                .ok_or_else(|| eyre::eyre!("Tor Waku profile requires an Arti client"))?,
-            http.client.clone(),
-        ),
+        WalletNetworkMode::Tor => {
+            let tor_client = http
+                .arti_client_provider()
+                .ok_or_else(|| eyre::eyre!("Tor Waku profile requires an Arti client"))?;
+            RelayNetworkConfig::tor_with_client_provider(tor_client, http.client.clone())
+        }
         WalletNetworkMode::Proxy => RelayNetworkConfig::proxy(http.client.clone()),
         WalletNetworkMode::Direct => RelayNetworkConfig::direct(),
     };
@@ -2504,8 +2505,10 @@ impl WalletRoot {
     fn start_new_tor_session(&mut self, cx: &mut Context<'_, Self>) {
         match self.http.start_new_tor_session() {
             Ok(generation) => {
+                let waku_refreshed = self.waku.refresh_network_session();
                 tracing::info!(
                     tor_session_generation = generation,
+                    waku_refreshed,
                     "started new Tor session"
                 );
                 self.network_status_error = None;

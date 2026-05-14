@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, broadcast, mpsc, oneshot};
 use tokio::time::Instant;
 use tracing::{debug, error, trace, warn};
 
@@ -345,11 +345,22 @@ fn store_status_ok(response: &proto::store::StoreQueryResponse) -> bool {
         .is_none_or(|status_code| (200..300).contains(&status_code))
 }
 
+const fn tor_discovery_retry_delay(failures: u32) -> Duration {
+    match failures {
+        0 => Duration::from_secs(10),
+        1 => Duration::from_secs(30),
+        2 => Duration::from_secs(60),
+        _ => Duration::from_secs(300),
+    }
+}
+
 struct NodeInner {
     config: NodeConfig,
     discovery_config: DiscoveryConfig,
     network_profile: WakuTransportProfile,
     peer_book: Arc<RwLock<PeerBook>>,
+    session_refresh_disconnects: RwLock<HashSet<PeerId>>,
+    discovery_wake: Notify,
     ops: OpTracker,
     transport_tx: mpsc::Sender<TransportCmd>,
     dial_tx: mpsc::Sender<PeerId>,
@@ -374,6 +385,11 @@ impl NodeInner {
 
     fn maybe_dial(&self) {
         let book = self.peer_book.read();
+
+        if self.uses_tor_profile() && !self.session_refresh_disconnects.read().is_empty() {
+            trace!("waiting for Waku session refresh disconnects before dialing");
+            return;
+        }
 
         if book.num_connections() >= self.config.connection_cap {
             trace!(
@@ -458,20 +474,69 @@ impl NodeInner {
 
         debug!(discovered, usable, known, "applied discovered peers");
         self.maybe_dial();
-        discovered
+        usable
     }
 
     async fn run_discovery_loop(self: Arc<Self>) {
-        if let Err(error) = self.discover().await {
-            warn!(?error, "dns discovery failed");
+        let mut tor_zero_peer_failures = 0_u32;
+        loop {
+            match self.discover().await {
+                Ok(usable) if usable > 0 => tor_zero_peer_failures = 0,
+                Ok(_) => {
+                    if self.uses_tor_profile() {
+                        tor_zero_peer_failures = tor_zero_peer_failures.saturating_add(1);
+                    }
+                }
+                Err(error) => {
+                    warn!(?error, "dns discovery failed");
+                    if self.uses_tor_profile() {
+                        tor_zero_peer_failures = tor_zero_peer_failures.saturating_add(1);
+                    }
+                }
+            }
+
+            let connected = self.peer_book.read().connected.len();
+            let sleep_for = if self.uses_tor_profile() && connected == 0 {
+                tor_discovery_retry_delay(tor_zero_peer_failures.saturating_sub(1))
+            } else {
+                self.discovery_config.dns_discovery_interval
+            };
+            tokio::select! {
+                () = tokio::time::sleep(sleep_for) => {}
+                () = self.discovery_wake.notified() => {}
+            }
+        }
+    }
+
+    fn refresh_network_session(&self) {
+        let connected_peers = {
+            let book = self.peer_book.read();
+            book.connected.iter().copied().collect::<Vec<_>>()
+        };
+
+        {
+            let mut book = self.peer_book.write();
+            self.session_refresh_disconnects
+                .write()
+                .extend(connected_peers.iter().copied());
+            book.connected.clear();
+            book.dialing.clear();
+            for state in book.peers.values_mut() {
+                state.connected = false;
+                state.dial_failures = 0;
+                state.next_dial_at = None;
+            }
         }
 
-        let mut ticker = tokio::time::interval(self.discovery_config.dns_discovery_interval);
-        loop {
-            ticker.tick().await;
-            if let Err(error) = self.discover().await {
-                warn!(?error, "dns discovery failed");
-            }
+        if let Err(error) = self.transport_tx.try_send(TransportCmd::DisconnectPeers {
+            peers: connected_peers.clone(),
+        }) {
+            warn!(%error, "failed to request Waku peer disconnect after network session refresh");
+            self.session_refresh_disconnects.write().clear();
+        }
+        self.discovery_wake.notify_one();
+        if connected_peers.is_empty() {
+            self.maybe_dial();
         }
     }
 
@@ -649,16 +714,23 @@ impl NodeInner {
             }
             TransportEvent::ConnectionClosed { peer_id } => {
                 debug!(%peer_id, "disconnected");
+                let suppress_backoff = self.session_refresh_disconnects.write().remove(&peer_id);
                 {
                     let mut book = self.peer_book.write();
                     book.connected.remove(&peer_id);
-                    book.dialing.remove(&peer_id);
+                    if !suppress_backoff {
+                        book.dialing.remove(&peer_id);
+                    }
                     if let Some(state) = book.peers.get_mut(&peer_id) {
                         state.connected = false;
-                        state.dial_failures = state.dial_failures.saturating_add(1);
-                        let pow = state.dial_failures.min(8);
-                        let backoff = Duration::from_secs(1 << pow);
-                        state.next_dial_at = Some(Instant::now() + backoff);
+                        if suppress_backoff {
+                            state.next_dial_at = None;
+                        } else {
+                            state.dial_failures = state.dial_failures.saturating_add(1);
+                            let pow = state.dial_failures.min(8);
+                            let backoff = Duration::from_secs(1 << pow);
+                            state.next_dial_at = Some(Instant::now() + backoff);
+                        }
                     }
                 }
                 self.maybe_dial();
@@ -1294,6 +1366,8 @@ impl WakuNode {
             discovery_config,
             network_profile: config.network.transport_profile,
             peer_book: Arc::new(RwLock::new(PeerBook::default())),
+            session_refresh_disconnects: RwLock::new(HashSet::new()),
+            discovery_wake: Notify::new(),
             ops: OpTracker::new(),
             transport_tx,
             dial_tx,
@@ -1336,6 +1410,15 @@ impl WakuNode {
 
     pub fn add_additional_peers(&self, peers: Vec<discovery::DiscoveredPeer>) {
         self.inner.apply_discovered_peers(peers);
+    }
+
+    /// Refresh peer dialing after the underlying network session changes.
+    ///
+    /// Existing connections are closed, dial backoff is cleared, known peers are
+    /// retried immediately, and DNS discovery is re-run without waiting for the
+    /// normal discovery interval.
+    pub fn refresh_network_session(&self) {
+        self.inner.refresh_network_session();
     }
 
     /// Get peer statistics
@@ -1794,5 +1877,22 @@ impl WakuNode {
             )
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tor_discovery_retry_delay_backs_off_and_caps() {
+        assert_eq!(tor_discovery_retry_delay(0), Duration::from_secs(10));
+        assert_eq!(tor_discovery_retry_delay(1), Duration::from_secs(30));
+        assert_eq!(tor_discovery_retry_delay(2), Duration::from_secs(60));
+        assert_eq!(tor_discovery_retry_delay(3), Duration::from_secs(300));
+        assert_eq!(
+            tor_discovery_retry_delay(u32::MAX),
+            Duration::from_secs(300)
+        );
     }
 }
