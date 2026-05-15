@@ -14,6 +14,7 @@ ark-groth16 = { workspace = true }
 ark-relations = "0.6"
 ark-serialize = "0.6"
 ark-std = "0.6"
+async-trait = { workspace = true }
 bloock-blake-rs = "0.1.0"
 bip39 = "2"
 brotli = "8.0.2"

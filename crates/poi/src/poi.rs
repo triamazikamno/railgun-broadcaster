@@ -12,6 +12,7 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::debug;
 
 pub const DEFAULT_WALLET_POI_RPC_URL: &str = "https://ppoi.fdi.network";
@@ -260,6 +261,9 @@ const POI_SUBMIT_TRANSACT_PROOF_METHOD: &str = "ppoi_submit_transact_proof";
 const POI_SUBMIT_SINGLE_COMMITMENT_PROOFS_METHOD: &str = "ppoi_submit_single_commitment_proofs";
 const POI_POIS_PER_LIST_METHOD: &str = "ppoi_pois_per_list";
 const POI_MERKLE_PROOFS_METHOD: &str = "ppoi_merkle_proofs";
+const POI_EVENTS_METHOD: &str = "ppoi_poi_events";
+const POI_MERKLETREE_LEAVES_METHOD: &str = "ppoi_poi_merkletree_leaves";
+const POI_BLOCKED_SHIELDS_METHOD: &str = "ppoi_blocked_shields";
 
 #[derive(Debug, Serialize)]
 struct JsonRpcReq<T> {
@@ -461,12 +465,77 @@ struct GetMerkleProofsParams {
     blinded_commitments: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GetPoiListEventRangeParams {
+    #[serde(flatten)]
+    chain: ChainParams,
+    list_key: String,
+    start_index: u64,
+    end_index: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GetPoiMerkletreeLeavesParams {
+    #[serde(flatten)]
+    chain: ChainParams,
+    list_key: String,
+    start_index: u64,
+    end_index: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GetBlockedShieldsParams<'a> {
+    #[serde(flatten)]
+    chain: ChainParams,
+    list_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bloom_filter_serialized: Option<&'a str>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoiMerkleProof {
     pub leaf: String,
     pub elements: Vec<String>,
     pub indices: String,
     pub root: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PoiEventType {
+    Shield,
+    Transact,
+    Unshield,
+    LegacyTransact,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignedPoiEvent {
+    pub index: u64,
+    pub blinded_commitment: String,
+    pub signature: String,
+    #[serde(rename = "type")]
+    pub event_type: PoiEventType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PoiSyncedListEvent {
+    #[serde(rename = "signedPOIEvent")]
+    pub signed_poi_event: SignedPoiEvent,
+    pub validated_merkleroot: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockedShield {
+    pub commitment_hash: String,
+    pub blinded_commitment: String,
+    pub block_reason: Option<String>,
+    pub signature: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -592,6 +661,7 @@ impl PoiRpcClient {
     where
         P: Serialize,
     {
+        let started = Instant::now();
         let req = JsonRpcReq {
             jsonrpc: "2.0",
             id: self.next_id(),
@@ -609,10 +679,23 @@ impl PoiRpcClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
+            debug!(
+                method,
+                %status,
+                response_bytes = body.len(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "POI RPC request failed"
+            );
             return Err(PoiRpcError::HttpStatus { status, body });
         }
 
         let body = resp.text().await?;
+        debug!(
+            method,
+            response_bytes = body.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "POI RPC request complete"
+        );
         Ok(body)
     }
 
@@ -748,6 +831,52 @@ impl PoiRpcClient {
                 .iter()
                 .map(hex::encode_prefixed)
                 .collect(),
+        }
+    }
+
+    fn poi_events_params(
+        txid_version: &str,
+        chain_type: u8,
+        chain_id: u64,
+        list_key: &FixedBytes<32>,
+        start_index: u64,
+        end_index: u64,
+    ) -> GetPoiListEventRangeParams {
+        GetPoiListEventRangeParams {
+            chain: Self::chain_params(txid_version, chain_type, chain_id),
+            list_key: hex::encode(list_key),
+            start_index,
+            end_index,
+        }
+    }
+
+    fn poi_merkletree_leaves_params(
+        txid_version: &str,
+        chain_type: u8,
+        chain_id: u64,
+        list_key: &FixedBytes<32>,
+        start_index: u64,
+        end_index: u64,
+    ) -> GetPoiMerkletreeLeavesParams {
+        GetPoiMerkletreeLeavesParams {
+            chain: Self::chain_params(txid_version, chain_type, chain_id),
+            list_key: hex::encode(list_key),
+            start_index,
+            end_index,
+        }
+    }
+
+    fn blocked_shields_params<'a>(
+        txid_version: &str,
+        chain_type: u8,
+        chain_id: u64,
+        list_key: &FixedBytes<32>,
+        bloom_filter_serialized: Option<&'a str>,
+    ) -> GetBlockedShieldsParams<'a> {
+        GetBlockedShieldsParams {
+            chain: Self::chain_params(txid_version, chain_type, chain_id),
+            list_key: hex::encode(list_key),
+            bloom_filter_serialized,
         }
     }
 
@@ -919,6 +1048,73 @@ impl PoiRpcClient {
         )
         .await
     }
+
+    pub async fn poi_events(
+        &self,
+        txid_version: &str,
+        chain_type: u8,
+        chain_id: u64,
+        list_key: &FixedBytes<32>,
+        start_index: u64,
+        end_index: u64,
+    ) -> Result<Vec<PoiSyncedListEvent>, PoiRpcError> {
+        self.send_request(
+            POI_EVENTS_METHOD,
+            Self::poi_events_params(
+                txid_version,
+                chain_type,
+                chain_id,
+                list_key,
+                start_index,
+                end_index,
+            ),
+        )
+        .await
+    }
+
+    pub async fn poi_merkletree_leaves(
+        &self,
+        txid_version: &str,
+        chain_type: u8,
+        chain_id: u64,
+        list_key: &FixedBytes<32>,
+        start_index: u64,
+        end_index: u64,
+    ) -> Result<Vec<String>, PoiRpcError> {
+        self.send_request(
+            POI_MERKLETREE_LEAVES_METHOD,
+            Self::poi_merkletree_leaves_params(
+                txid_version,
+                chain_type,
+                chain_id,
+                list_key,
+                start_index,
+                end_index,
+            ),
+        )
+        .await
+    }
+
+    pub async fn blocked_shields(
+        &self,
+        txid_version: &str,
+        chain_type: u8,
+        chain_id: u64,
+        list_key: &FixedBytes<32>,
+        bloom_filter_serialized: Option<&str>,
+    ) -> Result<Vec<BlockedShield>, PoiRpcError> {
+        self.send_request(
+            POI_BLOCKED_SHIELDS_METHOD,
+            Self::blocked_shields_params(
+                txid_version,
+                chain_type,
+                chain_id,
+                list_key,
+                bloom_filter_serialized,
+            ),
+        )
+        .await
+    }
 }
 
 fn decode_json_rpc_response<R>(body: &str) -> Result<R, PoiRpcError>
@@ -965,8 +1161,9 @@ fn encode_u256_bare(value: U256) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlindedCommitmentData, DEFAULT_ACTIVE_POI_LIST_KEY_HEX, DEFAULT_WALLET_POI_RPC_URL,
-        PoiMerkleProof, PoiRpcClient, PoiStatus, SingleCommitmentProofContext,
+        BlindedCommitmentData, BlockedShield, DEFAULT_ACTIVE_POI_LIST_KEY_HEX,
+        DEFAULT_WALLET_POI_RPC_URL, PoiEventType, PoiMerkleProof, PoiRpcClient, PoiStatus,
+        PoiSyncedListEvent, SignedPoiEvent, SingleCommitmentProofContext,
         ValidatedRailgunTxidStatus, decode_json_rpc_ack_response, decode_json_rpc_response,
         default_active_poi_list_key, encode_u256_bare, railgun_txid_leaf_hash,
     };
@@ -1270,6 +1467,82 @@ mod tests {
         assert_eq!(proofs[0].elements, vec!["0x22".to_string()]);
         assert_eq!(proofs[0].indices, "0x00");
         assert_eq!(proofs[0].root, "0x33");
+    }
+
+    #[test]
+    fn poi_events_query_serializes_range() {
+        let context = sample_context();
+        let list_key = context.required_poi_list_keys[0];
+        let params = PoiRpcClient::poi_events_params(&context.txid_version, 0, 1, &list_key, 5, 10);
+        let json = to_value(params).expect("serialize poi events params");
+
+        assert_eq!(json["txidVersion"], "V3_PoseidonMerkle");
+        assert_eq!(json["chainType"], "0");
+        assert_eq!(json["chainID"], "1");
+        assert_eq!(json["listKey"], hex::encode(list_key));
+        assert_eq!(json["startIndex"], 5);
+        assert_eq!(json["endIndex"], 10);
+    }
+
+    #[test]
+    fn poi_merkletree_leaves_query_serializes_range() {
+        let context = sample_context();
+        let list_key = context.required_poi_list_keys[0];
+        let params = PoiRpcClient::poi_merkletree_leaves_params(
+            &context.txid_version,
+            0,
+            1,
+            &list_key,
+            5,
+            10,
+        );
+        let json = to_value(params).expect("serialize poi leaves params");
+
+        assert_eq!(json["txidVersion"], "V3_PoseidonMerkle");
+        assert_eq!(json["listKey"], hex::encode(list_key));
+        assert_eq!(json["startIndex"], 5);
+        assert_eq!(json["endIndex"], 10);
+    }
+
+    #[test]
+    fn blocked_shields_query_omits_bloom_filter_when_absent() {
+        let context = sample_context();
+        let list_key = context.required_poi_list_keys[0];
+        let params =
+            PoiRpcClient::blocked_shields_params(&context.txid_version, 0, 1, &list_key, None);
+        let json = to_value(params).expect("serialize blocked shields params");
+
+        assert_eq!(json["txidVersion"], "V3_PoseidonMerkle");
+        assert_eq!(json["listKey"], hex::encode(list_key));
+        assert!(json.get("bloomFilterSerialized").is_none());
+    }
+
+    #[test]
+    fn bulk_poi_responses_decode() {
+        let events: Vec<PoiSyncedListEvent> = decode_json_rpc_response(
+            r#"{"result":[{"signedPOIEvent":{"index":7,"blindedCommitment":"0x11","signature":"sig","type":"Shield"},"validatedMerkleroot":"0x22"}]}"#,
+        )
+        .expect("decode poi events");
+        let blocked_shields: Vec<BlockedShield> = decode_json_rpc_response(
+            r#"{"result":[{"commitmentHash":"0x33","blindedCommitment":"0x44","blockReason":"blocked","signature":"sig"}]}"#,
+        )
+        .expect("decode blocked shields");
+
+        assert_eq!(events[0].signed_poi_event.index, 7);
+        assert_eq!(events[0].signed_poi_event.event_type, PoiEventType::Shield);
+        assert_eq!(events[0].validated_merkleroot, "0x22");
+        assert_eq!(blocked_shields[0].blinded_commitment, "0x44");
+        assert_eq!(blocked_shields[0].block_reason.as_deref(), Some("blocked"));
+
+        let signed = SignedPoiEvent {
+            index: 8,
+            blinded_commitment: "0x55".to_string(),
+            signature: "sig".to_string(),
+            event_type: PoiEventType::Transact,
+        };
+        let json = to_value(signed).expect("serialize signed poi event");
+        assert_eq!(json["type"], "Transact");
+        assert_eq!(json["blindedCommitment"], "0x55");
     }
 
     #[test]

@@ -16,9 +16,9 @@ use merkletree::quick::{GraphPostError, post_graphql_data};
 use merkletree::tree::{MerkleForest, MerkleTree};
 use railgun_wallet::prover::ProverError;
 use railgun_wallet::tx::{
-    InputWitness, PostTransactionPoiData, PostTransactionPoiGenerationRequest,
-    PreTransactionPoiError, PreTransactionPoiMap, PrivateInputs, PublicInputs,
-    TransactionPlanChunk, generate_post_transaction_pois,
+    InputWitness, PoiMerkleProofSource, PostTransactionPoiData,
+    PostTransactionPoiGenerationRequest, PreTransactionPoiError, PreTransactionPoiMap,
+    PrivateInputs, PublicInputs, TransactionPlanChunk, generate_post_transaction_pois,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -30,10 +30,12 @@ use local_db::{
     DbStore, OutputPoiRecoveryAction, OutputPoiRecoveryRecord, OutputPoiRecoveryStatus,
     PendingOutputPoiContextRecord, PendingOutputPoiObservation, PendingOutputPoiRole,
 };
+use poi::cache::{PoiCache, PoiCacheIdentity};
 use poi::error::PoiError;
 use poi::poi::{
-    BlindedCommitmentData, BlindedCommitmentType, DEFAULT_WALLET_POI_RPC_URL, PoiRpcClient,
-    SingleCommitmentProofContext, ValidatedRailgunTxidStatus, default_active_poi_list_keys,
+    BlindedCommitmentData, BlindedCommitmentType, DEFAULT_WALLET_POI_RPC_URL, PoiMerkleProof,
+    PoiRpcClient, SingleCommitmentProofContext, ValidatedRailgunTxidStatus,
+    default_active_poi_list_keys,
 };
 use railgun_wallet::scan::{
     CommitmentObservation, WalletLogDelta, WalletScanError, parse_wallet_delta_from_logs,
@@ -45,7 +47,9 @@ use railgun_wallet::{
 };
 use url::Url;
 
-use crate::types::{BackfillEvent, SharedLogBatch, WalletCacheStore, WalletConfig};
+use crate::types::{
+    BackfillEvent, SharedLogBatch, WalletCacheStore, WalletConfig, WalletLocalPoiCaches,
+};
 
 pub const WALLET_POI_STATUS_BATCH_SIZE: usize = 1000;
 pub const WALLET_POI_RECOVERABLE_REFRESH_AFTER: Duration = Duration::from_secs(60);
@@ -177,6 +181,90 @@ impl PoiStatusReader for PoiRpcClient {
             blinded_commitment_datas,
         )
         .await
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct LocalPoiStatusReader {
+    caches: WalletLocalPoiCaches,
+}
+
+impl LocalPoiStatusReader {
+    pub(crate) fn new(caches: WalletLocalPoiCaches) -> Self {
+        Self { caches }
+    }
+}
+
+#[async_trait]
+impl PoiStatusReader for LocalPoiStatusReader {
+    async fn pois_per_list(
+        &self,
+        txid_version: &str,
+        chain_type: u8,
+        chain_id: u64,
+        list_keys: &[FixedBytes<32>],
+        blinded_commitment_datas: &[BlindedCommitmentData],
+    ) -> Result<BTreeMap<FixedBytes<32>, BTreeMap<FixedBytes<32>, PoiStatus>>, PoiError> {
+        let caches = self.caches.read().await;
+        Ok(blinded_commitment_datas
+            .iter()
+            .map(|data| {
+                let per_list = list_keys
+                    .iter()
+                    .copied()
+                    .map(|list_key| {
+                        let status = caches
+                            .get(&list_key)
+                            .filter(|cache| {
+                                cache.identity().chain_type == chain_type
+                                    && cache.identity().chain_id == chain_id
+                                    && cache.identity().txid_version == txid_version
+                            })
+                            .map_or(PoiStatus::Unknown, |cache| cache.status_for_data(data));
+                        (list_key, status)
+                    })
+                    .collect();
+                (data.blinded_commitment, per_list)
+            })
+            .collect())
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct LocalPoiMerkleProofSource {
+    caches: WalletLocalPoiCaches,
+}
+
+impl LocalPoiMerkleProofSource {
+    pub(crate) fn new(caches: WalletLocalPoiCaches) -> Self {
+        Self { caches }
+    }
+}
+
+#[async_trait]
+impl PoiMerkleProofSource for LocalPoiMerkleProofSource {
+    async fn poi_merkle_proofs(
+        &self,
+        txid_version: &str,
+        chain_type: u8,
+        chain_id: u64,
+        list_key: &FixedBytes<32>,
+        blinded_commitments: &[FixedBytes<32>],
+    ) -> Result<Vec<PoiMerkleProof>, PreTransactionPoiError> {
+        let mut caches = self.caches.write().await;
+        let Some(cache) = caches.get_mut(list_key).filter(|cache| {
+            cache.identity().chain_type == chain_type
+                && cache.identity().chain_id == chain_id
+                && cache.identity().txid_version == txid_version
+        }) else {
+            return Err(PreTransactionPoiError::ProofSource(format!(
+                "local POI cache unavailable for listKey={}",
+                hex::encode(list_key)
+            )));
+        };
+        cache
+            .poi_merkle_proofs(blinded_commitments)
+            .map_err(|err| PreTransactionPoiError::ProofSource(err.to_string()))
     }
 }
 
@@ -788,6 +876,7 @@ struct OutputPoiRecoveryRequest<'a> {
     http_client: Option<&'a reqwest::Client>,
     forest: &'a MerkleForest,
     poi_client: &'a PoiRpcClient,
+    proof_source: &'a (dyn PoiMerkleProofSource + 'a),
     submitter: &'a dyn PendingOutputPoiSubmitter,
     active_list_keys: &'a [FixedBytes<32>],
     wallet_utxos: &'a [WalletUtxo],
@@ -1008,7 +1097,7 @@ async fn recover_missing_output_pois(request: OutputPoiRecoveryRequest<'_>) -> u
             chain_id: request.cfg.chain.chain_id,
             txid_version: Some(DEFAULT_TXID_VERSION),
             required_poi_list_keys: request.active_list_keys,
-            poi_client: request.poi_client,
+            proof_source: request.proof_source,
             prover,
             verify_proof: OUTPUT_POI_RECOVERY_VERIFY_PROOF,
         })
@@ -2200,6 +2289,126 @@ async fn refresh_wallet_poi_statuses_selected(
     changed
 }
 
+async fn sync_local_poi_caches(
+    client: &PoiRpcClient,
+    local_caches: &WalletLocalPoiCaches,
+    cache_key: &str,
+    chain_id: u64,
+    active_list_keys: &[FixedBytes<32>],
+    validate_roots: bool,
+) {
+    let mut caches = local_caches.write().await;
+    for list_key in active_list_keys {
+        caches.entry(*list_key).or_insert_with(|| {
+            PoiCache::new(PoiCacheIdentity::new(
+                EVM_CHAIN_TYPE,
+                chain_id,
+                DEFAULT_TXID_VERSION,
+                *list_key,
+            ))
+        });
+    }
+    for list_key in active_list_keys {
+        let Some(cache) = caches.get_mut(list_key) else {
+            continue;
+        };
+        let sync_started = Instant::now();
+        match cache.sync(client).await {
+            Ok(outcome) => {
+                debug!(
+                    cache_key,
+                    chain_id,
+                    list_key = %hex::encode(list_key),
+                    events = outcome.events,
+                    leaves = outcome.leaves,
+                    blocked_shields = outcome.blocked_shields,
+                    elapsed_ms = sync_started.elapsed().as_millis(),
+                    "local POI cache sync complete"
+                );
+                if validate_roots {
+                    match cache.validate_roots(client).await {
+                        Ok(true) => {
+                            debug!(
+                                cache_key,
+                                chain_id,
+                                list_key = %hex::encode(list_key),
+                                "local POI cache roots accepted"
+                            );
+                        }
+                        Ok(false) => {
+                            warn!(
+                                cache_key,
+                                chain_id,
+                                list_key = %hex::encode(list_key),
+                                "local POI cache roots rejected"
+                            );
+                        }
+                        Err(err) => {
+                            warn!(
+                                ?err,
+                                cache_key,
+                                chain_id,
+                                list_key = %hex::encode(list_key),
+                                "local POI cache root validation failed"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                warn!(
+                    ?err,
+                    cache_key,
+                    chain_id,
+                    list_key = %hex::encode(list_key),
+                    elapsed_ms = sync_started.elapsed().as_millis(),
+                    "local POI cache sync failed; using existing local cache state"
+                );
+            }
+        }
+    }
+}
+
+async fn refresh_wallet_poi_statuses_selected_with_config(
+    remote_client: &PoiRpcClient,
+    local_caches: Option<&WalletLocalPoiCaches>,
+    cache_key: &str,
+    chain_id: u64,
+    active_list_keys: &[FixedBytes<32>],
+    wallet_utxos: &mut [WalletUtxo],
+    selection: WalletPoiRefreshSelection,
+) -> bool {
+    if let Some(local_caches) = local_caches {
+        sync_local_poi_caches(
+            remote_client,
+            local_caches,
+            cache_key,
+            chain_id,
+            active_list_keys,
+            false,
+        )
+        .await;
+        let reader = LocalPoiStatusReader::new(Arc::clone(local_caches));
+        refresh_wallet_poi_statuses_selected(
+            &reader,
+            chain_id,
+            active_list_keys,
+            wallet_utxos,
+            selection,
+        )
+        .await
+    } else {
+        refresh_wallet_poi_statuses_selected(
+            remote_client,
+            chain_id,
+            active_list_keys,
+            wallet_utxos,
+            selection,
+        )
+        .await
+    }
+}
+
 pub(crate) fn wallet_poi_status_refresh_needed(
     wallet_utxos: &[WalletUtxo],
     active_list_keys: &[FixedBytes<32>],
@@ -2507,6 +2716,29 @@ async fn refresh_wallet_poi_statuses_and_persist(
     true
 }
 
+async fn refresh_wallet_poi_statuses_and_persist_with_config(
+    remote_client: &PoiRpcClient,
+    local_caches: Option<&WalletLocalPoiCaches>,
+    persist: WalletPoiStatusRefreshPersist<'_>,
+    selection: WalletPoiRefreshSelection,
+) -> bool {
+    if let Some(local_caches) = local_caches {
+        sync_local_poi_caches(
+            remote_client,
+            local_caches,
+            &persist.cfg.cache_key,
+            persist.cfg.chain.chain_id,
+            persist.active_list_keys,
+            false,
+        )
+        .await;
+        let reader = LocalPoiStatusReader::new(Arc::clone(local_caches));
+        refresh_wallet_poi_statuses_and_persist(&reader, persist, selection).await
+    } else {
+        refresh_wallet_poi_statuses_and_persist(remote_client, persist, selection).await
+    }
+}
+
 struct OutputPoiRecoveryRun<'a> {
     db: &'a DbStore,
     cfg: &'a WalletConfig,
@@ -2529,6 +2761,26 @@ async fn recover_missing_output_pois_from_wallet(run: OutputPoiRecoveryRun<'_>) 
         return 0;
     }
     let forest = run.forest.read().await.clone();
+    let local_proof_source = if let Some(local_caches) = run.cfg.local_poi_caches.as_ref() {
+        sync_local_poi_caches(
+            run.client,
+            local_caches,
+            &run.cfg.cache_key,
+            run.cfg.chain.chain_id,
+            run.active_list_keys,
+            true,
+        )
+        .await;
+        Some(LocalPoiMerkleProofSource::new(Arc::clone(local_caches)))
+    } else {
+        None
+    };
+    let proof_source: &(dyn PoiMerkleProofSource + '_);
+    if let Some(source) = local_proof_source.as_ref() {
+        proof_source = source;
+    } else {
+        proof_source = run.client;
+    }
     recover_missing_output_pois(OutputPoiRecoveryRequest {
         db: run.db,
         cfg: run.cfg,
@@ -2536,6 +2788,7 @@ async fn recover_missing_output_pois_from_wallet(run: OutputPoiRecoveryRun<'_>) 
         http_client: run.http_client,
         forest: &forest,
         poi_client: run.client,
+        proof_source,
         submitter: run.client,
         active_list_keys: run.active_list_keys,
         wallet_utxos: &snapshot,
@@ -2629,8 +2882,9 @@ pub(crate) fn spawn_wallet_worker(
                         continue;
                     }
                     set_poi_refreshing(&poi_refreshing_tx, true, &cfg.cache_key);
-                    let changed = refresh_wallet_poi_statuses_and_persist(
+                    let changed = refresh_wallet_poi_statuses_and_persist_with_config(
                         client,
+                        cfg.local_poi_caches.as_ref(),
                         WalletPoiStatusRefreshPersist {
                             cache_store: cache_store.as_ref(),
                             cfg: &cfg,
@@ -2690,8 +2944,9 @@ pub(crate) fn spawn_wallet_worker(
                         continue;
                     }
                     set_poi_refreshing(&poi_refreshing_tx, true, &cfg.cache_key);
-                    let changed = refresh_wallet_poi_statuses_and_persist(
+                    let changed = refresh_wallet_poi_statuses_and_persist_with_config(
                         client,
+                        cfg.local_poi_caches.as_ref(),
                         WalletPoiStatusRefreshPersist {
                             cache_store: cache_store.as_ref(),
                             cfg: &cfg,
@@ -2898,8 +3153,9 @@ pub(crate) fn spawn_wallet_worker(
                                 };
                                 if refresh_needed {
                                     set_poi_refreshing(&poi_refreshing_tx, true, &cfg.cache_key);
-                                    let changed = refresh_wallet_poi_statuses_and_persist(
+                                    let changed = refresh_wallet_poi_statuses_and_persist_with_config(
                                         client,
+                                        cfg.local_poi_caches.as_ref(),
                                         WalletPoiStatusRefreshPersist {
                                             cache_store: cache_store.as_ref(),
                                             cfg: &cfg,
@@ -3034,8 +3290,10 @@ pub(crate) fn spawn_wallet_worker(
                                         && let Some(client) = poi_status_client.as_ref()
                                     {
                                         let mut locked = utxos.write().await;
-                                        changed |= refresh_wallet_poi_statuses_selected(
+                                        changed |= refresh_wallet_poi_statuses_selected_with_config(
                                             client,
+                                            cfg.local_poi_caches.as_ref(),
+                                            &cfg.cache_key,
                                             cfg.chain.chain_id,
                                             &active_poi_list_keys,
                                             &mut locked,
@@ -3132,13 +3390,14 @@ fn wallet_utxo_counts(utxos: &[WalletUtxo]) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_TXID_VERSION, OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER,
-        OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER, PendingOutputPoiSubmitter, PoiStatusReader,
-        RecoveryGraphRailgunTransaction, WALLET_METADATA_LIVE_FLUSH_BLOCKS,
-        WALLET_METADATA_LIVE_FLUSH_INTERVAL, WALLET_POI_RECOVERABLE_REFRESH_AFTER,
-        WALLET_POI_STATUS_BATCH_SIZE, WalletHandle, WalletLiveMetadataFlush, WalletPersistState,
-        WalletPoiRefreshRequest, WalletPoiRefreshSelection, WalletProgressPersist,
-        apply_wallet_delta_to_vec, apply_wallet_delta_to_vec_with_outcome,
+        DEFAULT_TXID_VERSION, EVM_CHAIN_TYPE, LocalPoiStatusReader,
+        OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER, OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
+        PendingOutputPoiSubmitter, PoiStatusReader, RecoveryGraphRailgunTransaction,
+        WALLET_METADATA_LIVE_FLUSH_BLOCKS, WALLET_METADATA_LIVE_FLUSH_INTERVAL,
+        WALLET_POI_RECOVERABLE_REFRESH_AFTER, WALLET_POI_STATUS_BATCH_SIZE, WalletHandle,
+        WalletLiveMetadataFlush, WalletPersistState, WalletPoiRefreshRequest,
+        WalletPoiRefreshSelection, WalletProgressPersist, apply_wallet_delta_to_vec,
+        apply_wallet_delta_to_vec_with_outcome,
         discard_pending_output_poi_contexts_for_spent_outputs, output_poi_recovery_candidates,
         output_poi_recovery_proof_retry_after, output_start_global_position,
         pending_output_poi_submit_identity, process_pending_output_poi_observations,
@@ -3147,6 +3406,7 @@ mod tests {
         wallet_poi_status_refresh_needed, wallet_poi_status_refresh_needed_for_selection,
     };
     use crate::types::{ChainKey, WalletCacheStore, WalletConfig};
+    use alloy::hex;
     use alloy::primitives::{Address, Bytes, FixedBytes, U64, U256};
     use alloy::uint;
     use async_trait::async_trait;
@@ -3159,6 +3419,7 @@ mod tests {
         OutputPoiRecoveryStatus, PendingOutputPoiContextRecord, PendingOutputPoiRole, WalletMeta,
     };
     use merkletree::tree::{MerkleForest, MerkleTreeUpdate};
+    use poi::cache::{PoiCache, PoiCacheIdentity};
     use poi::error::PoiError;
     use poi::poi::{BlindedCommitmentData, SingleCommitmentProofContext};
     use railgun_wallet::scan::{CommitmentObservation, SpentNullifier, WalletLogDelta};
@@ -3216,6 +3477,7 @@ mod tests {
             progress_tx: None,
             cache_store: None,
             poi_recovery_prover: None,
+            local_poi_caches: None,
             use_indexed_wallet_catch_up: true,
         }
     }
@@ -3969,6 +4231,55 @@ mod tests {
             wallet_utxo.utxo.poi.is_valid_for_lists(&list_keys)
                 && wallet_utxo.utxo.poi.refreshed_at.is_some()
         }));
+    }
+
+    #[tokio::test]
+    async fn local_poi_status_refresh_reads_cache_without_remote_pois_per_list() {
+        let list_key = FixedBytes::from([0x11; 32]);
+        let list_keys = vec![list_key];
+        let mut wallet_utxos = vec![test_wallet_utxo(1), test_wallet_utxo(2)];
+        let valid_blinded_commitment = wallet_utxos[0].utxo.poi.blinded_commitment;
+        let missing_blinded_commitment = wallet_utxos[1].utxo.poi.blinded_commitment;
+        let mut cache = PoiCache::new(PoiCacheIdentity::new(
+            EVM_CHAIN_TYPE,
+            1,
+            DEFAULT_TXID_VERSION,
+            list_key,
+        ));
+        cache
+            .apply_poi_leaves(0, &[hex::encode_prefixed(valid_blinded_commitment)])
+            .expect("apply local poi leaf");
+        let local_caches = Arc::new(RwLock::new(BTreeMap::from([(list_key, cache)])));
+        let local_reader = LocalPoiStatusReader::new(local_caches);
+        let unused_remote = RecordingPoiStatusClient::default();
+
+        let changed = refresh_wallet_poi_statuses_selected(
+            &local_reader,
+            1,
+            &list_keys,
+            &mut wallet_utxos,
+            WalletPoiRefreshSelection::RequiredOrRecoverable,
+        )
+        .await;
+
+        assert!(changed);
+        assert!(unused_remote.calls().is_empty());
+        assert_eq!(
+            wallet_utxos[0].utxo.poi.statuses.get(&list_key),
+            Some(&PoiStatus::Valid)
+        );
+        assert_eq!(
+            wallet_utxos[1].utxo.poi.statuses.get(&list_key),
+            Some(&PoiStatus::Missing)
+        );
+        assert_eq!(
+            wallet_utxos[0].utxo.poi.blinded_commitment,
+            valid_blinded_commitment
+        );
+        assert_eq!(
+            wallet_utxos[1].utxo.poi.blinded_commitment,
+            missing_blinded_commitment
+        );
     }
 
     #[tokio::test]

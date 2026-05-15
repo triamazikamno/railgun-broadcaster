@@ -1,15 +1,16 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy::primitives::{Address, U256, address};
+use alloy::primitives::{Address, FixedBytes, U256, address};
 use alloy_rpc_types_eth::Log;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use local_db::{DbStore, WalletMeta};
+use poi::cache::PoiCache;
 use railgun_wallet::scan::{WalletLogDelta, WalletScanKeys};
 use railgun_wallet::wallet_cache::{WalletCacheDbExt, WalletCacheError};
 use railgun_wallet::{ProverService, WalletUtxo};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{RwLock, mpsc, watch};
 use url::Url;
 
 pub const DEFAULT_INDEXED_WALLET_BLOCK_RANGE: u64 = 100_000;
@@ -73,6 +74,7 @@ impl SyncProgressUpdate {
 }
 
 pub type SyncProgressSender = watch::Sender<Option<SyncProgressUpdate>>;
+pub type WalletLocalPoiCaches = Arc<RwLock<BTreeMap<FixedBytes<32>, PoiCache>>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChainKey {
@@ -327,6 +329,7 @@ pub struct WalletConfig {
     pub progress_tx: Option<SyncProgressSender>,
     pub cache_store: Option<Arc<dyn WalletCacheStore>>,
     pub poi_recovery_prover: Option<ProverService>,
+    pub local_poi_caches: Option<WalletLocalPoiCaches>,
     pub use_indexed_wallet_catch_up: bool,
 }
 

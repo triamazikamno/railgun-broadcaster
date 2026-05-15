@@ -522,6 +522,7 @@ impl BroadcasterService {
                     progress_tx: None,
                     cache_store: None,
                     poi_recovery_prover: Some((*poi_recovery_prover).clone()),
+                    local_poi_caches: None,
                     use_indexed_wallet_catch_up: true,
                 };
                 let handle = sync_manager.add_wallet(wallet_cfg).await?;

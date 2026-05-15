@@ -21,6 +21,10 @@ pub(crate) struct Options {
     /// Wallet network mode: tor (default), proxy, or direct.
     #[structopt(long, possible_values = &["tor", "proxy", "direct"])]
     pub(crate) network_mode: Option<WalletNetworkMode>,
+
+    /// Enable the experimental local POI cache for smoke testing.
+    #[structopt(long)]
+    pub(crate) local_poi_cache: bool,
 }
 
 pub(crate) fn default_db_path() -> PathBuf {

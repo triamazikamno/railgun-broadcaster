@@ -30,6 +30,9 @@ struct Options {
     /// Wallet network mode: tor (default), proxy, or direct.
     #[structopt(long, global = true, possible_values = &["tor", "proxy", "direct"])]
     network_mode: Option<WalletNetworkMode>,
+    /// Enable the experimental local POI cache for smoke testing.
+    #[structopt(long, global = true)]
+    local_poi_cache: bool,
     #[structopt(subcommand)]
     command: Command,
 }
@@ -141,15 +144,21 @@ async fn main() -> Result<()> {
         network_mode = %http_client.network_mode(),
         network_status = http_client.network_status_label(),
         network_detail = %http_client.network_status_detail(),
+        local_poi_cache = options.local_poi_cache,
         "wallet-cli network context ready"
     );
+    let local_poi_cache = options.local_poi_cache;
     match options.command {
         Command::ListUtxos(opts) => {
-            let output = list_utxos(opts.into(), rpc_url_override, &http_client).await?;
+            let mut request: ListUtxosRequest = opts.into();
+            request.use_local_poi_cache = local_poi_cache;
+            let output = list_utxos(request, rpc_url_override, &http_client).await?;
             print_json(&output)
         }
         Command::Unshield(opts) => {
-            let output = unshield(opts.into(), rpc_url_override, &http_client).await?;
+            let mut request: UnshieldRequest = opts.into();
+            request.use_local_poi_cache = local_poi_cache;
+            let output = unshield(request, rpc_url_override, &http_client).await?;
             match output {
                 UnshieldResult::Calldata(output) => print_json(&output),
                 UnshieldResult::Sent(output) => print_json(&output),
@@ -182,6 +191,7 @@ impl From<ListUtxosOptions> for ListUtxosRequest {
             init_block_number: value.init_block_number,
             sync_to_block: None,
             use_indexed_wallet_catch_up: true,
+            use_local_poi_cache: false,
         }
     }
 }
@@ -198,6 +208,7 @@ impl From<UnshieldOptions> for UnshieldRequest {
             init_block_number: value.init_block_number,
             unwrap: value.unwrap,
             private_key: value.private_key,
+            use_local_poi_cache: false,
         }
     }
 }
@@ -238,6 +249,7 @@ mod tests {
             rpc_url: None,
             proxy: None,
             network_mode: None,
+            local_poi_cache: false,
             command: Command::Shield(shield_options()),
         };
 
@@ -255,6 +267,7 @@ mod tests {
             rpc_url: None,
             proxy: None,
             network_mode: None,
+            local_poi_cache: false,
             command: Command::ListUtxos(ListUtxosOptions {
                 mnemonic: "test".to_string(),
                 chain_id: 1,

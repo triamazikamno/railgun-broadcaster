@@ -6,6 +6,7 @@ use alloy::hex;
 use alloy::primitives::{Address, Bytes, FixedBytes, U256, Uint};
 use alloy::sol_types::SolCall;
 use alloy::uint;
+use async_trait::async_trait;
 use rand::Rng;
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelIterator;
@@ -113,8 +114,44 @@ pub enum PreTransactionPoiError {
     InvalidHex { field: &'static str, value: String },
     #[error("POI RPC failed: {0}")]
     PoiRpc(#[from] PoiRpcError),
+    #[error("POI merkle proof source failed: {0}")]
+    ProofSource(String),
     #[error("POI prove failed: {0}")]
     Prover(#[from] ProverError),
+}
+
+#[async_trait]
+pub trait PoiMerkleProofSource: Send + Sync {
+    async fn poi_merkle_proofs(
+        &self,
+        txid_version: &str,
+        chain_type: u8,
+        chain_id: u64,
+        list_key: &FixedBytes<32>,
+        blinded_commitments: &[FixedBytes<32>],
+    ) -> Result<Vec<PoiMerkleProof>, PreTransactionPoiError>;
+}
+
+#[async_trait]
+impl PoiMerkleProofSource for PoiRpcClient {
+    async fn poi_merkle_proofs(
+        &self,
+        txid_version: &str,
+        chain_type: u8,
+        chain_id: u64,
+        list_key: &FixedBytes<32>,
+        blinded_commitments: &[FixedBytes<32>],
+    ) -> Result<Vec<PoiMerkleProof>, PreTransactionPoiError> {
+        Ok(PoiRpcClient::poi_merkle_proofs(
+            self,
+            txid_version,
+            chain_type,
+            chain_id,
+            list_key,
+            blinded_commitments,
+        )
+        .await?)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -897,7 +934,7 @@ pub struct PreTransactionPoiGenerationRequest<'a> {
     pub chain_id: u64,
     pub txid_version: Option<&'a str>,
     pub required_poi_list_keys: &'a [FixedBytes<32>],
-    pub poi_client: &'a PoiRpcClient,
+    pub proof_source: &'a (dyn PoiMerkleProofSource + 'a),
     pub prover: &'a ProverService,
     pub verify_proof: bool,
 }
@@ -915,7 +952,7 @@ pub async fn generate_pre_transaction_pois(
         for list_key in request.required_poi_list_keys {
             let merkle_started = Instant::now();
             let merkle_proofs = request
-                .poi_client
+                .proof_source
                 .poi_merkle_proofs(
                     txid_version,
                     request.chain_type,
@@ -963,7 +1000,7 @@ pub struct PostTransactionPoiGenerationRequest<'a> {
     pub chain_id: u64,
     pub txid_version: Option<&'a str>,
     pub required_poi_list_keys: &'a [FixedBytes<32>],
-    pub poi_client: &'a PoiRpcClient,
+    pub proof_source: &'a (dyn PoiMerkleProofSource + 'a),
     pub prover: &'a ProverService,
     pub verify_proof: bool,
 }
@@ -982,7 +1019,7 @@ pub async fn generate_post_transaction_pois(
     for list_key in request.required_poi_list_keys {
         let merkle_started = Instant::now();
         let merkle_proofs = request
-            .poi_client
+            .proof_source
             .poi_merkle_proofs(
                 txid_version,
                 request.chain_type,
@@ -3559,9 +3596,11 @@ fn rand_array<const N: usize>() -> [u8; N] {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::sync::Mutex;
 
     use super::*;
     use crate::artifacts::ArtifactSource;
+    use async_trait::async_trait;
     use broadcaster_core::utxo::{UtxoCommitmentKind, UtxoSource};
 
     struct MockSpendSigner {
@@ -3576,6 +3615,34 @@ mod tests {
         fn sign_spend_message(&self, msg: U256) -> [U256; 3] {
             self.signed_msg.set(Some(msg));
             [uint!(1_U256), uint!(2_U256), uint!(3_U256)]
+        }
+    }
+
+    #[derive(Default)]
+    struct FailingLocalPoiProofSource {
+        calls: Mutex<usize>,
+    }
+
+    impl FailingLocalPoiProofSource {
+        fn calls(&self) -> usize {
+            *self.calls.lock().expect("calls")
+        }
+    }
+
+    #[async_trait]
+    impl PoiMerkleProofSource for FailingLocalPoiProofSource {
+        async fn poi_merkle_proofs(
+            &self,
+            _txid_version: &str,
+            _chain_type: u8,
+            _chain_id: u64,
+            _list_key: &FixedBytes<32>,
+            _blinded_commitments: &[FixedBytes<32>],
+        ) -> Result<Vec<PoiMerkleProof>, PreTransactionPoiError> {
+            *self.calls.lock().expect("calls") += 1;
+            Err(PreTransactionPoiError::ProofSource(
+                "local cache unavailable".to_string(),
+            ))
         }
     }
 
@@ -3735,6 +3802,52 @@ mod tests {
             [seed; 32],
             [U256::from(seed), U256::from(seed + 1)],
         )
+    }
+
+    #[tokio::test]
+    async fn pre_transaction_poi_generation_uses_configured_proof_source() {
+        let chunk = sample_chunk(11, 1, 1, false);
+        let source = FailingLocalPoiProofSource::default();
+        let prover = ProverService::with_capacity_db(ArtifactSource::default(), 1, None);
+        let err = generate_pre_transaction_pois(PreTransactionPoiGenerationRequest {
+            chunks: &[chunk],
+            chain_type: 0,
+            chain_id: 1,
+            txid_version: Some(DEFAULT_TXID_VERSION),
+            required_poi_list_keys: &[FixedBytes::from([0x11; 32])],
+            proof_source: &source,
+            prover: &prover,
+            verify_proof: false,
+        })
+        .await
+        .expect_err("local proof source error should fail generation");
+
+        assert!(matches!(err, PreTransactionPoiError::ProofSource(_)));
+        assert_eq!(source.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn post_transaction_poi_generation_uses_configured_proof_source() {
+        let chunk = sample_chunk(12, 1, 1, false);
+        let txid_data = sample_post_txid_data(&chunk, uint!(5_U256));
+        let source = FailingLocalPoiProofSource::default();
+        let prover = ProverService::with_capacity_db(ArtifactSource::default(), 1, None);
+        let err = generate_post_transaction_pois(PostTransactionPoiGenerationRequest {
+            chunk: &chunk,
+            txid_data: &txid_data,
+            chain_type: 0,
+            chain_id: 1,
+            txid_version: Some(DEFAULT_TXID_VERSION),
+            required_poi_list_keys: &[FixedBytes::from([0x11; 32])],
+            proof_source: &source,
+            prover: &prover,
+            verify_proof: false,
+        })
+        .await
+        .expect_err("local proof source error should fail generation");
+
+        assert!(matches!(err, PreTransactionPoiError::ProofSource(_)));
+        assert_eq!(source.calls(), 1);
     }
 
     #[test]

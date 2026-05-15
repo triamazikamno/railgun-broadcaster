@@ -183,6 +183,7 @@ pub(crate) struct WalletAppOptions {
     db_path: PathBuf,
     proxy: Option<reqwest::Url>,
     network_mode: Option<WalletNetworkMode>,
+    local_poi_cache: bool,
 }
 
 impl From<crate::cli::Options> for WalletAppOptions {
@@ -191,6 +192,7 @@ impl From<crate::cli::Options> for WalletAppOptions {
             db_path: value.db_path.unwrap_or_else(crate::cli::default_db_path),
             proxy: value.proxy,
             network_mode: value.network_mode,
+            local_poi_cache: value.local_poi_cache,
         }
     }
 }
@@ -4035,6 +4037,7 @@ impl WalletRoot {
             init_block_number: overrides.init_block_number,
             sync_to_block: overrides.sync_to_block,
             use_indexed_wallet_catch_up: overrides.use_indexed_wallet_catch_up,
+            use_local_poi_cache: self.options.local_poi_cache,
             rewind_wallet_cache: overrides.rewind_wallet_cache,
             progress_tx: Some(progress_tx),
         };

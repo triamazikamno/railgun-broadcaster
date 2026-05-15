@@ -9383,10 +9383,13 @@ dependencies = [
  "alloy",
  "broadcaster-core",
  "hex",
+ "merkletree",
  "reqwest",
+ "rmp-serde",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 
@@ -10063,6 +10066,7 @@ dependencies = [
  "ark-relations",
  "ark-serialize 0.6.0",
  "ark-std 0.6.0",
+ "async-trait",
  "bip39",
  "bloock-blake-rs",
  "broadcaster-core",

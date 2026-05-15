@@ -17,8 +17,8 @@ pub use notes::{Note, NoteCiphertext};
 pub use prover::{ProverService, RailgunWitnessInputs};
 pub use scan::{WalletLogDelta, WalletScanError, WalletScanKeys};
 pub use tx::{
-    BroadcasterFeeOutput, PoiCircuitVariant, PoiProofInputs, PreTransactionPoiChunkInputs,
-    PreTransactionPoiGenerationRequest, PreTransactionPoiMap, PrivateInputs, PublicInputs,
-    SendPlan, TransactPlan, TransactionBuilder, TransactionCall, UnshieldPlan,
-    generate_pre_transaction_pois, poi_circuit_variant,
+    BroadcasterFeeOutput, PoiCircuitVariant, PoiMerkleProofSource, PoiProofInputs,
+    PreTransactionPoiChunkInputs, PreTransactionPoiGenerationRequest, PreTransactionPoiMap,
+    PrivateInputs, PublicInputs, SendPlan, TransactPlan, TransactionBuilder, TransactionCall,
+    UnshieldPlan, generate_pre_transaction_pois, poi_circuit_variant,
 };

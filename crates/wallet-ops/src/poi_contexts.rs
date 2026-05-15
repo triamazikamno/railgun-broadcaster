@@ -88,7 +88,7 @@ async fn generate_pre_transaction_pois_for_lists(
         chain_id,
         txid_version: Some(DEFAULT_TXID_VERSION),
         required_poi_list_keys: poi_list_keys,
-        poi_client: &poi_client,
+        proof_source: &poi_client,
         prover,
         verify_proof,
     })
