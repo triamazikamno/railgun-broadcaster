@@ -1,0 +1,9 @@
+{
+  "signedPOIEvent": {
+    "index": 2,
+    "blindedCommitment": "0x3333333333333333333333333333333333333333333333333333333333333333",
+    "signature": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "type": "Transact"
+  },
+  "validatedMerkleroot": "0x4444444444444444444444444444444444444444444444444444444444444444"
+}

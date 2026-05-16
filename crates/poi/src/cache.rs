@@ -461,7 +461,7 @@ impl PoiCache {
 
         let blocked_started = Instant::now();
         let blocked_shields = client
-            .blocked_shields(
+            .filtered_blocked_shields(
                 &self.snapshot.identity.txid_version,
                 self.snapshot.identity.chain_type,
                 self.snapshot.identity.chain_id,
@@ -632,7 +632,8 @@ fn rate_per_sec(count: usize, elapsed: Duration) -> f64 {
     if secs == 0.0 {
         0.0
     } else {
-        count as f64 / secs
+        let count = u32::try_from(count).unwrap_or(u32::MAX);
+        f64::from(count) / secs
     }
 }
 

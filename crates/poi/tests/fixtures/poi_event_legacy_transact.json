@@ -1,0 +1,9 @@
+{
+  "signedPOIEvent": {
+    "index": 4,
+    "blindedCommitment": "0x7777777777777777777777777777777777777777777777777777777777777777",
+    "signature": "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "type": "LegacyTransact"
+  },
+  "validatedMerkleroot": "0x8888888888888888888888888888888888888888888888888888888888888888"
+}

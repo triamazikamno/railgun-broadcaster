@@ -1,0 +1,9 @@
+{
+  "signedPOIEvent": {
+    "index": 3,
+    "blindedCommitment": "0x5555555555555555555555555555555555555555555555555555555555555555",
+    "signature": "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "type": "Unshield"
+  },
+  "validatedMerkleroot": "0x6666666666666666666666666666666666666666666666666666666666666666"
+}
