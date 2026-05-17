@@ -123,6 +123,51 @@ async fn migrations_apply_and_tables_roundtrip() -> Result<(), Box<dyn std::erro
 }
 
 #[tokio::test]
+async fn migrations_skip_when_schema_version_is_current() -> Result<(), Box<dyn std::error::Error>>
+{
+    let node = match Postgres::default().start().await {
+        Ok(node) => node,
+        Err(err) if is_docker_unavailable(&err) => {
+            eprintln!("skipping Postgres migration version test: Docker is unavailable");
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let connection_string = format!(
+        "postgres://postgres:postgres@127.0.0.1:{}/postgres",
+        node.get_host_port_ipv4(5432).await?
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&connection_string)
+        .await?;
+
+    sqlx::query(
+        r"
+        CREATE TABLE poi_indexer_schema_version (
+            id BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),
+            version INTEGER NOT NULL,
+            applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        ",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO poi_indexer_schema_version (id, version, applied_at) VALUES (TRUE, 4, now())",
+    )
+    .execute(&pool)
+    .await?;
+
+    run_migrations(&pool).await?;
+
+    assert!(!table_exists(&pool, "poi_events").await?);
+    assert_eq!(schema_version(&pool).await?, 4);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn store_methods_are_idempotent_and_monotonic() -> Result<(), Box<dyn std::error::Error>> {
     let node = match Postgres::default().start().await {
         Ok(node) => node,
@@ -414,6 +459,27 @@ fn is_docker_unavailable(error: &impl std::fmt::Debug) -> bool {
 async fn row_count(pool: &sqlx::PgPool, table: &str) -> Result<i64, sqlx::Error> {
     let sql = format!("SELECT COUNT(*) FROM {table}");
     sqlx::query_scalar(&sql).fetch_one(pool).await
+}
+
+async fn table_exists(pool: &sqlx::PgPool, table: &str) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        r"
+        SELECT EXISTS (
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_schema = 'public' AND table_name = $1
+        )
+        ",
+    )
+    .bind(table)
+    .fetch_one(pool)
+    .await
+}
+
+async fn schema_version(pool: &sqlx::PgPool) -> Result<i32, sqlx::Error> {
+    sqlx::query_scalar("SELECT version FROM poi_indexer_schema_version WHERE id = TRUE")
+        .fetch_one(pool)
+        .await
 }
 
 fn signed_event(index: u64, byte: u8, event_type: PoiEventType) -> SignedPoiEvent {

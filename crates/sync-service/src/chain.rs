@@ -1,3 +1,4 @@
+use crate::txid_cache::{TxidPublicCacheKey, sync_txid_public_cache_to_graph_tip};
 use crate::types::{
     BackfillEvent, BackfillRequest, ChainConfig, LogBatch, SharedLogBatch, SyncProgressSender,
     SyncProgressStage, SyncProgressUpdate, WalletConfig,
@@ -15,6 +16,7 @@ use alloy_transport::TransportError;
 use async_trait::async_trait;
 use broadcaster_core::provider::build_provider;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
+use broadcaster_core::transact::DEFAULT_TXID_VERSION;
 use local_db::DbStore;
 use merkletree::errors::SyncError;
 use merkletree::persist::{MerkleForestSnapshot, PersistError, SNAPSHOT_VERSION};
@@ -45,6 +47,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info, warn};
+
+const EVM_CHAIN_TYPE: u8 = 0;
+const TXID_PUBLIC_CACHE_SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IndexedWalletPageKind {
@@ -258,6 +263,7 @@ impl ChainService {
             snapshot_path,
             cancel.clone(),
         );
+        spawn_txid_public_cache_loop(service.clone(), cancel.clone());
         spawn_backfill_loop(
             service.clone(),
             backfill_rx,
@@ -1842,6 +1848,37 @@ fn spawn_head_poller(service: Arc<ChainService>, rpcs: Arc<QueryRpcPool>) {
             }
         }
         .instrument(tracing::info_span!("sync_head", chain_id)),
+    );
+}
+
+fn spawn_txid_public_cache_loop(service: Arc<ChainService>, cancel: CancellationToken) {
+    let Some(endpoint) = service.chain.quick_sync_endpoint.clone() else {
+        return;
+    };
+    let chain_id = service.chain.chain_id;
+    let http_client = service.chain.http_client.clone();
+    let db = service.db.clone();
+    tokio::spawn(
+        async move {
+            loop {
+                let key = TxidPublicCacheKey {
+                    chain_type: EVM_CHAIN_TYPE,
+                    chain_id,
+                    txid_version: DEFAULT_TXID_VERSION,
+                };
+                if let Err(err) =
+                    sync_txid_public_cache_to_graph_tip(&db, &endpoint, http_client.as_ref(), key)
+                        .await
+                {
+                    warn!(?err, chain_id, "TXID public cache background sync failed");
+                }
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep(TXID_PUBLIC_CACHE_SYNC_INTERVAL) => {}
+                }
+            }
+        }
+        .instrument(tracing::info_span!("txid_public_cache", chain_id)),
     );
 }
 

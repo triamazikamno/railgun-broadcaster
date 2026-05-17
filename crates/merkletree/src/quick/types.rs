@@ -1,12 +1,16 @@
 use std::fmt;
 
-use alloy::primitives::{Address, Bytes, FixedBytes, U256, Uint};
+use alloy::primitives::{Address, Bytes, FixedBytes, U64, U256, Uint};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer};
 
 use broadcaster_core::contracts::railgun::{
     CommitmentPreimage, LegacyCommitmentPreimage, ShieldCiphertext, TokenData,
 };
+use broadcaster_core::transact::{
+    compute_railgun_txid_parts, railgun_txid_leaf_hash_with_output_start,
+};
+use broadcaster_core::tree::TREE_LEAF_COUNT;
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Commitment {
@@ -426,6 +430,13 @@ where
             formatter.write_str("RAILGUN token type enum or numeric token type")
         }
 
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            u8::try_from(value).map_err(|_| E::custom(format!("token type out of range: {value}")))
+        }
+
         fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
         where
             E: de::Error,
@@ -438,13 +449,6 @@ where
                     .parse::<u8>()
                     .map_err(|_| E::custom(format!("unsupported indexed token type: {other}"))),
             }
-        }
-
-        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            u8::try_from(value).map_err(|_| E::custom(format!("token type out of range: {value}")))
         }
     }
 
@@ -475,6 +479,56 @@ pub struct IndexedNullifier {
     #[serde(rename = "treeNumber")]
     pub tree_number: U256,
     pub nullifier: U256,
+}
+
+#[derive(Debug, Clone, serde::Serialize, Deserialize, PartialEq, Eq)]
+pub struct IndexedRailgunTransaction {
+    pub id: String,
+    #[serde(rename = "blockNumber")]
+    pub block_number: U256,
+    #[serde(rename = "blockTimestamp")]
+    pub block_timestamp: U256,
+    #[serde(rename = "transactionHash")]
+    #[serde(deserialize_with = "deserialize_indexed_fixed_bytes_32")]
+    pub transaction_hash: FixedBytes<32>,
+    #[serde(rename = "merkleRoot")]
+    #[serde(deserialize_with = "deserialize_indexed_fixed_bytes_32")]
+    pub merkle_root: FixedBytes<32>,
+    pub nullifiers: Vec<U256>,
+    pub commitments: Vec<U256>,
+    #[serde(rename = "boundParamsHash")]
+    pub bound_params_hash: U256,
+    #[serde(rename = "hasUnshield")]
+    pub has_unshield: bool,
+    #[serde(rename = "utxoTreeIn")]
+    pub utxo_tree_in: U64,
+    #[serde(rename = "utxoTreeOut")]
+    pub utxo_tree_out: U64,
+    #[serde(rename = "utxoBatchStartPositionOut")]
+    pub utxo_batch_start_position_out: U64,
+}
+
+impl IndexedRailgunTransaction {
+    #[must_use]
+    pub fn railgun_txid(&self) -> U256 {
+        compute_railgun_txid_parts(&self.nullifiers, &self.commitments, self.bound_params_hash)
+    }
+
+    #[must_use]
+    pub fn txid_leaf_hash(&self) -> U256 {
+        railgun_txid_leaf_hash_with_output_start(
+            self.railgun_txid(),
+            self.utxo_tree_in.to(),
+            U256::from(self.output_start_global()),
+        )
+    }
+
+    #[must_use]
+    pub fn output_start_global(&self) -> u128 {
+        let output_tree = self.utxo_tree_out.to::<u128>();
+        let output_position = self.utxo_batch_start_position_out.to::<u128>();
+        output_tree * u128::from(TREE_LEAF_COUNT) + output_position
+    }
 }
 
 #[cfg(test)]

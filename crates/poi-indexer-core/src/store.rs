@@ -4,8 +4,10 @@ use poi::poi::{PoiEventType, SignedBlockedShield, SignedPoiEvent};
 use sqlx::{PgPool, Postgres, Transaction};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+use tracing::info;
 
 const IPNS_SEQUENCE_STATE_KEY: &str = "ipns_last_sequence";
+const CURRENT_SCHEMA_VERSION: i32 = 4;
 
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -517,10 +519,63 @@ pub enum StoreError {
 }
 
 pub async fn run_migrations(pool: &PgPool) -> Result<(), StoreError> {
+    sqlx::query(SCHEMA_VERSION_TABLE).execute(pool).await?;
+
     let mut tx = pool.begin().await?;
-    for statement in INLINE_MIGRATIONS {
-        sqlx::query(statement).execute(&mut *tx).await?;
+    sqlx::query(
+        r"
+        INSERT INTO poi_indexer_schema_version (id, version, applied_at)
+        VALUES (TRUE, 0, now())
+        ON CONFLICT (id) DO NOTHING
+        ",
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    let current_version = sqlx::query_scalar::<_, i32>(
+        r"
+        SELECT version
+        FROM poi_indexer_schema_version
+        WHERE id = TRUE
+        FOR UPDATE
+        ",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+
+    if current_version >= CURRENT_SCHEMA_VERSION {
+        tx.commit().await?;
+        info!(version = current_version, "POI indexer schema is current");
+        return Ok(());
     }
+
+    info!(
+        from_version = current_version,
+        to_version = CURRENT_SCHEMA_VERSION,
+        "applying POI indexer schema migrations"
+    );
+
+    for &(target_version, statements) in VERSIONED_MIGRATIONS {
+        if target_version <= current_version {
+            continue;
+        }
+
+        for statement in statements {
+            sqlx::query(statement).execute(&mut *tx).await?;
+        }
+
+        sqlx::query(
+            r"
+            UPDATE poi_indexer_schema_version
+            SET version = $1, applied_at = now()
+            WHERE id = TRUE
+            ",
+        )
+        .bind(target_version)
+        .execute(&mut *tx)
+        .await?;
+    }
+
     tx.commit().await?;
     Ok(())
 }
@@ -530,7 +585,17 @@ const COMMITMENT_HASH_BYTES: usize = 32;
 const MERKLEROOT_BYTES: usize = 32;
 const SIGNATURE_BYTES: usize = 64;
 
-const INLINE_MIGRATIONS: &[&str] = &[
+const SCHEMA_VERSION_TABLE: &str = r"
+CREATE TABLE IF NOT EXISTS poi_indexer_schema_version (
+    id BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),
+    version INTEGER NOT NULL,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+)
+";
+
+const VERSIONED_MIGRATIONS: &[(i32, &[&str])] = &[(4, V4_MIGRATIONS)];
+
+const V4_MIGRATIONS: &[&str] = &[
     r"
     CREATE TABLE IF NOT EXISTS poi_events (
         list_key BYTEA NOT NULL,
@@ -605,13 +670,6 @@ const INLINE_MIGRATIONS: &[&str] = &[
         key TEXT PRIMARY KEY,
         value BIGINT NOT NULL,
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    )
-    ",
-    r"
-    CREATE TABLE IF NOT EXISTS poi_indexer_schema_version (
-        id BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),
-        version INTEGER NOT NULL,
-        applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )
     ",
     r"
@@ -743,11 +801,6 @@ const INLINE_MIGRATIONS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS published_blocked_shields_active_lookup ON published_blocked_shields (list_key, chain_id, upstream_url, id) WHERE superseded_at IS NULL",
     "CREATE INDEX IF NOT EXISTS published_blocked_shields_retention_lookup ON published_blocked_shields (superseded_at, unpinned_at, cid) WHERE superseded_at IS NOT NULL AND unpinned_at IS NULL",
     "CREATE INDEX IF NOT EXISTS published_blocked_shields_cid_live_lookup ON published_blocked_shields (cid) WHERE superseded_at IS NULL",
-    r"
-    INSERT INTO poi_indexer_schema_version (id, version, applied_at)
-    VALUES (TRUE, 4, now())
-    ON CONFLICT (id) DO UPDATE SET version = GREATEST(poi_indexer_schema_version.version, EXCLUDED.version), applied_at = now()
-    ",
 ];
 
 fn decode_fixed_hex<const N: usize>(

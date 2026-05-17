@@ -7,6 +7,7 @@ use alloy_primitives::FixedBytes;
 use poi::error::PoiRpcError;
 use poi::poi::{PoiRpcClient, PoiSyncedListEvent, SignedBlockedShield};
 use reqwest::StatusCode;
+use std::error::Error;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::watch;
@@ -285,8 +286,12 @@ impl ScrapeWorker {
                     Ok(outcome) => return Ok(Some(outcome)),
                     Err(error) if error.is_retryable() && attempts < self.retry_policy.budget() => {
                         let backoff = self.retry_policy.backoff_delay(attempts - 1);
-                        self.record_page_failure(attempts, Some(backoff), error.to_string())
-                            .await;
+                        self.record_page_failure(
+                            attempts,
+                            Some(backoff),
+                            format_error_chain(&error),
+                        )
+                        .await;
                         if sleep_or_shutdown(backoff, shutdown).await {
                             return Ok(None);
                         }
@@ -295,7 +300,7 @@ impl ScrapeWorker {
                         let previous_size = self.page_size.current_size();
                         self.page_size.on_failure();
                         let current_size = self.page_size.current_size();
-                        self.record_page_failure(attempts, None, error.to_string())
+                        self.record_page_failure(attempts, None, format_error_chain(&error))
                             .await;
                         if current_size != previous_size {
                             info!(
@@ -317,7 +322,7 @@ impl ScrapeWorker {
                         break;
                     }
                     Err(error) => {
-                        self.record_page_failure(attempts, None, error.to_string())
+                        self.record_page_failure(attempts, None, format_error_chain(&error))
                             .await;
                         return Err(error);
                     }
@@ -343,8 +348,12 @@ impl ScrapeWorker {
                     Ok(outcome) => return Ok(Some(outcome)),
                     Err(error) if error.is_retryable() && attempts < self.retry_policy.budget() => {
                         let backoff = self.retry_policy.backoff_delay(attempts - 1);
-                        self.record_page_failure(attempts, Some(backoff), error.to_string())
-                            .await;
+                        self.record_page_failure(
+                            attempts,
+                            Some(backoff),
+                            format_error_chain(&error),
+                        )
+                        .await;
                         if sleep_or_shutdown(backoff, shutdown).await {
                             return Ok(None);
                         }
@@ -353,7 +362,7 @@ impl ScrapeWorker {
                         let previous_size = self.page_size.current_size();
                         self.page_size.on_failure();
                         let current_size = self.page_size.current_size();
-                        self.record_page_failure(attempts, None, error.to_string())
+                        self.record_page_failure(attempts, None, format_error_chain(&error))
                             .await;
                         if current_size != previous_size {
                             info!(
@@ -375,7 +384,7 @@ impl ScrapeWorker {
                         break;
                     }
                     Err(error) => {
-                        self.record_page_failure(attempts, None, error.to_string())
+                        self.record_page_failure(attempts, None, format_error_chain(&error))
                             .await;
                         return Err(error);
                     }
@@ -574,6 +583,17 @@ fn end_index(start_index: u64, page_size: usize) -> Result<u64, ScrapeError> {
         .ok_or(ScrapeError::IndexOverflow {
             last_event_index: start_index,
         })
+}
+
+fn format_error_chain(error: &(dyn Error + 'static)) -> String {
+    let mut formatted = error.to_string();
+    let mut source = error.source();
+    while let Some(error) = source {
+        formatted.push_str(": ");
+        formatted.push_str(&error.to_string());
+        source = error.source();
+    }
+    formatted
 }
 
 fn blocked_shield_sets_match(left: &[SignedBlockedShield], right: &[SignedBlockedShield]) -> bool {

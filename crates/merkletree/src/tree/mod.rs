@@ -37,6 +37,11 @@ pub struct MerkleProof {
     pub path_indices: [u8; TREE_DEPTH],
 }
 
+#[derive(Debug, Clone)]
+pub struct DenseMerkleTree {
+    layers: Vec<Vec<U256>>,
+}
+
 impl MerkleTree {
     pub fn insert(&mut self, position: u64, leaf: U256) -> Result<(), SyncError> {
         validate_tree_position(position)?;
@@ -222,6 +227,94 @@ impl MerkleForest {
         self.trees
             .get(&tree_number)
             .map(|tree| tree.prove_with_leaf_count(tree_position, leaf_count))
+    }
+}
+
+impl DenseMerkleTree {
+    #[must_use]
+    pub fn from_forest_prefix(forest: &MerkleForest, tree_number: u32, leaf_count: u64) -> Self {
+        let clamped_leaf_count = leaf_count.min(TREE_LEAF_COUNT);
+        let mut leaves = vec![MERKLE_ZERO_VALUE; TREE_LEAF_COUNT as usize];
+        for position in 0..clamped_leaf_count {
+            if let Some(leaf) = forest.leaf_at(tree_number, position) {
+                leaves[position as usize] = leaf;
+            }
+        }
+        Self::from_full_leaf_layer(leaves)
+    }
+
+    #[must_use]
+    pub fn from_ordered_leaves<I>(leaves: I, leaf_count: u64) -> Self
+    where
+        I: IntoIterator<Item = U256>,
+    {
+        let clamped_leaf_count = leaf_count.min(TREE_LEAF_COUNT) as usize;
+        let mut layer = vec![MERKLE_ZERO_VALUE; TREE_LEAF_COUNT as usize];
+        for (index, leaf) in leaves.into_iter().take(clamped_leaf_count).enumerate() {
+            layer[index] = leaf;
+        }
+        Self::from_full_leaf_layer(layer)
+    }
+
+    #[must_use]
+    pub fn from_full_leaf_layer(mut layer: Vec<U256>) -> Self {
+        layer.resize(TREE_LEAF_COUNT as usize, MERKLE_ZERO_VALUE);
+        if layer.len() > TREE_LEAF_COUNT as usize {
+            layer.truncate(TREE_LEAF_COUNT as usize);
+        }
+        let mut layers = Vec::with_capacity(TREE_DEPTH + 1);
+        layers.push(layer.clone());
+        while layer.len() > 1 {
+            hash_layer(&mut layer);
+            layers.push(layer.clone());
+        }
+        Self { layers }
+    }
+
+    #[must_use]
+    pub fn root(&self) -> U256 {
+        self.layers
+            .last()
+            .and_then(|layer| layer.first())
+            .copied()
+            .unwrap_or(MERKLE_ZERO_VALUE)
+    }
+
+    pub fn remove_leaf(&mut self, position: u64) {
+        let mut index = position as usize;
+        if index >= self.layers[0].len() {
+            return;
+        }
+        self.layers[0][index] = MERKLE_ZERO_VALUE;
+        for level in 0..TREE_DEPTH {
+            let parent_index = index / 2;
+            let left = self.layers[level][parent_index * 2];
+            let right = self.layers[level][parent_index * 2 + 1];
+            self.layers[level + 1][parent_index] = poseidon(vec![left, right]);
+            index = parent_index;
+        }
+    }
+
+    #[must_use]
+    pub fn prove(&self, position: u64) -> MerkleProof {
+        let local_position = position % TREE_LEAF_COUNT;
+        let mut path_elements = [U256::ZERO; TREE_DEPTH];
+        let mut path_indices = [0_u8; TREE_DEPTH];
+        let mut index = local_position as usize;
+        for level in 0..TREE_DEPTH {
+            let is_right = index % 2 == 1;
+            path_indices[level] = u8::from(is_right);
+            let sibling_index = if is_right { index - 1 } else { index + 1 };
+            path_elements[level] = self.layers[level][sibling_index];
+            index /= 2;
+        }
+        MerkleProof {
+            root: self.root(),
+            leaf: self.layers[0][local_position as usize],
+            leaf_index: local_position,
+            path_elements,
+            path_indices,
+        }
     }
 }
 

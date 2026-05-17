@@ -9,7 +9,8 @@ use url::Url;
 use crate::errors::SyncError;
 use crate::quick::types::{
     Commitment, IndexedLegacyEncryptedCommitment, IndexedLegacyGeneratedCommitment,
-    IndexedNullifier, IndexedShieldCommitment, IndexedTransactCommitment,
+    IndexedNullifier, IndexedRailgunTransaction, IndexedShieldCommitment,
+    IndexedTransactCommitment,
 };
 
 pub const DEFAULT_PAGE_SIZE: NonZeroUsize =
@@ -346,6 +347,25 @@ query IndexedNullifiers($fromBlock: BigInt = 0, $toBlock: BigInt = 0, $limit: In
 }
 ";
 
+pub(crate) const PUBLIC_TXID_PAGE_QUERY: &str = r"
+query PublicTxidPage($offset: Int!, $limit: Int!) {
+  transactions(orderBy: id_ASC, offset: $offset, limit: $limit) {
+    id
+    blockNumber
+    blockTimestamp
+    transactionHash
+    merkleRoot
+    nullifiers
+    commitments
+    boundParamsHash
+    hasUnshield
+    utxoTreeIn
+    utxoTreeOut
+    utxoBatchStartPositionOut
+  }
+}
+";
+
 #[derive(Debug, Clone)]
 pub struct QuickSyncClient {
     endpoint: Url,
@@ -480,6 +500,26 @@ impl QuickSyncClient {
         .await
     }
 
+    pub async fn fetch_public_txid_page(
+        &self,
+        offset: u64,
+        page_size: NonZeroUsize,
+    ) -> Result<Vec<IndexedRailgunTransaction>, SyncError> {
+        let limit = page_size.get();
+        let offset = i32::try_from(offset).map_err(|_| {
+            SyncError::UnexpectedFormat(format!(
+                "public TXID page offset {offset} exceeds GraphQL Int max {}",
+                i32::MAX
+            ))
+        })?;
+        let variables = GraphOffsetVariables {
+            offset,
+            limit: limit.min(i32::MAX as usize) as i32,
+        };
+        let data: PublicTxidPageData = self.post_graph(PUBLIC_TXID_PAGE_QUERY, &variables).await?;
+        Ok(data.transactions)
+    }
+
     pub(crate) async fn fetch_range<D>(
         &self,
         query: &str,
@@ -600,6 +640,12 @@ struct GraphRangeVariables {
     limit: i32,
 }
 
+#[derive(Debug, Serialize)]
+struct GraphOffsetVariables {
+    offset: i32,
+    limit: i32,
+}
+
 #[derive(Debug, Deserialize)]
 struct GraphResponse<T> {
     data: Option<T>,
@@ -669,6 +715,11 @@ pub struct IndexedLegacyWalletPageData {
     #[serde(rename = "legacyGeneratedCommitments")]
     pub legacy_generated_commitments: Vec<IndexedLegacyGeneratedCommitment>,
     pub nullifiers: Vec<IndexedNullifier>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PublicTxidPageData {
+    transactions: Vec<IndexedRailgunTransaction>,
 }
 
 #[derive(Debug, Deserialize)]

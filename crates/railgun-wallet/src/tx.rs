@@ -346,6 +346,22 @@ pub struct PrivateInputs {
 
 impl PublicInputs {
     #[must_use]
+    pub fn from_parts(
+        merkle_root: U256,
+        bound_params_hash: U256,
+        nullifiers: Vec<U256>,
+        outputs: &[Note],
+    ) -> Self {
+        let commitments_out = outputs.iter().map(Note::commitment).collect();
+        Self {
+            merkle_root,
+            bound_params_hash,
+            nullifiers,
+            commitments_out,
+        }
+    }
+
+    #[must_use]
     pub fn from_transaction(
         merkle_root: U256,
         transaction: &Transaction,
@@ -357,13 +373,7 @@ impl PublicInputs {
             .iter()
             .map(|value| U256::from_be_bytes(value.0))
             .collect();
-        let commitments_out = outputs.iter().map(Note::commitment).collect();
-        Self {
-            merkle_root,
-            bound_params_hash,
-            nullifiers,
-            commitments_out,
-        }
+        Self::from_parts(merkle_root, bound_params_hash, nullifiers, outputs)
     }
 
     #[must_use]

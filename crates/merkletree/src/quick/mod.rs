@@ -17,7 +17,7 @@ use crate::tree::{MerkleForest, MerkleTreeUpdate};
 pub use graphql::{DEFAULT_PAGE_SIZE, GraphPostError, QuickSyncClient, post_graphql_data};
 pub use types::{
     IndexedLegacyEncryptedCommitment, IndexedLegacyGeneratedCommitment, IndexedNullifier,
-    IndexedShieldCommitment, IndexedTransactCommitment,
+    IndexedRailgunTransaction, IndexedShieldCommitment, IndexedTransactCommitment,
 };
 
 #[derive(Debug, Clone)]
@@ -199,7 +199,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::num::NonZeroUsize;
     use std::sync::mpsc::{self, Receiver};
@@ -210,6 +210,7 @@ mod tests {
     use url::Url;
 
     use super::{QuickSyncClient, QuickSyncConfig, run_quick_sync, run_quick_sync_into};
+    use crate::errors::SyncError;
     use crate::tree::{MerkleForest, MerkleTreeUpdate};
 
     struct MockGraphql {
@@ -223,6 +224,7 @@ mod tests {
 
     fn spawn_graphql_with_status(responses: Vec<(u16, &'static str)>) -> MockGraphql {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        //noinspection HttpUrlsUsage
         let url = Url::parse(&format!(
             "http://{}/graphql",
             listener.local_addr().unwrap()
@@ -246,37 +248,24 @@ mod tests {
     }
 
     fn read_http_body(stream: &mut std::net::TcpStream) -> String {
-        let mut buffer = Vec::new();
-        let mut chunk = [0u8; 1024];
+        let mut reader = BufReader::new(stream);
+        let mut content_length = 0_usize;
         loop {
-            let read = stream.read(&mut chunk).expect("read request");
-            assert!(read > 0, "connection closed before request body");
-            buffer.extend_from_slice(&chunk[..read]);
-            if let Some((body_start, content_length)) = request_body_bounds(&buffer)
-                && buffer.len() >= body_start + content_length
+            let mut line = String::new();
+            let read = reader.read_line(&mut line).expect("read request header");
+            assert!(read > 0, "connection closed before request headers");
+            if line == "\r\n" || line == "\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
             {
-                return String::from_utf8_lossy(&buffer[body_start..body_start + content_length])
-                    .to_string();
+                content_length = value.trim().parse().expect("parse content length");
             }
         }
-    }
-
-    fn request_body_bounds(buffer: &[u8]) -> Option<(usize, usize)> {
-        let header_end = buffer.windows(4).position(|window| window == b"\r\n\r\n")?;
-        let body_start = header_end + 4;
-        let headers = String::from_utf8_lossy(&buffer[..header_end]);
-        let content_length = headers
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                if name.eq_ignore_ascii_case("content-length") {
-                    value.trim().parse::<usize>().ok()
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(0);
-        Some((body_start, content_length))
+        let mut body = vec![0_u8; content_length];
+        reader.read_exact(&mut body).expect("read request body");
+        String::from_utf8_lossy(&body).to_string()
     }
 
     #[tokio::test]
@@ -289,6 +278,25 @@ mod tests {
         assert_eq!(height, 123);
         let request = mock.requests.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(request.contains("squidStatus"));
+    }
+
+    #[tokio::test]
+    async fn public_txid_page_rejects_offset_above_graphql_int_limit() {
+        //noinspection HttpUrlsUsage
+        let client = QuickSyncClient::new(
+            Url::parse("http://127.0.0.1:1/graphql").expect("unused mock URL"),
+        );
+
+        let err = client
+            .fetch_public_txid_page(i32::MAX as u64 + 1, NonZeroUsize::new(1).expect("non-zero"))
+            .await
+            .expect_err("oversized offset should fail before request");
+
+        assert!(matches!(
+            err,
+            SyncError::UnexpectedFormat(message)
+                if message.contains("exceeds GraphQL Int max")
+        ));
     }
 
     #[tokio::test]

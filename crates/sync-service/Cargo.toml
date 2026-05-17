@@ -15,10 +15,11 @@ local-db = { path = "../local-db" }
 merkletree = { path = "../merkletree" }
 poi = { path = "../poi" }
 railgun-wallet = { path = "../railgun-wallet" }
-rayon = { workspace = true }
 reqwest = { workspace = true }
+rmp-serde = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 tokio-util = "0.7"
 tracing = { workspace = true }

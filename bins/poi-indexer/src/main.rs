@@ -246,7 +246,10 @@ async fn run_scraper_loop(
             .await
             .wrap_err("run scraper until caught up")
         {
-            warn!(error = %error, "POI scraper cycle failed; backing off before retry");
+            warn!(
+                error = %format_report_chain(&error),
+                "POI scraper cycle failed; backing off before retry"
+            );
         }
 
         if sleep_or_shutdown(idle_interval, &mut shutdown).await {
@@ -266,16 +269,7 @@ async fn run_publication_scheduler(
     let mut interval = tokio::time::interval(publish_interval);
 
     loop {
-        tokio::select! {
-            _ = interval.tick() => {}
-            result = shutdown.changed() => {
-                if result.is_err() || shutdown_requested(&shutdown) {
-                    return Ok(());
-                }
-            }
-        }
-
-        if shutdown_requested(&shutdown) {
+        if interval_tick_or_shutdown(&mut interval, &mut shutdown).await {
             return Ok(());
         }
 
@@ -294,16 +288,7 @@ async fn run_retention_sweeper(
 ) -> Result<()> {
     let mut interval = tokio::time::interval(retention_interval);
     loop {
-        tokio::select! {
-            _ = interval.tick() => {}
-            result = shutdown.changed() => {
-                if result.is_err() || shutdown_requested(&shutdown) {
-                    return Ok(());
-                }
-            }
-        }
-
-        if shutdown_requested(&shutdown) {
+        if interval_tick_or_shutdown(&mut interval, &mut shutdown).await {
             return Ok(());
         }
 
@@ -402,12 +387,7 @@ impl PublicationScheduler {
         }
 
         if published_snapshot || self.manifest_needs_publish || self.last_manifest_cid.is_none() {
-            if let Some(manifest) = self.publish_manifest(now).await? {
-                self.last_manifest_cid = Some(manifest.cid.clone());
-                self.manifest_needs_publish = false;
-                self.publish_ipns(&manifest.cid, manifest.sequence).await?;
-                self.last_ipns_publish_at = Some(now);
-            }
+            self.publish_manifest_and_ipns(now).await?;
             return Ok(());
         }
 
@@ -420,12 +400,7 @@ impl PublicationScheduler {
                 manifest_cid,
                 "published POI manifest CID is missing from IPFS service; repinning manifest"
             );
-            if let Some(manifest) = self.publish_manifest(now).await? {
-                self.last_manifest_cid = Some(manifest.cid.clone());
-                self.manifest_needs_publish = false;
-                self.publish_ipns(&manifest.cid, manifest.sequence).await?;
-                self.last_ipns_publish_at = Some(now);
-            }
+            self.publish_manifest_and_ipns(now).await?;
             return Ok(());
         }
 
@@ -435,6 +410,16 @@ impl PublicationScheduler {
             self.last_ipns_publish_at = Some(now);
         }
 
+        Ok(())
+    }
+
+    async fn publish_manifest_and_ipns(&mut self, now: SystemTime) -> Result<()> {
+        if let Some(manifest) = self.publish_manifest(now).await? {
+            self.last_manifest_cid = Some(manifest.cid.clone());
+            self.manifest_needs_publish = false;
+            self.publish_ipns(&manifest.cid, manifest.sequence).await?;
+            self.last_ipns_publish_at = Some(now);
+        }
         Ok(())
     }
 
@@ -937,6 +922,14 @@ fn checked_interval(duration: Duration, field: &'static str) -> Result<Duration>
     }
 }
 
+fn format_report_chain(error: &eyre::Report) -> String {
+    error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
+}
+
 fn status_router(status: SharedStatus) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -1006,6 +999,20 @@ fn shutdown_requested(shutdown: &watch::Receiver<bool>) -> bool {
     *shutdown.borrow()
 }
 
+async fn shutdown_changed_or_requested(shutdown: &mut watch::Receiver<bool>) -> bool {
+    shutdown.changed().await.is_err() || shutdown_requested(shutdown)
+}
+
+async fn interval_tick_or_shutdown(
+    interval: &mut tokio::time::Interval,
+    shutdown: &mut watch::Receiver<bool>,
+) -> bool {
+    tokio::select! {
+        _ = interval.tick() => shutdown_requested(shutdown),
+        shutdown = shutdown_changed_or_requested(shutdown) => shutdown,
+    }
+}
+
 async fn sleep_or_shutdown(duration: Duration, shutdown: &mut watch::Receiver<bool>) -> bool {
     if duration.is_zero() {
         return shutdown_requested(shutdown);
@@ -1013,7 +1020,7 @@ async fn sleep_or_shutdown(duration: Duration, shutdown: &mut watch::Receiver<bo
 
     tokio::select! {
         () = tokio::time::sleep(duration) => shutdown_requested(shutdown),
-        result = shutdown.changed() => result.is_err() || shutdown_requested(shutdown),
+        shutdown = shutdown_changed_or_requested(shutdown) => shutdown,
     }
 }
 
