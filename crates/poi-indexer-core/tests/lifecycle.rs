@@ -1,7 +1,7 @@
 use alloy_primitives::FixedBytes;
 use poi::poi::{PoiEventType, SignedBlockedShield, SignedPoiEvent};
 use poi_indexer_core::blocked::BlockedShieldsArtifact;
-use poi_indexer_core::manifest::{Manifest, ManifestEntry};
+use poi_indexer_core::manifest::{ArtifactDescriptor, Manifest, ManifestEntry};
 use poi_indexer_core::snapshot::{Lifecycle, SnapshotKind, SnapshotReader};
 use poi_indexer_core::store::{Store, run_migrations};
 use sqlx::postgres::PgPoolOptions;
@@ -98,10 +98,10 @@ async fn lifecycle_manifest_base_and_deltas_replay_full_event_set()
         ("bafydelta2".to_string(), delta_2_bytes),
     ]);
     let entry = &manifest.entries[0];
-    let replayed_from_manifest = std::iter::once(&entry.base_cid)
-        .chain(entry.delta_cids.iter())
-        .flat_map(|cid| {
-            SnapshotReader::read(files.get(cid).expect("manifest CID exists"))
+    let replayed_from_manifest = std::iter::once(&entry.base)
+        .chain(entry.deltas.iter())
+        .flat_map(|descriptor| {
+            SnapshotReader::read(files.get(&descriptor.cid).expect("manifest CID exists"))
                 .expect("snapshot decodes")
                 .events
                 .into_iter()
@@ -124,13 +124,21 @@ fn manifest_for_snapshots(list_key: &FixedBytes<32>, tip_merkleroot: &str) -> Ma
         vec![ManifestEntry {
             list_key: format!("0x{}", hex::encode(list_key.as_slice())),
             chain_id: 1,
-            base_cid: "bafybase".to_string(),
-            delta_cids: vec!["bafydelta1".to_string(), "bafydelta2".to_string()],
-            blocked_shields_cid: "bafyblocked".to_string(),
+            base: descriptor("bafybase"),
+            deltas: vec![descriptor("bafydelta1"), descriptor("bafydelta2")],
+            blocked_shields: descriptor("bafyblocked"),
             current_tip_index: 4,
             current_tip_merkleroot: tip_merkleroot.to_string(),
         }],
     )
+}
+
+fn descriptor(cid: &str) -> ArtifactDescriptor {
+    ArtifactDescriptor {
+        cid: cid.to_string(),
+        sha256: hex_bytes(1, 32),
+        byte_size: 1,
+    }
 }
 
 fn signed_event(index: u64, byte: u8) -> SignedPoiEvent {

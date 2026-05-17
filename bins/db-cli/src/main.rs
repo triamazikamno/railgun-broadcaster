@@ -3,7 +3,7 @@ use eyre::{Result, WrapErr, bail, eyre};
 use local_db::{
     BlobMeta, LOCAL_DB_TABLES, LocalDbTableDecodeKind, LocalDbTableInfo, MerkleForestMeta, Meta,
     OutputPoiRecoveryRecord, PendingFeeNoteAssuranceRecord, PendingOutputPoiContextRecord,
-    TerminalFeeNoteAssuranceRecord, WalletMeta, ZkeyMeta,
+    PoiArtifactCacheRecord, TerminalFeeNoteAssuranceRecord, WalletMeta, ZkeyMeta,
 };
 use redb::{Builder, ReadOnlyDatabase, ReadableDatabase, TableDefinition};
 use serde::Serialize;
@@ -193,6 +193,9 @@ fn print_value(table: Option<LocalDbTableInfo>, key: &str, value: &[u8], raw: bo
         }
         LocalDbTableDecodeKind::OutputPoiRecovery => {
             print_decoded::<OutputPoiRecoveryRecord>(key, value)
+        }
+        LocalDbTableDecodeKind::PoiArtifactCache => {
+            print_decoded::<PoiArtifactCacheRecord>(key, value)
         }
         LocalDbTableDecodeKind::WalletUtxo => print_wallet_utxo(key, value),
         LocalDbTableDecodeKind::DesktopWalletVault => print_desktop_wallet_vault(key, value),

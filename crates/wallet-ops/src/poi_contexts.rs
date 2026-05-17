@@ -9,6 +9,7 @@ pub(crate) struct PublicBroadcasterPreTransactionPois {
 pub(crate) async fn public_broadcaster_pre_transaction_pois(
     chunks: &[TransactionPlanChunk],
     broadcaster: &PublicBroadcasterCandidate,
+    session: &WalletSession,
     chain_id: u64,
     prover: &ProverService,
     verify_proof: bool,
@@ -20,6 +21,7 @@ pub(crate) async fn public_broadcaster_pre_transaction_pois(
     let poi_started = Instant::now();
     let all_pois = generate_pre_transaction_pois_for_lists(
         chunks,
+        session,
         chain_id,
         prover,
         verify_proof,
@@ -47,6 +49,7 @@ pub(crate) async fn public_broadcaster_pre_transaction_pois(
 
 pub(crate) async fn active_list_pre_transaction_pois(
     chunks: &[TransactionPlanChunk],
+    session: &WalletSession,
     chain_id: u64,
     prover: &ProverService,
     verify_proof: bool,
@@ -56,6 +59,7 @@ pub(crate) async fn active_list_pre_transaction_pois(
     let poi_list_keys = default_active_poi_list_keys();
     let pois = generate_pre_transaction_pois_for_lists(
         chunks,
+        session,
         chain_id,
         prover,
         verify_proof,
@@ -69,6 +73,7 @@ pub(crate) async fn active_list_pre_transaction_pois(
 
 async fn generate_pre_transaction_pois_for_lists(
     chunks: &[TransactionPlanChunk],
+    session: &WalletSession,
     chain_id: u64,
     prover: &ProverService,
     verify_proof: bool,
@@ -79,21 +84,57 @@ async fn generate_pre_transaction_pois_for_lists(
     if poi_list_keys.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let poi_rpc_url =
-        Url::parse(DEFAULT_WALLET_POI_RPC_URL).wrap_err("parse default POI RPC URL")?;
-    let poi_client = PoiRpcClient::with_http_client(poi_rpc_url, http.client.clone());
+    let proof_source = wallet_poi_merkle_proof_source(session, http)?;
     generate_pre_transaction_pois(PreTransactionPoiGenerationRequest {
         chunks,
         chain_type: 0,
         chain_id,
         txid_version: Some(DEFAULT_TXID_VERSION),
         required_poi_list_keys: poi_list_keys,
-        proof_source: &poi_client,
+        proof_source: proof_source.as_dyn(),
         prover,
         verify_proof,
     })
     .await
     .wrap_err(context)
+}
+
+enum WalletPoiMerkleProofSourceSelection {
+    IndexedArtifacts(LocalPoiMerkleProofSource),
+    PoiProxy(PoiRpcClient),
+}
+
+impl WalletPoiMerkleProofSourceSelection {
+    fn as_dyn(&self) -> &dyn PoiMerkleProofSource {
+        match self {
+            Self::IndexedArtifacts(source) => source,
+            Self::PoiProxy(source) => source,
+        }
+    }
+}
+
+fn wallet_poi_merkle_proof_source(
+    session: &WalletSession,
+    http: &HttpContext,
+) -> Result<WalletPoiMerkleProofSourceSelection> {
+    match session.handle.poi_read_source() {
+        PoiReadSource::IndexedArtifacts(_) => {
+            let caches = session
+                .handle
+                .local_poi_caches()
+                .ok_or_else(|| eyre!("artifact POI read source missing local cache handle"))?;
+            Ok(WalletPoiMerkleProofSourceSelection::IndexedArtifacts(
+                LocalPoiMerkleProofSource::new(caches),
+            ))
+        }
+        PoiReadSource::PoiProxy => {
+            let poi_rpc_url =
+                Url::parse(DEFAULT_WALLET_POI_RPC_URL).wrap_err("parse default POI RPC URL")?;
+            Ok(WalletPoiMerkleProofSourceSelection::PoiProxy(
+                PoiRpcClient::with_http_client(poi_rpc_url, http.client.clone()),
+            ))
+        }
+    }
 }
 
 fn combined_poi_list_keys(

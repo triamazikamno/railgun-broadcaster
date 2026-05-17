@@ -20,6 +20,7 @@ impl Audit {
         end_index: u64,
         cid: &Cid,
         byte_size: u64,
+        content_hash: &[u8; 32],
         format_version: u16,
         tip_merkleroot: &[u8; 32],
     ) -> Result<(), AuditError> {
@@ -56,10 +57,11 @@ impl Audit {
                 end_index,
                 cid,
                 byte_size,
+                content_hash,
                 format_version,
                 tip_merkleroot
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             ",
         )
         .bind(list_key.as_slice())
@@ -70,6 +72,7 @@ impl Audit {
         .bind(end_index)
         .bind(cid.to_string())
         .bind(byte_size)
+        .bind(content_hash.as_slice())
         .bind(format_version)
         .bind(tip_merkleroot.as_slice())
         .execute(&mut **tx)

@@ -57,17 +57,17 @@ use wallet_ops::{
     DesktopSendPublicBroadcasterEstimateRequest, DesktopSendPublicBroadcasterRequest,
     DesktopUnshieldCalldataRequest, DesktopUnshieldPublicBroadcasterEstimateRequest,
     DesktopUnshieldPublicBroadcasterRequest, DesktopWalletSyncStartPolicy, HttpContext,
-    ListUtxosOutput, PreparedSendCall, PreparedUnshieldCall, PublicActionProgressStatus,
-    PublicActionProgressStep, PublicActionProgressUpdate, PublicAssetId, PublicBalanceAmount,
-    PublicBalanceEntry, PublicBalanceSnapshot, PublicBroadcasterCandidate,
-    PublicBroadcasterCostEstimate, PublicBroadcasterFeeBreakdown, PublicBroadcasterFeeMargin,
-    PublicBroadcasterFeeMode, PublicBroadcasterResultKind, PublicBroadcasterSelection,
-    PublicBroadcasterSubmissionResult, PublicBroadcasterWakuClient, PublicSendRequest,
-    PublicShieldRequest, SyncProgressUpdate, TokenAnchorRateCache, TokenAnchorRefreshHandle,
-    TokenTotal, TransactionGenerationStage, UtxoOutput, ViewWalletChainSessionRequest,
-    WalletNetworkConfig, WalletNetworkHealth, WalletNetworkHealthState, WalletNetworkMode,
-    WalletNetworkProgress, WalletSessionStore, build_wallet_network_context_with_progress,
-    estimate_desktop_send_public_broadcaster_cost,
+    ListUtxosOutput, PoiReadSource, PreparedSendCall, PreparedUnshieldCall,
+    PublicActionProgressStatus, PublicActionProgressStep, PublicActionProgressUpdate,
+    PublicAssetId, PublicBalanceAmount, PublicBalanceEntry, PublicBalanceSnapshot,
+    PublicBroadcasterCandidate, PublicBroadcasterCostEstimate, PublicBroadcasterFeeBreakdown,
+    PublicBroadcasterFeeMargin, PublicBroadcasterFeeMode, PublicBroadcasterResultKind,
+    PublicBroadcasterSelection, PublicBroadcasterSubmissionResult, PublicBroadcasterWakuClient,
+    PublicSendRequest, PublicShieldRequest, SyncProgressUpdate, TokenAnchorRateCache,
+    TokenAnchorRefreshHandle, TokenTotal, TransactionGenerationStage, UtxoOutput,
+    ViewWalletChainSessionRequest, WalletNetworkConfig, WalletNetworkHealth,
+    WalletNetworkHealthState, WalletNetworkMode, WalletNetworkProgress, WalletSessionStore,
+    build_wallet_network_context_with_progress, estimate_desktop_send_public_broadcaster_cost,
     estimate_desktop_unshield_public_broadcaster_cost, estimate_public_native_action_gas_reserve,
     fee_policy_eligible_public_broadcasters, fixed_token_anchor_rate, is_wrapped_native_token,
     max_broadcaster_fee_token_amount_from_outputs as planner_max_broadcaster_fee_token_amount_from_outputs,
@@ -183,17 +183,20 @@ pub(crate) struct WalletAppOptions {
     db_path: PathBuf,
     proxy: Option<reqwest::Url>,
     network_mode: Option<WalletNetworkMode>,
-    local_poi_cache: bool,
+    poi_read_source: PoiReadSource,
 }
 
-impl From<crate::cli::Options> for WalletAppOptions {
-    fn from(value: crate::cli::Options) -> Self {
-        Self {
+impl TryFrom<crate::cli::Options> for WalletAppOptions {
+    type Error = eyre::Report;
+
+    fn try_from(value: crate::cli::Options) -> Result<Self, Self::Error> {
+        let poi_read_source = value.poi_read_source()?;
+        Ok(Self {
             db_path: value.db_path.unwrap_or_else(crate::cli::default_db_path),
             proxy: value.proxy,
             network_mode: value.network_mode,
-            local_poi_cache: value.local_poi_cache,
-        }
+            poi_read_source,
+        })
     }
 }
 
@@ -4037,7 +4040,7 @@ impl WalletRoot {
             init_block_number: overrides.init_block_number,
             sync_to_block: overrides.sync_to_block,
             use_indexed_wallet_catch_up: overrides.use_indexed_wallet_catch_up,
-            use_local_poi_cache: self.options.local_poi_cache,
+            poi_read_source: self.options.poi_read_source.clone(),
             rewind_wallet_cache: overrides.rewind_wallet_cache,
             progress_tx: Some(progress_tx),
         };

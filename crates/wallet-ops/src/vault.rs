@@ -1157,6 +1157,7 @@ impl DesktopVaultStore {
             start_block,
             last_scanned_block,
             last_scanned_block_hash: None,
+            poi_read_source: None,
         };
         self.store_wallet_chain_metadata_with_session(view_session, &metadata)?;
         Ok(metadata)
@@ -2238,6 +2239,8 @@ pub struct WalletChainMetadataBundle {
     pub start_block: u64,
     pub last_scanned_block: u64,
     pub last_scanned_block_hash: Option<[u8; KEY_LEN]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poi_read_source: Option<String>,
 }
 
 #[must_use]
@@ -4111,6 +4114,7 @@ mod tests {
             start_block: 100,
             last_scanned_block: 200,
             last_scanned_block_hash: Some([9u8; KEY_LEN]),
+            poi_read_source: None,
         };
 
         store

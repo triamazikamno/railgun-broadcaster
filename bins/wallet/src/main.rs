@@ -40,7 +40,7 @@ fn main() -> Result<()> {
 
     let chain_ids = DEFAULT_CHAINS.to_vec();
     let runtime_guard = runtime.enter();
-    let wallet_options = WalletAppOptions::from(opts);
+    let wallet_options = WalletAppOptions::try_from(opts)?;
     let application = Application::new().with_assets(WalletAssets);
     application.run(move |app: &mut App| {
         gpui_component::init(app);

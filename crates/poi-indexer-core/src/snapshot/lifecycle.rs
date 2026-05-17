@@ -1,8 +1,11 @@
 use crate::blocked::{BlockedShieldsArtifact, BlockedShieldsArtifactError};
 use crate::snapshot::format::FORMAT_VERSION;
-use crate::snapshot::{SnapshotError, SnapshotHeaderInput, SnapshotKind, SnapshotWriter};
-use crate::store::{Store, StoreError};
+use crate::snapshot::{
+    SnapshotError, SnapshotEventRecord, SnapshotHeaderInput, SnapshotKind, SnapshotWriter,
+};
+use crate::store::{Store, StoreError, StoredBlockedShield, StoredEvent};
 use alloy_primitives::FixedBytes;
+use poi::poi::SignedBlockedShield;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -43,6 +46,7 @@ impl Lifecycle {
         let header = self
             .snapshot_header(list_key, chain_id, SnapshotKind::Base, 0, end_index)
             .await?;
+        let events = snapshot_event_records(&events);
         SnapshotWriter::write(&header, &events).map_err(LifecycleError::Snapshot)
     }
 
@@ -66,6 +70,7 @@ impl Lifecycle {
                 end_index,
             )
             .await?;
+        let events = snapshot_event_records(&events);
         SnapshotWriter::write(&header, &events).map_err(LifecycleError::Snapshot)
     }
 
@@ -75,7 +80,11 @@ impl Lifecycle {
         chain_id: u64,
     ) -> Result<BlockedShieldsArtifact, LifecycleError> {
         let blocked_shields = self.store.all_blocked_shields(list_key, chain_id).await?;
-        Ok(BlockedShieldsArtifact::from_records(
+        let blocked_shields = blocked_shields
+            .iter()
+            .map(signed_blocked_shield)
+            .collect::<Vec<_>>();
+        Ok(BlockedShieldsArtifact::from_signed_records(
             FORMAT_VERSION,
             &fixed_bytes(list_key),
             chain_id,
@@ -178,6 +187,31 @@ const fn fixed_bytes(value: &FixedBytes<32>) -> [u8; 32] {
     let mut bytes = [0; 32];
     bytes.copy_from_slice(value.as_slice());
     bytes
+}
+
+fn snapshot_event_records(events: &[StoredEvent]) -> Vec<SnapshotEventRecord> {
+    events
+        .iter()
+        .map(|event| SnapshotEventRecord {
+            event_index: event.event_index,
+            blinded_commitment: event.blinded_commitment,
+            signature: event.signature,
+            event_type: event.event_type,
+        })
+        .collect()
+}
+
+fn signed_blocked_shield(record: &StoredBlockedShield) -> SignedBlockedShield {
+    SignedBlockedShield {
+        commitment_hash: prefixed_hex(&record.commitment_hash),
+        blinded_commitment: prefixed_hex(&record.blinded_commitment),
+        block_reason: record.block_reason.clone(),
+        signature: prefixed_hex(&record.signature),
+    }
+}
+
+fn prefixed_hex(bytes: &[u8]) -> String {
+    format!("0x{}", hex::encode(bytes))
 }
 
 fn unix_now() -> Result<i64, LifecycleError> {

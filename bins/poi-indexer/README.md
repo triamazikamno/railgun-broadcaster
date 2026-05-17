@@ -51,6 +51,12 @@ The v1 Filebase publisher uses normal S3 `PutObject` uploads. Filebase returns
 the IPFS CID in object metadata, and the indexer copies each object to a stable
 CID-based key so later retention sweeps can delete it by CID.
 
+Manifest entries publish signed artifact descriptors for every base snapshot,
+delta snapshot, and blocked-shields artifact. Each descriptor contains the IPFS
+`cid`, SHA-256 as `sha256`, and `byte_size`; wallets must verify those bytes
+before parsing artifacts. IPFS/Filebase/gateways are transport only, while the
+publisher signature and upstream list-key signatures are the trust boundaries.
+
 Use the root Filebase S3 endpoint, not a bucket-specific host such as
 `https://<bucket>.s3.filebase.io`. The bucket is supplied separately with
 `POI_INDEXER_FILEBASE_BUCKET`.
@@ -94,6 +100,6 @@ During bootstrap, expect:
 - Upstream unreachable: page failures and retry/backoff state appear in `/status`; the scraper retries bounded failures and shrinks page size before surfacing a hard error.
 - Postgres connection lost: scrape, publication, and retention cycles log failures and retry; restore Postgres and the next cycle resumes from durable state.
 - IPFS pinning quota exceeded: publication cycles log the pinning error and retry on the next publication tick; existing published artifacts remain in Postgres for audit.
-- Provider data loss or cleared bucket: publication cycles verify active snapshot and blocked-shields CIDs before publishing a manifest. If an active snapshot CID is missing, the indexer rebuilds a fresh base snapshot for that `(list_key, chain_id)` and supersedes the old active base/deltas. If an active blocked-shields CID is missing, the indexer repins the current blocked-shields artifact. Superseded CIDs remain in the audit tables and are cleaned up by retention later.
+- Provider data loss or cleared bucket: publication cycles verify active snapshot and blocked-shields CIDs before publishing a descriptor manifest. If an active snapshot CID is missing, the indexer rebuilds a fresh base snapshot for that `(list_key, chain_id)` and supersedes the old active base/deltas. If an active blocked-shields CID is missing, the indexer repins the current blocked-shields artifact. Superseded CIDs remain in the audit tables and are cleaned up by retention later.
 - IPNS DHT publish timeout: manifest pinning may succeed while IPNS update fails; the scheduler retries on the next publication or republish tick.
 - Retention sweep behavior: superseded CIDs older than `retention_interval` are unpinned, but `published_snapshots` and `published_blocked_shields` rows are retained permanently for audit.

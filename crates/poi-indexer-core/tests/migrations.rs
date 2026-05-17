@@ -252,6 +252,7 @@ async fn store_methods_are_idempotent_and_monotonic() -> Result<(), Box<dyn std:
         1,
         &old_base_cid,
         256,
+        &[17_u8; 32],
         1,
         &[7_u8; 32],
     )
@@ -266,6 +267,7 @@ async fn store_methods_are_idempotent_and_monotonic() -> Result<(), Box<dyn std:
         2,
         &delta_cid,
         128,
+        &[18_u8; 32],
         1,
         &[7_u8; 32],
     )
@@ -280,6 +282,7 @@ async fn store_methods_are_idempotent_and_monotonic() -> Result<(), Box<dyn std:
         2,
         &new_base_cid,
         384,
+        &[19_u8; 32],
         1,
         &[7_u8; 32],
     )
@@ -294,6 +297,7 @@ async fn store_methods_are_idempotent_and_monotonic() -> Result<(), Box<dyn std:
         2,
         &switched_upstream_base_cid,
         384,
+        &[20_u8; 32],
         1,
         &[7_u8; 32],
     )
@@ -352,6 +356,7 @@ async fn store_methods_are_idempotent_and_monotonic() -> Result<(), Box<dyn std:
         switched_upstream_publications[0].cid,
         switched_upstream_base_cid.to_string()
     );
+    assert_eq!(switched_upstream_publications[0].content_hash, [20_u8; 32]);
 
     sqlx::query(
         "UPDATE published_snapshots \

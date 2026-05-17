@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::debug;
 
+use crate::artifacts::SnapshotEvent;
 use crate::error::PoiRpcError;
 use crate::poi::{
     BlindedCommitmentData, BlockedShield, PoiMerkleProof, PoiRpcClient, PoiStatus,
@@ -166,7 +167,22 @@ impl PoiCache {
             Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err.into()),
         };
-        let mut snapshot: PoiCacheSnapshot = rmp_serde::from_slice(&data)?;
+        Self::from_bytes(&data, identity).map(Some)
+    }
+
+    pub fn write(&self, path: &Path) -> Result<(), PoiCacheError> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let data = self.to_bytes()?;
+        let temp_path = temp_path(path);
+        fs::write(&temp_path, data)?;
+        fs::rename(temp_path, path)?;
+        Ok(())
+    }
+
+    pub fn from_bytes(bytes: &[u8], identity: &PoiCacheIdentity) -> Result<Self, PoiCacheError> {
+        let mut snapshot: PoiCacheSnapshot = rmp_serde::from_slice(bytes)?;
         if snapshot.version != POI_CACHE_SNAPSHOT_VERSION {
             return Err(PoiCacheError::UnsupportedVersion {
                 version: snapshot.version,
@@ -178,18 +194,11 @@ impl PoiCache {
             });
         }
         snapshot.forest.compute_roots();
-        Ok(Some(Self { snapshot }))
+        Ok(Self { snapshot })
     }
 
-    pub fn write(&self, path: &Path) -> Result<(), PoiCacheError> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let data = rmp_serde::to_vec_named(&self.snapshot)?;
-        let temp_path = temp_path(path);
-        fs::write(&temp_path, data)?;
-        fs::rename(temp_path, path)?;
-        Ok(())
+    pub fn to_bytes(&self) -> Result<Vec<u8>, PoiCacheError> {
+        Ok(rmp_serde::to_vec_named(&self.snapshot)?)
     }
 
     #[must_use]
@@ -324,6 +333,58 @@ impl PoiCache {
         }
         self.snapshot.progress.blocked_shields_synced = true;
         Ok(blocked_shields.len())
+    }
+
+    pub fn apply_verified_artifact_events(
+        &mut self,
+        events: &[SnapshotEvent],
+    ) -> Result<usize, PoiCacheError> {
+        let mut inserted = 0usize;
+        for event in events {
+            let global_index = event.event_index;
+            let leaf = U256::from_be_bytes(event.blinded_commitment);
+            let (tree_number, tree_position) = normalize_tree_position(0, global_index);
+            self.snapshot.forest.insert_leaf(MerkleTreeUpdate {
+                tree_number,
+                tree_position,
+                hash: leaf,
+            })?;
+            let blinded_commitment = fixed_from_u256(leaf);
+            self.snapshot.position_by_blinded_commitment.insert(
+                blinded_commitment,
+                PoiCachePosition {
+                    global_index,
+                    tree_number,
+                    tree_position,
+                },
+            );
+            self.snapshot
+                .status_by_blinded_commitment
+                .insert(blinded_commitment, PoiStatus::Valid);
+            self.snapshot.progress.next_event_index = self
+                .snapshot
+                .progress
+                .next_event_index
+                .max(next_index(global_index)?);
+            self.snapshot.progress.next_leaf_index = self
+                .snapshot
+                .progress
+                .next_leaf_index
+                .max(next_index(global_index)?);
+            inserted += 1;
+        }
+        if inserted > 0 {
+            self.snapshot.progress.root_validation = PoiCacheRootValidation::Pending;
+        }
+        Ok(inserted)
+    }
+
+    pub fn accept_current_roots(&mut self) -> BTreeMap<u32, FixedBytes<32>> {
+        let roots = self.current_roots();
+        self.snapshot.progress.root_validation = PoiCacheRootValidation::Validated {
+            roots: roots.clone(),
+        };
+        roots
     }
 
     pub async fn sync(

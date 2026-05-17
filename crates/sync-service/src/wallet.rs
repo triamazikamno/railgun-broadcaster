@@ -47,8 +47,10 @@ use railgun_wallet::{
 };
 use url::Url;
 
+use crate::poi_artifacts::{PoiArtifactIngestor, load_persisted_cache};
 use crate::types::{
-    BackfillEvent, SharedLogBatch, WalletCacheStore, WalletConfig, WalletLocalPoiCaches,
+    BackfillEvent, PoiReadSource, SharedLogBatch, WalletCacheStore, WalletConfig,
+    WalletLocalPoiCaches,
 };
 
 pub const WALLET_POI_STATUS_BATCH_SIZE: usize = 1000;
@@ -130,6 +132,8 @@ pub struct WalletHandle {
     pub ready_rx: watch::Receiver<bool>,
     pub rev_rx: watch::Receiver<u64>,
     pub poi_refreshing_rx: watch::Receiver<bool>,
+    poi_read_source: PoiReadSource,
+    local_poi_caches: Option<WalletLocalPoiCaches>,
     poi_refresh_tx: mpsc::Sender<WalletPoiRefreshRequest>,
     rev_tx: watch::Sender<u64>,
 }
@@ -142,6 +146,16 @@ impl WalletHandle {
             })
             .await
             .is_ok()
+    }
+
+    #[must_use]
+    pub const fn poi_read_source(&self) -> &PoiReadSource {
+        &self.poi_read_source
+    }
+
+    #[must_use]
+    pub fn local_poi_caches(&self) -> Option<WalletLocalPoiCaches> {
+        self.local_poi_caches.clone()
     }
 }
 
@@ -231,12 +245,13 @@ impl PoiStatusReader for LocalPoiStatusReader {
 }
 
 #[derive(Clone)]
-pub(crate) struct LocalPoiMerkleProofSource {
+pub struct LocalPoiMerkleProofSource {
     caches: WalletLocalPoiCaches,
 }
 
 impl LocalPoiMerkleProofSource {
-    pub(crate) fn new(caches: WalletLocalPoiCaches) -> Self {
+    #[must_use]
+    pub const fn new(caches: WalletLocalPoiCaches) -> Self {
         Self { caches }
     }
 }
@@ -2290,122 +2305,148 @@ async fn refresh_wallet_poi_statuses_selected(
 }
 
 async fn sync_local_poi_caches(
-    client: &PoiRpcClient,
-    local_caches: &WalletLocalPoiCaches,
-    cache_key: &str,
-    chain_id: u64,
+    db: &DbStore,
+    http_client: Option<&reqwest::Client>,
+    cfg: &WalletConfig,
     active_list_keys: &[FixedBytes<32>],
-    validate_roots: bool,
 ) {
+    let Some(local_caches) = cfg.local_poi_caches.as_ref() else {
+        return;
+    };
+    let PoiReadSource::IndexedArtifacts(artifact_config) = &cfg.poi_read_source else {
+        return;
+    };
+    let ingestor = PoiArtifactIngestor::new(
+        artifact_config.clone(),
+        http_client.cloned().unwrap_or_else(reqwest::Client::new),
+    );
     let mut caches = local_caches.write().await;
     for list_key in active_list_keys {
         caches.entry(*list_key).or_insert_with(|| {
             PoiCache::new(PoiCacheIdentity::new(
                 EVM_CHAIN_TYPE,
-                chain_id,
+                cfg.chain.chain_id,
                 DEFAULT_TXID_VERSION,
                 *list_key,
             ))
         });
     }
     for list_key in active_list_keys {
-        let Some(cache) = caches.get_mut(list_key) else {
-            continue;
-        };
+        let identity = PoiCacheIdentity::new(
+            EVM_CHAIN_TYPE,
+            cfg.chain.chain_id,
+            DEFAULT_TXID_VERSION,
+            *list_key,
+        );
         let sync_started = Instant::now();
-        match cache.sync(client).await {
-            Ok(outcome) => {
-                debug!(
-                    cache_key,
-                    chain_id,
+        match ingestor
+            .refresh_persisted_cache(db, identity.clone(), SystemTime::now())
+            .await
+        {
+            Ok(refresh) => {
+                let manifest_sequence = refresh.manifest_sequence;
+                let current_tip_index = refresh.entry.current_tip_index;
+                caches.insert(*list_key, refresh.cache);
+                info!(
+                    cache_key = %cfg.cache_key,
+                    chain_id = cfg.chain.chain_id,
                     list_key = %hex::encode(list_key),
-                    events = outcome.events,
-                    leaves = outcome.leaves,
-                    blocked_shields = outcome.blocked_shields,
+                    manifest_sequence,
+                    current_tip_index,
+                    base_cid = %refresh.entry.base.cid,
+                    delta_count = refresh.entry.deltas.len(),
+                    blocked_shields_cid = %refresh.entry.blocked_shields.cid,
                     elapsed_ms = sync_started.elapsed().as_millis(),
-                    "local POI cache sync complete"
+                    "artifact POI cache sync complete"
                 );
-                if validate_roots {
-                    match cache.validate_roots(client).await {
-                        Ok(true) => {
-                            debug!(
-                                cache_key,
-                                chain_id,
-                                list_key = %hex::encode(list_key),
-                                "local POI cache roots accepted"
-                            );
-                        }
-                        Ok(false) => {
-                            warn!(
-                                cache_key,
-                                chain_id,
-                                list_key = %hex::encode(list_key),
-                                "local POI cache roots rejected"
-                            );
-                        }
-                        Err(err) => {
-                            warn!(
-                                ?err,
-                                cache_key,
-                                chain_id,
-                                list_key = %hex::encode(list_key),
-                                "local POI cache root validation failed"
-                            );
-                        }
-                    }
-                }
             }
             Err(err) => {
                 warn!(
                     ?err,
-                    cache_key,
-                    chain_id,
+                    cache_key = %cfg.cache_key,
+                    chain_id = cfg.chain.chain_id,
                     list_key = %hex::encode(list_key),
                     elapsed_ms = sync_started.elapsed().as_millis(),
-                    "local POI cache sync failed; using existing local cache state"
+                    "artifact POI cache sync failed; using last accepted local cache state if available"
                 );
+                match load_persisted_cache(db, &identity) {
+                    Ok(Some(persisted)) => {
+                        caches.insert(*list_key, persisted.cache);
+                    }
+                    Ok(None) => {}
+                    Err(err) => warn!(
+                        ?err,
+                        cache_key = %cfg.cache_key,
+                        chain_id = cfg.chain.chain_id,
+                        list_key = %hex::encode(list_key),
+                        "failed to load persisted artifact POI cache after refresh error"
+                    ),
+                }
             }
         }
     }
 }
 
+fn spawn_startup_artifact_poi_cache_warmup(
+    db: Arc<DbStore>,
+    http_client: Option<reqwest::Client>,
+    cfg: WalletConfig,
+    active_list_keys: Vec<FixedBytes<32>>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !matches!(cfg.poi_read_source, PoiReadSource::IndexedArtifacts(_)) {
+        return None;
+    }
+    info!(
+        cache_key = %cfg.cache_key,
+        chain_id = cfg.chain.chain_id,
+        list_count = active_list_keys.len(),
+        "warming artifact POI cache"
+    );
+    Some(tokio::spawn(async move {
+        sync_local_poi_caches(db.as_ref(), http_client.as_ref(), &cfg, &active_list_keys).await;
+    }))
+}
+
 async fn refresh_wallet_poi_statuses_selected_with_config(
     remote_client: &PoiRpcClient,
-    local_caches: Option<&WalletLocalPoiCaches>,
-    cache_key: &str,
-    chain_id: u64,
+    db: &DbStore,
+    http_client: Option<&reqwest::Client>,
+    cfg: &WalletConfig,
     active_list_keys: &[FixedBytes<32>],
     wallet_utxos: &mut [WalletUtxo],
     selection: WalletPoiRefreshSelection,
 ) -> bool {
-    if let Some(local_caches) = local_caches {
-        sync_local_poi_caches(
-            remote_client,
-            local_caches,
-            cache_key,
-            chain_id,
-            active_list_keys,
-            false,
-        )
-        .await;
-        let reader = LocalPoiStatusReader::new(Arc::clone(local_caches));
-        refresh_wallet_poi_statuses_selected(
-            &reader,
-            chain_id,
-            active_list_keys,
-            wallet_utxos,
-            selection,
-        )
-        .await
-    } else {
-        refresh_wallet_poi_statuses_selected(
-            remote_client,
-            chain_id,
-            active_list_keys,
-            wallet_utxos,
-            selection,
-        )
-        .await
+    match &cfg.poi_read_source {
+        PoiReadSource::IndexedArtifacts(_) => {
+            sync_local_poi_caches(db, http_client, cfg, active_list_keys).await;
+            let local_caches = cfg.local_poi_caches.as_ref().cloned().unwrap_or_else(|| {
+                warn!(
+                    cache_key = %cfg.cache_key,
+                    chain_id = cfg.chain.chain_id,
+                    "artifact POI read source missing local cache handle"
+                );
+                Arc::new(RwLock::new(BTreeMap::new()))
+            });
+            let reader = LocalPoiStatusReader::new(local_caches);
+            refresh_wallet_poi_statuses_selected(
+                &reader,
+                cfg.chain.chain_id,
+                active_list_keys,
+                wallet_utxos,
+                selection,
+            )
+            .await
+        }
+        PoiReadSource::PoiProxy => {
+            refresh_wallet_poi_statuses_selected(
+                remote_client,
+                cfg.chain.chain_id,
+                active_list_keys,
+                wallet_utxos,
+                selection,
+            )
+            .await
+        }
     }
 }
 
@@ -2718,24 +2759,33 @@ async fn refresh_wallet_poi_statuses_and_persist(
 
 async fn refresh_wallet_poi_statuses_and_persist_with_config(
     remote_client: &PoiRpcClient,
-    local_caches: Option<&WalletLocalPoiCaches>,
+    db: &DbStore,
+    http_client: Option<&reqwest::Client>,
     persist: WalletPoiStatusRefreshPersist<'_>,
     selection: WalletPoiRefreshSelection,
 ) -> bool {
-    if let Some(local_caches) = local_caches {
-        sync_local_poi_caches(
-            remote_client,
-            local_caches,
-            &persist.cfg.cache_key,
-            persist.cfg.chain.chain_id,
-            persist.active_list_keys,
-            false,
-        )
-        .await;
-        let reader = LocalPoiStatusReader::new(Arc::clone(local_caches));
-        refresh_wallet_poi_statuses_and_persist(&reader, persist, selection).await
-    } else {
-        refresh_wallet_poi_statuses_and_persist(remote_client, persist, selection).await
+    match &persist.cfg.poi_read_source {
+        PoiReadSource::IndexedArtifacts(_) => {
+            sync_local_poi_caches(db, http_client, persist.cfg, persist.active_list_keys).await;
+            let local_caches = persist
+                .cfg
+                .local_poi_caches
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| {
+                    warn!(
+                        cache_key = %persist.cfg.cache_key,
+                        chain_id = persist.cfg.chain.chain_id,
+                        "artifact POI read source missing local cache handle"
+                    );
+                    Arc::new(RwLock::new(BTreeMap::new()))
+                });
+            let reader = LocalPoiStatusReader::new(local_caches);
+            refresh_wallet_poi_statuses_and_persist(&reader, persist, selection).await
+        }
+        PoiReadSource::PoiProxy => {
+            refresh_wallet_poi_statuses_and_persist(remote_client, persist, selection).await
+        }
     }
 }
 
@@ -2761,19 +2811,25 @@ async fn recover_missing_output_pois_from_wallet(run: OutputPoiRecoveryRun<'_>) 
         return 0;
     }
     let forest = run.forest.read().await.clone();
-    let local_proof_source = if let Some(local_caches) = run.cfg.local_poi_caches.as_ref() {
-        sync_local_poi_caches(
-            run.client,
-            local_caches,
-            &run.cfg.cache_key,
-            run.cfg.chain.chain_id,
-            run.active_list_keys,
-            true,
-        )
-        .await;
-        Some(LocalPoiMerkleProofSource::new(Arc::clone(local_caches)))
-    } else {
-        None
+    let local_proof_source = match &run.cfg.poi_read_source {
+        PoiReadSource::IndexedArtifacts(_) => {
+            sync_local_poi_caches(run.db, run.http_client, run.cfg, run.active_list_keys).await;
+            let local_caches = run
+                .cfg
+                .local_poi_caches
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| {
+                    warn!(
+                        cache_key = %run.cfg.cache_key,
+                        chain_id = run.cfg.chain.chain_id,
+                        "artifact POI read source missing local cache handle"
+                    );
+                    Arc::new(RwLock::new(BTreeMap::new()))
+                });
+            Some(LocalPoiMerkleProofSource::new(local_caches))
+        }
+        PoiReadSource::PoiProxy => None,
     };
     let proof_source: &(dyn PoiMerkleProofSource + '_);
     if let Some(source) = local_proof_source.as_ref() {
@@ -2830,6 +2886,8 @@ pub(crate) fn spawn_wallet_worker(
         ready_rx,
         rev_rx,
         poi_refreshing_rx,
+        poi_read_source: cfg.poi_read_source.clone(),
+        local_poi_caches: cfg.local_poi_caches.clone(),
         poi_refresh_tx,
         rev_tx,
     };
@@ -2856,6 +2914,12 @@ pub(crate) fn spawn_wallet_worker(
         let mut live_metadata_flush = WalletLiveMetadataFlush::new(last_scanned, worker_started);
         let poi_status_client = wallet_poi_status_client(http_client.as_ref());
         let active_poi_list_keys = default_active_poi_list_keys();
+        let _ = spawn_startup_artifact_poi_cache_warmup(
+            Arc::clone(&db),
+            http_client.clone(),
+            cfg.clone(),
+            active_poi_list_keys.clone(),
+        );
 
         if poi_status_client.is_some() {
             let locked = utxos.read().await;
@@ -2884,7 +2948,8 @@ pub(crate) fn spawn_wallet_worker(
                     set_poi_refreshing(&poi_refreshing_tx, true, &cfg.cache_key);
                     let changed = refresh_wallet_poi_statuses_and_persist_with_config(
                         client,
-                        cfg.local_poi_caches.as_ref(),
+                        db.as_ref(),
+                        http_client.as_ref(),
                         WalletPoiStatusRefreshPersist {
                             cache_store: cache_store.as_ref(),
                             cfg: &cfg,
@@ -2946,7 +3011,8 @@ pub(crate) fn spawn_wallet_worker(
                     set_poi_refreshing(&poi_refreshing_tx, true, &cfg.cache_key);
                     let changed = refresh_wallet_poi_statuses_and_persist_with_config(
                         client,
-                        cfg.local_poi_caches.as_ref(),
+                        db.as_ref(),
+                        http_client.as_ref(),
                         WalletPoiStatusRefreshPersist {
                             cache_store: cache_store.as_ref(),
                             cfg: &cfg,
@@ -3155,7 +3221,8 @@ pub(crate) fn spawn_wallet_worker(
                                     set_poi_refreshing(&poi_refreshing_tx, true, &cfg.cache_key);
                                     let changed = refresh_wallet_poi_statuses_and_persist_with_config(
                                         client,
-                                        cfg.local_poi_caches.as_ref(),
+                                        db.as_ref(),
+                                        http_client.as_ref(),
                                         WalletPoiStatusRefreshPersist {
                                             cache_store: cache_store.as_ref(),
                                             cfg: &cfg,
@@ -3292,9 +3359,9 @@ pub(crate) fn spawn_wallet_worker(
                                         let mut locked = utxos.write().await;
                                         changed |= refresh_wallet_poi_statuses_selected_with_config(
                                             client,
-                                            cfg.local_poi_caches.as_ref(),
-                                            &cfg.cache_key,
-                                            cfg.chain.chain_id,
+                                            db.as_ref(),
+                                            http_client.as_ref(),
+                                            &cfg,
                                             &active_poi_list_keys,
                                             &mut locked,
                                             WalletPoiRefreshSelection::RequiredOrRecoverable,
@@ -3390,7 +3457,7 @@ fn wallet_utxo_counts(utxos: &[WalletUtxo]) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_TXID_VERSION, EVM_CHAIN_TYPE, LocalPoiStatusReader,
+        DEFAULT_TXID_VERSION, EVM_CHAIN_TYPE, LocalPoiMerkleProofSource, LocalPoiStatusReader,
         OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER, OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
         PendingOutputPoiSubmitter, PoiStatusReader, RecoveryGraphRailgunTransaction,
         WALLET_METADATA_LIVE_FLUSH_BLOCKS, WALLET_METADATA_LIVE_FLUSH_INTERVAL,
@@ -3402,10 +3469,14 @@ mod tests {
         output_poi_recovery_proof_retry_after, output_start_global_position,
         pending_output_poi_submit_identity, process_pending_output_poi_observations,
         process_pending_output_poi_observations_inner, recovery_leaf_count_for_merkle_root,
-        refresh_wallet_poi_statuses_selected, rewind_wallet_utxos, spent_source_for_utxo,
+        refresh_wallet_poi_statuses_selected, refresh_wallet_poi_statuses_selected_with_config,
+        rewind_wallet_utxos, spawn_startup_artifact_poi_cache_warmup, spent_source_for_utxo,
         wallet_poi_status_refresh_needed, wallet_poi_status_refresh_needed_for_selection,
     };
-    use crate::types::{ChainKey, WalletCacheStore, WalletConfig};
+    use crate::types::{
+        ChainKey, PoiArtifactManifestSource, PoiArtifactSourceConfig, PoiReadSource,
+        WalletCacheStore, WalletConfig,
+    };
     use alloy::hex;
     use alloy::primitives::{Address, Bytes, FixedBytes, U64, U256};
     use alloy::uint;
@@ -3416,25 +3487,32 @@ mod tests {
     use broadcaster_core::tree::TREE_LEAF_COUNT;
     use local_db::{
         DbConfig, DbStore, OutputPoiRecoveryAction, OutputPoiRecoveryRecord,
-        OutputPoiRecoveryStatus, PendingOutputPoiContextRecord, PendingOutputPoiRole, WalletMeta,
+        OutputPoiRecoveryStatus, PendingOutputPoiContextRecord, PendingOutputPoiRole,
+        PoiArtifactCacheRecord, PoiArtifactDescriptorRecord, WalletMeta,
     };
     use merkletree::tree::{MerkleForest, MerkleTreeUpdate};
+    use poi::artifacts::{ArtifactDescriptor, Manifest, ManifestEntry};
     use poi::cache::{PoiCache, PoiCacheIdentity};
     use poi::error::PoiError;
-    use poi::poi::{BlindedCommitmentData, SingleCommitmentProofContext};
+    use poi::poi::{BlindedCommitmentData, PoiRpcClient, SingleCommitmentProofContext};
+    use railgun_wallet::prover::ProverError;
     use railgun_wallet::scan::{CommitmentObservation, SpentNullifier, WalletLogDelta};
+    use railgun_wallet::tx::{PoiMerkleProofSource, PreTransactionPoiError};
     use railgun_wallet::wallet_cache::WalletCacheError;
     use railgun_wallet::{
         PoiStatus, Utxo, UtxoCommitmentKind, UtxoPoiMetadata, UtxoSource, WalletUtxo,
     };
-    use railgun_wallet::{prover::ProverError, tx::PreTransactionPoiError};
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc as std_mpsc;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
     use tokio::sync::{RwLock, mpsc, watch};
+    use url::Url;
 
     static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -3477,6 +3555,7 @@ mod tests {
             progress_tx: None,
             cache_store: None,
             poi_recovery_prover: None,
+            poi_read_source: PoiReadSource::PoiProxy,
             local_poi_caches: None,
             use_indexed_wallet_catch_up: true,
         }
@@ -3537,6 +3616,11 @@ mod tests {
         fail_calls: Mutex<HashSet<usize>>,
     }
 
+    struct MockPoiRpc {
+        url: Url,
+        requests: std_mpsc::Receiver<serde_json::Value>,
+    }
+
     impl RecordingPoiStatusClient {
         fn fail_call(&self, call_index: usize) {
             self.fail_calls
@@ -3548,6 +3632,104 @@ mod tests {
         fn calls(&self) -> Vec<(Vec<FixedBytes<32>>, Vec<BlindedCommitmentData>)> {
             self.calls.lock().expect("poi calls").clone()
         }
+    }
+
+    async fn spawn_poi_rpc(result: serde_json::Value) -> MockPoiRpc {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock POI RPC");
+        let url = Url::parse(&format!(
+            "http://{}",
+            listener.local_addr().expect("local addr")
+        ))
+        .expect("mock POI RPC URL");
+        let (tx, requests) = std_mpsc::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut bytes = Vec::new();
+            let mut buf = [0_u8; 1024];
+            let (body_start, content_length) = loop {
+                let read = socket.read(&mut buf).await.expect("read request");
+                assert!(
+                    read > 0,
+                    "mock POI RPC connection closed before request body"
+                );
+                bytes.extend_from_slice(&buf[..read]);
+                if let Some(lengths) = http_body_bounds(&bytes) {
+                    break lengths;
+                }
+            };
+            let body = &bytes[body_start..body_start + content_length];
+            let request: serde_json::Value = serde_json::from_slice(body).expect("request JSON");
+            tx.send(request.clone()).expect("record request");
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request["id"].clone(),
+                "result": result,
+            })
+            .to_string();
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                response.len()
+            );
+            socket
+                .write_all(headers.as_bytes())
+                .await
+                .expect("write headers");
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write body");
+        });
+        MockPoiRpc { url, requests }
+    }
+
+    async fn spawn_http_response(body: Vec<u8>) -> (Url, std_mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock HTTP server");
+        let url = Url::parse(&format!(
+            "http://{}",
+            listener.local_addr().expect("local addr")
+        ))
+        .expect("mock HTTP URL");
+        let (tx, requests) = std_mpsc::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut bytes = Vec::new();
+            let mut buf = [0_u8; 1024];
+            loop {
+                let read = socket.read(&mut buf).await.expect("read request");
+                assert!(read > 0, "mock HTTP connection closed before request");
+                bytes.extend_from_slice(&buf[..read]);
+                if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            tx.send(String::from_utf8_lossy(&bytes).to_string())
+                .expect("record request");
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            socket
+                .write_all(headers.as_bytes())
+                .await
+                .expect("write headers");
+            socket.write_all(&body).await.expect("write body");
+        });
+        (url, requests)
+    }
+
+    fn http_body_bounds(bytes: &[u8]) -> Option<(usize, usize)> {
+        let body_start = bytes.windows(4).position(|window| window == b"\r\n\r\n")? + 4;
+        let headers = std::str::from_utf8(&bytes[..body_start]).ok()?;
+        let content_length = headers.lines().find_map(|line| {
+            line.strip_prefix("content-length:")
+                .or_else(|| line.strip_prefix("Content-Length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+        })?;
+        (bytes.len() >= body_start + content_length).then_some((body_start, content_length))
     }
 
     #[async_trait]
@@ -4280,6 +4462,292 @@ mod tests {
             wallet_utxos[1].utxo.poi.blinded_commitment,
             missing_blinded_commitment
         );
+    }
+
+    #[tokio::test]
+    async fn indexed_artifacts_status_refresh_does_not_call_remote_pois_per_list() {
+        let list_key = FixedBytes::from([0x11; 32]);
+        let list_keys = vec![list_key];
+        let mut wallet_utxos = vec![test_wallet_utxo(1)];
+        let blinded_commitment = wallet_utxos[0].utxo.poi.blinded_commitment;
+        let mut cache = PoiCache::new(PoiCacheIdentity::new(
+            EVM_CHAIN_TYPE,
+            1,
+            DEFAULT_TXID_VERSION,
+            list_key,
+        ));
+        cache
+            .apply_verified_artifact_events(&[poi::artifacts::SnapshotEvent {
+                event_index: 0,
+                blinded_commitment: *blinded_commitment,
+                signature: [0_u8; 64],
+                event_type: poi::poi::PoiEventType::Transact,
+            }])
+            .expect("apply artifact event");
+        cache.accept_current_roots();
+        let local_caches = Arc::new(RwLock::new(BTreeMap::from([(list_key, cache)])));
+        let mut cfg = wallet_config(U256::ZERO);
+        cfg.poi_read_source = PoiReadSource::IndexedArtifacts(PoiArtifactSourceConfig {
+            trusted_publisher_pubkey: FixedBytes::from([0x22; 32]),
+            manifest_source: PoiArtifactManifestSource::Url(
+                Url::parse("http://127.0.0.1:1/manifest").expect("artifact URL"),
+            ),
+            gateway_urls: vec![Url::parse("http://127.0.0.1:1").expect("gateway URL")],
+            max_manifest_age: None,
+        });
+        cfg.local_poi_caches = Some(local_caches);
+        let root_dir = temp_db_root();
+        let db = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open temp db");
+        let mock = spawn_poi_rpc(serde_json::json!({})).await;
+        let remote_client = PoiRpcClient::new(mock.url.clone());
+
+        let changed = refresh_wallet_poi_statuses_selected_with_config(
+            &remote_client,
+            &db,
+            None,
+            &cfg,
+            &list_keys,
+            &mut wallet_utxos,
+            WalletPoiRefreshSelection::RequiredOrRecoverable,
+        )
+        .await;
+
+        assert!(changed);
+        assert_eq!(
+            wallet_utxos[0].utxo.poi.statuses.get(&list_key),
+            Some(&PoiStatus::Valid)
+        );
+        assert!(
+            mock.requests
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "remote ppoi_pois_per_list should not be called"
+        );
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test]
+    async fn indexed_artifacts_startup_warms_cache_even_when_status_refresh_not_needed() {
+        let list_key = FixedBytes::from([0x11; 32]);
+        let identity = PoiCacheIdentity::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION, list_key);
+        let mut cache = PoiCache::new(identity.clone());
+        cache
+            .apply_verified_artifact_events(&[poi::artifacts::SnapshotEvent {
+                event_index: 0,
+                blinded_commitment: [0x33; 32],
+                signature: [0_u8; 64],
+                event_type: poi::poi::PoiEventType::Transact,
+            }])
+            .expect("apply artifact event");
+        let expected_root = *cache.current_roots().get(&0).expect("current root");
+        cache.accept_current_roots();
+
+        let base_descriptor = ArtifactDescriptor::from_bytes("bafybase", b"");
+        let blocked_descriptor = ArtifactDescriptor::from_bytes("bafyblocked", b"");
+        let entry = ManifestEntry {
+            list_key: hex::encode_prefixed(list_key),
+            chain_id: 1,
+            base: base_descriptor.clone(),
+            deltas: Vec::new(),
+            blocked_shields: blocked_descriptor.clone(),
+            current_tip_index: 0,
+            current_tip_merkleroot: hex::encode_prefixed(expected_root),
+        };
+
+        let root_dir = temp_db_root();
+        fs::create_dir_all(&root_dir).expect("create temp db root");
+        let key_path = root_dir.join("publisher.key");
+        fs::write(&key_path, [0x07_u8; 32]).expect("write publisher key");
+        let signing_key = poi::artifacts::manifest::load_publisher_signing_key(&key_path)
+            .expect("load publisher key");
+        let trusted_publisher_pubkey = FixedBytes::from(signing_key.verifying_key().to_bytes());
+        let mut manifest = Manifest::new(2, 1_700_000_000_000, 7, String::new(), vec![entry]);
+        manifest.sign_manifest(&signing_key).expect("sign manifest");
+        let manifest_bytes = serde_json::to_vec(&manifest).expect("manifest JSON");
+        let (manifest_url, requests) = spawn_http_response(manifest_bytes).await;
+
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open temp db"),
+        );
+        db.put_poi_artifact_cache(&PoiArtifactCacheRecord {
+            chain_type: identity.chain_type,
+            chain_id: identity.chain_id,
+            txid_version: identity.txid_version.clone(),
+            list_key,
+            last_accepted_manifest_sequence: 6,
+            base_descriptor: descriptor_record(&base_descriptor),
+            applied_delta_descriptors: Vec::new(),
+            blocked_shields_descriptor: descriptor_record(&blocked_descriptor),
+            current_tip_index: 0,
+            current_tip_root: expected_root,
+            cache_payload: cache.to_bytes().expect("cache payload"),
+            updated_at: 1,
+        })
+        .expect("seed artifact cache");
+
+        let local_caches = Arc::new(RwLock::new(BTreeMap::new()));
+        let mut cfg = wallet_config(U256::ZERO);
+        cfg.poi_read_source = PoiReadSource::IndexedArtifacts(PoiArtifactSourceConfig {
+            trusted_publisher_pubkey,
+            manifest_source: PoiArtifactManifestSource::Url(manifest_url.clone()),
+            gateway_urls: vec![manifest_url],
+            max_manifest_age: None,
+        });
+        cfg.local_poi_caches = Some(Arc::clone(&local_caches));
+
+        let handle =
+            spawn_startup_artifact_poi_cache_warmup(Arc::clone(&db), None, cfg, vec![list_key])
+                .expect("startup warmup spawned");
+        handle.await.expect("startup warmup joined");
+
+        let request = requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("manifest request");
+        assert!(request.starts_with("GET / HTTP/1.1"));
+        let locked = local_caches.read().await;
+        let mut warmed = locked.get(&list_key).expect("warmed local cache").clone();
+        assert_eq!(warmed.current_roots().get(&0), Some(&expected_root));
+        let persisted = db
+            .get_poi_artifact_cache(
+                identity.chain_type,
+                identity.chain_id,
+                &identity.txid_version,
+                &identity.list_key,
+            )
+            .expect("read persisted artifact cache")
+            .expect("persisted artifact cache");
+        assert_eq!(persisted.last_accepted_manifest_sequence, 7);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    fn descriptor_record(descriptor: &ArtifactDescriptor) -> PoiArtifactDescriptorRecord {
+        PoiArtifactDescriptorRecord {
+            cid: descriptor.cid.clone(),
+            sha256: descriptor.sha256.clone(),
+            byte_size: descriptor.byte_size,
+        }
+    }
+
+    #[tokio::test]
+    async fn poi_proxy_status_refresh_calls_remote_pois_per_list_without_local_ingestion() {
+        let list_key = FixedBytes::from([0x11; 32]);
+        let list_keys = vec![list_key];
+        let mut wallet_utxos = vec![test_wallet_utxo(1)];
+        let blinded_commitment = wallet_utxos[0].utxo.poi.blinded_commitment;
+        let mock = spawn_poi_rpc(serde_json::json!({
+            hex::encode_prefixed(blinded_commitment): {
+                hex::encode(list_key): "Valid",
+            }
+        }))
+        .await;
+        let remote_client = PoiRpcClient::new(mock.url.clone());
+        let mut cfg = wallet_config(U256::ZERO);
+        cfg.poi_read_source = PoiReadSource::PoiProxy;
+        cfg.local_poi_caches = Some(Arc::new(RwLock::new(BTreeMap::new())));
+        let root_dir = temp_db_root();
+        let db = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open temp db");
+
+        let changed = refresh_wallet_poi_statuses_selected_with_config(
+            &remote_client,
+            &db,
+            None,
+            &cfg,
+            &list_keys,
+            &mut wallet_utxos,
+            WalletPoiRefreshSelection::RequiredOrRecoverable,
+        )
+        .await;
+
+        let request = mock
+            .requests
+            .recv_timeout(Duration::from_secs(2))
+            .expect("remote status request");
+        assert_eq!(request["method"], "ppoi_pois_per_list");
+        assert!(changed);
+        assert_eq!(
+            wallet_utxos[0].utxo.poi.statuses.get(&list_key),
+            Some(&PoiStatus::Valid)
+        );
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test]
+    async fn poi_proxy_merkle_proof_source_calls_remote_merkle_proofs() {
+        let list_key = FixedBytes::from([0x11; 32]);
+        let blinded_commitment = FixedBytes::from([0x22; 32]);
+        let mock = spawn_poi_rpc(serde_json::json!([{
+            "leaf": hex::encode_prefixed(blinded_commitment),
+            "elements": [],
+            "indices": "0x00",
+            "root": "0x00",
+        }]))
+        .await;
+        let client = PoiRpcClient::new(mock.url.clone());
+
+        let proofs = client
+            .poi_merkle_proofs(
+                DEFAULT_TXID_VERSION,
+                EVM_CHAIN_TYPE,
+                1,
+                &list_key,
+                &[blinded_commitment],
+            )
+            .await
+            .expect("remote proof response");
+
+        let request = mock
+            .requests
+            .recv_timeout(Duration::from_secs(2))
+            .expect("remote proof request");
+        assert_eq!(request["method"], "ppoi_merkle_proofs");
+        assert_eq!(proofs.len(), 1);
+        assert_eq!(proofs[0].leaf, hex::encode_prefixed(blinded_commitment));
+    }
+
+    #[tokio::test]
+    async fn local_poi_merkle_proof_source_reads_cache_without_remote_merkle_proofs() {
+        let list_key = FixedBytes::from([0x11; 32]);
+        let blinded_commitment = FixedBytes::from([0x22; 32]);
+        let mut cache = PoiCache::new(PoiCacheIdentity::new(
+            EVM_CHAIN_TYPE,
+            1,
+            DEFAULT_TXID_VERSION,
+            list_key,
+        ));
+        cache
+            .apply_verified_artifact_events(&[poi::artifacts::SnapshotEvent {
+                event_index: 0,
+                blinded_commitment: *blinded_commitment,
+                signature: [0_u8; 64],
+                event_type: poi::poi::PoiEventType::Transact,
+            }])
+            .expect("apply artifact event");
+        cache.accept_current_roots();
+        let local_caches = Arc::new(RwLock::new(BTreeMap::from([(list_key, cache)])));
+        let source = LocalPoiMerkleProofSource::new(local_caches);
+
+        let proofs = source
+            .poi_merkle_proofs(
+                DEFAULT_TXID_VERSION,
+                EVM_CHAIN_TYPE,
+                1,
+                &list_key,
+                &[blinded_commitment],
+            )
+            .await
+            .expect("local proof");
+
+        assert_eq!(proofs.len(), 1);
+        assert_eq!(proofs[0].leaf, hex::encode_prefixed(blinded_commitment));
     }
 
     #[tokio::test]
@@ -5032,6 +5500,8 @@ mod tests {
             ready_rx,
             rev_rx,
             poi_refreshing_rx,
+            poi_read_source: PoiReadSource::PoiProxy,
+            local_poi_caches: None,
             poi_refresh_tx,
             rev_tx,
         };
@@ -5056,6 +5526,8 @@ mod tests {
             ready_rx,
             rev_rx,
             poi_refreshing_rx,
+            poi_read_source: PoiReadSource::PoiProxy,
+            local_poi_caches: None,
             poi_refresh_tx,
             rev_tx,
         };

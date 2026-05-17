@@ -25,6 +25,8 @@ const PENDING_OUTPUT_POI_CONTEXT_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("pending_output_poi_context");
 const OUTPUT_POI_RECOVERY_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("output_poi_recovery");
+const POI_ARTIFACT_CACHE_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("poi_artifact_cache");
 const DESKTOP_WALLET_VAULT_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("desktop_wallet_vault_v1");
 
@@ -40,6 +42,7 @@ pub enum LocalDbTable {
     TerminalFeeNoteAssurance,
     PendingOutputPoiContext,
     OutputPoiRecovery,
+    PoiArtifactCache,
     DesktopWalletVault,
 }
 
@@ -55,6 +58,7 @@ pub enum LocalDbTableDecodeKind {
     TerminalFeeNoteAssurance,
     PendingOutputPoiContext,
     OutputPoiRecovery,
+    PoiArtifactCache,
     DesktopWalletVault,
 }
 
@@ -117,6 +121,11 @@ pub const LOCAL_DB_TABLES: &[LocalDbTableInfo] = &[
         decode_kind: LocalDbTableDecodeKind::OutputPoiRecovery,
     },
     LocalDbTableInfo {
+        table: LocalDbTable::PoiArtifactCache,
+        name: "poi_artifact_cache",
+        decode_kind: LocalDbTableDecodeKind::PoiArtifactCache,
+    },
+    LocalDbTableInfo {
         table: LocalDbTable::DesktopWalletVault,
         name: "desktop_wallet_vault_v1",
         decode_kind: LocalDbTableDecodeKind::DesktopWalletVault,
@@ -137,6 +146,7 @@ impl LocalDbTable {
             Self::TerminalFeeNoteAssurance => TERMINAL_FEE_NOTE_ASSURANCE_TABLE,
             Self::PendingOutputPoiContext => PENDING_OUTPUT_POI_CONTEXT_TABLE,
             Self::OutputPoiRecovery => OUTPUT_POI_RECOVERY_TABLE,
+            Self::PoiArtifactCache => POI_ARTIFACT_CACHE_TABLE,
             Self::DesktopWalletVault => DESKTOP_WALLET_VAULT_TABLE,
         }
     }
@@ -253,6 +263,54 @@ pub struct WalletMeta {
     pub updated_at: u64,
     #[serde(default)]
     pub last_scanned_block_hash: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PoiArtifactDescriptorRecord {
+    pub cid: String,
+    pub sha256: String,
+    pub byte_size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PoiArtifactCacheRecord {
+    pub chain_type: u8,
+    pub chain_id: u64,
+    pub txid_version: String,
+    pub list_key: FixedBytes<32>,
+    pub last_accepted_manifest_sequence: u64,
+    pub base_descriptor: PoiArtifactDescriptorRecord,
+    pub applied_delta_descriptors: Vec<PoiArtifactDescriptorRecord>,
+    pub blocked_shields_descriptor: PoiArtifactDescriptorRecord,
+    pub current_tip_index: u64,
+    pub current_tip_root: FixedBytes<32>,
+    pub cache_payload: Vec<u8>,
+    pub updated_at: u64,
+}
+
+impl PoiArtifactCacheRecord {
+    #[must_use]
+    pub fn key(&self) -> String {
+        Self::key_for(
+            self.chain_type,
+            self.chain_id,
+            &self.txid_version,
+            &self.list_key,
+        )
+    }
+
+    #[must_use]
+    pub fn key_for(
+        chain_type: u8,
+        chain_id: u64,
+        txid_version: &str,
+        list_key: &FixedBytes<32>,
+    ) -> String {
+        format!(
+            "{chain_type}|{chain_id}|{txid_version}|{}",
+            hex::encode(list_key)
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -886,6 +944,36 @@ impl DbStore {
         Ok(())
     }
 
+    pub fn get_poi_artifact_cache(
+        &self,
+        chain_type: u8,
+        chain_id: u64,
+        txid_version: &str,
+        list_key: &FixedBytes<32>,
+    ) -> Result<Option<PoiArtifactCacheRecord>, DbError> {
+        let key = PoiArtifactCacheRecord::key_for(chain_type, chain_id, txid_version, list_key);
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(POI_ARTIFACT_CACHE_TABLE)?;
+        match table.get(key.as_str())? {
+            Some(value) => Ok(Some(decode(value.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn put_poi_artifact_cache(&self, record: &PoiArtifactCacheRecord) -> Result<(), DbError> {
+        let mut record = record.clone();
+        record.updated_at = now_epoch_secs()?;
+        let key = record.key();
+        let data = encode(&record)?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(POI_ARTIFACT_CACHE_TABLE)?;
+            table.insert(key.as_str(), data.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     pub fn get_pending_fee_note_assurance(
         &self,
         chain_id: u64,
@@ -1187,6 +1275,7 @@ impl DbStore {
         txn.open_table(TERMINAL_FEE_NOTE_ASSURANCE_TABLE)?;
         txn.open_table(PENDING_OUTPUT_POI_CONTEXT_TABLE)?;
         txn.open_table(OUTPUT_POI_RECOVERY_TABLE)?;
+        txn.open_table(POI_ARTIFACT_CACHE_TABLE)?;
         txn.open_table(DESKTOP_WALLET_VAULT_TABLE)?;
         txn.commit()?;
         Ok(())

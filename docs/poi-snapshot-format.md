@@ -59,9 +59,9 @@ record corresponds to `start_index`; subsequent records increment by one.
 
 ## Blocked-Shields Artifact
 
-Each manifest entry has a `blocked_shields_cid` pointing to the current
-blocked-shields artifact for that `(list_key, chain_id)`. The artifact is
-deterministic JSON sorted by `blinded_commitment`, then `commitment_hash`.
+Each manifest entry has a `blocked_shields` artifact descriptor pointing to the
+current blocked-shields artifact for that `(list_key, chain_id)`. The artifact
+is deterministic JSON sorted by `blinded_commitment`, then `commitment_hash`.
 
 Example:
 
@@ -88,9 +88,9 @@ from the artifact record. When the upstream response contains an empty string,
 `block_reason` is present as `""`. This preserves the distinction between an
 absent reason and a present empty string.
 
-The artifact CID is authenticated by the publisher-signed manifest. Each
-blocked-shield record's content remains authenticated by the upstream operator's
-ed25519 signature.
+The artifact descriptor is authenticated by the publisher-signed manifest and
+contains the CID, SHA-256, and byte size. Each blocked-shield record's content
+remains authenticated by the upstream operator's ed25519 signature.
 
 The legacy binary blocked-shield record layout is not used by v2 snapshots:
 
@@ -167,9 +167,28 @@ Example:
     {
       "list_key": "0xefc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88",
       "chain_id": 1,
-      "base_cid": "bafybase...",
-      "delta_cids": ["bafydelta1...", "bafydelta2..."],
-      "blocked_shields_cid": "bafyblocked...",
+      "base": {
+        "cid": "bafybase...",
+        "sha256": "0x1111111111111111111111111111111111111111111111111111111111111111",
+        "byte_size": 1048576
+      },
+      "deltas": [
+        {
+          "cid": "bafydelta1...",
+          "sha256": "0x2222222222222222222222222222222222222222222222222222222222222222",
+          "byte_size": 65536
+        },
+        {
+          "cid": "bafydelta2...",
+          "sha256": "0x3333333333333333333333333333333333333333333333333333333333333333",
+          "byte_size": 32768
+        }
+      ],
+      "blocked_shields": {
+        "cid": "bafyblocked...",
+        "sha256": "0x4444444444444444444444444444444444444444444444444444444444444444",
+        "byte_size": 4096
+      },
       "current_tip_index": 12345,
       "current_tip_merkleroot": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     }
@@ -179,18 +198,20 @@ Example:
 ```
 
 Manifest entries are sorted by `list_key`, then `chain_id` before signing.
-For each entry, a reader downloads `base_cid`, then every CID in `delta_cids`
-in order. Applying those files must reproduce events `[0, current_tip_index]`.
-The reader also downloads `blocked_shields_cid` to obtain the current blocked set
-for the same pair. `sequence` is strictly monotonic across manifest publications
-and is also used as the IPNS record sequence for the manifest publication.
+For each entry, a reader downloads `base.cid`, then every descriptor in `deltas`
+in order. Before parsing, the reader verifies the downloaded byte length equals
+`byte_size` and SHA-256 equals `sha256`. Applying those files must reproduce
+events `[0, current_tip_index]`. The reader also downloads `blocked_shields` to
+obtain the current blocked set for the same pair. `sequence` is strictly
+monotonic across manifest publications and is also used as the IPNS record
+sequence for the manifest publication.
 
 ## Manifest Signature Verification
 
 To verify a manifest:
 
 1. Remove `publisher_signature` from the JSON object.
-2. Rebuild deterministic body bytes with fields `format_version`, `issued_at_ms`, `sequence`, `publisher_pubkey`, `entries`.
+2. Rebuild deterministic body bytes with fields `format_version`, `issued_at_ms`, `sequence`, `publisher_pubkey`, `entries`, including each artifact descriptor's `cid`, `sha256`, and `byte_size`.
 3. Sort `entries` by `list_key`, then `chain_id`.
 4. Verify `publisher_signature` as ed25519 over those body bytes using `publisher_pubkey`.
 

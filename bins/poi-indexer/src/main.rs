@@ -7,7 +7,9 @@ use eyre::{Result, WrapErr, eyre};
 use poi_indexer_core::audit::{Audit, Retention};
 use poi_indexer_core::blocked::content_hash;
 use poi_indexer_core::config::Config;
-use poi_indexer_core::manifest::{Manifest, ManifestEntry, load_publisher_signing_key};
+use poi_indexer_core::manifest::{
+    ArtifactDescriptor, Manifest, ManifestEntry, load_publisher_signing_key,
+};
 use poi_indexer_core::publish::ipfs::{
     FilebaseIpfsClient, IpfsClient, MultiPinner, pin_blocked_shields, pin_manifest,
     pin_snapshot_file,
@@ -565,6 +567,7 @@ impl PublicationScheduler {
             .await
             .wrap_err("pin snapshot to IPFS")?;
         let byte_size = u64::try_from(bytes.len()).wrap_err("snapshot byte size overflow")?;
+        let artifact_hash = content_hash(&bytes);
 
         let mut tx = self
             .store
@@ -581,6 +584,7 @@ impl PublicationScheduler {
             end_index,
             &cid,
             byte_size,
+            &artifact_hash,
             FORMAT_VERSION,
             tip_merkleroot,
         )
@@ -597,6 +601,7 @@ impl PublicationScheduler {
             start_index,
             end_index,
             byte_size,
+            sha256 = %prefixed_hex(&artifact_hash),
             cid = %cid,
             "published POI snapshot"
         );
@@ -750,12 +755,12 @@ impl PublicationScheduler {
                 entries.push(ManifestEntry {
                     list_key: list_key_hex(list_key),
                     chain_id: *chain_id,
-                    base_cid: base.cid.clone(),
-                    delta_cids: deltas
+                    base: artifact_descriptor(base),
+                    deltas: deltas
                         .iter()
-                        .map(|publication| publication.cid.clone())
+                        .map(|publication| artifact_descriptor(publication))
                         .collect(),
-                    blocked_shields_cid: blocked_shields.cid,
+                    blocked_shields: blocked_shields_descriptor(&blocked_shields),
                     current_tip_index: current.end_index,
                     current_tip_merkleroot: format!("0x{}", hex::encode(tip_merkleroot)),
                 });
@@ -883,6 +888,28 @@ fn upstream_endpoint_hash(upstream_url: &str) -> [u8; 32] {
 
 fn list_key_hex(list_key: &alloy_primitives::FixedBytes<32>) -> String {
     format!("0x{}", hex::encode(list_key.as_slice()))
+}
+
+fn artifact_descriptor(publication: &StoredPublication) -> ArtifactDescriptor {
+    ArtifactDescriptor {
+        cid: publication.cid.clone(),
+        sha256: prefixed_hex(&publication.content_hash),
+        byte_size: publication.byte_size,
+    }
+}
+
+fn blocked_shields_descriptor(
+    publication: &poi_indexer_core::store::StoredBlockedShieldsPublication,
+) -> ArtifactDescriptor {
+    ArtifactDescriptor {
+        cid: publication.cid.clone(),
+        sha256: prefixed_hex(&publication.content_hash),
+        byte_size: publication.byte_size,
+    }
+}
+
+fn prefixed_hex(bytes: &[u8]) -> String {
+    format!("0x{}", hex::encode(bytes))
 }
 
 const fn snapshot_kind_label(kind: SnapshotKind) -> &'static str {
@@ -1102,6 +1129,8 @@ mod tests {
             start_index,
             end_index,
             cid: cid.to_string(),
+            byte_size: 1,
+            content_hash: [8_u8; 32],
             tip_merkleroot: Some([9_u8; 32]),
             published_at: UNIX_EPOCH,
         }

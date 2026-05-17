@@ -46,8 +46,8 @@ use railgun_wallet::wallet_cache::wallet_cache_key;
 use railgun_wallet::{ProverService, Utxo, WalletKeys};
 use serde::{Deserialize, Serialize};
 use sync_service::{
-    ChainConfig, ChainConfigDefaults, ChainKey, DEFAULT_INDEXED_WALLET_BLOCK_RANGE, SyncManager,
-    SyncManagerError, WalletConfig,
+    ChainConfig, ChainConfigDefaults, ChainKey, DEFAULT_INDEXED_WALLET_BLOCK_RANGE, PoiReadSource,
+    SyncManager, SyncManagerError, WalletConfig,
 };
 use waku_relay::msg::ContentTopic;
 
@@ -522,6 +522,7 @@ impl BroadcasterService {
                     progress_tx: None,
                     cache_store: None,
                     poi_recovery_prover: Some((*poi_recovery_prover).clone()),
+                    poi_read_source: PoiReadSource::PoiProxy,
                     local_poi_caches: None,
                     use_indexed_wallet_catch_up: true,
                 };

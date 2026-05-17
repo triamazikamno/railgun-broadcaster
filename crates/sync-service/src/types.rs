@@ -76,6 +76,27 @@ impl SyncProgressUpdate {
 pub type SyncProgressSender = watch::Sender<Option<SyncProgressUpdate>>;
 pub type WalletLocalPoiCaches = Arc<RwLock<BTreeMap<FixedBytes<32>, PoiCache>>>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoiArtifactSourceConfig {
+    pub trusted_publisher_pubkey: FixedBytes<32>,
+    pub manifest_source: PoiArtifactManifestSource,
+    pub gateway_urls: Vec<Url>,
+    pub max_manifest_age: Option<Duration>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PoiArtifactManifestSource {
+    Url(Url),
+    Cid(String),
+    IpnsName(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PoiReadSource {
+    IndexedArtifacts(PoiArtifactSourceConfig),
+    PoiProxy,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChainKey {
     pub chain_id: u64,
@@ -329,6 +350,7 @@ pub struct WalletConfig {
     pub progress_tx: Option<SyncProgressSender>,
     pub cache_store: Option<Arc<dyn WalletCacheStore>>,
     pub poi_recovery_prover: Option<ProverService>,
+    pub poi_read_source: PoiReadSource,
     pub local_poi_caches: Option<WalletLocalPoiCaches>,
     pub use_indexed_wallet_catch_up: bool,
 }

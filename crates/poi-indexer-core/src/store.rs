@@ -90,13 +90,16 @@ impl Store {
         upstream_url: &str,
     ) -> Result<Vec<StoredPublication>, StoreError> {
         let chain_id = u64_to_i64(chain_id, "chain_id")?;
-        let rows = sqlx::query_as::<_, (String, i64, i64, String, Option<Vec<u8>>, i64)>(
-            r"
+        let rows =
+            sqlx::query_as::<_, (String, i64, i64, String, i64, Vec<u8>, Option<Vec<u8>>, i64)>(
+                r"
             SELECT
                 kind,
                 start_index,
                 end_index,
                 cid,
+                byte_size,
+                content_hash,
                 tip_merkleroot,
                 EXTRACT(EPOCH FROM published_at)::BIGINT AS published_at_unix_seconds
             FROM published_snapshots
@@ -104,26 +107,38 @@ impl Store {
                 AND chain_id = $2
                 AND upstream_url = $3
                 AND superseded_at IS NULL
+                AND content_hash IS NOT NULL
             ORDER BY
                 CASE kind WHEN 'base' THEN 0 ELSE 1 END,
                 start_index ASC,
                 id ASC
             ",
-        )
-        .bind(list_key.as_slice())
-        .bind(chain_id)
-        .bind(upstream_url)
-        .fetch_all(&self.pool)
-        .await?;
+            )
+            .bind(list_key.as_slice())
+            .bind(chain_id)
+            .bind(upstream_url)
+            .fetch_all(&self.pool)
+            .await?;
 
         rows.into_iter()
             .map(
-                |(kind, start_index, end_index, cid, tip_merkleroot, published_at)| {
+                |(
+                    kind,
+                    start_index,
+                    end_index,
+                    cid,
+                    byte_size,
+                    content_hash,
+                    tip_merkleroot,
+                    published_at,
+                )| {
                     Ok(StoredPublication {
                         kind: parse_snapshot_kind(&kind)?,
                         start_index: i64_to_u64(start_index, "start_index")?,
                         end_index: i64_to_u64(end_index, "end_index")?,
                         cid,
+                        byte_size: i64_to_u64(byte_size, "byte_size")?,
+                        content_hash: exact_array("snapshot_content_hash", &content_hash)?,
                         tip_merkleroot: tip_merkleroot
                             .map(|bytes| exact_array("tip_merkleroot", &bytes))
                             .transpose()?,
@@ -141,10 +156,11 @@ impl Store {
         upstream_url: &str,
     ) -> Result<Option<StoredBlockedShieldsPublication>, StoreError> {
         let chain_id = u64_to_i64(chain_id, "chain_id")?;
-        let row = sqlx::query_as::<_, (String, Vec<u8>, i64)>(
+        let row = sqlx::query_as::<_, (String, i64, Vec<u8>, i64)>(
             r"
             SELECT
                 cid,
+                byte_size,
                 content_hash,
                 EXTRACT(EPOCH FROM published_at)::BIGINT AS published_at_unix_seconds
             FROM published_blocked_shields
@@ -162,9 +178,10 @@ impl Store {
         .fetch_optional(&self.pool)
         .await?;
 
-        row.map(|(cid, content_hash, published_at)| {
+        row.map(|(cid, byte_size, content_hash, published_at)| {
             Ok(StoredBlockedShieldsPublication {
                 cid,
+                byte_size: i64_to_u64(byte_size, "byte_size")?,
                 content_hash: exact_array("blocked_shields_content_hash", &content_hash)?,
                 published_at: i64_to_system_time(published_at, "published_at")?,
             })
@@ -452,6 +469,8 @@ pub struct StoredPublication {
     pub start_index: u64,
     pub end_index: u64,
     pub cid: String,
+    pub byte_size: u64,
+    pub content_hash: [u8; 32],
     pub tip_merkleroot: Option<[u8; 32]>,
     pub published_at: SystemTime,
 }
@@ -459,6 +478,7 @@ pub struct StoredPublication {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredBlockedShieldsPublication {
     pub cid: String,
+    pub byte_size: u64,
     pub content_hash: [u8; 32],
     pub published_at: SystemTime,
 }
@@ -557,6 +577,7 @@ const INLINE_MIGRATIONS: &[&str] = &[
         end_index BIGINT NOT NULL,
         cid TEXT NOT NULL,
         byte_size BIGINT NOT NULL,
+        content_hash BYTEA,
         format_version INTEGER NOT NULL,
         tip_merkleroot BYTEA,
         published_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -639,6 +660,16 @@ const INLINE_MIGRATIONS: &[&str] = &[
         ADD COLUMN IF NOT EXISTS unpinned_at TIMESTAMPTZ
     ",
     r"
+    ALTER TABLE published_snapshots
+        ADD COLUMN IF NOT EXISTS content_hash BYTEA
+    ",
+    r"
+    UPDATE published_snapshots
+    SET superseded_at = now()
+    WHERE content_hash IS NULL
+        AND superseded_at IS NULL
+    ",
+    r"
     UPDATE published_snapshots
     SET superseded_at = now()
     WHERE upstream_url = '__unknown_upstream__'
@@ -690,6 +721,10 @@ const INLINE_MIGRATIONS: &[&str] = &[
         IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'published_snapshots_tip_root_len_check') THEN
             ALTER TABLE published_snapshots
                 ADD CONSTRAINT published_snapshots_tip_root_len_check CHECK (tip_merkleroot IS NULL OR octet_length(tip_merkleroot) = 32);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'published_snapshots_content_hash_len_check') THEN
+            ALTER TABLE published_snapshots
+                ADD CONSTRAINT published_snapshots_content_hash_len_check CHECK (content_hash IS NULL OR octet_length(content_hash) = 32);
         END IF;
         IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'published_blocked_shields_list_key_len_check') THEN
             ALTER TABLE published_blocked_shields
