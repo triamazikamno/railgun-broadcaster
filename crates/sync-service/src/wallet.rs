@@ -7,21 +7,25 @@ use alloy::primitives::{Bytes, FixedBytes, U64, U256};
 use alloy::sol_types::SolCall;
 use async_trait::async_trait;
 use broadcaster_core::contracts::railgun::{Transaction, relayCall, transactCall};
+use broadcaster_core::crypto::poseidon::poseidon;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use broadcaster_core::transact::{
-    DEFAULT_TXID_VERSION, compute_railgun_txid_parts, railgun_txid_leaf_hash_with_output_start,
+    DEFAULT_TXID_VERSION, MERKLE_ZERO_VALUE, compute_railgun_txid_parts,
+    railgun_txid_leaf_hash_with_output_start,
 };
-use broadcaster_core::tree::TREE_LEAF_COUNT;
+use broadcaster_core::tree::{TREE_DEPTH, TREE_LEAF_COUNT, normalize_tree_position};
 use merkletree::quick::{GraphPostError, post_graphql_data};
-use merkletree::tree::{MerkleForest, MerkleTree};
+use merkletree::tree::{MerkleForest, MerkleProof};
 use railgun_wallet::prover::ProverError;
 use railgun_wallet::tx::{
     InputWitness, PoiMerkleProofSource, PostTransactionPoiData,
     PostTransactionPoiGenerationRequest, PreTransactionPoiError, PreTransactionPoiMap,
     PrivateInputs, PublicInputs, TransactionPlanChunk, generate_post_transaction_pois,
 };
+use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::json;
+use thiserror::Error;
 use tokio::sync::{RwLock, broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info, warn};
@@ -30,11 +34,12 @@ use local_db::{
     DbStore, OutputPoiRecoveryAction, OutputPoiRecoveryRecord, OutputPoiRecoveryStatus,
     PendingOutputPoiContextRecord, PendingOutputPoiObservation, PendingOutputPoiRole,
 };
-use poi::cache::{PoiCache, PoiCacheIdentity};
-use poi::error::PoiError;
+use poi::artifacts::{SnapshotEvent, verify_poi_event};
+use poi::cache::{POI_EVENTS_PAGE_SIZE, PoiCache, PoiCacheError, PoiCacheIdentity};
+use poi::error::{PoiError, PoiRpcError};
 use poi::poi::{
     BlindedCommitmentData, BlindedCommitmentType, DEFAULT_WALLET_POI_RPC_URL, PoiMerkleProof,
-    PoiRpcClient, SingleCommitmentProofContext, ValidatedRailgunTxidStatus,
+    PoiRpcClient, PoiSyncedListEvent, SingleCommitmentProofContext, ValidatedRailgunTxidStatus,
     default_active_poi_list_keys,
 };
 use railgun_wallet::scan::{
@@ -56,6 +61,7 @@ use crate::types::{
 pub const WALLET_POI_STATUS_BATCH_SIZE: usize = 1000;
 pub const WALLET_POI_RECOVERABLE_REFRESH_AFTER: Duration = Duration::from_secs(60);
 const WALLET_POI_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+const WALLET_POI_LIVE_TAIL_INTERVAL: Duration = Duration::from_secs(60);
 const WALLET_METADATA_LIVE_FLUSH_INTERVAL: Duration = Duration::from_secs(60);
 const WALLET_METADATA_LIVE_FLUSH_BLOCKS: u64 = 25;
 const OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER: Duration = Duration::from_secs(10 * 60);
@@ -64,6 +70,8 @@ const OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER: Duration = Duration::from_secs(
 const OUTPUT_POI_RECOVERY_ROOT_SEARCH_LEAVES: u64 = 128;
 const OUTPUT_POI_RECOVERY_TXID_GRAPH_PAGE_SIZE: usize = 10_000;
 const OUTPUT_POI_RECOVERY_VERIFY_PROOF: bool = true;
+const OUTPUT_POI_RECOVERY_SLOW_STEP_AFTER: Duration = Duration::from_secs(5);
+const DENSE_MERKLE_PARALLEL_HASH_MIN_LEN: usize = 1024;
 const EVM_CHAIN_TYPE: u8 = 0;
 
 #[derive(Debug, Clone, Copy)]
@@ -892,6 +900,7 @@ struct OutputPoiRecoveryRequest<'a> {
     forest: &'a MerkleForest,
     poi_client: &'a PoiRpcClient,
     proof_source: &'a (dyn PoiMerkleProofSource + 'a),
+    local_proof_source: Option<&'a LocalPoiMerkleProofSource>,
     submitter: &'a dyn PendingOutputPoiSubmitter,
     active_list_keys: &'a [FixedBytes<32>],
     wallet_utxos: &'a [WalletUtxo],
@@ -968,8 +977,15 @@ async fn recover_missing_output_pois(request: OutputPoiRecoveryRequest<'_>) -> u
         HashMap::new();
     let mut recovered = 0usize;
     let candidates = output_poi_recovery_candidates(request.wallet_utxos, request.active_list_keys);
+    debug!(
+        cache_key = %request.cfg.cache_key,
+        candidates = candidates.len(),
+        force_retry = request.force_retry,
+        "output POI recovery scan started"
+    );
 
     for candidate in candidates {
+        let candidate_started = Instant::now();
         let output_commitment = candidate.utxo.poi.commitment;
         let source_tx_hash = candidate.utxo.source.tx_hash;
         let existing_pending_context = request
@@ -1008,15 +1024,17 @@ async fn recover_missing_output_pois(request: OutputPoiRecoveryRequest<'_>) -> u
             }
         }
 
-        let tx_input = if let Some(cached) = fetched_inputs.get(&source_tx_hash) {
-            cached.clone()
+        let tx_input_started = Instant::now();
+        let (tx_input, tx_input_source) = if let Some(cached) = fetched_inputs.get(&source_tx_hash)
+        {
+            (cached.clone(), "memory_cache")
         } else if let Ok(Some(record)) = request.db.get_output_poi_recovery(
             request.cfg.chain.chain_id,
             &request.cfg.cache_key,
             &output_commitment,
         ) && let Some(tx_input) = record.tx_input
         {
-            Ok(Bytes::from(tx_input))
+            (Ok(Bytes::from(tx_input)), "db_cache")
         } else {
             let fetched = fetch_transaction_input(
                 request.rpcs,
@@ -1029,8 +1047,18 @@ async fn recover_missing_output_pois(request: OutputPoiRecoveryRequest<'_>) -> u
             if let Ok(tx_input) = &fetched {
                 put_output_poi_recovery_tx_input(request.db, request.cfg, candidate, tx_input, now);
             }
-            fetched
+            (fetched, "rpc")
         };
+        let tx_input_elapsed_ms = tx_input_started.elapsed().as_millis();
+        debug!(
+            cache_key = %request.cfg.cache_key,
+            commitment = %hex::encode(output_commitment),
+            source_tx_hash = %hex::encode(source_tx_hash),
+            tx_input_source,
+            tx_input_elapsed_ms,
+            candidate_elapsed_ms = candidate_started.elapsed().as_millis(),
+            "output POI recovery transaction input resolved"
+        );
 
         let tx_input = match tx_input {
             Ok(tx_input) => tx_input,
@@ -1046,6 +1074,7 @@ async fn recover_missing_output_pois(request: OutputPoiRecoveryRequest<'_>) -> u
             }
         };
 
+        let decode_started = Instant::now();
         let decoded = match decode_railgun_transactions(&tx_input) {
             Ok(decoded) => decoded,
             Err(failure) => {
@@ -1059,7 +1088,63 @@ async fn recover_missing_output_pois(request: OutputPoiRecoveryRequest<'_>) -> u
                 continue;
             }
         };
+        let decode_elapsed_ms = decode_started.elapsed().as_millis();
+        debug!(
+            cache_key = %request.cfg.cache_key,
+            commitment = %hex::encode(output_commitment),
+            source_tx_hash = %hex::encode(source_tx_hash),
+            transactions = decoded.len(),
+            decode_elapsed_ms,
+            candidate_elapsed_ms = candidate_started.elapsed().as_millis(),
+            "output POI recovery transaction input decoded"
+        );
 
+        if request.local_proof_source.is_some() {
+            let preflight_started = Instant::now();
+            match preflight_local_output_poi_input_proofs(
+                request.local_proof_source,
+                request.cfg,
+                candidate,
+                request.wallet_utxos,
+                &decoded,
+                request.active_list_keys,
+                &request.cfg.scan_keys,
+            )
+            .await
+            {
+                Ok(()) => {
+                    debug!(
+                        cache_key = %request.cfg.cache_key,
+                        commitment = %hex::encode(output_commitment),
+                        source_tx_hash = %hex::encode(source_tx_hash),
+                        preflight_elapsed_ms = preflight_started.elapsed().as_millis(),
+                        candidate_elapsed_ms = candidate_started.elapsed().as_millis(),
+                        "output POI recovery local proof preflight complete"
+                    );
+                }
+                Err(failure) => {
+                    warn!(
+                        cache_key = %request.cfg.cache_key,
+                        commitment = %hex::encode(output_commitment),
+                        source_tx_hash = %hex::encode(source_tx_hash),
+                        preflight_elapsed_ms = preflight_started.elapsed().as_millis(),
+                        candidate_elapsed_ms = candidate_started.elapsed().as_millis(),
+                        error = %failure.message,
+                        "output POI recovery local proof preflight failed"
+                    );
+                    record_output_poi_recovery_failure(
+                        request.db,
+                        request.cfg,
+                        candidate,
+                        failure,
+                        now,
+                    );
+                    continue;
+                }
+            }
+        }
+
+        let build_chunk_started = Instant::now();
         let recovery_chunk = match build_output_poi_recovery_chunk(
             candidate,
             request.wallet_utxos,
@@ -1081,7 +1166,20 @@ async fn recover_missing_output_pois(request: OutputPoiRecoveryRequest<'_>) -> u
                 continue;
             }
         };
+        let build_chunk_elapsed_ms = build_chunk_started.elapsed().as_millis();
+        debug!(
+            cache_key = %request.cfg.cache_key,
+            commitment = %hex::encode(output_commitment),
+            source_tx_hash = %hex::encode(source_tx_hash),
+            inputs = recovery_chunk.chunk.inputs.len(),
+            outputs = recovery_chunk.chunk.outputs.len(),
+            output_start_global = recovery_chunk.output_start_global,
+            build_chunk_elapsed_ms,
+            candidate_elapsed_ms = candidate_started.elapsed().as_millis(),
+            "output POI recovery chunk built"
+        );
 
+        let txid_data_started = Instant::now();
         let txid_data = match recovered_output_txid_data(
             request.cfg,
             request.poi_client,
@@ -1104,7 +1202,19 @@ async fn recover_missing_output_pois(request: OutputPoiRecoveryRequest<'_>) -> u
                 continue;
             }
         };
+        let txid_data_elapsed_ms = txid_data_started.elapsed().as_millis();
+        debug!(
+            cache_key = %request.cfg.cache_key,
+            commitment = %hex::encode(output_commitment),
+            source_tx_hash = %hex::encode(source_tx_hash),
+            target_txid_index = txid_data.target_txid_index,
+            txid_merkleroot_index = txid_data.poi_data.txid_merkleroot_index,
+            txid_data_elapsed_ms,
+            candidate_elapsed_ms = candidate_started.elapsed().as_millis(),
+            "output POI recovery TXID data recovered"
+        );
 
+        let proof_generation_started = Instant::now();
         match generate_post_transaction_pois(PostTransactionPoiGenerationRequest {
             chunk: &recovery_chunk.chunk,
             txid_data: &txid_data.poi_data,
@@ -1119,6 +1229,7 @@ async fn recover_missing_output_pois(request: OutputPoiRecoveryRequest<'_>) -> u
         .await
         {
             Ok(pre_transaction_pois) => {
+                let proof_generation_elapsed_ms = proof_generation_started.elapsed().as_millis();
                 let record = pending_output_poi_context_from_recovery(
                     request.cfg,
                     candidate,
@@ -1159,11 +1270,23 @@ async fn recover_missing_output_pois(request: OutputPoiRecoveryRequest<'_>) -> u
                     inputs = recovery_chunk.chunk.inputs.len(),
                     outputs = recovery_chunk.chunk.outputs.len(),
                     input_tree = recovery_chunk.chunk.tree_number,
+                    proof_generation_elapsed_ms,
+                    candidate_elapsed_ms = candidate_started.elapsed().as_millis(),
                     "reconstructed output POI context"
                 );
                 recovered += 1;
             }
             Err(err) => {
+                let proof_generation_elapsed_ms = proof_generation_started.elapsed().as_millis();
+                warn!(
+                    cache_key = %request.cfg.cache_key,
+                    commitment = %hex::encode(output_commitment),
+                    source_tx_hash = %hex::encode(source_tx_hash),
+                    proof_generation_elapsed_ms,
+                    candidate_elapsed_ms = candidate_started.elapsed().as_millis(),
+                    error = %err,
+                    "output POI recovery proof generation failed"
+                );
                 let retry_after = output_poi_recovery_proof_retry_after(&err);
                 record_output_poi_recovery_failure(
                     request.db,
@@ -1177,6 +1300,24 @@ async fn recover_missing_output_pois(request: OutputPoiRecoveryRequest<'_>) -> u
                     now,
                 );
             }
+        }
+        let candidate_elapsed = candidate_started.elapsed();
+        if candidate_elapsed >= OUTPUT_POI_RECOVERY_SLOW_STEP_AFTER {
+            warn!(
+                cache_key = %request.cfg.cache_key,
+                commitment = %hex::encode(output_commitment),
+                source_tx_hash = %hex::encode(source_tx_hash),
+                elapsed_ms = candidate_elapsed.as_millis(),
+                "slow output POI recovery candidate"
+            );
+        } else {
+            debug!(
+                cache_key = %request.cfg.cache_key,
+                commitment = %hex::encode(output_commitment),
+                source_tx_hash = %hex::encode(source_tx_hash),
+                elapsed_ms = candidate_elapsed.as_millis(),
+                "output POI recovery candidate complete"
+            );
         }
     }
 
@@ -1209,6 +1350,13 @@ async fn recover_missing_output_pois(request: OutputPoiRecoveryRequest<'_>) -> u
         }
     }
 
+    debug!(
+        cache_key = %request.cfg.cache_key,
+        recovered,
+        elapsed_ms = started.elapsed().as_millis(),
+        "output POI recovery scan complete"
+    );
+
     recovered
 }
 
@@ -1216,6 +1364,109 @@ async fn recover_missing_output_pois(request: OutputPoiRecoveryRequest<'_>) -> u
 struct RecoveredOutputTxidData {
     target_txid_index: u64,
     poi_data: PostTransactionPoiData,
+}
+
+struct DenseMerkleTree {
+    layers: Vec<Vec<U256>>,
+}
+
+impl DenseMerkleTree {
+    fn from_forest_prefix(forest: &MerkleForest, tree_number: u32, leaf_count: u64) -> Self {
+        let clamped_leaf_count = leaf_count.min(TREE_LEAF_COUNT);
+        let mut leaves = vec![MERKLE_ZERO_VALUE; TREE_LEAF_COUNT as usize];
+        for position in 0..clamped_leaf_count {
+            if let Some(leaf) = forest.leaf_at(tree_number, position) {
+                leaves[position as usize] = leaf;
+            }
+        }
+        Self::from_full_leaf_layer(leaves)
+    }
+
+    fn from_ordered_leaves<I>(leaves: I, leaf_count: u64) -> Self
+    where
+        I: IntoIterator<Item = U256>,
+    {
+        let clamped_leaf_count = leaf_count.min(TREE_LEAF_COUNT) as usize;
+        let mut layer = vec![MERKLE_ZERO_VALUE; TREE_LEAF_COUNT as usize];
+        for (index, leaf) in leaves.into_iter().take(clamped_leaf_count).enumerate() {
+            layer[index] = leaf;
+        }
+        Self::from_full_leaf_layer(layer)
+    }
+
+    fn from_full_leaf_layer(mut layer: Vec<U256>) -> Self {
+        let mut layers = Vec::with_capacity(TREE_DEPTH + 1);
+        layers.push(layer.clone());
+        while layer.len() > 1 {
+            dense_hash_layer(&mut layer);
+            layers.push(layer.clone());
+        }
+        Self { layers }
+    }
+
+    fn root(&self) -> U256 {
+        self.layers
+            .last()
+            .and_then(|layer| layer.first())
+            .copied()
+            .unwrap_or(MERKLE_ZERO_VALUE)
+    }
+
+    fn remove_leaf(&mut self, position: u64) {
+        let mut index = position as usize;
+        if index >= self.layers[0].len() {
+            return;
+        }
+        self.layers[0][index] = MERKLE_ZERO_VALUE;
+        for level in 0..TREE_DEPTH {
+            let parent_index = index / 2;
+            let left = self.layers[level][parent_index * 2];
+            let right = self.layers[level][parent_index * 2 + 1];
+            self.layers[level + 1][parent_index] = poseidon(vec![left, right]);
+            index = parent_index;
+        }
+    }
+
+    fn prove(&self, position: u64) -> MerkleProof {
+        let local_position = position % TREE_LEAF_COUNT;
+        let mut path_elements = [U256::ZERO; TREE_DEPTH];
+        let mut path_indices = [0_u8; TREE_DEPTH];
+        let mut index = local_position as usize;
+        for level in 0..TREE_DEPTH {
+            let is_right = index % 2 == 1;
+            path_indices[level] = u8::from(is_right);
+            let sibling_index = if is_right { index - 1 } else { index + 1 };
+            path_elements[level] = self.layers[level][sibling_index];
+            index /= 2;
+        }
+        MerkleProof {
+            root: self.root(),
+            leaf: self.layers[0][local_position as usize],
+            leaf_index: local_position,
+            path_elements,
+            path_indices,
+        }
+    }
+}
+
+fn dense_hash_layer(layer: &mut Vec<U256>) {
+    let parent_count = layer.len() / 2;
+    if parent_count >= DENSE_MERKLE_PARALLEL_HASH_MIN_LEN {
+        let mut parents = vec![U256::ZERO; parent_count];
+        parents
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(index, parent)| {
+                *parent = poseidon(vec![layer[index * 2], layer[index * 2 + 1]]);
+            });
+        *layer = parents;
+        return;
+    }
+
+    for index in 0..parent_count {
+        layer[index] = poseidon(vec![layer[index * 2], layer[index * 2 + 1]]);
+    }
+    layer.truncate(parent_count);
 }
 
 async fn recovered_output_txid_data(
@@ -1234,6 +1485,8 @@ async fn recovered_output_txid_data(
         ));
     };
     let client = http_client.cloned().unwrap_or_else(reqwest::Client::new);
+    let started = Instant::now();
+    let fetch_target_started = Instant::now();
     let target = fetch_recovery_graph_transaction_by_commitment(
         &client,
         endpoint,
@@ -1241,12 +1494,35 @@ async fn recovered_output_txid_data(
         output_commitment,
     )
     .await?;
+    let fetch_target_elapsed_ms = fetch_target_started.elapsed().as_millis();
+    debug!(
+        cache_key = %cfg.cache_key,
+        source_tx_hash = %hex::encode(source_tx_hash),
+        output_commitment = %hex::encode(output_commitment),
+        graph_id = %target.id,
+        fetch_target_elapsed_ms,
+        elapsed_ms = started.elapsed().as_millis(),
+        "output POI recovery target transaction fetched"
+    );
     target.validate_against_recovery_chunk(recovery_chunk)?;
 
+    let txid_index_started = Instant::now();
     let target_txid_index = fetch_recovery_graph_txid_index(&client, endpoint, &target.id).await?;
+    let txid_index_elapsed_ms = txid_index_started.elapsed().as_millis();
+    debug!(
+        cache_key = %cfg.cache_key,
+        source_tx_hash = %hex::encode(source_tx_hash),
+        output_commitment = %hex::encode(output_commitment),
+        graph_id = %target.id,
+        target_txid_index,
+        txid_index_elapsed_ms,
+        elapsed_ms = started.elapsed().as_millis(),
+        "output POI recovery target TXID index fetched"
+    );
     let target_tree = target_txid_index / TREE_LEAF_COUNT;
     let target_index = target_txid_index % TREE_LEAF_COUNT;
 
+    let latest_validated_started = Instant::now();
     let latest_validated = poi_client
         .latest_validated_railgun_txid(DEFAULT_TXID_VERSION, EVM_CHAIN_TYPE, cfg.chain.chain_id)
         .await
@@ -1257,6 +1533,7 @@ async fn recovered_output_txid_data(
                 OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
             )
         })?;
+    let latest_validated_elapsed_ms = latest_validated_started.elapsed().as_millis();
     let root_txid_index = txid_root_index_for_target(target_txid_index, latest_validated)?;
     let root_tree = root_txid_index / TREE_LEAF_COUNT;
     if root_tree != target_tree {
@@ -1268,8 +1545,33 @@ async fn recovered_output_txid_data(
     }
     let root_index = root_txid_index % TREE_LEAF_COUNT;
     let leaf_count = root_index.saturating_add(1);
+    debug!(
+        cache_key = %cfg.cache_key,
+        source_tx_hash = %hex::encode(source_tx_hash),
+        output_commitment = %hex::encode(output_commitment),
+        target_txid_index,
+        root_txid_index,
+        target_tree,
+        leaf_count,
+        latest_validated_elapsed_ms,
+        elapsed_ms = started.elapsed().as_millis(),
+        "output POI recovery latest validated TXID fetched"
+    );
+    let tree_segment_started = Instant::now();
     let transactions =
         fetch_recovery_graph_txid_tree_segment(&client, endpoint, target_tree, leaf_count).await?;
+    let tree_segment_elapsed_ms = tree_segment_started.elapsed().as_millis();
+    debug!(
+        cache_key = %cfg.cache_key,
+        source_tx_hash = %hex::encode(source_tx_hash),
+        output_commitment = %hex::encode(output_commitment),
+        target_tree,
+        leaf_count,
+        returned = transactions.len(),
+        tree_segment_elapsed_ms,
+        elapsed_ms = started.elapsed().as_millis(),
+        "output POI recovery TXID tree segment fetched"
+    );
     if transactions.len() != leaf_count as usize {
         return Err(RecoveryFailure::retryable(
             OutputPoiRecoveryStatus::MissingMerkleProof,
@@ -1281,19 +1583,15 @@ async fn recovered_output_txid_data(
         ));
     }
 
-    let mut txid_tree = MerkleTree::default();
-    for (position, transaction) in transactions.iter().enumerate() {
-        txid_tree
-            .insert(position as u64, transaction.txid_leaf_hash())
-            .map_err(|err| {
-                RecoveryFailure::retryable(
-                    OutputPoiRecoveryStatus::MissingMerkleProof,
-                    format!("build TXID Merkle tree failed: {err}"),
-                    OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-                )
-            })?;
-    }
-    let proof = txid_tree.prove_with_leaf_count(target_index, leaf_count);
+    let txid_tree_started = Instant::now();
+    let txid_tree = DenseMerkleTree::from_ordered_leaves(
+        transactions
+            .iter()
+            .map(RecoveryGraphRailgunTransaction::txid_leaf_hash),
+        leaf_count,
+    );
+    let proof = txid_tree.prove(target_index);
+    let txid_tree_elapsed_ms = txid_tree_started.elapsed().as_millis();
     let expected_leaf = target.txid_leaf_hash();
     if proof.leaf != expected_leaf {
         return Err(RecoveryFailure::retryable(
@@ -1303,6 +1601,7 @@ async fn recovered_output_txid_data(
         ));
     }
     let txid_merkleroot = FixedBytes::from(proof.root.to_be_bytes::<32>());
+    let validate_root_started = Instant::now();
     let valid_root = poi_client
         .validate_txid_merkleroot(
             DEFAULT_TXID_VERSION,
@@ -1320,6 +1619,7 @@ async fn recovered_output_txid_data(
                 OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
             )
         })?;
+    let validate_root_elapsed_ms = validate_root_started.elapsed().as_millis();
     if !valid_root {
         return Err(RecoveryFailure::retryable(
             OutputPoiRecoveryStatus::MissingMerkleProof,
@@ -1327,6 +1627,20 @@ async fn recovered_output_txid_data(
             OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
         ));
     }
+    debug!(
+        cache_key = %cfg.cache_key,
+        source_tx_hash = %hex::encode(source_tx_hash),
+        output_commitment = %hex::encode(output_commitment),
+        target_txid_index,
+        root_txid_index,
+        target_tree,
+        target_index,
+        leaf_count,
+        txid_tree_elapsed_ms,
+        validate_root_elapsed_ms,
+        elapsed_ms = started.elapsed().as_millis(),
+        "output POI recovery TXID data ready"
+    );
 
     Ok(RecoveredOutputTxidData {
         target_txid_index,
@@ -1463,11 +1777,13 @@ query RecoveryTxidTreeSegment($offset: Int!, $limit: Int!) {
 }
 "#;
     let start = tree.saturating_mul(TREE_LEAF_COUNT);
+    let started = Instant::now();
     let mut transactions = Vec::with_capacity(leaf_count as usize);
     while transactions.len() < leaf_count as usize {
         let remaining = leaf_count as usize - transactions.len();
         let limit = remaining.min(OUTPUT_POI_RECOVERY_TXID_GRAPH_PAGE_SIZE);
         let offset = start.saturating_add(transactions.len() as u64);
+        let page_started = Instant::now();
         let data: RecoveryGraphTransactionsData = post_recovery_graphql(
             client,
             endpoint,
@@ -1478,6 +1794,17 @@ query RecoveryTxidTreeSegment($offset: Int!, $limit: Int!) {
             }),
         )
         .await?;
+        debug!(
+            tree,
+            leaf_count,
+            offset,
+            limit,
+            returned = data.transactions.len(),
+            accumulated = transactions.len() + data.transactions.len(),
+            page_elapsed_ms = page_started.elapsed().as_millis(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "output POI recovery TXID graph page fetched"
+        );
         if data.transactions.is_empty() {
             break;
         }
@@ -1724,6 +2051,101 @@ fn decode_railgun_transactions(calldata: &[u8]) -> Result<Vec<Transaction>, Reco
     ))
 }
 
+async fn preflight_local_output_poi_input_proofs(
+    proof_source: Option<&LocalPoiMerkleProofSource>,
+    cfg: &WalletConfig,
+    candidate: &WalletUtxo,
+    wallet_utxos: &[WalletUtxo],
+    transactions: &[Transaction],
+    active_list_keys: &[FixedBytes<32>],
+    scan_keys: &railgun_wallet::scan::WalletScanKeys,
+) -> Result<(), RecoveryFailure> {
+    let Some(proof_source) = proof_source else {
+        return Ok(());
+    };
+    let Some(blinded_commitments) = output_poi_recovery_input_blinded_commitments(
+        candidate,
+        wallet_utxos,
+        transactions,
+        active_list_keys,
+        scan_keys,
+    ) else {
+        return Ok(());
+    };
+    for list_key in active_list_keys {
+        if let Err(err) = proof_source
+            .poi_merkle_proofs(
+                DEFAULT_TXID_VERSION,
+                EVM_CHAIN_TYPE,
+                cfg.chain.chain_id,
+                list_key,
+                &blinded_commitments,
+            )
+            .await
+        {
+            return Err(RecoveryFailure::retryable(
+                OutputPoiRecoveryStatus::ProofGenerationFailed,
+                format!("local POI proof preflight failed: {err}"),
+                output_poi_recovery_proof_retry_after(&err),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn output_poi_recovery_input_blinded_commitments(
+    candidate: &WalletUtxo,
+    wallet_utxos: &[WalletUtxo],
+    transactions: &[Transaction],
+    active_list_keys: &[FixedBytes<32>],
+    scan_keys: &railgun_wallet::scan::WalletScanKeys,
+) -> Option<Vec<FixedBytes<32>>> {
+    if transactions.len() != 1 {
+        return None;
+    }
+    let output_commitment = U256::from_be_bytes(candidate.utxo.poi.commitment.0);
+    for transaction in transactions {
+        let Some(output_index) = transaction
+            .commitments
+            .iter()
+            .position(|commitment| U256::from_be_bytes(commitment.0) == output_commitment)
+        else {
+            continue;
+        };
+        if transaction.boundParams.unshield != 0 {
+            return None;
+        }
+        let Ok(output_start_global) = output_start_global_position(&candidate.utxo, output_index)
+        else {
+            return None;
+        };
+        let output_start_tree = (output_start_global / u128::from(TREE_LEAF_COUNT)) as u32;
+        let input_tree = u32::from(transaction.boundParams.treeNumber);
+        if input_tree > output_start_tree {
+            return None;
+        }
+        if wallet_outputs_for_transaction(candidate, wallet_utxos, transaction).is_err() {
+            return None;
+        }
+        let inputs =
+            wallet_inputs_for_transaction(candidate, wallet_utxos, transaction, scan_keys).ok()?;
+        if inputs.iter().any(|wallet_utxo| {
+            active_list_keys.iter().any(|list_key| {
+                wallet_utxo.utxo.poi.statuses.get(list_key) == Some(&PoiStatus::ShieldBlocked)
+            })
+        }) {
+            return None;
+        }
+        return Some(
+            inputs
+                .iter()
+                .map(|wallet_utxo| wallet_utxo.utxo.poi.blinded_commitment)
+                .collect(),
+        );
+    }
+    None
+}
+
 fn build_output_poi_recovery_chunk(
     candidate: &WalletUtxo,
     wallet_utxos: &[WalletUtxo],
@@ -1793,7 +2215,7 @@ fn build_output_poi_recovery_chunk(
                 "transaction has no wallet-owned inputs",
             )
         })?;
-        let leaf_count = recovery_leaf_count_for_merkle_root(
+        let input_merkle = recovery_input_merkle_tree_for_root(
             forest,
             input_tree,
             first_input,
@@ -1802,15 +2224,7 @@ fn build_output_poi_recovery_chunk(
         )?;
         let mut input_witnesses = Vec::with_capacity(inputs.len());
         for input in inputs {
-            let Some(proof) =
-                forest.prove_with_leaf_count(input.utxo.tree, input.utxo.position, leaf_count)
-            else {
-                return Err(RecoveryFailure::retryable(
-                    OutputPoiRecoveryStatus::MissingMerkleProof,
-                    "input tree missing from local Merkle forest",
-                    OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER,
-                ));
-            };
+            let proof = input_merkle.tree.prove(input.utxo.position);
             if proof.root != merkle_root || proof.leaf != input.utxo.note.commitment() {
                 return Err(RecoveryFailure::retryable(
                     OutputPoiRecoveryStatus::MissingMerkleProof,
@@ -1871,13 +2285,17 @@ fn output_start_global_position(utxo: &Utxo, output_index: usize) -> Result<u128
     })
 }
 
-fn recovery_leaf_count_for_merkle_root(
+struct RecoveryInputMerkleTree {
+    tree: DenseMerkleTree,
+}
+
+fn recovery_input_merkle_tree_for_root(
     forest: &MerkleForest,
     input_tree: u32,
     first_input: &WalletUtxo,
     max_leaf_count: u64,
     merkle_root: U256,
-) -> Result<u64, RecoveryFailure> {
+) -> Result<RecoveryInputMerkleTree, RecoveryFailure> {
     let min_leaf_count = first_input.utxo.position.saturating_add(1);
     if max_leaf_count < min_leaf_count {
         return Err(RecoveryFailure::retryable(
@@ -1889,18 +2307,24 @@ fn recovery_leaf_count_for_merkle_root(
     let lower_bound = max_leaf_count
         .saturating_sub(OUTPUT_POI_RECOVERY_ROOT_SEARCH_LEAVES)
         .max(min_leaf_count);
+    if forest
+        .leaf_at(input_tree, first_input.utxo.position)
+        .is_none()
+    {
+        return Err(RecoveryFailure::retryable(
+            OutputPoiRecoveryStatus::MissingMerkleProof,
+            "input tree missing from local Merkle forest",
+            OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER,
+        ));
+    }
+    let mut tree = DenseMerkleTree::from_forest_prefix(forest, input_tree, max_leaf_count);
     for leaf_count in (lower_bound..=max_leaf_count).rev() {
-        let Some(proof) =
-            forest.prove_with_leaf_count(input_tree, first_input.utxo.position, leaf_count)
-        else {
-            return Err(RecoveryFailure::retryable(
-                OutputPoiRecoveryStatus::MissingMerkleProof,
-                "input tree missing from local Merkle forest",
-                OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER,
-            ));
-        };
+        let proof = tree.prove(first_input.utxo.position);
         if proof.leaf == first_input.utxo.note.commitment() && proof.root == merkle_root {
-            return Ok(leaf_count);
+            return Ok(RecoveryInputMerkleTree { tree });
+        }
+        if leaf_count > lower_bound {
+            tree.remove_leaf(leaf_count - 1);
         }
     }
     Err(RecoveryFailure::retryable(
@@ -2304,6 +2728,174 @@ async fn refresh_wallet_poi_statuses_selected(
     changed
 }
 
+#[derive(Debug, Default)]
+struct LivePoiTailOutcome {
+    events: usize,
+    pages: usize,
+    start_index: u64,
+    next_event_index: u64,
+}
+
+#[derive(Debug, Error)]
+enum LivePoiTailError {
+    #[error("live POI tail request failed")]
+    Rpc(#[from] PoiRpcError),
+    #[error("live POI event signature verification failed")]
+    Verify(#[from] poi::artifacts::VerifyError),
+    #[error("live POI cache update failed")]
+    Cache(#[from] PoiCacheError),
+    #[error("live POI event index mismatch: expected {expected}, got {actual}")]
+    EventIndexMismatch { expected: u64, actual: u64 },
+    #[error("live POI event range overflow")]
+    RangeOverflow,
+    #[error("invalid hex in {field}: {value}")]
+    InvalidHex { field: &'static str, value: String },
+    #[error("{field} has {actual} bytes, expected {expected}")]
+    InvalidByteLen {
+        field: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+    #[error("live POI root missing for tree {tree_number}")]
+    MissingRoot { tree_number: u32 },
+    #[error("live POI root mismatch for tree {tree_number}: expected {expected}, got {actual}")]
+    RootMismatch {
+        tree_number: u32,
+        expected: String,
+        actual: String,
+    },
+}
+
+async fn sync_live_poi_event_tail(
+    client: &PoiRpcClient,
+    cache: &mut PoiCache,
+) -> Result<LivePoiTailOutcome, LivePoiTailError> {
+    let identity = cache.identity().clone();
+    let mut outcome = LivePoiTailOutcome {
+        start_index: cache.progress().next_event_index,
+        next_event_index: cache.progress().next_event_index,
+        ..LivePoiTailOutcome::default()
+    };
+    if outcome.next_event_index == 0 {
+        return Ok(outcome);
+    }
+
+    loop {
+        let start_index = outcome.next_event_index;
+        let end_index = start_index
+            .checked_add(POI_EVENTS_PAGE_SIZE - 1)
+            .ok_or(LivePoiTailError::RangeOverflow)?;
+        let events = client
+            .poi_events(
+                &identity.txid_version,
+                identity.chain_type,
+                identity.chain_id,
+                &identity.list_key,
+                start_index,
+                end_index,
+            )
+            .await?;
+        if events.is_empty() {
+            break;
+        }
+        let returned = events.len();
+        apply_live_poi_events(cache, &identity.list_key, start_index, &events)?;
+        outcome.events += returned;
+        outcome.pages += 1;
+        outcome.next_event_index = cache.progress().next_event_index;
+        if returned < POI_EVENTS_PAGE_SIZE as usize {
+            break;
+        }
+    }
+
+    Ok(outcome)
+}
+
+fn apply_live_poi_events(
+    cache: &mut PoiCache,
+    list_key: &FixedBytes<32>,
+    start_index: u64,
+    events: &[PoiSyncedListEvent],
+) -> Result<(), LivePoiTailError> {
+    let mut expected_index = start_index;
+    let mut snapshot_events = Vec::with_capacity(events.len());
+    let mut expected_roots = BTreeMap::new();
+    let list_key_bytes = fixed_bytes(list_key);
+    for event in events {
+        if event.signed_poi_event.index != expected_index {
+            return Err(LivePoiTailError::EventIndexMismatch {
+                expected: expected_index,
+                actual: event.signed_poi_event.index,
+            });
+        }
+        verify_poi_event(&event.signed_poi_event, &list_key_bytes)?;
+        let blinded_commitment = decode_hex_array::<32>(
+            "signedPOIEvent.blindedCommitment",
+            &event.signed_poi_event.blinded_commitment,
+        )?;
+        let signature = decode_hex_array::<64>(
+            "signedPOIEvent.signature",
+            &event.signed_poi_event.signature,
+        )?;
+        let (tree_number, _) = normalize_tree_position(0, event.signed_poi_event.index);
+        expected_roots.insert(
+            tree_number,
+            decode_hex_array::<32>("validatedMerkleroot", &event.validated_merkleroot)?,
+        );
+        snapshot_events.push(SnapshotEvent {
+            event_index: event.signed_poi_event.index,
+            blinded_commitment,
+            signature,
+            event_type: event.signed_poi_event.event_type,
+        });
+        expected_index = expected_index
+            .checked_add(1)
+            .ok_or(LivePoiTailError::RangeOverflow)?;
+    }
+    cache.apply_verified_artifact_events(&snapshot_events)?;
+    let actual_roots = cache.current_roots();
+    for (tree_number, expected_root) in expected_roots {
+        let actual_root = actual_roots
+            .get(&tree_number)
+            .ok_or(LivePoiTailError::MissingRoot { tree_number })?;
+        if *actual_root != expected_root {
+            return Err(LivePoiTailError::RootMismatch {
+                tree_number,
+                expected: hex::encode_prefixed(expected_root),
+                actual: hex::encode_prefixed(actual_root),
+            });
+        }
+    }
+    cache.accept_current_roots();
+    Ok(())
+}
+
+fn decode_hex_array<const N: usize>(
+    field: &'static str,
+    value: &str,
+) -> Result<[u8; N], LivePoiTailError> {
+    let bytes = hex::decode(value.strip_prefix("0x").unwrap_or(value)).map_err(|_| {
+        LivePoiTailError::InvalidHex {
+            field,
+            value: value.to_string(),
+        }
+    })?;
+    let actual = bytes.len();
+    bytes
+        .try_into()
+        .map_err(|_| LivePoiTailError::InvalidByteLen {
+            field,
+            expected: N,
+            actual,
+        })
+}
+
+fn fixed_bytes<const N: usize>(value: &FixedBytes<N>) -> [u8; N] {
+    let mut bytes = [0_u8; N];
+    bytes.copy_from_slice(value.as_slice());
+    bytes
+}
+
 async fn sync_local_poi_caches(
     db: &DbStore,
     http_client: Option<&reqwest::Client>,
@@ -2320,17 +2912,7 @@ async fn sync_local_poi_caches(
         artifact_config.clone(),
         http_client.cloned().unwrap_or_else(reqwest::Client::new),
     );
-    let mut caches = local_caches.write().await;
-    for list_key in active_list_keys {
-        caches.entry(*list_key).or_insert_with(|| {
-            PoiCache::new(PoiCacheIdentity::new(
-                EVM_CHAIN_TYPE,
-                cfg.chain.chain_id,
-                DEFAULT_TXID_VERSION,
-                *list_key,
-            ))
-        });
-    }
+    let live_tail_client = http_client.and_then(|client| wallet_poi_status_client(Some(client)));
     for list_key in active_list_keys {
         let identity = PoiCacheIdentity::new(
             EVM_CHAIN_TYPE,
@@ -2345,14 +2927,38 @@ async fn sync_local_poi_caches(
         {
             Ok(refresh) => {
                 let manifest_sequence = refresh.manifest_sequence;
-                let current_tip_index = refresh.entry.current_tip_index;
-                caches.insert(*list_key, refresh.cache);
+                let artifact_tip_index = refresh.entry.current_tip_index;
+                let mut cache = refresh.cache;
+                let live_tail = if let Some(client) = live_tail_client.as_ref() {
+                    match sync_live_poi_event_tail(client, &mut cache).await {
+                        Ok(outcome) => Some(outcome),
+                        Err(err) => {
+                            warn!(
+                                ?err,
+                                cache_key = %cfg.cache_key,
+                                chain_id = cfg.chain.chain_id,
+                                list_key = %hex::encode(list_key),
+                                "live POI event tail failed; using artifact checkpoint"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let local_tip_index = cache.progress().next_event_index.saturating_sub(1);
+                local_caches.write().await.insert(*list_key, cache);
                 info!(
                     cache_key = %cfg.cache_key,
                     chain_id = cfg.chain.chain_id,
                     list_key = %hex::encode(list_key),
                     manifest_sequence,
-                    current_tip_index,
+                    artifact_tip_index,
+                    local_tip_index,
+                    live_tail_events = live_tail.as_ref().map_or(0, |outcome| outcome.events),
+                    live_tail_pages = live_tail.as_ref().map_or(0, |outcome| outcome.pages),
+                    live_tail_start_index = live_tail.as_ref().map_or(local_tip_index.saturating_add(1), |outcome| outcome.start_index),
+                    live_tail_next_event_index = live_tail.as_ref().map_or(local_tip_index.saturating_add(1), |outcome| outcome.next_event_index),
                     base_cid = %refresh.entry.base.cid,
                     delta_count = refresh.entry.deltas.len(),
                     blocked_shields_cid = %refresh.entry.blocked_shields.cid,
@@ -2371,7 +2977,19 @@ async fn sync_local_poi_caches(
                 );
                 match load_persisted_cache(db, &identity) {
                     Ok(Some(persisted)) => {
-                        caches.insert(*list_key, persisted.cache);
+                        let mut cache = persisted.cache;
+                        if let Some(client) = live_tail_client.as_ref()
+                            && let Err(err) = sync_live_poi_event_tail(client, &mut cache).await
+                        {
+                            warn!(
+                                ?err,
+                                cache_key = %cfg.cache_key,
+                                chain_id = cfg.chain.chain_id,
+                                list_key = %hex::encode(list_key),
+                                "live POI event tail failed after artifact refresh error"
+                            );
+                        }
+                        local_caches.write().await.insert(*list_key, cache);
                     }
                     Ok(None) => {}
                     Err(err) => warn!(
@@ -2385,6 +3003,98 @@ async fn sync_local_poi_caches(
             }
         }
     }
+}
+
+async fn sync_local_poi_live_tails(
+    client: &PoiRpcClient,
+    cfg: &WalletConfig,
+    active_list_keys: &[FixedBytes<32>],
+) {
+    if !matches!(cfg.poi_read_source, PoiReadSource::IndexedArtifacts(_)) {
+        return;
+    }
+    let Some(local_caches) = cfg.local_poi_caches.as_ref() else {
+        return;
+    };
+    for list_key in active_list_keys {
+        let Some(mut cache) = local_caches.read().await.get(list_key).cloned() else {
+            continue;
+        };
+        let original_next_event_index = cache.progress().next_event_index;
+        if original_next_event_index == 0 {
+            continue;
+        }
+        let started = Instant::now();
+        match sync_live_poi_event_tail(client, &mut cache).await {
+            Ok(outcome) => {
+                if outcome.events > 0 {
+                    if install_tailed_poi_cache_if_current(
+                        local_caches,
+                        *list_key,
+                        cache,
+                        original_next_event_index,
+                    )
+                    .await
+                    {
+                        info!(
+                            cache_key = %cfg.cache_key,
+                            chain_id = cfg.chain.chain_id,
+                            list_key = %hex::encode(list_key),
+                            events = outcome.events,
+                            pages = outcome.pages,
+                            start_index = outcome.start_index,
+                            next_event_index = outcome.next_event_index,
+                            elapsed_ms = started.elapsed().as_millis(),
+                            "live POI event tail applied"
+                        );
+                    } else {
+                        debug!(
+                            cache_key = %cfg.cache_key,
+                            chain_id = cfg.chain.chain_id,
+                            list_key = %hex::encode(list_key),
+                            start_index = outcome.start_index,
+                            next_event_index = outcome.next_event_index,
+                            "live POI event tail install skipped; cache already advanced"
+                        );
+                    }
+                } else {
+                    debug!(
+                        cache_key = %cfg.cache_key,
+                        chain_id = cfg.chain.chain_id,
+                        list_key = %hex::encode(list_key),
+                        start_index = outcome.start_index,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "live POI event tail already current"
+                    );
+                }
+            }
+            Err(err) => warn!(
+                ?err,
+                cache_key = %cfg.cache_key,
+                chain_id = cfg.chain.chain_id,
+                list_key = %hex::encode(list_key),
+                elapsed_ms = started.elapsed().as_millis(),
+                "live POI event tail failed"
+            ),
+        }
+    }
+}
+
+async fn install_tailed_poi_cache_if_current(
+    local_caches: &WalletLocalPoiCaches,
+    list_key: FixedBytes<32>,
+    cache: PoiCache,
+    expected_next_event_index: u64,
+) -> bool {
+    let mut caches = local_caches.write().await;
+    let Some(current) = caches.get(&list_key) else {
+        return false;
+    };
+    if current.progress().next_event_index != expected_next_event_index {
+        return false;
+    }
+    caches.insert(list_key, cache);
+    true
 }
 
 fn spawn_startup_artifact_poi_cache_warmup(
@@ -2407,10 +3117,44 @@ fn spawn_startup_artifact_poi_cache_warmup(
     }))
 }
 
+async fn await_startup_artifact_poi_cache_warmup(
+    startup_warmup: &mut Option<tokio::task::JoinHandle<()>>,
+    cfg: &WalletConfig,
+    reason: &'static str,
+) {
+    if !matches!(cfg.poi_read_source, PoiReadSource::IndexedArtifacts(_)) {
+        return;
+    }
+    let Some(handle) = startup_warmup.take() else {
+        return;
+    };
+    info!(
+        cache_key = %cfg.cache_key,
+        chain_id = cfg.chain.chain_id,
+        reason,
+        "waiting for startup artifact POI cache warmup"
+    );
+    match handle.await {
+        Ok(()) => debug!(
+            cache_key = %cfg.cache_key,
+            chain_id = cfg.chain.chain_id,
+            reason,
+            "startup artifact POI cache warmup complete"
+        ),
+        Err(err) => warn!(
+            ?err,
+            cache_key = %cfg.cache_key,
+            chain_id = cfg.chain.chain_id,
+            reason,
+            "startup artifact POI cache warmup task failed"
+        ),
+    }
+}
+
 async fn refresh_wallet_poi_statuses_selected_with_config(
     remote_client: &PoiRpcClient,
-    db: &DbStore,
-    http_client: Option<&reqwest::Client>,
+    _db: &DbStore,
+    _http_client: Option<&reqwest::Client>,
     cfg: &WalletConfig,
     active_list_keys: &[FixedBytes<32>],
     wallet_utxos: &mut [WalletUtxo],
@@ -2418,7 +3162,6 @@ async fn refresh_wallet_poi_statuses_selected_with_config(
 ) -> bool {
     match &cfg.poi_read_source {
         PoiReadSource::IndexedArtifacts(_) => {
-            sync_local_poi_caches(db, http_client, cfg, active_list_keys).await;
             let local_caches = cfg.local_poi_caches.as_ref().cloned().unwrap_or_else(|| {
                 warn!(
                     cache_key = %cfg.cache_key,
@@ -2759,14 +3502,13 @@ async fn refresh_wallet_poi_statuses_and_persist(
 
 async fn refresh_wallet_poi_statuses_and_persist_with_config(
     remote_client: &PoiRpcClient,
-    db: &DbStore,
-    http_client: Option<&reqwest::Client>,
+    _db: &DbStore,
+    _http_client: Option<&reqwest::Client>,
     persist: WalletPoiStatusRefreshPersist<'_>,
     selection: WalletPoiRefreshSelection,
 ) -> bool {
     match &persist.cfg.poi_read_source {
         PoiReadSource::IndexedArtifacts(_) => {
-            sync_local_poi_caches(db, http_client, persist.cfg, persist.active_list_keys).await;
             let local_caches = persist
                 .cfg
                 .local_poi_caches
@@ -2813,7 +3555,6 @@ async fn recover_missing_output_pois_from_wallet(run: OutputPoiRecoveryRun<'_>) 
     let forest = run.forest.read().await.clone();
     let local_proof_source = match &run.cfg.poi_read_source {
         PoiReadSource::IndexedArtifacts(_) => {
-            sync_local_poi_caches(run.db, run.http_client, run.cfg, run.active_list_keys).await;
             let local_caches = run
                 .cfg
                 .local_poi_caches
@@ -2845,6 +3586,7 @@ async fn recover_missing_output_pois_from_wallet(run: OutputPoiRecoveryRun<'_>) 
         forest: &forest,
         poi_client: run.client,
         proof_source,
+        local_proof_source: local_proof_source.as_ref(),
         submitter: run.client,
         active_list_keys: run.active_list_keys,
         wallet_utxos: &snapshot,
@@ -2914,7 +3656,8 @@ pub(crate) fn spawn_wallet_worker(
         let mut live_metadata_flush = WalletLiveMetadataFlush::new(last_scanned, worker_started);
         let poi_status_client = wallet_poi_status_client(http_client.as_ref());
         let active_poi_list_keys = default_active_poi_list_keys();
-        let _ = spawn_startup_artifact_poi_cache_warmup(
+        let mut last_live_tail_poll = Instant::now();
+        let mut startup_artifact_warmup = spawn_startup_artifact_poi_cache_warmup(
             Arc::clone(&db),
             http_client.clone(),
             cfg.clone(),
@@ -2946,6 +3689,11 @@ pub(crate) fn spawn_wallet_worker(
                         continue;
                     }
                     set_poi_refreshing(&poi_refreshing_tx, true, &cfg.cache_key);
+                    await_startup_artifact_poi_cache_warmup(
+                        &mut startup_artifact_warmup,
+                        &cfg,
+                        "manual_poi_refresh",
+                    ).await;
                     let changed = refresh_wallet_poi_statuses_and_persist_with_config(
                         client,
                         db.as_ref(),
@@ -2986,6 +3734,10 @@ pub(crate) fn spawn_wallet_worker(
                     let Some(client) = poi_status_client.as_ref() else {
                         continue;
                     };
+                    if last_live_tail_poll.elapsed() >= WALLET_POI_LIVE_TAIL_INTERVAL {
+                        sync_local_poi_live_tails(client, &cfg, &active_poi_list_keys).await;
+                        last_live_tail_poll = Instant::now();
+                    }
                     let now = now_epoch_secs();
                     let selection = WalletPoiRefreshSelection::RecoverableStale { now };
                     let refresh_needed = {
@@ -3009,6 +3761,11 @@ pub(crate) fn spawn_wallet_worker(
                         continue;
                     }
                     set_poi_refreshing(&poi_refreshing_tx, true, &cfg.cache_key);
+                    await_startup_artifact_poi_cache_warmup(
+                        &mut startup_artifact_warmup,
+                        &cfg,
+                        "periodic_poi_refresh",
+                    ).await;
                     let changed = refresh_wallet_poi_statuses_and_persist_with_config(
                         client,
                         db.as_ref(),
@@ -3202,12 +3959,15 @@ pub(crate) fn spawn_wallet_worker(
 
                             if let Some(client) = poi_status_client.as_ref() {
                                 let post_ready_poi_started = Instant::now();
+                                let pending_observations_started = Instant::now();
                                 process_pending_output_poi_observations(
                                     db.as_ref(),
                                     cfg.chain.chain_id,
                                     &[],
                                     Some(client as &dyn PendingOutputPoiSubmitter),
                                 ).await;
+                                let pending_observations_elapsed_ms =
+                                    pending_observations_started.elapsed().as_millis();
 
                                 let refresh_needed = {
                                     let locked = utxos.read().await;
@@ -3219,6 +3979,15 @@ pub(crate) fn spawn_wallet_worker(
                                 };
                                 if refresh_needed {
                                     set_poi_refreshing(&poi_refreshing_tx, true, &cfg.cache_key);
+                                    let warmup_wait_started = Instant::now();
+                                    await_startup_artifact_poi_cache_warmup(
+                                        &mut startup_artifact_warmup,
+                                        &cfg,
+                                        "post_ready_poi_refresh",
+                                    ).await;
+                                    let warmup_wait_elapsed_ms =
+                                        warmup_wait_started.elapsed().as_millis();
+                                    let status_refresh_started = Instant::now();
                                     let changed = refresh_wallet_poi_statuses_and_persist_with_config(
                                         client,
                                         db.as_ref(),
@@ -3233,7 +4002,10 @@ pub(crate) fn spawn_wallet_worker(
                                         },
                                         WalletPoiRefreshSelection::RequiredOrRecoverable,
                                     ).await;
-                                    recover_missing_output_pois_from_wallet(OutputPoiRecoveryRun {
+                                    let status_refresh_elapsed_ms =
+                                        status_refresh_started.elapsed().as_millis();
+                                    let output_recovery_started = Instant::now();
+                                    let recovered = recover_missing_output_pois_from_wallet(OutputPoiRecoveryRun {
                                         db: db.as_ref(),
                                         cfg: &cfg,
                                         rpcs: rpcs.as_ref(),
@@ -3244,17 +4016,25 @@ pub(crate) fn spawn_wallet_worker(
                                         active_list_keys: &active_poi_list_keys,
                                         force_retry: false,
                                     }).await;
+                                    let output_recovery_elapsed_ms =
+                                        output_recovery_started.elapsed().as_millis();
                                     set_poi_refreshing(&poi_refreshing_tx, false, &cfg.cache_key);
                                     worker_handle.notify_if_changed(changed);
                                     info!(
                                         cache_key = %cfg.cache_key,
                                         changed,
+                                        recovered,
+                                        pending_observations_elapsed_ms,
+                                        warmup_wait_elapsed_ms,
+                                        status_refresh_elapsed_ms,
+                                        output_recovery_elapsed_ms,
                                         elapsed_ms = post_ready_poi_started.elapsed().as_millis(),
-                                        "post-ready wallet POI status refresh complete"
+                                        "post-ready wallet POI maintenance complete"
                                     );
                                 } else {
                                     debug!(
                                         cache_key = %cfg.cache_key,
+                                        pending_observations_elapsed_ms,
                                         elapsed_ms = post_ready_poi_started.elapsed().as_millis(),
                                         "post-ready wallet POI status refresh not needed"
                                     );
@@ -3457,21 +4237,23 @@ fn wallet_utxo_counts(utxos: &[WalletUtxo]) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_TXID_VERSION, EVM_CHAIN_TYPE, LocalPoiMerkleProofSource, LocalPoiStatusReader,
-        OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER, OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-        PendingOutputPoiSubmitter, PoiStatusReader, RecoveryGraphRailgunTransaction,
-        WALLET_METADATA_LIVE_FLUSH_BLOCKS, WALLET_METADATA_LIVE_FLUSH_INTERVAL,
-        WALLET_POI_RECOVERABLE_REFRESH_AFTER, WALLET_POI_STATUS_BATCH_SIZE, WalletHandle,
-        WalletLiveMetadataFlush, WalletPersistState, WalletPoiRefreshRequest,
-        WalletPoiRefreshSelection, WalletProgressPersist, apply_wallet_delta_to_vec,
-        apply_wallet_delta_to_vec_with_outcome,
-        discard_pending_output_poi_contexts_for_spent_outputs, output_poi_recovery_candidates,
-        output_poi_recovery_proof_retry_after, output_start_global_position,
-        pending_output_poi_submit_identity, process_pending_output_poi_observations,
-        process_pending_output_poi_observations_inner, recovery_leaf_count_for_merkle_root,
+        DEFAULT_TXID_VERSION, DenseMerkleTree, EVM_CHAIN_TYPE, LocalPoiMerkleProofSource,
+        LocalPoiStatusReader, OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER,
+        OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER, PendingOutputPoiSubmitter, PoiStatusReader,
+        RecoveryGraphRailgunTransaction, WALLET_METADATA_LIVE_FLUSH_BLOCKS,
+        WALLET_METADATA_LIVE_FLUSH_INTERVAL, WALLET_POI_RECOVERABLE_REFRESH_AFTER,
+        WALLET_POI_STATUS_BATCH_SIZE, WalletHandle, WalletLiveMetadataFlush, WalletPersistState,
+        WalletPoiRefreshRequest, WalletPoiRefreshSelection, WalletProgressPersist,
+        apply_wallet_delta_to_vec, apply_wallet_delta_to_vec_with_outcome,
+        discard_pending_output_poi_contexts_for_spent_outputs, install_tailed_poi_cache_if_current,
+        output_poi_recovery_candidates, output_poi_recovery_proof_retry_after,
+        output_start_global_position, pending_output_poi_submit_identity,
+        preflight_local_output_poi_input_proofs, process_pending_output_poi_observations,
+        process_pending_output_poi_observations_inner, recovery_input_merkle_tree_for_root,
         refresh_wallet_poi_statuses_selected, refresh_wallet_poi_statuses_selected_with_config,
         rewind_wallet_utxos, spawn_startup_artifact_poi_cache_warmup, spent_source_for_utxo,
-        wallet_poi_status_refresh_needed, wallet_poi_status_refresh_needed_for_selection,
+        sync_live_poi_event_tail, wallet_poi_status_refresh_needed,
+        wallet_poi_status_refresh_needed_for_selection,
     };
     use crate::types::{
         ChainKey, PoiArtifactManifestSource, PoiArtifactSourceConfig, PoiReadSource,
@@ -3481,10 +4263,14 @@ mod tests {
     use alloy::primitives::{Address, Bytes, FixedBytes, U64, U256};
     use alloy::uint;
     use async_trait::async_trait;
+    use broadcaster_core::contracts::railgun::{
+        BoundParams, CommitmentPreimage, SnarkProof, Transaction,
+    };
     use broadcaster_core::crypto::railgun::ViewingKeyData;
     use broadcaster_core::notes::Note;
     use broadcaster_core::transact::{PreTxPoi, SnarkJsProof, railgun_txid_leaf_hash};
     use broadcaster_core::tree::TREE_LEAF_COUNT;
+    use ed25519_dalek::{Signer, SigningKey};
     use local_db::{
         DbConfig, DbStore, OutputPoiRecoveryAction, OutputPoiRecoveryRecord,
         OutputPoiRecoveryStatus, PendingOutputPoiContextRecord, PendingOutputPoiRole,
@@ -3494,7 +4280,10 @@ mod tests {
     use poi::artifacts::{ArtifactDescriptor, Manifest, ManifestEntry};
     use poi::cache::{PoiCache, PoiCacheIdentity};
     use poi::error::PoiError;
-    use poi::poi::{BlindedCommitmentData, PoiRpcClient, SingleCommitmentProofContext};
+    use poi::poi::{
+        BlindedCommitmentData, PoiEventType, PoiRpcClient, PoiSyncedListEvent, SignedPoiEvent,
+        SingleCommitmentProofContext,
+    };
     use railgun_wallet::prover::ProverError;
     use railgun_wallet::scan::{CommitmentObservation, SpentNullifier, WalletLogDelta};
     use railgun_wallet::tx::{PoiMerkleProofSource, PreTransactionPoiError};
@@ -3578,6 +4367,30 @@ mod tests {
             source((position % 200) as u8 + 1),
             kind,
         ))
+    }
+
+    fn recovery_test_transaction(
+        input: &WalletUtxo,
+        output: &WalletUtxo,
+        nullifying_key: U256,
+    ) -> Transaction {
+        Transaction {
+            proof: SnarkProof::default(),
+            merkleRoot: FixedBytes::ZERO,
+            nullifiers: vec![FixedBytes::from(
+                input.utxo.nullifier(nullifying_key).to_be_bytes::<32>(),
+            )],
+            commitments: vec![output.utxo.poi.commitment],
+            boundParams: BoundParams::new_transact(
+                input.utxo.tree,
+                EVM_CHAIN_TYPE,
+                1,
+                Vec::new(),
+                Address::ZERO,
+                FixedBytes::ZERO,
+            ),
+            unshieldPreimage: CommitmentPreimage::empty(),
+        }
     }
 
     #[test]
@@ -4323,7 +5136,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_leaf_count_search_finds_root_before_later_commitments() {
+    fn recovery_input_tree_search_finds_root_before_later_commitments() {
         let first_input = test_wallet_utxo(0);
         let mut forest_before_later = MerkleForest::new();
         forest_before_later
@@ -4354,16 +5167,23 @@ mod tests {
             })
             .expect("insert second later leaf");
 
-        let leaf_count = recovery_leaf_count_for_merkle_root(
+        let current_proof = forest_after_later
+            .prove_with_leaf_count(first_input.utxo.tree, first_input.utxo.position, 3)
+            .expect("current proof");
+        assert_ne!(current_proof.root, expected_root);
+
+        let input_merkle = recovery_input_merkle_tree_for_root(
             &forest_after_later,
             first_input.utxo.tree,
             &first_input,
             3,
             expected_root,
         )
-        .expect("find historical leaf count");
+        .expect("find historical root");
+        let recovered_proof = input_merkle.tree.prove(first_input.utxo.position);
 
-        assert_eq!(leaf_count, 1);
+        assert_eq!(recovered_proof.root, expected_root);
+        assert_eq!(recovered_proof.leaf, first_input.utxo.note.commitment());
     }
 
     #[test]
@@ -4748,6 +5568,271 @@ mod tests {
 
         assert_eq!(proofs.len(), 1);
         assert_eq!(proofs[0].leaf, hex::encode_prefixed(blinded_commitment));
+    }
+
+    #[tokio::test]
+    async fn local_output_poi_proof_preflight_fails_before_expensive_recovery_when_cache_missing() {
+        let nullifying_key = uint!(9_U256);
+        let cfg = wallet_config(nullifying_key);
+        let list_key = FixedBytes::from([0x11; 32]);
+        let mut input = test_wallet_utxo(0);
+        let output = test_wallet_utxo(8);
+        input.spent = Some(output.utxo.source.clone());
+        let transaction = recovery_test_transaction(&input, &output, nullifying_key);
+        let wallet_utxos = vec![input, output.clone()];
+        let mut cache = PoiCache::new(PoiCacheIdentity::new(
+            EVM_CHAIN_TYPE,
+            cfg.chain.chain_id,
+            DEFAULT_TXID_VERSION,
+            list_key,
+        ));
+        cache.accept_current_roots();
+        let local_caches = Arc::new(RwLock::new(BTreeMap::from([(list_key, cache)])));
+        let source = LocalPoiMerkleProofSource::new(local_caches);
+
+        let failure = preflight_local_output_poi_input_proofs(
+            Some(&source),
+            &cfg,
+            &output,
+            &wallet_utxos,
+            &[transaction],
+            &[list_key],
+            &cfg.scan_keys,
+        )
+        .await
+        .expect_err("missing local proof preflight should fail");
+
+        assert_eq!(
+            failure.status,
+            OutputPoiRecoveryStatus::ProofGenerationFailed
+        );
+        assert!(failure.message.contains("missing POI cache proof data"));
+        assert_eq!(
+            failure.retry_after,
+            Some(OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER)
+        );
+    }
+
+    #[tokio::test]
+    async fn local_output_poi_proof_preflight_checks_transaction_inputs() {
+        let nullifying_key = uint!(9_U256);
+        let cfg = wallet_config(nullifying_key);
+        let list_key = FixedBytes::from([0x11; 32]);
+        let mut input = test_wallet_utxo(0);
+        let output = test_wallet_utxo(8);
+        input.spent = Some(output.utxo.source.clone());
+        let transaction = recovery_test_transaction(&input, &output, nullifying_key);
+        let wallet_utxos = vec![input.clone(), output.clone()];
+        let mut cache = PoiCache::new(PoiCacheIdentity::new(
+            EVM_CHAIN_TYPE,
+            cfg.chain.chain_id,
+            DEFAULT_TXID_VERSION,
+            list_key,
+        ));
+        cache
+            .apply_verified_artifact_events(&[poi::artifacts::SnapshotEvent {
+                event_index: 0,
+                blinded_commitment: *input.utxo.poi.blinded_commitment,
+                signature: [0_u8; 64],
+                event_type: poi::poi::PoiEventType::Transact,
+            }])
+            .expect("apply input POI event");
+        cache.accept_current_roots();
+        let local_caches = Arc::new(RwLock::new(BTreeMap::from([(list_key, cache)])));
+        let source = LocalPoiMerkleProofSource::new(local_caches);
+
+        preflight_local_output_poi_input_proofs(
+            Some(&source),
+            &cfg,
+            &output,
+            &wallet_utxos,
+            &[transaction],
+            &[list_key],
+            &cfg.scan_keys,
+        )
+        .await
+        .expect("input proof preflight succeeds");
+    }
+
+    #[tokio::test]
+    async fn live_poi_tail_applies_public_events_and_validates_root() {
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let list_key = FixedBytes::from(signing_key.verifying_key().to_bytes());
+        let blinded_commitment = FixedBytes::from([0x33; 32]);
+        let artifact_commitment = FixedBytes::from([0x22; 32]);
+        let mut signed_event = SignedPoiEvent {
+            index: 1,
+            blinded_commitment: hex::encode_prefixed(blinded_commitment),
+            signature: String::new(),
+            event_type: PoiEventType::Transact,
+        };
+        signed_event.signature = hex::encode(
+            signing_key
+                .sign(&poi::artifacts::verify::canonical_poi_event_message(
+                    &signed_event,
+                ))
+                .to_bytes(),
+        );
+        let signature: [u8; 64] = hex::decode(&signed_event.signature)
+            .expect("signature hex")
+            .try_into()
+            .expect("signature length");
+        let identity = PoiCacheIdentity::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION, list_key);
+        let mut expected_cache = PoiCache::new(identity.clone());
+        expected_cache
+            .apply_verified_artifact_events(&[poi::artifacts::SnapshotEvent {
+                event_index: 0,
+                blinded_commitment: *artifact_commitment,
+                signature: [0_u8; 64],
+                event_type: PoiEventType::Transact,
+            }])
+            .expect("apply artifact checkpoint event");
+        expected_cache
+            .apply_verified_artifact_events(&[poi::artifacts::SnapshotEvent {
+                event_index: signed_event.index,
+                blinded_commitment: *blinded_commitment,
+                signature,
+                event_type: signed_event.event_type,
+            }])
+            .expect("apply expected event");
+        let expected_root = *expected_cache
+            .current_roots()
+            .get(&0)
+            .expect("expected root");
+        let events = vec![PoiSyncedListEvent {
+            signed_poi_event: signed_event,
+            validated_merkleroot: hex::encode_prefixed(expected_root),
+        }];
+        let mock = spawn_poi_rpc(serde_json::to_value(events).expect("events JSON")).await;
+        let client = PoiRpcClient::new(mock.url.clone());
+        let mut cache = PoiCache::new(identity);
+        cache
+            .apply_verified_artifact_events(&[poi::artifacts::SnapshotEvent {
+                event_index: 0,
+                blinded_commitment: *artifact_commitment,
+                signature: [0_u8; 64],
+                event_type: PoiEventType::Transact,
+            }])
+            .expect("apply artifact checkpoint event");
+        cache.accept_current_roots();
+
+        let outcome = sync_live_poi_event_tail(&client, &mut cache)
+            .await
+            .expect("live tail sync");
+
+        let request = mock
+            .requests
+            .recv_timeout(Duration::from_secs(2))
+            .expect("remote event request");
+        assert_eq!(request["method"], "ppoi_poi_events");
+        assert_eq!(outcome.events, 1);
+        assert_eq!(outcome.start_index, 1);
+        assert_eq!(outcome.next_event_index, 2);
+        assert_eq!(cache.current_roots().get(&0), Some(&expected_root));
+        let proof = cache
+            .poi_merkle_proofs(&[blinded_commitment])
+            .expect("proof after live root validation");
+        assert_eq!(proof[0].leaf, hex::encode_prefixed(blinded_commitment));
+    }
+
+    #[test]
+    fn dense_merkle_tree_matches_forest_proof_and_removal_roots() {
+        let mut forest = MerkleForest::default();
+        for position in [0_u64, 1, 2, 7, 8, 9, 42] {
+            forest
+                .insert_leaf(MerkleTreeUpdate {
+                    tree_number: 0,
+                    tree_position: position,
+                    hash: U256::from(position + 100),
+                })
+                .expect("insert leaf");
+        }
+
+        let mut dense = DenseMerkleTree::from_forest_prefix(&forest, 0, 43);
+        let dense_proof = dense.prove(7);
+        let sparse_proof = forest
+            .prove_with_leaf_count(0, 7, 43)
+            .expect("sparse proof");
+        assert_eq!(dense_proof.root, sparse_proof.root);
+        assert_eq!(dense_proof.leaf, sparse_proof.leaf);
+        assert_eq!(dense_proof.path_elements, sparse_proof.path_elements);
+        assert_eq!(dense_proof.path_indices, sparse_proof.path_indices);
+
+        for position in (10_u64..43).rev() {
+            dense.remove_leaf(position);
+        }
+        let dense_short_proof = dense.prove(7);
+        let sparse_short_proof = forest
+            .prove_with_leaf_count(0, 7, 10)
+            .expect("sparse short proof");
+        assert_eq!(dense_short_proof.root, sparse_short_proof.root);
+        assert_eq!(
+            dense_short_proof.path_elements,
+            sparse_short_proof.path_elements
+        );
+    }
+
+    #[tokio::test]
+    async fn tailed_cache_install_skips_when_current_cache_advanced() {
+        let list_key = FixedBytes::from([0x11; 32]);
+        let identity = PoiCacheIdentity::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION, list_key);
+        let initial_commitment = FixedBytes::from([0x22; 32]);
+        let stale_tail_commitment = FixedBytes::from([0x33; 32]);
+        let current_tail_commitment = FixedBytes::from([0x44; 32]);
+
+        let mut initial_cache = PoiCache::new(identity);
+        initial_cache
+            .apply_verified_artifact_events(&[poi::artifacts::SnapshotEvent {
+                event_index: 0,
+                blinded_commitment: *initial_commitment,
+                signature: [0_u8; 64],
+                event_type: PoiEventType::Transact,
+            }])
+            .expect("apply initial event");
+        initial_cache.accept_current_roots();
+        let original_next_event_index = initial_cache.progress().next_event_index;
+
+        let local_caches = Arc::new(RwLock::new(BTreeMap::from([(
+            list_key,
+            initial_cache.clone(),
+        )])));
+        let mut stale_tail_cache = initial_cache;
+        stale_tail_cache
+            .apply_verified_artifact_events(&[poi::artifacts::SnapshotEvent {
+                event_index: 1,
+                blinded_commitment: *stale_tail_commitment,
+                signature: [0_u8; 64],
+                event_type: PoiEventType::Transact,
+            }])
+            .expect("apply stale tail event");
+
+        {
+            let mut locked = local_caches.write().await;
+            let current = locked.get_mut(&list_key).expect("current cache");
+            current
+                .apply_verified_artifact_events(&[poi::artifacts::SnapshotEvent {
+                    event_index: 1,
+                    blinded_commitment: *current_tail_commitment,
+                    signature: [0_u8; 64],
+                    event_type: PoiEventType::Transact,
+                }])
+                .expect("advance current cache");
+            current.accept_current_roots();
+        }
+
+        let installed = install_tailed_poi_cache_if_current(
+            &local_caches,
+            list_key,
+            stale_tail_cache,
+            original_next_event_index,
+        )
+        .await;
+
+        let locked = local_caches.read().await;
+        let current = locked.get(&list_key).expect("current cache");
+        assert!(!installed);
+        assert!(current.position(&current_tail_commitment).is_some());
+        assert!(current.position(&stale_tail_commitment).is_none());
     }
 
     #[tokio::test]

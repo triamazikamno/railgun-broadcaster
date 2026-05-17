@@ -15,6 +15,7 @@ local-db = { path = "../local-db" }
 merkletree = { path = "../merkletree" }
 poi = { path = "../poi" }
 railgun-wallet = { path = "../railgun-wallet" }
+rayon = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -23,3 +24,6 @@ tokio-util = "0.7"
 tracing = { workspace = true }
 url = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true }
