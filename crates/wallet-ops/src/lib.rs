@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -55,7 +56,7 @@ pub use sync_service::{
     PoiArtifactManifestSource, PoiArtifactSourceConfig, PoiReadSource, SyncProgressStage,
     SyncProgressUpdate,
 };
-use tokio::sync::{RwLock, watch};
+use tokio::sync::{RwLock, oneshot, watch};
 use waku_relay::client::Client as WakuClient;
 use waku_relay::msg::ContentTopic;
 use zeroize::{Zeroize, Zeroizing};
@@ -125,6 +126,7 @@ const GAS_LIMIT_BUFFER: u64 = 100_000;
 const GAS_PRICE_BUFFER_NUMERATOR: u128 = 105;
 const GAS_PRICE_BUFFER_DENOMINATOR: u128 = 100;
 const PUBLIC_BROADCASTER_FEE_ATTEMPTS: usize = 5;
+const PUBLIC_BROADCASTER_REPUBLISH_INTERVAL: Duration = Duration::from_secs(5);
 const PUBLIC_BROADCASTER_FEE_BUFFER_DIVISOR: U256 = uint!(100_U256);
 const APPROX_BASE_GAS: u64 = 650_000;
 const APPROX_GAS_PER_INPUT: u64 = 155_000;
@@ -2933,6 +2935,56 @@ fn public_broadcaster_transact_params(
     }
 }
 
+async fn publish_public_broadcaster_payload(
+    waku: &WakuClient,
+    pubsub_path: &str,
+    transact_topic: &str,
+    payload: &[u8],
+    attempt: usize,
+) -> Result<()> {
+    tracing::info!(
+        pubsub_path = %pubsub_path,
+        transact_topic = %transact_topic,
+        payload_len = payload.len(),
+        attempt,
+        "publishing public broadcaster transact request"
+    );
+    let publish_started = Instant::now();
+    waku.publish(transact_topic, payload)
+        .await
+        .wrap_err("publish public broadcaster transact request")?;
+    tracing::info!(
+        pubsub_path = %pubsub_path,
+        transact_topic = %transact_topic,
+        elapsed_ms = publish_started.elapsed().as_millis(),
+        attempt,
+        "published public broadcaster transact request"
+    );
+    Ok(())
+}
+
+async fn public_broadcaster_republish_loop<F, Fut>(
+    mut stop_rx: oneshot::Receiver<()>,
+    republish_interval: Duration,
+    mut publish: F,
+) where
+    F: FnMut(usize) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<()>> + Send,
+{
+    let mut attempt = 1usize;
+    loop {
+        tokio::select! {
+            _ = &mut stop_rx => break,
+            () = tokio::time::sleep(republish_interval) => {
+                attempt = attempt.saturating_add(1);
+                if let Err(error) = publish(attempt).await {
+                    tracing::warn!(%error, attempt, "republish public broadcaster transact request failed");
+                }
+            }
+        }
+    }
+}
+
 async fn submit_public_broadcaster_plan(
     waku: Arc<WakuClient>,
     to: Address,
@@ -2996,7 +3048,7 @@ async fn submit_public_broadcaster_plan(
         elapsed_ms = encrypt_started.elapsed().as_millis(),
         "built public broadcaster encrypted Waku payload"
     );
-    let pubsub_path = waku.pubsub_path();
+    let pubsub_path = waku.pubsub_path().to_string();
     tracing::info!(
         pubsub_path = %pubsub_path,
         response_topic = %response_topic,
@@ -3012,26 +3064,39 @@ async fn submit_public_broadcaster_plan(
         elapsed_ms = subscribe_started.elapsed().as_millis(),
         "subscribed to public broadcaster response topic"
     );
-    tracing::info!(
-        pubsub_path = %pubsub_path,
-        transact_topic = %transact_topic,
-        payload_len = payload.len(),
-        "publishing public broadcaster transact request"
-    );
-    let publish_started = Instant::now();
-    waku.publish(&transact_topic, &payload)
+    publish_public_broadcaster_payload(&waku, &pubsub_path, &transact_topic, &payload, 1)
         .await
-        .wrap_err("publish public broadcaster transact request")?;
-    tracing::info!(
-        pubsub_path = %pubsub_path,
-        transact_topic = %transact_topic,
-        elapsed_ms = publish_started.elapsed().as_millis(),
-        "published public broadcaster transact request"
-    );
+        .wrap_err("publish initial public broadcaster transact request")?;
     update_transaction_generation_stage(
         progress_tx.as_ref(),
         TransactionGenerationStage::WaitingForBroadcasterResponse,
     );
+
+    let (republish_stop_tx, republish_stop_rx) = oneshot::channel();
+    let republish_waku = Arc::clone(&waku);
+    let republish_pubsub_path = pubsub_path.clone();
+    let republish_transact_topic = transact_topic.clone();
+    let republish_payload = payload.clone();
+    let republish_handle = tokio::spawn(public_broadcaster_republish_loop(
+        republish_stop_rx,
+        PUBLIC_BROADCASTER_REPUBLISH_INTERVAL,
+        move |attempt| {
+            let waku = Arc::clone(&republish_waku);
+            let pubsub_path = republish_pubsub_path.clone();
+            let transact_topic = republish_transact_topic.clone();
+            let payload = republish_payload.clone();
+            async move {
+                publish_public_broadcaster_payload(
+                    &waku,
+                    &pubsub_path,
+                    &transact_topic,
+                    &payload,
+                    attempt,
+                )
+                .await
+            }
+        },
+    ));
 
     let sleep = tokio::time::sleep(timeout);
     tokio::pin!(sleep);
@@ -3069,6 +3134,8 @@ async fn submit_public_broadcaster_plan(
             }
         }
     };
+    let _ = republish_stop_tx.send(());
+    republish_handle.abort();
 
     Ok(PublicBroadcasterSubmissionResult {
         broadcaster,
@@ -3636,9 +3703,9 @@ mod tests {
         public_broadcaster_amount_split_for_tokens, public_broadcaster_anchor_rate_for_policy,
         public_broadcaster_build_error, public_broadcaster_candidates,
         public_broadcaster_fee_breakdown, public_broadcaster_max_entered_amount,
-        public_broadcaster_max_entered_amount_for_tokens, public_broadcaster_transact_params,
-        resolve_desktop_wallet_chain_start, select_public_broadcaster,
-        select_public_broadcaster_with_policy, send_approximate_shape,
+        public_broadcaster_max_entered_amount_for_tokens, public_broadcaster_republish_loop,
+        public_broadcaster_transact_params, resolve_desktop_wallet_chain_start,
+        select_public_broadcaster, select_public_broadcaster_with_policy, send_approximate_shape,
         sort_specific_public_broadcasters, transact_topic, unshield_approximate_shape,
         utxo_outputs_from_utxos, wrapped_native_token_for_chain,
     };
@@ -5647,6 +5714,72 @@ mod tests {
                 tx_hash: tx_hash.to_string()
             }
         );
+    }
+
+    #[test]
+    fn public_broadcaster_republish_loop_retries_until_stopped() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("build runtime");
+
+        runtime.block_on(async {
+            let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+            let (attempt_tx, mut attempt_rx) = tokio::sync::mpsc::unbounded_channel();
+            let handle = tokio::spawn(public_broadcaster_republish_loop(
+                stop_rx,
+                Duration::from_millis(10),
+                move |attempt| {
+                    let attempt_tx = attempt_tx.clone();
+                    async move {
+                        attempt_tx.send(attempt).expect("record attempt");
+                        Ok(())
+                    }
+                },
+            ));
+
+            let first = tokio::time::timeout(Duration::from_secs(1), attempt_rx.recv())
+                .await
+                .expect("first retry timed out")
+                .expect("first retry attempt");
+            let second = tokio::time::timeout(Duration::from_secs(1), attempt_rx.recv())
+                .await
+                .expect("second retry timed out")
+                .expect("second retry attempt");
+            let _ = stop_tx.send(());
+            handle.await.expect("republish loop joined");
+
+            assert_eq!(first, 2);
+            assert_eq!(second, 3);
+        });
+    }
+
+    #[test]
+    fn public_broadcaster_republish_loop_stops_before_first_retry() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("build runtime");
+
+        runtime.block_on(async {
+            let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+            let (attempt_tx, mut attempt_rx) = tokio::sync::mpsc::unbounded_channel();
+            let handle = tokio::spawn(public_broadcaster_republish_loop(
+                stop_rx,
+                Duration::from_millis(50),
+                move |attempt| {
+                    let attempt_tx = attempt_tx.clone();
+                    async move {
+                        attempt_tx.send(attempt).expect("record attempt");
+                        Ok(())
+                    }
+                },
+            ));
+            let _ = stop_tx.send(());
+            handle.await.expect("republish loop joined");
+
+            assert!(attempt_rx.try_recv().is_err());
+        });
     }
 
     #[test]

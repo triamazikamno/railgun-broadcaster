@@ -52,6 +52,13 @@ const EVM_CHAIN_TYPE: u8 = 0;
 const TXID_PUBLIC_CACHE_SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForestReorgDecision {
+    Skip,
+    Match,
+    Mismatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IndexedWalletPageKind {
     Legacy,
     Modern,
@@ -1489,6 +1496,23 @@ fn wallet_sync_target(safe_head: u64, sync_to_block: Option<u64>) -> u64 {
     }
 }
 
+fn forest_reorg_decision(
+    last_processed: u64,
+    meta_last_block: u64,
+    stored_hash: [u8; 32],
+    confirmed_current_hash: Option<[u8; 32]>,
+) -> ForestReorgDecision {
+    if stored_hash == [0u8; 32] || meta_last_block != last_processed {
+        return ForestReorgDecision::Skip;
+    }
+
+    match confirmed_current_hash {
+        Some(current_hash) if current_hash == stored_hash => ForestReorgDecision::Match,
+        Some(_) => ForestReorgDecision::Mismatch,
+        None => ForestReorgDecision::Skip,
+    }
+}
+
 fn wallet_startup_hedge_block_count(
     last_scanned: u64,
     start_block: u64,
@@ -1674,13 +1698,17 @@ impl MerkleForestDbExt for DbStore {
                                 Ok(progress) => {
                                     let block_hash = match provider {
                                         Some(provider) => chain
-                                            .fetch_block_hash(provider, archive_provider, target)
+                                            .fetch_confirmed_block_hash(
+                                                provider,
+                                                archive_provider,
+                                                target,
+                                            )
                                             .await
                                             .unwrap_or_else(|err| {
                                                 warn!(
                                                     ?err,
                                                     target,
-                                                    "failed to fetch indexed forest target block hash"
+                                                    "failed to fetch confirmed indexed forest target block hash"
                                                 );
                                                 None
                                             }),
@@ -1919,6 +1947,7 @@ fn spawn_live_log_loop(
                     .check_forest_reorg(
                         &rpc.provider,
                         archive_provider.as_ref(),
+                        rpc.url.as_str(),
                         &snapshot_path,
                         safe_head,
                         last_processed,
@@ -1970,10 +1999,14 @@ fn spawn_live_log_loop(
                         };
                         let to_block_hash = service
                             .chain
-                            .fetch_block_hash(&rpc.provider, archive_provider.as_ref(), to_block)
+                            .fetch_confirmed_block_hash(
+                                &rpc.provider,
+                                archive_provider.as_ref(),
+                                to_block,
+                            )
                             .await
                             .unwrap_or_else(|err| {
-                                warn!(?err, to_block, "failed to fetch block hash");
+                                warn!(?err, to_block, "failed to fetch confirmed block hash");
                                 None
                             });
                         let batch = Arc::new(LogBatch {
@@ -2360,6 +2393,7 @@ impl ChainService {
         &self,
         provider: &DynProvider,
         archive_provider: Option<&DynProvider>,
+        rpc_url: &str,
         snapshot_path: &Path,
         safe_head: u64,
         last_processed: u64,
@@ -2376,22 +2410,57 @@ impl ChainService {
         if meta.hash == [0u8; 32] {
             return Ok(());
         }
+
+        if meta.last_block != last_processed {
+            warn!(
+                chain_id = self.chain.chain_id,
+                contract = %self.chain.contract,
+                rpc = rpc_url,
+                safe_head,
+                last_processed,
+                meta_last_block = meta.last_block,
+                stored_hash = %FixedBytes::<32>::from(meta.hash),
+                "skipping reorg check because forest metadata block does not match progress"
+            );
+            return Ok(());
+        }
+
         let current_hash = self
             .chain
-            .fetch_block_hash(provider, archive_provider, last_processed)
+            .fetch_confirmed_block_hash(provider, archive_provider, last_processed)
             .await?;
-        if let Some(current_hash) = current_hash
-            && current_hash != meta.hash
-        {
-            warn!(
-                last_processed,
-                "detected reorg, rewinding forest and wallet caches"
-            );
-            let reset_block = self
-                .reset_forest_state(snapshot_path, last_processed)
-                .await?;
-            self.reset_wallets(safe_head, reset_block.saturating_add(1))
-                .await;
+        match forest_reorg_decision(last_processed, meta.last_block, meta.hash, current_hash) {
+            ForestReorgDecision::Skip => {
+                debug!(
+                    chain_id = self.chain.chain_id,
+                    contract = %self.chain.contract,
+                    rpc = rpc_url,
+                    safe_head,
+                    last_processed,
+                    meta_last_block = meta.last_block,
+                    "skipping reorg check without a confirmed block hash"
+                );
+            }
+            ForestReorgDecision::Match => {}
+            ForestReorgDecision::Mismatch => {
+                let current_hash = current_hash.expect("mismatch requires confirmed hash");
+                warn!(
+                    chain_id = self.chain.chain_id,
+                    contract = %self.chain.contract,
+                    rpc = rpc_url,
+                    safe_head,
+                    last_processed,
+                    meta_last_block = meta.last_block,
+                    stored_hash = %FixedBytes::<32>::from(meta.hash),
+                    current_hash = %FixedBytes::<32>::from(current_hash),
+                    "detected confirmed reorg, rewinding forest and wallet caches"
+                );
+                let reset_block = self
+                    .reset_forest_state(snapshot_path, last_processed)
+                    .await?;
+                self.reset_wallets(safe_head, reset_block.saturating_add(1))
+                    .await;
+            }
         }
         Ok(())
     }
@@ -2511,6 +2580,43 @@ impl ChainService {
 }
 
 impl ChainConfig {
+    async fn fetch_confirmed_block_hash(
+        &self,
+        provider: &DynProvider,
+        archive_provider: Option<&DynProvider>,
+        block_number: u64,
+    ) -> Result<Option<[u8; 32]>, ChainError> {
+        let Some(first_hash) = self
+            .fetch_block_hash(provider, archive_provider, block_number)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let Some(second_hash) = self
+            .fetch_block_hash(provider, archive_provider, block_number)
+            .await?
+        else {
+            debug!(
+                block_number,
+                "block hash confirmation read returned no block"
+            );
+            return Ok(None);
+        };
+
+        if second_hash != first_hash {
+            debug!(
+                block_number,
+                first_hash = %FixedBytes::<32>::from(first_hash),
+                second_hash = %FixedBytes::<32>::from(second_hash),
+                "block hash changed between confirmation reads"
+            );
+            return Ok(None);
+        }
+
+        Ok(Some(first_hash))
+    }
+
     async fn fetch_block_hash(
         &self,
         provider: &DynProvider,
@@ -2767,10 +2873,11 @@ mod tests {
     use alloy::sol_types::SolEvent;
 
     use super::{
-        CommitmentBatch, GeneratedCommitmentBatch, IndexedWalletPageKind, Nullified, Nullifiers,
-        Shield, ShieldLegacyPreMar23, Transact, combined_log_event_signatures_for_range,
-        complete_stream_checkpoint, indexed_wallet_page_kind, indexed_wallet_to_block,
-        should_hedge_wallet_startup, wallet_backfill_from_block, wallet_reorg_backfill_from_block,
+        CommitmentBatch, ForestReorgDecision, GeneratedCommitmentBatch, IndexedWalletPageKind,
+        Nullified, Nullifiers, Shield, ShieldLegacyPreMar23, Transact,
+        combined_log_event_signatures_for_range, complete_stream_checkpoint, forest_reorg_decision,
+        indexed_wallet_page_kind, indexed_wallet_to_block, should_hedge_wallet_startup,
+        wallet_backfill_from_block, wallet_reorg_backfill_from_block,
         wallet_startup_hedge_block_count, wallet_sync_target,
     };
 
@@ -2806,6 +2913,34 @@ mod tests {
         assert_eq!(wallet_sync_target(1_000, Some(900)), 900);
         assert_eq!(wallet_sync_target(1_000, Some(1_100)), 1_000);
         assert_eq!(wallet_sync_target(0, Some(900)), 900);
+    }
+
+    #[test]
+    fn forest_reorg_decision_skips_without_comparable_hashes() {
+        assert_eq!(
+            forest_reorg_decision(100, 100, [0u8; 32], Some([1u8; 32])),
+            ForestReorgDecision::Skip
+        );
+        assert_eq!(
+            forest_reorg_decision(100, 99, [1u8; 32], Some([2u8; 32])),
+            ForestReorgDecision::Skip
+        );
+        assert_eq!(
+            forest_reorg_decision(100, 100, [1u8; 32], None),
+            ForestReorgDecision::Skip
+        );
+    }
+
+    #[test]
+    fn forest_reorg_decision_requires_confirmed_mismatch() {
+        assert_eq!(
+            forest_reorg_decision(100, 100, [1u8; 32], Some([1u8; 32])),
+            ForestReorgDecision::Match
+        );
+        assert_eq!(
+            forest_reorg_decision(100, 100, [1u8; 32], Some([2u8; 32])),
+            ForestReorgDecision::Mismatch
+        );
     }
 
     #[test]
