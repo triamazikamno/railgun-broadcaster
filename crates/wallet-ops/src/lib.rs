@@ -51,11 +51,11 @@ use reqwest::Url;
 use serde::Serialize;
 use sync_service::{
     ChainConfig, ChainConfigDefaults, ChainKey, LocalPoiMerkleProofSource, SyncManager,
-    SyncProgressSender, WalletConfig, WalletHandle,
+    SyncProgressSender, WalletConfig, WalletHandle, WalletLocalPoiCaches,
 };
 pub use sync_service::{
-    PoiArtifactManifestSource, PoiArtifactSourceConfig, PoiReadSource, SyncProgressStage,
-    SyncProgressUpdate,
+    PoiArtifactManifestSource, PoiArtifactSourceConfig, PoiCacheService, PoiReadSource,
+    SyncProgressStage, SyncProgressUpdate,
 };
 use tokio::sync::{RwLock, oneshot, watch};
 use waku_relay::client::Client as WakuClient;
@@ -210,6 +210,7 @@ pub struct WalletSessionRequest {
     pub sync_to_block: Option<u64>,
     pub use_indexed_wallet_catch_up: bool,
     pub poi_read_source: PoiReadSource,
+    pub local_poi_caches: Option<WalletLocalPoiCaches>,
     pub progress_tx: Option<SyncProgressSender>,
 }
 
@@ -220,6 +221,7 @@ pub struct WalletChainSessionRequest {
     pub sync_to_block: Option<u64>,
     pub use_indexed_wallet_catch_up: bool,
     pub poi_read_source: PoiReadSource,
+    pub local_poi_caches: Option<WalletLocalPoiCaches>,
     pub progress_tx: Option<SyncProgressSender>,
 }
 
@@ -246,6 +248,7 @@ pub struct ViewWalletChainSessionRequest {
     pub sync_to_block: Option<u64>,
     pub use_indexed_wallet_catch_up: bool,
     pub poi_read_source: PoiReadSource,
+    pub local_poi_caches: Option<WalletLocalPoiCaches>,
     pub rewind_wallet_cache: bool,
     pub progress_tx: Option<SyncProgressSender>,
 }
@@ -260,6 +263,7 @@ impl From<ListUtxosRequest> for WalletSessionRequest {
             sync_to_block: value.sync_to_block,
             use_indexed_wallet_catch_up: value.use_indexed_wallet_catch_up,
             poi_read_source: value.poi_read_source,
+            local_poi_caches: None,
             progress_tx: None,
         }
     }
@@ -274,6 +278,7 @@ impl From<WalletSessionRequest> for WalletChainSessionRequest {
             sync_to_block: value.sync_to_block,
             use_indexed_wallet_catch_up: value.use_indexed_wallet_catch_up,
             poi_read_source: value.poi_read_source,
+            local_poi_caches: value.local_poi_caches,
             progress_tx: value.progress_tx,
         }
     }
@@ -1506,6 +1511,7 @@ impl WalletSessionStore {
             request.sync_to_block,
             request.use_indexed_wallet_catch_up,
             request.poi_read_source.clone(),
+            request.local_poi_caches.clone(),
             rpc_url_override,
             http,
             UnsupportedChainMessage::WalletCliV1,
@@ -1554,6 +1560,7 @@ impl WalletSessionStore {
             request.sync_to_block,
             request.use_indexed_wallet_catch_up,
             request.poi_read_source.clone(),
+            request.local_poi_caches.clone(),
             request.rewind_wallet_cache,
             rpc_url_override,
             http,
@@ -1810,6 +1817,7 @@ pub async fn unshield(
         None,
         true,
         request.poi_read_source,
+        None,
         rpc_url_override,
         http,
         UnsupportedChainMessage::Generic,
@@ -3405,6 +3413,7 @@ async fn setup_synced_wallet(
     sync_to_block: Option<u64>,
     use_indexed_wallet_catch_up: bool,
     poi_read_source: PoiReadSource,
+    local_poi_caches: Option<WalletLocalPoiCaches>,
     rpc_url_override: Option<Url>,
     http: &HttpContext,
     unsupported_chain_message: UnsupportedChainMessage,
@@ -3418,6 +3427,7 @@ async fn setup_synced_wallet(
         sync_to_block,
         use_indexed_wallet_catch_up,
         poi_read_source,
+        local_poi_caches,
         rpc_url_override,
         http,
         unsupported_chain_message,
@@ -3435,6 +3445,7 @@ async fn setup_synced_wallet_with_store(
     sync_to_block: Option<u64>,
     use_indexed_wallet_catch_up: bool,
     poi_read_source: PoiReadSource,
+    shared_local_poi_caches: Option<WalletLocalPoiCaches>,
     rpc_url_override: Option<Url>,
     http: &HttpContext,
     unsupported_chain_message: UnsupportedChainMessage,
@@ -3463,7 +3474,12 @@ async fn setup_synced_wallet_with_store(
         .wrap_err("derive wallet id")?;
     let cache_key = wallet_cache_key(wallet_id.as_ref(), chain_id, chain_key.contract);
     let start_block = init_block_number.unwrap_or(chain_defaults.deployment_block);
-    let local_poi_caches = wallet_local_poi_caches(&poi_read_source, chain_id, &cache_key);
+    let (local_poi_caches, manage_local_poi_cache) = wallet_local_poi_caches(
+        &poi_read_source,
+        chain_id,
+        &cache_key,
+        shared_local_poi_caches,
+    );
     tracing::info!(
         chain_id,
         start_block,
@@ -3485,6 +3501,7 @@ async fn setup_synced_wallet_with_store(
         poi_recovery_prover: Some(poi_recovery_prover),
         poi_read_source,
         local_poi_caches,
+        manage_local_poi_cache,
         use_indexed_wallet_catch_up,
     };
 
@@ -3514,6 +3531,7 @@ async fn setup_synced_view_wallet_with_store(
     sync_to_block: Option<u64>,
     use_indexed_wallet_catch_up: bool,
     poi_read_source: PoiReadSource,
+    shared_local_poi_caches: Option<WalletLocalPoiCaches>,
     rewind_wallet_cache: bool,
     rpc_url_override: Option<Url>,
     http: &HttpContext,
@@ -3600,7 +3618,12 @@ async fn setup_synced_view_wallet_with_store(
             .wrap_err("persist selected POI read source")?;
     }
     let cache_key = wallet_chain_metadata.wallet_chain_uuid.clone();
-    let local_poi_caches = wallet_local_poi_caches(&poi_read_source, chain_id, &cache_key);
+    let (local_poi_caches, manage_local_poi_cache) = wallet_local_poi_caches(
+        &poi_read_source,
+        chain_id,
+        &cache_key,
+        shared_local_poi_caches,
+    );
     let cache_store = Arc::new(
         vault::DesktopEncryptedWalletCacheStore::new(
             Arc::clone(&db),
@@ -3624,6 +3647,7 @@ async fn setup_synced_view_wallet_with_store(
         poi_recovery_prover: Some(poi_recovery_prover),
         poi_read_source,
         local_poi_caches,
+        manage_local_poi_cache,
         use_indexed_wallet_catch_up,
     };
 
@@ -3699,9 +3723,19 @@ fn wallet_local_poi_caches(
     poi_read_source: &PoiReadSource,
     chain_id: u64,
     cache_key: &str,
-) -> Option<sync_service::types::WalletLocalPoiCaches> {
+    shared_local_poi_caches: Option<WalletLocalPoiCaches>,
+) -> (Option<WalletLocalPoiCaches>, bool) {
     if !matches!(poi_read_source, PoiReadSource::IndexedArtifacts(_)) {
-        return None;
+        return (None, false);
+    }
+
+    if let Some(local_poi_caches) = shared_local_poi_caches {
+        tracing::info!(
+            chain_id,
+            cache_key,
+            "using shared chain-scoped local POI cache for wallet session"
+        );
+        return (Some(local_poi_caches), false);
     }
 
     tracing::info!(
@@ -3709,7 +3743,7 @@ fn wallet_local_poi_caches(
         cache_key,
         "local POI cache enabled for wallet session"
     );
-    Some(Arc::new(RwLock::new(BTreeMap::new())))
+    (Some(Arc::new(RwLock::new(BTreeMap::new()))), true)
 }
 
 const fn poi_read_source_label(poi_read_source: &PoiReadSource) -> &'static str {

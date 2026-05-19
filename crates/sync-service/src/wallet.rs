@@ -3856,15 +3856,15 @@ async fn refresh_wallet_poi_statuses_selected(
 }
 
 #[derive(Debug, Default)]
-struct LivePoiTailOutcome {
-    events: usize,
-    pages: usize,
-    start_index: u64,
-    next_event_index: u64,
+pub(crate) struct LivePoiTailOutcome {
+    pub(crate) events: usize,
+    pub(crate) pages: usize,
+    pub(crate) start_index: u64,
+    pub(crate) next_event_index: u64,
 }
 
 #[derive(Debug, Error)]
-enum LivePoiTailError {
+pub(crate) enum LivePoiTailError {
     #[error("live POI tail request failed")]
     Rpc(#[from] PoiRpcError),
     #[error("live POI event signature verification failed")]
@@ -3893,7 +3893,7 @@ enum LivePoiTailError {
     },
 }
 
-async fn sync_live_poi_event_tail(
+pub(crate) async fn sync_live_poi_event_tail(
     client: &PoiRpcClient,
     cache: &mut PoiCache,
 ) -> Result<LivePoiTailOutcome, LivePoiTailError> {
@@ -4392,6 +4392,31 @@ async fn await_startup_artifact_poi_cache_warmup(
             "startup artifact POI cache warmup task failed"
         ),
     }
+}
+
+async fn local_poi_caches_ready_for_refresh(
+    startup_warmup: &mut Option<tokio::task::JoinHandle<()>>,
+    cfg: &WalletConfig,
+    active_list_keys: &[FixedBytes<32>],
+    reason: &'static str,
+) -> bool {
+    if !matches!(cfg.poi_read_source, PoiReadSource::IndexedArtifacts(_)) {
+        return true;
+    }
+    if local_poi_caches_available_for_lists(cfg, active_list_keys).await {
+        return true;
+    }
+    await_startup_artifact_poi_cache_warmup(startup_warmup, cfg, reason).await;
+    local_poi_caches_available_for_lists(cfg, active_list_keys).await
+}
+
+fn log_local_poi_cache_unavailable(cfg: &WalletConfig, reason: &'static str) {
+    warn!(
+        cache_key = %cfg.cache_key,
+        chain_id = cfg.chain.chain_id,
+        reason,
+        "artifact POI local cache unavailable; skipping local POI refresh"
+    );
 }
 
 async fn refresh_wallet_poi_statuses_selected_with_config(
@@ -4900,15 +4925,27 @@ pub(crate) fn spawn_wallet_worker(
         let poi_status_client = wallet_poi_status_client(http_client.as_ref());
         let active_poi_list_keys = default_active_poi_list_keys();
         let mut last_live_tail_poll = Instant::now();
-        let preloaded_poi_caches =
-            install_persisted_local_poi_caches(db.as_ref(), &cfg, &active_poi_list_keys).await;
-        let mut startup_artifact_warmup = spawn_startup_artifact_poi_cache_warmup(
-            Arc::clone(&db),
-            http_client.clone(),
-            cfg.clone(),
-            active_poi_list_keys.clone(),
-            preloaded_poi_caches,
-        );
+        let preloaded_poi_caches = if cfg.manage_local_poi_cache {
+            install_persisted_local_poi_caches(db.as_ref(), &cfg, &active_poi_list_keys).await
+        } else {
+            BTreeMap::new()
+        };
+        let mut startup_artifact_warmup = if cfg.manage_local_poi_cache {
+            spawn_startup_artifact_poi_cache_warmup(
+                Arc::clone(&db),
+                http_client.clone(),
+                cfg.clone(),
+                active_poi_list_keys.clone(),
+                preloaded_poi_caches,
+            )
+        } else {
+            debug!(
+                cache_key = %cfg.cache_key,
+                chain_id = cfg.chain.chain_id,
+                "wallet using externally managed artifact POI cache"
+            );
+            None
+        };
 
         if poi_status_client.is_some() {
             let locked = utxos.read().await;
@@ -4935,11 +4972,16 @@ pub(crate) fn spawn_wallet_worker(
                         continue;
                     }
                     set_poi_refreshing(&poi_refreshing_tx, true, &cfg.cache_key);
-                    await_startup_artifact_poi_cache_warmup(
+                    if !local_poi_caches_ready_for_refresh(
                         &mut startup_artifact_warmup,
                         &cfg,
+                        &active_poi_list_keys,
                         "manual_poi_refresh",
-                    ).await;
+                    ).await {
+                        log_local_poi_cache_unavailable(&cfg, "manual_poi_refresh");
+                        set_poi_refreshing(&poi_refreshing_tx, false, &cfg.cache_key);
+                        continue;
+                    }
                     let changed = refresh_wallet_poi_statuses_and_persist_with_config(
                         client,
                         db.as_ref(),
@@ -5007,7 +5049,9 @@ pub(crate) fn spawn_wallet_worker(
                     let Some(client) = poi_status_client.as_ref() else {
                         continue;
                     };
-                    if last_live_tail_poll.elapsed() >= WALLET_POI_LIVE_TAIL_INTERVAL {
+                    if cfg.manage_local_poi_cache
+                        && last_live_tail_poll.elapsed() >= WALLET_POI_LIVE_TAIL_INTERVAL
+                    {
                         sync_local_poi_live_tails(client, &cfg, &active_poi_list_keys).await;
                         last_live_tail_poll = Instant::now();
                     }
@@ -5040,11 +5084,16 @@ pub(crate) fn spawn_wallet_worker(
                         continue;
                     }
                     set_poi_refreshing(&poi_refreshing_tx, true, &cfg.cache_key);
-                    await_startup_artifact_poi_cache_warmup(
+                    if !local_poi_caches_ready_for_refresh(
                         &mut startup_artifact_warmup,
                         &cfg,
+                        &active_poi_list_keys,
                         "periodic_poi_refresh",
-                    ).await;
+                    ).await {
+                        log_local_poi_cache_unavailable(&cfg, "periodic_poi_refresh");
+                        set_poi_refreshing(&poi_refreshing_tx, false, &cfg.cache_key);
+                        continue;
+                    }
                     let changed = refresh_wallet_poi_statuses_and_persist_with_config(
                         client,
                         db.as_ref(),
@@ -5325,25 +5374,19 @@ pub(crate) fn spawn_wallet_worker(
                                 if refresh_needed {
                                     set_poi_refreshing(&poi_refreshing_tx, true, &cfg.cache_key);
                                     let warmup_wait_started = Instant::now();
-                                    let local_cache_available = local_poi_caches_available_for_lists(
+                                    let local_cache_available = local_poi_caches_ready_for_refresh(
+                                        &mut startup_artifact_warmup,
                                         &cfg,
                                         &active_poi_list_keys,
+                                        "post_ready_poi_refresh",
                                     ).await;
-                                    if local_cache_available {
-                                        debug!(
-                                            cache_key = %cfg.cache_key,
-                                            chain_id = cfg.chain.chain_id,
-                                            "post-ready POI refresh using installed local cache without waiting for artifact warmup"
-                                        );
-                                    } else {
-                                        await_startup_artifact_poi_cache_warmup(
-                                            &mut startup_artifact_warmup,
-                                            &cfg,
-                                            "post_ready_poi_refresh",
-                                        ).await;
-                                    }
                                     let warmup_wait_elapsed_ms =
                                         warmup_wait_started.elapsed().as_millis();
+                                    if !local_cache_available {
+                                        log_local_poi_cache_unavailable(&cfg, "post_ready_poi_refresh");
+                                        set_poi_refreshing(&poi_refreshing_tx, false, &cfg.cache_key);
+                                        continue;
+                                    }
                                     let status_refresh_started = Instant::now();
                                     let changed = refresh_wallet_poi_statuses_and_persist_with_config(
                                         client,
@@ -5740,6 +5783,7 @@ mod tests {
             poi_recovery_prover: None,
             poi_read_source: PoiReadSource::PoiProxy,
             local_poi_caches: None,
+            manage_local_poi_cache: true,
             use_indexed_wallet_catch_up: true,
         }
     }

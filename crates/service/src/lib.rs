@@ -524,6 +524,7 @@ impl BroadcasterService {
                     poi_recovery_prover: Some((*poi_recovery_prover).clone()),
                     poi_read_source: PoiReadSource::PoiProxy,
                     local_poi_caches: None,
+                    manage_local_poi_cache: false,
                     use_indexed_wallet_catch_up: true,
                 };
                 let handle = sync_manager.add_wallet(wallet_cfg).await?;

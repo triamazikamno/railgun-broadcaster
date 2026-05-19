@@ -57,7 +57,7 @@ use wallet_ops::{
     DesktopSendPublicBroadcasterEstimateRequest, DesktopSendPublicBroadcasterRequest,
     DesktopUnshieldCalldataRequest, DesktopUnshieldPublicBroadcasterEstimateRequest,
     DesktopUnshieldPublicBroadcasterRequest, DesktopWalletSyncStartPolicy, HttpContext,
-    ListUtxosOutput, PoiReadSource, PreparedSendCall, PreparedUnshieldCall,
+    ListUtxosOutput, PoiCacheService, PoiReadSource, PreparedSendCall, PreparedUnshieldCall,
     PublicActionProgressStatus, PublicActionProgressStep, PublicActionProgressUpdate,
     PublicAssetId, PublicBalanceAmount, PublicBalanceEntry, PublicBalanceSnapshot,
     PublicBroadcasterCandidate, PublicBroadcasterCostEstimate, PublicBroadcasterFeeBreakdown,
@@ -1082,6 +1082,34 @@ async fn build_wallet_startup(
     Ok(WalletStartupReady { http, waku })
 }
 
+fn start_shared_poi_cache_service(
+    poi_read_source: &PoiReadSource,
+    vault_store: Option<&Arc<DesktopVaultStore>>,
+    http: &HttpContext,
+    runtime: &Handle,
+    chain_ids: &[u64],
+) -> Option<Arc<PoiCacheService>> {
+    let PoiReadSource::IndexedArtifacts(artifact_config) = poi_read_source else {
+        return None;
+    };
+    let Some(vault_store) = vault_store else {
+        tracing::warn!("artifact POI cache service disabled because wallet DB is unavailable");
+        return None;
+    };
+
+    let service = Arc::new(PoiCacheService::new(
+        vault_store.db(),
+        artifact_config.clone(),
+        Some(http.client.clone()),
+    ));
+    let startup_service = Arc::clone(&service);
+    let chain_ids = chain_ids.to_vec();
+    runtime.spawn(async move {
+        startup_service.start_chains(chain_ids).await;
+    });
+    Some(service)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Activity {
     Wallet,
@@ -2035,6 +2063,7 @@ pub(crate) struct WalletRoot {
     selected_chain: u64,
     chain_select: Entity<SelectState<Vec<ChainSelectItem>>>,
     chain_states: BTreeMap<u64, ChainUtxoState>,
+    poi_cache_service: Option<Arc<PoiCacheService>>,
     session_store: Arc<OnceCell<Arc<WalletSessionStore>>>,
     unlock_password_input: Entity<InputState>,
     new_password_input: Entity<InputState>,
@@ -2105,6 +2134,13 @@ impl WalletRoot {
                 None
             }
         };
+        let poi_cache_service = start_shared_poi_cache_service(
+            &options.poi_read_source,
+            vault_store.as_ref(),
+            &http,
+            &runtime,
+            &chain_ids,
+        );
         let (vault_state, vault_error) = match vault_store.as_ref() {
             Some(store) => match store.vault_exists() {
                 Ok(true) => (VaultState::UnlockVault, None),
@@ -2257,6 +2293,7 @@ impl WalletRoot {
             wallet_switch_generation: 0,
             chain_select: chain_select.clone(),
             chain_states,
+            poi_cache_service,
             session_store: Arc::new(OnceCell::new()),
             unlock_password_input,
             new_password_input,
@@ -4069,14 +4106,20 @@ impl WalletRoot {
             poi_read_source: self.options.poi_read_source.clone(),
             rewind_wallet_cache: overrides.rewind_wallet_cache,
             progress_tx: Some(progress_tx),
+            local_poi_caches: None,
         };
         let db_path = self.options.db_path.clone();
         let http = self.http.clone();
+        let poi_cache_service = self.poi_cache_service.clone();
         let session_store = Arc::clone(&self.session_store);
         let vault_db = self.vault_store.as_ref().map(|store| store.db());
         let join = self.runtime.spawn(async move {
             if let Some(previous_session) = previous_session {
                 previous_session.stop().await?;
+            }
+            let mut request = request;
+            if let Some(poi_cache_service) = poi_cache_service.as_ref() {
+                request.local_poi_caches = Some(poi_cache_service.start_chain(chain_id).await);
             }
             let store = session_store
                 .get_or_try_init(|| {
