@@ -32,7 +32,7 @@
   </g>
 
   <!-- Hematite hero geometry, scaled for app icon legibility on a dark rounded tile. -->
-  <g filter="url(#gemShadow)" transform="translate(512 526) scale(0.94) translate(-512 -512)">
+  <g filter="url(#gemShadow)" transform="translate(512 526) scale(0.78) translate(-512 -512)">
     <polygon points="844,759 597,892 293,854 464,683" fill="#1F1812"/>
     <polygon points="920,474 844,759 464,683 692,550" fill="#44322A"/>
     <polygon points="293,854 103,607 464,683" fill="#5C4B40"/>
