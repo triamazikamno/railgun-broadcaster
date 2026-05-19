@@ -29,6 +29,10 @@ pub(crate) struct Options {
     #[structopt(long, possible_values = &["tor", "proxy", "direct"])]
     pub(crate) network_mode: Option<WalletNetworkMode>,
 
+    /// Download and prebuild wallet prover caches, then exit without opening the UI.
+    #[structopt(long)]
+    pub(crate) build_cache: bool,
+
     /// POI read source: poi-proxy (default) or indexed-artifacts.
     #[structopt(long, possible_values = &[
         PoiReadSourceArg::POI_PROXY,

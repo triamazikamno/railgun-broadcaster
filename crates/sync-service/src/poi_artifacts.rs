@@ -1,4 +1,4 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::hex;
 use alloy::primitives::FixedBytes;
@@ -32,6 +32,7 @@ impl PoiArtifactIngestor {
         last_accepted_sequence: Option<u64>,
         now: SystemTime,
     ) -> Result<Manifest, PoiArtifactError> {
+        let started = Instant::now();
         let manifest_url = self.manifest_url()?;
         let bytes = self.fetch_url(&manifest_url).await?;
         let manifest: Manifest = serde_json::from_slice(&bytes).map_err(PoiArtifactError::Json)?;
@@ -43,6 +44,14 @@ impl PoiArtifactIngestor {
             self.config.max_manifest_age,
             now,
         )?;
+        debug!(
+            url = %manifest_url,
+            bytes = bytes.len(),
+            manifest_sequence = manifest.sequence,
+            entries = manifest.entries.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "fetched POI artifact manifest"
+        );
         Ok(manifest)
     }
 
@@ -50,36 +59,48 @@ impl PoiArtifactIngestor {
         &self,
         descriptor: &ArtifactDescriptor,
     ) -> Result<Vec<u8>, PoiArtifactError> {
+        let started = Instant::now();
         let urls = self.artifact_urls(&descriptor.cid)?;
         let bytes = self.fetch_first_available(&urls).await?;
         descriptor.verify_bytes(&bytes)?;
+        debug!(
+            cid = %descriptor.cid,
+            bytes = bytes.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "fetched verified POI artifact"
+        );
         Ok(bytes)
     }
 
-    pub(crate) async fn fetch_verified_cache(
+    async fn fetch_verified_cache_from_entry(
         &self,
         identity: PoiCacheIdentity,
-        last_accepted_sequence: Option<u64>,
-        now: SystemTime,
+        manifest_sequence: u64,
+        entry: ManifestEntry,
     ) -> Result<PoiArtifactRefresh, PoiArtifactError> {
-        let manifest = self.fetch_manifest(last_accepted_sequence, now).await?;
-        let entry = manifest_entry_for_identity(&manifest, &identity)?.clone();
+        let started = Instant::now();
         let mut cache = PoiCache::new(identity.clone());
 
+        let base_started = Instant::now();
         let base_bytes = self.fetch_artifact(&entry.base).await?;
         let base = SnapshotReader::read(&base_bytes)?;
         let mut next_start = validate_snapshot(&base, &identity, &entry, SnapshotKind::Base, 0)?;
         verify_snapshot_events(&base, &fixed_bytes(&identity.list_key))?;
         cache.apply_verified_artifact_events(&base.events)?;
+        let base_elapsed_ms = base_started.elapsed().as_millis();
 
+        let deltas_started = Instant::now();
+        let mut delta_events = 0_usize;
         for delta_descriptor in &entry.deltas {
             let delta_bytes = self.fetch_artifact(delta_descriptor).await?;
             let delta = SnapshotReader::read(&delta_bytes)?;
             next_start =
                 validate_snapshot(&delta, &identity, &entry, SnapshotKind::Delta, next_start)?;
             verify_snapshot_events(&delta, &fixed_bytes(&identity.list_key))?;
+            delta_events = delta_events.saturating_add(delta.events.len());
             cache.apply_verified_artifact_events(&delta.events)?;
         }
+        let deltas_elapsed_ms = deltas_started.elapsed().as_millis();
 
         let final_index = next_start
             .checked_sub(1)
@@ -91,6 +112,7 @@ impl PoiArtifactIngestor {
             });
         }
 
+        let blocked_started = Instant::now();
         let blocked_bytes = self.fetch_artifact(&entry.blocked_shields).await?;
         let blocked = BlockedShieldsArtifact::read(&blocked_bytes)?;
         let blocked_records = validate_blocked_shields_artifact(&blocked, &identity)?;
@@ -98,19 +120,37 @@ impl PoiArtifactIngestor {
             verify_blocked_shield(record, &fixed_bytes(&identity.list_key))?;
         }
         cache.apply_blocked_shields(&blocked_records)?;
+        let blocked_elapsed_ms = blocked_started.elapsed().as_millis();
 
+        let root_started = Instant::now();
         verify_manifest_root(&mut cache, &entry)?;
         let accepted_roots = cache.accept_current_roots();
+        let root_validation_elapsed_ms = root_started.elapsed().as_millis();
         debug!(
             chain_id = identity.chain_id,
             list_key = %hex::encode(identity.list_key),
-            manifest_sequence = manifest.sequence,
+            manifest_sequence,
             roots = accepted_roots.len(),
             "accepted POI artifact cache refresh"
         );
+        debug!(
+            chain_id = identity.chain_id,
+            list_key = %hex::encode(identity.list_key),
+            manifest_sequence,
+            base_events = base.events.len(),
+            delta_count = entry.deltas.len(),
+            delta_events,
+            blocked_records = blocked_records.len(),
+            base_elapsed_ms,
+            deltas_elapsed_ms,
+            blocked_elapsed_ms,
+            root_validation_elapsed_ms,
+            elapsed_ms = started.elapsed().as_millis(),
+            "full POI artifact cache replay complete"
+        );
 
         Ok(PoiArtifactRefresh {
-            manifest_sequence: manifest.sequence,
+            manifest_sequence,
             cache,
             entry,
         })
@@ -122,14 +162,49 @@ impl PoiArtifactIngestor {
         identity: PoiCacheIdentity,
         now: SystemTime,
     ) -> Result<PoiArtifactRefresh, PoiArtifactError> {
+        let load_started = Instant::now();
         let persisted = load_persisted_cache(db, &identity)?;
+        let load_persisted_elapsed_ms = load_started.elapsed().as_millis();
+        self.refresh_persisted_cache_with_preloaded(
+            db,
+            identity,
+            persisted,
+            load_persisted_elapsed_ms,
+            now,
+        )
+        .await
+    }
+
+    pub(crate) async fn refresh_persisted_cache_with_preloaded(
+        &self,
+        db: &DbStore,
+        identity: PoiCacheIdentity,
+        persisted: Option<PersistedPoiArtifactCache>,
+        load_persisted_elapsed_ms: u128,
+        now: SystemTime,
+    ) -> Result<PoiArtifactRefresh, PoiArtifactError> {
+        let started = Instant::now();
         let last_sequence = persisted
             .as_ref()
             .map(|persisted| persisted.record.last_accepted_manifest_sequence);
+        let refresh_started = Instant::now();
         let refresh = self
-            .refresh_verified_cache(identity, persisted, last_sequence, now)
+            .refresh_verified_cache(identity.clone(), persisted, last_sequence, now)
             .await?;
+        let refresh_elapsed_ms = refresh_started.elapsed().as_millis();
+        let persist_started = Instant::now();
         persist_refresh(db, refresh.identity(), &refresh)?;
+        let persist_elapsed_ms = persist_started.elapsed().as_millis();
+        debug!(
+            chain_id = identity.chain_id,
+            list_key = %hex::encode(identity.list_key),
+            manifest_sequence = refresh.manifest_sequence,
+            load_persisted_elapsed_ms,
+            refresh_elapsed_ms,
+            persist_elapsed_ms,
+            elapsed_ms = started.elapsed().as_millis(),
+            "persisted POI artifact cache refresh complete"
+        );
         Ok(refresh)
     }
 
@@ -151,7 +226,7 @@ impl PoiArtifactIngestor {
             return Ok(refresh);
         }
 
-        self.fetch_verified_cache(identity, last_accepted_sequence, now)
+        self.fetch_verified_cache_from_entry(identity, manifest.sequence, entry)
             .await
     }
 
@@ -162,6 +237,7 @@ impl PoiArtifactIngestor {
         entry: &ManifestEntry,
         persisted: PersistedPoiArtifactCache,
     ) -> Result<Option<PoiArtifactRefresh>, PoiArtifactError> {
+        let started = Instant::now();
         if !descriptor_matches_record(&entry.base, &persisted.record.base_descriptor) {
             return Ok(None);
         }
@@ -182,14 +258,18 @@ impl PoiArtifactIngestor {
             .checked_add(1)
             .ok_or(PoiArtifactError::RangeOverflow)?;
 
+        let deltas_started = Instant::now();
+        let mut delta_events = 0_usize;
         for delta_descriptor in entry.deltas.iter().skip(applied_delta_count) {
             let delta_bytes = self.fetch_artifact(delta_descriptor).await?;
             let delta = SnapshotReader::read(&delta_bytes)?;
             next_start =
                 validate_snapshot(&delta, identity, entry, SnapshotKind::Delta, next_start)?;
             verify_snapshot_events(&delta, &fixed_bytes(&identity.list_key))?;
+            delta_events = delta_events.saturating_add(delta.events.len());
             cache.apply_verified_artifact_events(&delta.events)?;
         }
+        let deltas_elapsed_ms = deltas_started.elapsed().as_millis();
 
         let final_index = next_start
             .checked_sub(1)
@@ -201,21 +281,43 @@ impl PoiArtifactIngestor {
             });
         }
 
-        if !descriptor_matches_record(
+        let blocked_started = Instant::now();
+        let mut blocked_records_count = 0_usize;
+        let blocked_refreshed = !descriptor_matches_record(
             &entry.blocked_shields,
             &persisted.record.blocked_shields_descriptor,
-        ) {
+        );
+        if blocked_refreshed {
             let blocked_bytes = self.fetch_artifact(&entry.blocked_shields).await?;
             let blocked = BlockedShieldsArtifact::read(&blocked_bytes)?;
             let blocked_records = validate_blocked_shields_artifact(&blocked, identity)?;
+            blocked_records_count = blocked_records.len();
             for record in &blocked_records {
                 verify_blocked_shield(record, &fixed_bytes(&identity.list_key))?;
             }
             cache.apply_blocked_shields(&blocked_records)?;
         }
+        let blocked_elapsed_ms = blocked_started.elapsed().as_millis();
 
+        let root_started = Instant::now();
         verify_manifest_root(&mut cache, entry)?;
         cache.accept_current_roots();
+        let root_validation_elapsed_ms = root_started.elapsed().as_millis();
+        debug!(
+            chain_id = identity.chain_id,
+            list_key = %hex::encode(identity.list_key),
+            manifest_sequence,
+            applied_delta_count,
+            new_delta_count = entry.deltas.len().saturating_sub(applied_delta_count),
+            delta_events,
+            blocked_refreshed,
+            blocked_records = blocked_records_count,
+            deltas_elapsed_ms,
+            blocked_elapsed_ms,
+            root_validation_elapsed_ms,
+            elapsed_ms = started.elapsed().as_millis(),
+            "incremental POI artifact cache replay complete"
+        );
         Ok(Some(PoiArtifactRefresh {
             manifest_sequence,
             cache,
@@ -261,6 +363,7 @@ impl PoiArtifactIngestor {
     }
 
     async fn fetch_url(&self, url: &Url) -> Result<Vec<u8>, PoiArtifactError> {
+        let started = Instant::now();
         let response = self.client.get(url.clone()).send().await?;
         let status = response.status();
         if !status.is_success() {
@@ -269,7 +372,14 @@ impl PoiArtifactIngestor {
                 status,
             });
         }
-        Ok(response.bytes().await?.to_vec())
+        let bytes = response.bytes().await?.to_vec();
+        debug!(
+            url = %url,
+            bytes = bytes.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "fetched POI artifact URL"
+        );
+        Ok(bytes)
     }
 }
 

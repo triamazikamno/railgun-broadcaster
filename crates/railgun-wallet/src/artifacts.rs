@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 use alloy::primitives::FixedBytes;
 use brotli::Decompressor;
@@ -9,6 +11,7 @@ use reqwest::blocking::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tracing::warn;
 use url::Url;
 
 const DEFAULT_GATEWAY: &str = "https://ipfs-lb.com";
@@ -19,6 +22,7 @@ const ARTIFACTS_LIST_FILE: &str = "artifacts.json";
 const ARTIFACTS_HASHES_FILE: &str = "artifact-v2-hashes.json";
 const POI_ARTIFACT_PREFIX: &str = "POI_";
 const POI_ARTIFACT_CACHE_DIR: &str = "artifacts-v2.1/poi-nov-2-23";
+const ARTIFACT_DOWNLOAD_ATTEMPTS: usize = 5;
 
 const ARTIFACTS_LIST_EMBED: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -441,9 +445,36 @@ fn assert_supported_poi_variant(variant: &str) -> Result<(), ArtifactError> {
 }
 
 fn fetch_bytes(client: &Client, url: &Url) -> Result<bytes::Bytes, ArtifactError> {
+    for attempt in 1..=ARTIFACT_DOWNLOAD_ATTEMPTS {
+        match fetch_bytes_once(client, url) {
+            Ok(bytes) => return Ok(bytes),
+            Err(error) if attempt == ARTIFACT_DOWNLOAD_ATTEMPTS => return Err(error),
+            Err(error) => {
+                let delay = artifact_download_retry_delay(attempt);
+                warn!(
+                    %error,
+                    url = %url,
+                    attempt,
+                    max_attempts = ARTIFACT_DOWNLOAD_ATTEMPTS,
+                    retry_delay_ms = delay.as_millis(),
+                    "artifact download failed; retrying"
+                );
+                thread::sleep(delay);
+            }
+        }
+    }
+    unreachable!("artifact download retry loop must return")
+}
+
+fn fetch_bytes_once(client: &Client, url: &Url) -> Result<bytes::Bytes, ArtifactError> {
     client
         .get(url.clone())
         .send()
+        .map_err(|source| ArtifactError::Download {
+            source,
+            url: url.clone(),
+        })?
+        .error_for_status()
         .map_err(|source| ArtifactError::Download {
             source,
             url: url.clone(),
@@ -453,6 +484,10 @@ fn fetch_bytes(client: &Client, url: &Url) -> Result<bytes::Bytes, ArtifactError
             source,
             url: url.clone(),
         })
+}
+
+fn artifact_download_retry_delay(attempt: usize) -> Duration {
+    Duration::from_secs(1_u64 << attempt.saturating_sub(1).min(3))
 }
 
 fn brotli_decompress(data: &[u8]) -> Result<Vec<u8>, ArtifactError> {

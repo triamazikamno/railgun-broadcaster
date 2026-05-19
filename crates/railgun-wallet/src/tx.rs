@@ -22,9 +22,9 @@ use broadcaster_core::transact::{
     dummy_txid_root, pre_transaction_output_global_position, railgun_txid_leaf_hash,
     railgun_txid_leaf_hash_with_output_start,
 };
-use broadcaster_core::tree::TREE_DEPTH;
+use broadcaster_core::tree::{TREE_DEPTH, TREE_LEAF_COUNT, normalize_tree_position};
 use broadcaster_core::utxo::Utxo;
-use merkletree::tree::{MerkleForest, MerkleProof};
+use merkletree::tree::{DenseMerkleTree, MerkleForest, MerkleProof};
 use poi::error::PoiRpcError;
 use poi::poi::{PoiMerkleProof, PoiRpcClient};
 
@@ -957,47 +957,118 @@ pub async fn generate_pre_transaction_pois(
         return Ok(map);
     }
     let txid_version = request.txid_version.unwrap_or(DEFAULT_TXID_VERSION);
-    for chunk in request.chunks {
-        let chunk_inputs = chunk.pre_transaction_poi_inputs()?;
-        for list_key in request.required_poi_list_keys {
-            let merkle_started = Instant::now();
-            let merkle_proofs = request
+    let chunk_inputs = request
+        .chunks
+        .iter()
+        .map(|chunk| {
+            chunk
+                .pre_transaction_poi_inputs()
+                .map(|inputs| (chunk, inputs))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for list_key in request.required_poi_list_keys {
+        let blinded_commitments_in = chunk_inputs
+            .iter()
+            .flat_map(|(_, inputs)| inputs.blinded_commitments_in.iter().copied())
+            .collect::<Vec<_>>();
+        let merkle_started = Instant::now();
+        let all_merkle_proofs = if blinded_commitments_in.is_empty() {
+            Vec::new()
+        } else {
+            request
                 .proof_source
                 .poi_merkle_proofs(
                     txid_version,
                     request.chain_type,
                     request.chain_id,
                     list_key,
-                    &chunk_inputs.blinded_commitments_in,
+                    &blinded_commitments_in,
                 )
-                .await?;
-            let merkle_elapsed_ms = merkle_started.elapsed().as_millis();
-            let proof_inputs = chunk_inputs.proof_inputs(&merkle_proofs)?;
-            let prove_started = Instant::now();
-            let snark_proof = request
-                .prover
-                .prove_poi(&proof_inputs, request.verify_proof)
-                .await?;
-            let prove_elapsed_ms = prove_started.elapsed().as_millis();
-            tracing::debug!(
-                chain_type = request.chain_type,
-                chain_id = request.chain_id,
-                tree_number = chunk.tree_number,
-                input_count = chunk.inputs.len(),
-                output_count = chunk.outputs.len(),
-                has_unshield = chunk.has_unshield,
-                list_key = %hex::encode(list_key),
-                merkle_elapsed_ms,
-                prove_elapsed_ms,
-                "generated pre-transaction POI proof"
-            );
-            let pre_tx_poi = chunk_inputs.pre_tx_poi(snark_proof, &proof_inputs);
-            insert_pre_transaction_poi(
-                &mut map,
-                *list_key,
-                chunk_inputs.txid_leaf_hash,
-                pre_tx_poi,
-            );
+                .await?
+        };
+        let merkle_elapsed_ms = merkle_started.elapsed().as_millis();
+        let mut proof_jobs = Vec::with_capacity(chunk_inputs.len());
+        let mut proof_offset = 0_usize;
+        for (index, (chunk, chunk_inputs)) in chunk_inputs.iter().enumerate() {
+            let proof_count = chunk_inputs.blinded_commitments_in.len();
+            let proof_end = proof_offset.saturating_add(proof_count);
+            let Some(merkle_proofs) = all_merkle_proofs.get(proof_offset..proof_end) else {
+                return Err(PreTransactionPoiError::MerkleProofCountMismatch {
+                    expected: blinded_commitments_in.len(),
+                    got: all_merkle_proofs.len(),
+                });
+            };
+            let proof_inputs = chunk_inputs.proof_inputs(merkle_proofs)?;
+            proof_jobs.push((
+                index,
+                chunk.tree_number,
+                chunk.inputs.len(),
+                chunk.outputs.len(),
+                chunk.has_unshield,
+                chunk_inputs.clone(),
+                proof_inputs,
+            ));
+            proof_offset = proof_end;
+        }
+        if proof_offset != all_merkle_proofs.len() {
+            return Err(PreTransactionPoiError::MerkleProofCountMismatch {
+                expected: blinded_commitments_in.len(),
+                got: all_merkle_proofs.len(),
+            });
+        }
+
+        let mut handles = Vec::with_capacity(proof_jobs.len());
+        for (
+            index,
+            tree_number,
+            input_count,
+            output_count,
+            has_unshield,
+            chunk_inputs,
+            proof_inputs,
+        ) in proof_jobs
+        {
+            let prover = request.prover.clone();
+            let chain_type = request.chain_type;
+            let chain_id = request.chain_id;
+            let list_key = *list_key;
+            let batched_merkle_commitments = blinded_commitments_in.len();
+            let verify_proof = request.verify_proof;
+            handles.push(tokio::spawn(async move {
+                let prove_started = Instant::now();
+                let snark_proof = prover.prove_poi(&proof_inputs, verify_proof).await?;
+                let prove_elapsed_ms = prove_started.elapsed().as_millis();
+                tracing::debug!(
+                    chain_type,
+                    chain_id,
+                    tree_number,
+                    input_count,
+                    output_count,
+                    has_unshield,
+                    list_key = %hex::encode(list_key),
+                    batched_merkle_commitments,
+                    merkle_elapsed_ms,
+                    prove_elapsed_ms,
+                    "generated pre-transaction POI proof"
+                );
+                let txid_leaf_hash = chunk_inputs.txid_leaf_hash;
+                let pre_tx_poi = chunk_inputs.pre_tx_poi(snark_proof, &proof_inputs);
+                Ok::<_, PreTransactionPoiError>((index, list_key, txid_leaf_hash, pre_tx_poi))
+            }));
+        }
+
+        let mut proof_results: Vec<Option<(FixedBytes<32>, FixedBytes<32>, PreTxPoi)>> =
+            std::iter::repeat_with(|| None)
+                .take(handles.len())
+                .collect();
+        for handle in handles {
+            let (index, list_key, txid_leaf_hash, pre_tx_poi) =
+                handle.await.map_err(join_error_to_prover_error)??;
+            proof_results[index] = Some((list_key, txid_leaf_hash, pre_tx_poi));
+        }
+        for result in proof_results {
+            let (list_key, txid_leaf_hash, pre_tx_poi) = result.expect("all POI proofs generated");
+            insert_pre_transaction_poi(&mut map, list_key, txid_leaf_hash, pre_tx_poi);
         }
     }
     Ok(map)
@@ -1378,6 +1449,7 @@ impl TransactionBuilder {
         fee: BroadcasterFeeOutput,
         prover: &ProverService,
     ) -> Result<UnshieldPlan, BuildError> {
+        let mut input_witness_cache = InputWitnessProofCache::new(forest);
         let receiver = viewing.address_data();
         let fee_change = fee_selection.total - fee.amount;
         let fee_plan_builder = TransactionPlanBuilder::new(
@@ -1400,6 +1472,7 @@ impl TransactionBuilder {
             request.min_gas_price,
             outputs,
             commitment_ciphertext,
+            Some(&mut input_witness_cache),
         )?;
 
         let allocations = spend_allocations(
@@ -1451,6 +1524,7 @@ impl TransactionBuilder {
                 outputs,
                 commitment_ciphertext,
                 unshield_notes.last().expect("pushed unshield note"),
+                Some(&mut input_witness_cache),
             )?);
         }
 
@@ -1477,10 +1551,11 @@ impl TransactionBuilder {
             }
         }
 
-        let mut transactions = Vec::with_capacity(unproven_plans.len());
-        let mut chunks = Vec::with_capacity(unproven_plans.len());
-        for plan in unproven_plans {
-            let proven = prove_transaction_plan(plan, signer, prover, request.verify_proof).await?;
+        let proven_plans =
+            prove_transaction_plans(unproven_plans, signer, prover, request.verify_proof).await?;
+        let mut transactions = Vec::with_capacity(proven_plans.len());
+        let mut chunks = Vec::with_capacity(proven_plans.len());
+        for proven in proven_plans {
             transactions.push(proven.transaction);
             chunks.push(proven.chunk);
         }
@@ -1550,8 +1625,12 @@ impl TransactionBuilder {
         fee: BroadcasterFeeOutput,
         prover: &ProverService,
     ) -> Result<SendPlan, BuildError> {
+        let total_started = Instant::now();
+        let mut input_witness_cache = InputWitnessProofCache::new(forest);
+        let setup_started = Instant::now();
         let sender = viewing.address_data();
         let fee_change = fee_selection.total - fee.amount;
+        let setup_elapsed_ms = setup_started.elapsed().as_millis();
         let fee_plan_builder = TransactionPlanBuilder::new(
             self,
             viewing,
@@ -1561,19 +1640,25 @@ impl TransactionBuilder {
             fee_selection.utxos,
             fee.token_address,
         )?;
+        let fee_outputs_started = Instant::now();
         let FeeOnlyOutputs {
             outputs,
             commitment_ciphertext,
             broadcaster_fee_note,
             mut change_note,
         } = build_fee_only_outputs(fee, fee_change, &sender, &viewing.viewing_private_key)?;
+        let fee_outputs_elapsed_ms = fee_outputs_started.elapsed().as_millis();
+        let fee_unproven_started = Instant::now();
         let fee_unproven_plan = fee_plan_builder.build_unproven_fee_only(
             fee.token_address,
             request.min_gas_price,
             outputs,
             commitment_ciphertext,
+            Some(&mut input_witness_cache),
         )?;
+        let fee_unproven_elapsed_ms = fee_unproven_started.elapsed().as_millis();
 
+        let allocations_started = Instant::now();
         let allocations = spend_allocations(
             &action_selection,
             request.amount,
@@ -1581,9 +1666,12 @@ impl TransactionBuilder {
             None,
             request.spend_up_to,
         )?;
+        let allocations_elapsed_ms = allocations_started.elapsed().as_millis();
         let mut unproven_plans = Vec::with_capacity(1 + action_selection.chunks.len());
         unproven_plans.push(fee_unproven_plan);
         let mut recipient_notes = Vec::with_capacity(action_selection.chunks.len());
+        let mut action_outputs_elapsed_ms = 0_u128;
+        let mut action_unproven_elapsed_ms = 0_u128;
 
         for (chunk, allocation) in action_selection.chunks.into_iter().zip(allocations) {
             let plan_builder = TransactionPlanBuilder::new(
@@ -1595,6 +1683,7 @@ impl TransactionBuilder {
                 chunk.utxos,
                 request.token_address,
             )?;
+            let action_outputs_started = Instant::now();
             let SendOutputs {
                 outputs,
                 commitment_ciphertext,
@@ -1610,24 +1699,31 @@ impl TransactionBuilder {
                 None,
                 &viewing.viewing_private_key,
             )?;
+            action_outputs_elapsed_ms += action_outputs_started.elapsed().as_millis();
             if chunk_change_note.is_some() {
                 change_note = chunk_change_note.clone();
             }
             recipient_notes.push(recipient_note);
+            let action_unproven_started = Instant::now();
             unproven_plans.push(plan_builder.build_unproven_send(
                 request,
                 outputs,
                 commitment_ciphertext,
+                Some(&mut input_witness_cache),
             )?);
+            action_unproven_elapsed_ms += action_unproven_started.elapsed().as_millis();
         }
 
-        let mut transactions = Vec::with_capacity(unproven_plans.len());
-        let mut chunks = Vec::with_capacity(unproven_plans.len());
-        for plan in unproven_plans {
-            let proven = prove_transaction_plan(plan, signer, prover, request.verify_proof).await?;
+        let prove_started = Instant::now();
+        let proven_plans =
+            prove_transaction_plans(unproven_plans, signer, prover, request.verify_proof).await?;
+        let mut transactions = Vec::with_capacity(proven_plans.len());
+        let mut chunks = Vec::with_capacity(proven_plans.len());
+        for proven in proven_plans {
             transactions.push(proven.transaction);
             chunks.push(proven.chunk);
         }
+        let prove_elapsed_ms = prove_started.elapsed().as_millis();
 
         let first_chunk = chunks.first().expect("fee selection has one chunk").clone();
         let inputs = chunks
@@ -1643,14 +1739,33 @@ impl TransactionBuilder {
             .expect("action selection has at least one chunk")
             .clone();
 
+        let abi_started = Instant::now();
         let data = transactCall {
             _transactions: transactions,
         }
         .abi_encode();
+        let abi_elapsed_ms = abi_started.elapsed().as_millis();
         let call = TransactionCall {
             to: self.railgun_contract,
             data: data.into(),
         };
+        let witness_stats = input_witness_cache.stats();
+        tracing::debug!(
+            transaction_count = chunks.len(),
+            setup_elapsed_ms,
+            fee_outputs_elapsed_ms,
+            fee_unproven_elapsed_ms,
+            allocations_elapsed_ms,
+            action_outputs_elapsed_ms,
+            action_unproven_elapsed_ms,
+            prove_elapsed_ms,
+            abi_elapsed_ms,
+            input_witness_proofs = witness_stats.proof_count,
+            input_witness_dense_tree_builds = witness_stats.dense_tree_build_count,
+            input_witness_dense_tree_build_elapsed_ms = witness_stats.dense_tree_build_elapsed_ms,
+            elapsed_ms = total_started.elapsed().as_millis(),
+            "built separate-fee send batch"
+        );
 
         Ok(SendPlan {
             call,
@@ -1678,6 +1793,7 @@ impl TransactionBuilder {
         request: UnshieldRequest,
         prover: &ProverService,
     ) -> Result<UnshieldPlan, BuildError> {
+        let mut input_witness_cache = InputWitnessProofCache::new(forest);
         let allocations = spend_allocations(
             &selection,
             request.amount,
@@ -1733,6 +1849,7 @@ impl TransactionBuilder {
                 outputs,
                 commitment_ciphertext,
                 unshield_notes.last().expect("pushed unshield note"),
+                Some(&mut input_witness_cache),
             )?);
         }
 
@@ -1759,10 +1876,11 @@ impl TransactionBuilder {
             }
         }
 
-        let mut transactions = Vec::with_capacity(unproven_plans.len());
-        let mut chunks = Vec::with_capacity(unproven_plans.len());
-        for plan in unproven_plans {
-            let proven = prove_transaction_plan(plan, signer, prover, request.verify_proof).await?;
+        let proven_plans =
+            prove_transaction_plans(unproven_plans, signer, prover, request.verify_proof).await?;
+        let mut transactions = Vec::with_capacity(proven_plans.len());
+        let mut chunks = Vec::with_capacity(proven_plans.len());
+        for proven in proven_plans {
             transactions.push(proven.transaction);
             chunks.push(proven.chunk);
         }
@@ -1832,6 +1950,9 @@ impl TransactionBuilder {
         request: SendRequest,
         prover: &ProverService,
     ) -> Result<SendPlan, BuildError> {
+        let total_started = Instant::now();
+        let mut input_witness_cache = InputWitnessProofCache::new(forest);
+        let allocations_started = Instant::now();
         let allocations = spend_allocations(
             &selection,
             request.amount,
@@ -1839,11 +1960,14 @@ impl TransactionBuilder {
             request.same_token_broadcaster_fee(),
             request.spend_up_to,
         )?;
+        let allocations_elapsed_ms = allocations_started.elapsed().as_millis();
         let sender = viewing.address_data();
         let mut unproven_plans = Vec::with_capacity(selection.chunks.len());
         let mut broadcaster_fee_note = None;
         let mut recipient_notes = Vec::with_capacity(selection.chunks.len());
         let mut change_note = None;
+        let mut outputs_elapsed_ms = 0_u128;
+        let mut unproven_elapsed_ms = 0_u128;
 
         for (chunk, allocation) in selection.chunks.into_iter().zip(allocations) {
             let plan_builder = TransactionPlanBuilder::new(
@@ -1855,6 +1979,7 @@ impl TransactionBuilder {
                 chunk.utxos,
                 request.token_address,
             )?;
+            let outputs_started = Instant::now();
             let SendOutputs {
                 outputs,
                 commitment_ciphertext,
@@ -1870,6 +1995,7 @@ impl TransactionBuilder {
                 allocation.fee,
                 &viewing.viewing_private_key,
             )?;
+            outputs_elapsed_ms += outputs_started.elapsed().as_millis();
             if broadcaster_fee_note.is_none() {
                 broadcaster_fee_note = chunk_fee_note;
             }
@@ -1877,20 +2003,26 @@ impl TransactionBuilder {
                 change_note = chunk_change_note.clone();
             }
             recipient_notes.push(recipient_note);
+            let unproven_started = Instant::now();
             unproven_plans.push(plan_builder.build_unproven_send(
                 request,
                 outputs,
                 commitment_ciphertext,
+                Some(&mut input_witness_cache),
             )?);
+            unproven_elapsed_ms += unproven_started.elapsed().as_millis();
         }
 
-        let mut transactions = Vec::with_capacity(unproven_plans.len());
-        let mut chunks = Vec::with_capacity(unproven_plans.len());
-        for plan in unproven_plans {
-            let proven = prove_transaction_plan(plan, signer, prover, request.verify_proof).await?;
+        let prove_started = Instant::now();
+        let proven_plans =
+            prove_transaction_plans(unproven_plans, signer, prover, request.verify_proof).await?;
+        let mut transactions = Vec::with_capacity(proven_plans.len());
+        let mut chunks = Vec::with_capacity(proven_plans.len());
+        for proven in proven_plans {
             transactions.push(proven.transaction);
             chunks.push(proven.chunk);
         }
+        let prove_elapsed_ms = prove_started.elapsed().as_millis();
 
         let first_chunk = chunks
             .first()
@@ -1909,14 +2041,30 @@ impl TransactionBuilder {
             .expect("selection has at least one chunk")
             .clone();
 
+        let abi_started = Instant::now();
         let data = transactCall {
             _transactions: transactions,
         }
         .abi_encode();
+        let abi_elapsed_ms = abi_started.elapsed().as_millis();
         let call = TransactionCall {
             to: self.railgun_contract,
             data: data.into(),
         };
+        let witness_stats = input_witness_cache.stats();
+        tracing::debug!(
+            transaction_count = chunks.len(),
+            allocations_elapsed_ms,
+            outputs_elapsed_ms,
+            unproven_elapsed_ms,
+            prove_elapsed_ms,
+            abi_elapsed_ms,
+            input_witness_proofs = witness_stats.proof_count,
+            input_witness_dense_tree_builds = witness_stats.dense_tree_build_count,
+            input_witness_dense_tree_build_elapsed_ms = witness_stats.dense_tree_build_elapsed_ms,
+            elapsed_ms = total_started.elapsed().as_millis(),
+            "built send batch"
+        );
 
         Ok(SendPlan {
             call,
@@ -1969,6 +2117,59 @@ struct TransactionPlanBuilder<'a, S: RailgunSpendSigner> {
     token_address: Address,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct InputWitnessProofCacheStats {
+    proof_count: usize,
+    dense_tree_build_count: usize,
+    dense_tree_build_elapsed_ms: u128,
+}
+
+struct InputWitnessProofCache<'a> {
+    forest: &'a MerkleForest,
+    dense_trees: BTreeMap<u32, DenseMerkleTree>,
+    stats: InputWitnessProofCacheStats,
+}
+
+impl<'a> InputWitnessProofCache<'a> {
+    fn new(forest: &'a MerkleForest) -> Self {
+        Self {
+            forest,
+            dense_trees: BTreeMap::new(),
+            stats: InputWitnessProofCacheStats::default(),
+        }
+    }
+
+    fn prove(&mut self, tree_number: u32, tree_position: u64) -> Result<MerkleProof, BuildError> {
+        let (normalized_tree, normalized_position) =
+            normalize_tree_position(tree_number, tree_position);
+        if !self.forest.contains_tree(normalized_tree) {
+            return Err(BuildError::MissingProof {
+                tree: tree_number,
+                position: tree_position,
+            });
+        }
+
+        if !self.dense_trees.contains_key(&normalized_tree) {
+            let build_started = Instant::now();
+            let dense_tree =
+                DenseMerkleTree::from_forest_prefix(self.forest, normalized_tree, TREE_LEAF_COUNT);
+            self.stats.dense_tree_build_elapsed_ms += build_started.elapsed().as_millis();
+            self.stats.dense_tree_build_count += 1;
+            self.dense_trees.insert(normalized_tree, dense_tree);
+        }
+        self.stats.proof_count += 1;
+        Ok(self
+            .dense_trees
+            .get(&normalized_tree)
+            .expect("dense tree inserted")
+            .prove(normalized_position))
+    }
+
+    const fn stats(&self) -> InputWitnessProofCacheStats {
+        self.stats
+    }
+}
+
 struct UnprovenTransactionPlan {
     transaction: Transaction,
     tree_number: u32,
@@ -1977,6 +2178,15 @@ struct UnprovenTransactionPlan {
     outputs: Vec<Note>,
     has_unshield: bool,
     private_inputs: PrivateInputs,
+}
+
+struct PreparedTransactionPlan {
+    plan: UnprovenTransactionPlan,
+    public_inputs: PublicInputs,
+    signature: [U256; 3],
+    started: Instant,
+    public_inputs_elapsed_ms: u128,
+    signature_elapsed_ms: u128,
 }
 
 struct ProvenTransactionPlan {
@@ -2057,7 +2267,25 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
     }
 
     /// Build input witnesses with merkle proofs.
-    fn build_input_witnesses(&self) -> Result<Vec<InputWitness>, BuildError> {
+    fn build_input_witnesses(
+        &self,
+        proof_cache: Option<&mut InputWitnessProofCache<'_>>,
+    ) -> Result<Vec<InputWitness>, BuildError> {
+        if let Some(proof_cache) = proof_cache {
+            return self
+                .inputs
+                .iter()
+                .map(|utxo| {
+                    proof_cache
+                        .prove(utxo.tree, utxo.position)
+                        .map(|proof| InputWitness {
+                            utxo: utxo.clone(),
+                            merkle_proof: proof,
+                        })
+                })
+                .collect();
+        }
+
         self.inputs
             .par_iter()
             .map(|utxo| {
@@ -2076,8 +2304,11 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
     }
 
     /// Build witnesses and derive the public root from their proofs.
-    fn build_input_witnesses_and_root(&self) -> Result<(Vec<InputWitness>, U256), BuildError> {
-        let inputs = self.build_input_witnesses()?;
+    fn build_input_witnesses_and_root(
+        &self,
+        proof_cache: Option<&mut InputWitnessProofCache<'_>>,
+    ) -> Result<(Vec<InputWitness>, U256), BuildError> {
+        let inputs = self.build_input_witnesses(proof_cache)?;
         let root = inputs
             .first()
             .map(|input| input.merkle_proof.root)
@@ -2111,11 +2342,12 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
         outputs: Vec<Note>,
         commitment_ciphertext: Vec<NoteCiphertext>,
         unshield_note: &Note,
+        proof_cache: Option<&mut InputWitnessProofCache<'_>>,
     ) -> Result<UnprovenTransactionPlan, BuildError> {
         self.validate_signature_limit(outputs.len())?;
 
         let tree_number = self.tree_number();
-        let (inputs, root) = self.build_input_witnesses_and_root()?;
+        let (inputs, root) = self.build_input_witnesses_and_root(proof_cache)?;
         let nullifiers = self.compute_nullifiers();
         let commitments = Self::compute_commitments(&outputs);
         let commitment_ciphertext = commitment_ciphertext
@@ -2167,11 +2399,12 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
         request: SendRequest,
         outputs: Vec<Note>,
         commitment_ciphertext: Vec<NoteCiphertext>,
+        proof_cache: Option<&mut InputWitnessProofCache<'_>>,
     ) -> Result<UnprovenTransactionPlan, BuildError> {
         self.validate_signature_limit(outputs.len())?;
 
         let tree_number = self.tree_number();
-        let (inputs, root) = self.build_input_witnesses_and_root()?;
+        let (inputs, root) = self.build_input_witnesses_and_root(proof_cache)?;
         let nullifiers = self.compute_nullifiers();
         let commitments = Self::compute_commitments(&outputs);
         let commitment_ciphertext = commitment_ciphertext
@@ -2221,11 +2454,12 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
         min_gas_price: u128,
         outputs: Vec<Note>,
         commitment_ciphertext: Vec<NoteCiphertext>,
+        proof_cache: Option<&mut InputWitnessProofCache<'_>>,
     ) -> Result<UnprovenTransactionPlan, BuildError> {
         self.validate_signature_limit(outputs.len())?;
 
         let tree_number = self.tree_number();
-        let (inputs, root) = self.build_input_witnesses_and_root()?;
+        let (inputs, root) = self.build_input_witnesses_and_root(proof_cache)?;
         let nullifiers = self.compute_nullifiers();
         let commitments = Self::compute_commitments(&outputs);
         let commitment_ciphertext = commitment_ciphertext
@@ -2293,7 +2527,7 @@ impl<'a, S: RailgunSpendSigner> TransactionPlanBuilder<'a, S> {
         self.validate_signature_limit(outputs.len())?;
 
         let tree_number = self.tree_number();
-        let (inputs, root) = self.build_input_witnesses_and_root()?;
+        let (inputs, root) = self.build_input_witnesses_and_root(None)?;
 
         // Build transaction
         let nullifiers = self.compute_nullifiers();
@@ -2447,15 +2681,86 @@ fn spend_allocations(
     }
 }
 
-async fn prove_transaction_plan(
-    mut plan: UnprovenTransactionPlan,
+fn prepare_transaction_plan(
+    plan: UnprovenTransactionPlan,
+    signer: &impl RailgunSpendSigner,
+) -> PreparedTransactionPlan {
+    let started = Instant::now();
+    let public_inputs_started = Instant::now();
+    let public_inputs =
+        PublicInputs::from_transaction(plan.merkle_root, &plan.transaction, &plan.outputs);
+    let public_inputs_elapsed_ms = public_inputs_started.elapsed().as_millis();
+    let signature_started = Instant::now();
+    let signature = public_inputs.signature(signer);
+    let signature_elapsed_ms = signature_started.elapsed().as_millis();
+    PreparedTransactionPlan {
+        plan,
+        public_inputs,
+        signature,
+        started,
+        public_inputs_elapsed_ms,
+        signature_elapsed_ms,
+    }
+}
+
+async fn prove_transaction_plans(
+    plans: Vec<UnprovenTransactionPlan>,
     signer: &impl RailgunSpendSigner,
     prover: &ProverService,
     verify_proof: bool,
+) -> Result<Vec<ProvenTransactionPlan>, BuildError> {
+    let plan_count = plans.len();
+    if plan_count == 0 {
+        return Ok(Vec::new());
+    }
+    let prepared_plans = plans
+        .into_iter()
+        .map(|plan| prepare_transaction_plan(plan, signer))
+        .collect::<Vec<_>>();
+
+    if plan_count == 1 {
+        let proven = prove_prepared_transaction_plan(
+            prepared_plans.into_iter().next().expect("one plan"),
+            prover,
+            verify_proof,
+        )
+        .await?;
+        return Ok(vec![proven]);
+    }
+
+    let mut handles = Vec::with_capacity(plan_count);
+    for (index, prepared) in prepared_plans.into_iter().enumerate() {
+        let prover = prover.clone();
+        handles.push(tokio::spawn(async move {
+            prove_prepared_transaction_plan(prepared, &prover, verify_proof)
+                .await
+                .map(|proven| (index, proven))
+        }));
+    }
+
+    let mut proven_plans = std::iter::repeat_with(|| None)
+        .take(plan_count)
+        .collect::<Vec<_>>();
+    for handle in handles {
+        let (index, proven) = handle.await.map_err(join_error_to_prover_error)??;
+        proven_plans[index] = Some(proven);
+    }
+
+    Ok(proven_plans
+        .into_iter()
+        .map(|proven| proven.expect("all plans proved"))
+        .collect())
+}
+
+async fn prove_prepared_transaction_plan(
+    prepared: PreparedTransactionPlan,
+    prover: &ProverService,
+    verify_proof: bool,
 ) -> Result<ProvenTransactionPlan, BuildError> {
-    let public_inputs =
-        PublicInputs::from_transaction(plan.merkle_root, &plan.transaction, &plan.outputs);
-    let signature = public_inputs.signature(signer);
+    let mut plan = prepared.plan;
+    let public_inputs = prepared.public_inputs;
+    let signature = prepared.signature;
+    let prove_started = Instant::now();
     let proof = prover
         .prove_unshield(
             &public_inputs,
@@ -2464,6 +2769,7 @@ async fn prove_transaction_plan(
             verify_proof,
         )
         .await?;
+    let prove_elapsed_ms = prove_started.elapsed().as_millis();
     plan.transaction.proof = proof;
     let chunk = TransactionPlanChunk {
         tree_number: plan.tree_number,
@@ -2475,10 +2781,25 @@ async fn prove_transaction_plan(
         private_inputs: plan.private_inputs,
         signature,
     };
+    tracing::debug!(
+        tree_number = plan.tree_number,
+        input_count = chunk.inputs.len(),
+        output_count = chunk.outputs.len(),
+        has_unshield = chunk.has_unshield,
+        public_inputs_elapsed_ms = prepared.public_inputs_elapsed_ms,
+        signature_elapsed_ms = prepared.signature_elapsed_ms,
+        prove_elapsed_ms,
+        elapsed_ms = prepared.started.elapsed().as_millis(),
+        "proved transaction plan"
+    );
     Ok(ProvenTransactionPlan {
         transaction: plan.transaction,
         chunk,
     })
+}
+
+fn join_error_to_prover_error(error: tokio::task::JoinError) -> ProverError {
+    ProverError::WorkerPanic(error.to_string())
 }
 
 fn push_broadcaster_fee_output(
@@ -3631,11 +3952,19 @@ mod tests {
     #[derive(Default)]
     struct FailingLocalPoiProofSource {
         calls: Mutex<usize>,
+        commitment_counts: Mutex<Vec<usize>>,
     }
 
     impl FailingLocalPoiProofSource {
         fn calls(&self) -> usize {
             *self.calls.lock().expect("calls")
+        }
+
+        fn commitment_counts(&self) -> Vec<usize> {
+            self.commitment_counts
+                .lock()
+                .expect("commitment counts")
+                .clone()
         }
     }
 
@@ -3647,9 +3976,13 @@ mod tests {
             _chain_type: u8,
             _chain_id: u64,
             _list_key: &FixedBytes<32>,
-            _blinded_commitments: &[FixedBytes<32>],
+            blinded_commitments: &[FixedBytes<32>],
         ) -> Result<Vec<PoiMerkleProof>, PreTransactionPoiError> {
             *self.calls.lock().expect("calls") += 1;
+            self.commitment_counts
+                .lock()
+                .expect("commitment counts")
+                .push(blinded_commitments.len());
             Err(PreTransactionPoiError::ProofSource(
                 "local cache unavailable".to_string(),
             ))
@@ -3837,6 +4170,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pre_transaction_poi_generation_batches_merkle_proof_source_by_list() {
+        let chunks = [sample_chunk(11, 1, 1, false), sample_chunk(12, 1, 1, false)];
+        let source = FailingLocalPoiProofSource::default();
+        let prover = ProverService::with_capacity_db(ArtifactSource::default(), 1, None);
+        let err = generate_pre_transaction_pois(PreTransactionPoiGenerationRequest {
+            chunks: &chunks,
+            chain_type: 0,
+            chain_id: 1,
+            txid_version: Some(DEFAULT_TXID_VERSION),
+            required_poi_list_keys: &[FixedBytes::from([0x11; 32])],
+            proof_source: &source,
+            prover: &prover,
+            verify_proof: false,
+        })
+        .await
+        .expect_err("local proof source error should fail generation");
+
+        assert!(matches!(err, PreTransactionPoiError::ProofSource(_)));
+        assert_eq!(source.calls(), 1);
+        assert_eq!(source.commitment_counts(), vec![2]);
+    }
+
+    #[tokio::test]
     async fn post_transaction_poi_generation_uses_configured_proof_source() {
         let chunk = sample_chunk(12, 1, 1, false);
         let txid_data = sample_post_txid_data(&chunk, uint!(5_U256));
@@ -3920,6 +4276,7 @@ mod tests {
                 },
                 outputs.outputs,
                 outputs.commitment_ciphertext,
+                None,
             )
             .expect("unproven send");
         let expected_root = forest

@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use alloy::hex;
 use alloy::primitives::{FixedBytes, U256};
-use broadcaster_core::tree::normalize_tree_position;
-use merkletree::tree::{MerkleForest, MerkleProof, MerkleTreeUpdate};
+use broadcaster_core::tree::{TREE_LEAF_COUNT, normalize_tree_position};
+use merkletree::tree::{DenseMerkleTree, MerkleForest, MerkleProof, MerkleTreeUpdate};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::debug;
@@ -22,6 +22,7 @@ use crate::poi::{
 pub const POI_CACHE_SNAPSHOT_VERSION: u32 = 1;
 pub const POI_EVENTS_PAGE_SIZE: u64 = 500;
 pub const POI_MERKLETREE_LEAVES_PAGE_SIZE: u64 = 100;
+const DENSE_POI_PROOF_MIN_COMMITMENTS_PER_TREE: usize = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoiCacheIdentity {
@@ -225,6 +226,17 @@ impl PoiCache {
     }
 
     #[must_use]
+    pub fn positions_for_blinded_commitments(
+        &self,
+        blinded_commitments: &[FixedBytes<32>],
+    ) -> Vec<Option<PoiCachePosition>> {
+        blinded_commitments
+            .iter()
+            .map(|commitment| self.position(commitment))
+            .collect()
+    }
+
+    #[must_use]
     pub fn status(&self, blinded_commitment: &FixedBytes<32>) -> PoiStatus {
         self.snapshot
             .status_by_blinded_commitment
@@ -240,12 +252,11 @@ impl PoiCache {
 
     pub fn current_roots(&mut self) -> BTreeMap<u32, FixedBytes<32>> {
         self.snapshot.forest.compute_roots();
-        self.snapshot
-            .forest
-            .roots()
-            .into_iter()
-            .map(|(tree, root)| (tree, fixed_from_u256(root)))
-            .collect()
+        fixed_roots(self.snapshot.forest.roots())
+    }
+
+    fn current_roots_readonly(&self) -> BTreeMap<u32, FixedBytes<32>> {
+        fixed_roots(self.snapshot.forest.computed_roots())
     }
 
     pub fn apply_poi_events(
@@ -576,18 +587,34 @@ impl PoiCache {
     }
 
     pub fn poi_merkle_proofs(
-        &mut self,
+        &self,
         blinded_commitments: &[FixedBytes<32>],
     ) -> Result<Vec<PoiMerkleProof>, PoiCacheError> {
         self.ensure_roots_validated()?;
-        blinded_commitments
+        let positions = blinded_commitments
             .iter()
-            .map(|blinded_commitment| self.poi_merkle_proof(blinded_commitment))
+            .map(|blinded_commitment| {
+                self.position_for_blinded_commitment(blinded_commitment)
+                    .map(|position| (*blinded_commitment, position))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let dense_tree_counts = dense_tree_counts(&positions);
+        let mut dense_trees = BTreeMap::new();
+        positions
+            .into_iter()
+            .map(|(blinded_commitment, position)| {
+                self.poi_merkle_proof_at_position(
+                    &blinded_commitment,
+                    position,
+                    &dense_tree_counts,
+                    &mut dense_trees,
+                )
+            })
             .collect()
     }
 
-    fn ensure_roots_validated(&mut self) -> Result<(), PoiCacheError> {
-        let roots = self.current_roots();
+    fn ensure_roots_validated(&self) -> Result<(), PoiCacheError> {
+        let roots = self.current_roots_readonly();
         if self.snapshot.progress.root_validation.accepts(&roots) {
             Ok(())
         } else if self.snapshot.progress.root_validation.rejects(&roots) {
@@ -597,33 +624,79 @@ impl PoiCache {
         }
     }
 
-    fn poi_merkle_proof(
+    fn poi_merkle_proof_at_position(
         &self,
         blinded_commitment: &FixedBytes<32>,
+        position: PoiCachePosition,
+        dense_tree_counts: &BTreeMap<u32, usize>,
+        dense_trees: &mut BTreeMap<u32, DenseMerkleTree>,
     ) -> Result<PoiMerkleProof, PoiCacheError> {
-        let position = self
-            .snapshot
+        let proof = if dense_tree_counts
+            .get(&position.tree_number)
+            .is_some_and(|count| *count >= DENSE_POI_PROOF_MIN_COMMITMENTS_PER_TREE)
+        {
+            let dense_tree = dense_trees.entry(position.tree_number).or_insert_with(|| {
+                DenseMerkleTree::from_forest_prefix(
+                    &self.snapshot.forest,
+                    position.tree_number,
+                    TREE_LEAF_COUNT,
+                )
+            });
+            dense_tree.prove(position.tree_position)
+        } else {
+            self.sparse_poi_merkle_proof(position, blinded_commitment)?
+        };
+        validate_poi_merkle_proof_leaf(&proof, blinded_commitment)?;
+        Ok(poi_merkle_proof_from_cache(&proof))
+    }
+
+    fn position_for_blinded_commitment(
+        &self,
+        blinded_commitment: &FixedBytes<32>,
+    ) -> Result<PoiCachePosition, PoiCacheError> {
+        self.snapshot
             .position_by_blinded_commitment
             .get(blinded_commitment)
+            .copied()
             .ok_or(PoiCacheError::MissingCommitment {
                 blinded_commitment: *blinded_commitment,
-            })?;
-        let proof = self
-            .snapshot
+            })
+    }
+
+    fn sparse_poi_merkle_proof(
+        &self,
+        position: PoiCachePosition,
+        blinded_commitment: &FixedBytes<32>,
+    ) -> Result<MerkleProof, PoiCacheError> {
+        self.snapshot
             .forest
             .prove(position.tree_number, position.tree_position)
             .ok_or(PoiCacheError::MissingCommitment {
                 blinded_commitment: *blinded_commitment,
-            })?;
-        let leaf = fixed_from_u256(proof.leaf);
-        if leaf != *blinded_commitment {
-            return Err(PoiCacheError::LeafMismatch {
-                blinded_commitment: *blinded_commitment,
-                leaf,
-            });
-        }
-        Ok(poi_merkle_proof_from_cache(&proof))
+            })
     }
+}
+
+fn validate_poi_merkle_proof_leaf(
+    proof: &MerkleProof,
+    blinded_commitment: &FixedBytes<32>,
+) -> Result<(), PoiCacheError> {
+    let leaf = fixed_from_u256(proof.leaf);
+    if leaf != *blinded_commitment {
+        return Err(PoiCacheError::LeafMismatch {
+            blinded_commitment: *blinded_commitment,
+            leaf,
+        });
+    }
+    Ok(())
+}
+
+fn dense_tree_counts(positions: &[(FixedBytes<32>, PoiCachePosition)]) -> BTreeMap<u32, usize> {
+    let mut counts = BTreeMap::new();
+    for (_, position) in positions {
+        *counts.entry(position.tree_number).or_default() += 1;
+    }
+    counts
 }
 
 fn poi_merkle_proof_from_cache(proof: &MerkleProof) -> PoiMerkleProof {
@@ -642,6 +715,13 @@ fn poi_merkle_proof_from_cache(proof: &MerkleProof) -> PoiMerkleProof {
 
 fn fixed_from_u256(value: U256) -> FixedBytes<32> {
     FixedBytes::from(value.to_be_bytes::<32>())
+}
+
+fn fixed_roots(roots: BTreeMap<u32, U256>) -> BTreeMap<u32, FixedBytes<32>> {
+    roots
+        .into_iter()
+        .map(|(tree, root)| (tree, fixed_from_u256(root)))
+        .collect()
 }
 
 fn encode_u256_prefixed(value: U256) -> String {
@@ -887,6 +967,7 @@ mod tests {
             FixedBytes::from([0x22; 32]),
             FixedBytes::from([0x33; 32]),
             FixedBytes::from([0x44; 32]),
+            FixedBytes::from([0x55; 32]),
         ];
         let leaves = commitments
             .iter()
@@ -907,19 +988,29 @@ mod tests {
                 })
                 .expect("insert expected leaf");
         }
-        let expected = [commitments[0], commitments[2]]
-            .iter()
-            .map(|commitment| {
-                let position = cache.position(commitment).expect("position");
-                let proof = expected_forest
-                    .prove(position.tree_number, position.tree_position)
-                    .expect("expected proof");
-                poi_merkle_proof_from_cache(&proof)
-            })
-            .collect::<Vec<_>>();
+        let expected = [
+            commitments[0],
+            commitments[1],
+            commitments[2],
+            commitments[3],
+        ]
+        .iter()
+        .map(|commitment| {
+            let position = cache.position(commitment).expect("position");
+            let proof = expected_forest
+                .prove(position.tree_number, position.tree_position)
+                .expect("expected proof");
+            poi_merkle_proof_from_cache(&proof)
+        })
+        .collect::<Vec<_>>();
 
         let actual = cache
-            .poi_merkle_proofs(&[commitments[0], commitments[2]])
+            .poi_merkle_proofs(&[
+                commitments[0],
+                commitments[1],
+                commitments[2],
+                commitments[3],
+            ])
             .unwrap();
 
         assert_eq!(actual, expected);

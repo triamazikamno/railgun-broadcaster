@@ -5,6 +5,7 @@ pub mod prover;
 pub mod scan;
 pub mod tx;
 pub mod wallet_cache;
+mod wasm_module_cache;
 mod zkey_cache;
 
 pub use broadcaster_core::crypto::railgun::{AddressData, ViewingKeyData};

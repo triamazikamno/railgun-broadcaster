@@ -55,6 +55,17 @@ impl MerkleTree {
             return root;
         }
 
+        let root = self.computed_root();
+        self.root = Some(root);
+        root
+    }
+
+    #[must_use]
+    pub fn computed_root(&self) -> U256 {
+        if let Some(root) = self.root {
+            return root;
+        }
+
         let mut layer = vec![ZERO_HASHES[0]; TREE_LEAF_COUNT as usize];
         for (index, leaf) in &self.leaves {
             let idx = *index as usize;
@@ -67,9 +78,7 @@ impl MerkleTree {
             hash_layer(&mut layer);
         }
 
-        let root = layer[0];
-        self.root = Some(root);
-        root
+        layer[0]
     }
 
     #[must_use]
@@ -184,6 +193,14 @@ impl MerkleForest {
     }
 
     #[must_use]
+    pub fn computed_roots(&self) -> BTreeMap<u32, U256> {
+        self.trees
+            .iter()
+            .map(|(id, tree)| (*id, tree.computed_root()))
+            .collect()
+    }
+
+    #[must_use]
     pub fn roots(&self) -> BTreeMap<u32, U256> {
         self.trees
             .iter()
@@ -206,6 +223,11 @@ impl MerkleForest {
         self.trees
             .get(&tree_number)
             .and_then(|tree| tree.leaves.get(&position).copied())
+    }
+
+    #[must_use]
+    pub fn contains_tree(&self, tree_number: u32) -> bool {
+        self.trees.contains_key(&tree_number)
     }
 
     #[must_use]
@@ -235,9 +257,9 @@ impl DenseMerkleTree {
     pub fn from_forest_prefix(forest: &MerkleForest, tree_number: u32, leaf_count: u64) -> Self {
         let clamped_leaf_count = leaf_count.min(TREE_LEAF_COUNT);
         let mut leaves = vec![MERKLE_ZERO_VALUE; TREE_LEAF_COUNT as usize];
-        for position in 0..clamped_leaf_count {
-            if let Some(leaf) = forest.leaf_at(tree_number, position) {
-                leaves[position as usize] = leaf;
+        if let Some(tree) = forest.trees.get(&tree_number) {
+            for (position, leaf) in tree.leaves.range(0..clamped_leaf_count) {
+                leaves[*position as usize] = *leaf;
             }
         }
         Self::from_full_leaf_layer(leaves)

@@ -30,6 +30,7 @@ use local_db::{DbConfig, DbStore, PendingOutputPoiContextRecord, PendingOutputPo
 use merkletree::tree::MerkleForest;
 use poi::poi::{DEFAULT_WALLET_POI_RPC_URL, PoiRpcClient, default_active_poi_list_keys};
 use railgun_wallet::artifacts::ArtifactSource;
+use railgun_wallet::prover::{ProverCacheBuildReport, build_prover_cache};
 use railgun_wallet::tx::{
     BroadcasterFeeOutput, BuildError, PoiMerkleProofSource, PreTransactionPoiGenerationRequest,
     PreTransactionPoiMap, SendPlan, SendRequest as RailgunSendRequest, TransactionPlanChunk,
@@ -104,6 +105,49 @@ pub use utxos::{
     max_send_amount_from_outputs, max_unshield_amount_from_outputs,
 };
 
+#[derive(Debug, Clone)]
+pub struct BuildCacheRequest {
+    pub db_path: PathBuf,
+    pub network_mode: Option<WalletNetworkMode>,
+    pub proxy: Option<Url>,
+}
+
+pub async fn build_cache(request: BuildCacheRequest) -> Result<ProverCacheBuildReport> {
+    let http = build_wallet_network_context(WalletNetworkConfig {
+        network_mode: request.network_mode,
+        proxy: request.proxy.as_ref(),
+        data_dir: &request.db_path,
+    })
+    .await?;
+    let db = Arc::new(
+        DbStore::open(DbConfig {
+            root_dir: request.db_path.clone(),
+        })
+        .wrap_err("open local db")?,
+    );
+    let source = artifact_source(&http);
+    tracing::info!(
+        db_path = %request.db_path.display(),
+        network_mode = %http.network_mode(),
+        artifact_dir = %source.out_dir.display(),
+        "starting wallet cache build"
+    );
+    let report =
+        tokio::task::spawn_blocking(move || build_prover_cache(&source, Some(db.as_ref())))
+            .await
+            .wrap_err("join prover cache build task")??;
+    tracing::info!(
+        railgun_variants = report.railgun_variants,
+        poi_variants = report.poi_variants,
+        total_variants = report.total_variants,
+        succeeded_variants = report.succeeded_variants,
+        failed_variants = report.failed_variants,
+        elapsed_ms = report.elapsed_ms,
+        "wallet cache build complete"
+    );
+    Ok(report)
+}
+
 pub(crate) use poi_contexts::{
     active_list_pre_transaction_pois, persist_pending_send_output_poi_contexts,
     persist_pending_unshield_output_poi_contexts, public_broadcaster_pre_transaction_pois,
@@ -136,6 +180,8 @@ const APPROX_GAS_PER_TRANSACTION: u64 = 120_000;
 const APPROX_SEND_EXTRA_GAS: u64 = 40_000;
 const APPROX_UNWRAP_EXTRA_GAS: u64 = 50_000;
 const APPROX_SAFETY_GAS: u64 = 150_000;
+const APPROX_GAS_UPLIFT_NUMERATOR: u64 = 112;
+const APPROX_GAS_UPLIFT_DENOMINATOR: u64 = 100;
 const PUBLIC_BROADCASTER_MAX_ENTERED_AMOUNT_ERROR: &str = "public broadcaster max entered amount: ";
 const PUBLIC_BROADCASTER_FEE_TOKEN_MAX_SPENDABLE_ERROR: &str =
     "public broadcaster fee-token max spendable: ";
@@ -1159,7 +1205,7 @@ async fn public_broadcaster_setup(
 }
 
 const fn approximate_public_broadcaster_gas(shape: ApproximateTransactionShape) -> u64 {
-    APPROX_BASE_GAS
+    let raw = APPROX_BASE_GAS
         + APPROX_GAS_PER_TRANSACTION * shape.transaction_count.saturating_sub(1) as u64
         + APPROX_GAS_PER_INPUT * shape.input_count as u64
         + APPROX_GAS_PER_PRIVATE_OUTPUT * shape.private_output_count as u64
@@ -1170,7 +1216,62 @@ const fn approximate_public_broadcaster_gas(shape: ApproximateTransactionShape) 
         } else {
             0
         }
-        + APPROX_SAFETY_GAS
+        + APPROX_SAFETY_GAS;
+    raw.saturating_mul(APPROX_GAS_UPLIFT_NUMERATOR)
+        .saturating_add(APPROX_GAS_UPLIFT_DENOMINATOR - 1)
+        / APPROX_GAS_UPLIFT_DENOMINATOR
+}
+
+const fn gas_shortfall_bps(predicted_gas_limit: u64, actual_gas_limit: u64) -> Option<u64> {
+    if predicted_gas_limit == 0 || actual_gas_limit <= predicted_gas_limit {
+        return None;
+    }
+    Some((actual_gas_limit - predicted_gas_limit) * 10_000 / predicted_gas_limit)
+}
+
+fn log_public_broadcaster_fee_prediction_failure(
+    action: &'static str,
+    attempt: usize,
+    available_fee: U256,
+    computed_fee: U256,
+    gas_limit: u64,
+    estimate: Option<&PublicBroadcasterCostEstimate>,
+    plan_transaction_count: usize,
+    plan_input_count: usize,
+    plan_private_output_count: usize,
+    plan_public_output_count: usize,
+    broadcaster: &PublicBroadcasterCandidate,
+) {
+    let predicted_gas_limit = estimate.map(|estimate| estimate.gas_limit);
+    let gas_shortfall = predicted_gas_limit.map(|predicted| gas_limit.saturating_sub(predicted));
+    let gas_shortfall_bps =
+        predicted_gas_limit.and_then(|predicted| gas_shortfall_bps(predicted, gas_limit));
+    let estimated_transaction_count = estimate.map(|estimate| estimate.transaction_count);
+    let estimated_input_count = estimate.map(|estimate| estimate.input_count);
+    let estimated_private_output_count = estimate.map(|estimate| estimate.private_output_count);
+    let estimated_public_output_count = estimate.map(|estimate| estimate.public_output_count);
+    tracing::warn!(
+        action,
+        attempt,
+        available_fee = %available_fee,
+        computed_fee = %computed_fee,
+        fee_shortfall = %computed_fee.saturating_sub(available_fee),
+        gas_limit,
+        ?predicted_gas_limit,
+        ?gas_shortfall,
+        ?gas_shortfall_bps,
+        plan_transaction_count,
+        plan_input_count,
+        plan_private_output_count,
+        plan_public_output_count,
+        ?estimated_transaction_count,
+        ?estimated_input_count,
+        ?estimated_private_output_count,
+        ?estimated_public_output_count,
+        broadcaster = %broadcaster.railgun_address,
+        fees_id = %broadcaster.fees_id,
+        "public broadcaster fee prediction failed; retrying with buffered fee"
+    );
 }
 
 fn approximate_public_broadcaster_cost(
@@ -2357,7 +2458,7 @@ async fn prepare_desktop_unshield_public_broadcaster(
                 request.unwrap,
             ))
         })?;
-    let initial_fee_amount = match approximate_public_broadcaster_cost(
+    let initial_fee_estimate = match approximate_public_broadcaster_cost(
         broadcaster.clone(),
         request.token,
         request.fee_token,
@@ -2403,7 +2504,7 @@ async fn prepare_desktop_unshield_public_broadcaster(
                 fees_id = %broadcaster.fees_id,
                 "using approximate public broadcaster unshield fee for first proof"
             );
-            estimate.fee_amount
+            Some(estimate)
         }
         Err(err) => {
             if !same_token_fee {
@@ -2415,9 +2516,12 @@ async fn prepare_desktop_unshield_public_broadcaster(
                 fees_id = %broadcaster.fees_id,
                 "failed to estimate initial same-token public broadcaster unshield fee; starting at zero"
             );
-            U256::ZERO
+            None
         }
     };
+    let initial_fee_amount = initial_fee_estimate
+        .as_ref()
+        .map_or(U256::ZERO, |estimate| estimate.fee_amount);
 
     let mut grant = request
         .vault_store
@@ -2586,6 +2690,19 @@ async fn prepare_desktop_unshield_public_broadcaster(
             });
         }
         let next_fee = buffered_public_broadcaster_fee(computed_fee);
+        log_public_broadcaster_fee_prediction_failure(
+            "unshield",
+            attempt,
+            fee_amount,
+            computed_fee,
+            gas_limit,
+            initial_fee_estimate.as_ref(),
+            plan.transaction_count(),
+            plan.input_count(),
+            plan.private_output_count(),
+            plan.public_output_count(),
+            &broadcaster,
+        );
         tracing::info!(
             attempt,
             previous_fee = %fee_amount,
@@ -2659,7 +2776,7 @@ async fn prepare_desktop_send_public_broadcaster(
             })?;
             Ok(send_approximate_shape(&selection, selection.max_spendable))
         })?;
-    let initial_fee_amount = match approximate_public_broadcaster_cost(
+    let initial_fee_estimate = match approximate_public_broadcaster_cost(
         broadcaster.clone(),
         request.token,
         request.fee_token,
@@ -2701,7 +2818,7 @@ async fn prepare_desktop_send_public_broadcaster(
                 fees_id = %broadcaster.fees_id,
                 "using approximate public broadcaster send fee for first proof"
             );
-            estimate.fee_amount
+            Some(estimate)
         }
         Err(err) => {
             if !same_token_fee {
@@ -2713,9 +2830,12 @@ async fn prepare_desktop_send_public_broadcaster(
                 fees_id = %broadcaster.fees_id,
                 "failed to estimate initial same-token public broadcaster send fee; starting at zero"
             );
-            U256::ZERO
+            None
         }
     };
+    let initial_fee_amount = initial_fee_estimate
+        .as_ref()
+        .map_or(U256::ZERO, |estimate| estimate.fee_amount);
 
     let mut grant = request
         .vault_store
@@ -2773,6 +2893,21 @@ async fn prepare_desktop_send_public_broadcaster(
                 public_broadcaster_build_error(error, fee_amount, split.fee_mode, same_token_fee)
             })
             .wrap_err("build public broadcaster send proof")?;
+        let chunk_input_counts = plan
+            .chunks
+            .iter()
+            .map(|chunk| chunk.inputs.len())
+            .collect::<Vec<_>>();
+        let chunk_output_counts = plan
+            .chunks
+            .iter()
+            .map(|chunk| chunk.outputs.len())
+            .collect::<Vec<_>>();
+        let chunk_tree_numbers = plan
+            .chunks
+            .iter()
+            .map(|chunk| chunk.tree_number)
+            .collect::<Vec<_>>();
         tracing::info!(
             attempt,
             fee_amount = %fee_amount,
@@ -2781,6 +2916,10 @@ async fn prepare_desktop_send_public_broadcaster(
             input_count = plan.input_count(),
             private_output_count = plan.private_output_count(),
             public_output_count = plan.public_output_count(),
+            same_token_fee,
+            ?chunk_input_counts,
+            ?chunk_output_counts,
+            ?chunk_tree_numbers,
             broadcaster = %broadcaster.railgun_address,
             fees_id = %broadcaster.fees_id,
             "built public broadcaster send proof"
@@ -2875,6 +3014,19 @@ async fn prepare_desktop_send_public_broadcaster(
             });
         }
         let next_fee = buffered_public_broadcaster_fee(computed_fee);
+        log_public_broadcaster_fee_prediction_failure(
+            "send",
+            attempt,
+            fee_amount,
+            computed_fee,
+            gas_limit,
+            initial_fee_estimate.as_ref(),
+            plan.transaction_count(),
+            plan.input_count(),
+            plan.private_output_count(),
+            plan.public_output_count(),
+            &broadcaster,
+        );
         tracing::info!(
             attempt,
             previous_fee = %fee_amount,
@@ -5539,6 +5691,21 @@ mod tests {
         });
 
         assert!(larger > base);
+    }
+
+    #[test]
+    fn approximate_public_broadcaster_gas_applies_safety_uplift() {
+        let gas = approximate_public_broadcaster_gas(ApproximateTransactionShape {
+            transaction_count: 2,
+            input_count: 2,
+            private_output_count: 4,
+            public_output_count: 0,
+            max_receiver_amount: U256::ZERO,
+            unwrap: false,
+            send: true,
+        });
+
+        assert_eq!(gas, 1_803_200);
     }
 
     #[test]

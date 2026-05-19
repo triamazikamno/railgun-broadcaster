@@ -141,6 +141,20 @@ pub fn load_or_parse_zkey(
     Ok((proving_key, matrices))
 }
 
+pub fn zkey_cache_exists(
+    db: &DbStore,
+    variant: &str,
+    expected_hash: [u8; 32],
+) -> Result<bool, ZkeyCacheError> {
+    let Some(meta) = db.get_zkey_meta(variant)? else {
+        return Ok(false);
+    };
+    if meta.format_version != ZKEY_CACHE_FORMAT_VERSION || meta.zkey_hash != expected_hash {
+        return Ok(false);
+    }
+    Ok(db.resolve_path(&meta.relative_path).exists())
+}
+
 fn write_matrices<W: Write>(writer: &mut W, matrices: &NPIndex<Fr>) -> Result<(), ZkeyCacheError> {
     writer.write_u64::<LittleEndian>(matrices.num_instance_variables as u64)?;
     writer.write_u64::<LittleEndian>(matrices.num_witness_variables as u64)?;

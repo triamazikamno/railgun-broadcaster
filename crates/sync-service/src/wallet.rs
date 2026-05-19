@@ -49,7 +49,7 @@ use railgun_wallet::{
 };
 use url::Url;
 
-use crate::poi_artifacts::{PoiArtifactIngestor, load_persisted_cache};
+use crate::poi_artifacts::{PersistedPoiArtifactCache, PoiArtifactIngestor, load_persisted_cache};
 use crate::txid_cache::{
     TxidPublicCacheError, TxidPublicCacheKey, TxidPublicCacheTransaction,
     TxidPublicCachedTransaction, TxidPublicLatestValidated, sync_txid_public_cache,
@@ -231,8 +231,11 @@ impl PoiStatusReader for LocalPoiStatusReader {
         list_keys: &[FixedBytes<32>],
         blinded_commitment_datas: &[BlindedCommitmentData],
     ) -> Result<BTreeMap<FixedBytes<32>, BTreeMap<FixedBytes<32>, PoiStatus>>, PoiError> {
+        let started = Instant::now();
+        let lock_started = Instant::now();
         let caches = self.caches.read().await;
-        Ok(blinded_commitment_datas
+        let lock_wait_elapsed_ms = lock_started.elapsed().as_millis();
+        let statuses = blinded_commitment_datas
             .iter()
             .map(|data| {
                 let per_list = list_keys
@@ -252,7 +255,17 @@ impl PoiStatusReader for LocalPoiStatusReader {
                     .collect();
                 (data.blinded_commitment, per_list)
             })
-            .collect())
+            .collect();
+        debug!(
+            chain_type,
+            chain_id,
+            list_keys = list_keys.len(),
+            commitments = blinded_commitment_datas.len(),
+            lock_wait_elapsed_ms,
+            elapsed_ms = started.elapsed().as_millis(),
+            "local POI status read complete"
+        );
+        Ok(statuses)
     }
 }
 
@@ -275,7 +288,10 @@ impl LocalPoiMerkleProofSource {
         list_key: &FixedBytes<32>,
         blinded_commitments: &[FixedBytes<32>],
     ) -> Result<(), PreTransactionPoiError> {
+        let started = Instant::now();
+        let lock_started = Instant::now();
         let caches = self.caches.read().await;
+        let lock_wait_elapsed_ms = lock_started.elapsed().as_millis();
         let Some(cache) = caches.get(list_key).filter(|cache| {
             cache.identity().chain_type == chain_type
                 && cache.identity().chain_id == chain_id
@@ -293,6 +309,15 @@ impl LocalPoiMerkleProofSource {
                 )));
             }
         }
+        debug!(
+            chain_type,
+            chain_id,
+            list_key = %hex::encode(list_key),
+            commitments = blinded_commitments.len(),
+            lock_wait_elapsed_ms,
+            elapsed_ms = started.elapsed().as_millis(),
+            "local POI proof preflight complete"
+        );
         Ok(())
     }
 }
@@ -307,8 +332,11 @@ impl PoiMerkleProofSource for LocalPoiMerkleProofSource {
         list_key: &FixedBytes<32>,
         blinded_commitments: &[FixedBytes<32>],
     ) -> Result<Vec<PoiMerkleProof>, PreTransactionPoiError> {
-        let mut caches = self.caches.write().await;
-        let Some(cache) = caches.get_mut(list_key).filter(|cache| {
+        let started = Instant::now();
+        let lock_started = Instant::now();
+        let caches = self.caches.read().await;
+        let lock_wait_elapsed_ms = lock_started.elapsed().as_millis();
+        let Some(cache) = caches.get(list_key).filter(|cache| {
             cache.identity().chain_type == chain_type
                 && cache.identity().chain_id == chain_id
                 && cache.identity().txid_version == txid_version
@@ -318,9 +346,38 @@ impl PoiMerkleProofSource for LocalPoiMerkleProofSource {
                 hex::encode(list_key)
             )));
         };
-        cache
+        let positions = cache.positions_for_blinded_commitments(blinded_commitments);
+        let proof_global_indices = positions
+            .iter()
+            .map(|position| position.map(|position| position.global_index))
+            .collect::<Vec<_>>();
+        let proof_tree_numbers = positions
+            .iter()
+            .map(|position| position.map(|position| position.tree_number))
+            .collect::<Vec<_>>();
+        let proof_tree_positions = positions
+            .iter()
+            .map(|position| position.map(|position| position.tree_position))
+            .collect::<Vec<_>>();
+        let proof_started = Instant::now();
+        let proofs = cache
             .poi_merkle_proofs(blinded_commitments)
-            .map_err(|err| PreTransactionPoiError::ProofSource(err.to_string()))
+            .map_err(|err| PreTransactionPoiError::ProofSource(err.to_string()))?;
+        debug!(
+            chain_type,
+            chain_id,
+            list_key = %hex::encode(list_key),
+            commitments = blinded_commitments.len(),
+            proofs = proofs.len(),
+            ?proof_global_indices,
+            ?proof_tree_numbers,
+            ?proof_tree_positions,
+            lock_wait_elapsed_ms,
+            proof_elapsed_ms = proof_started.elapsed().as_millis(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "local POI merkle proofs complete"
+        );
+        Ok(proofs)
     }
 }
 
@@ -3971,6 +4028,7 @@ async fn sync_local_poi_caches(
     http_client: Option<&reqwest::Client>,
     cfg: &WalletConfig,
     active_list_keys: &[FixedBytes<32>],
+    mut preloaded_caches: BTreeMap<FixedBytes<32>, PersistedPoiArtifactCache>,
 ) {
     let Some(local_caches) = cfg.local_poi_caches.as_ref() else {
         return;
@@ -3991,14 +4049,30 @@ async fn sync_local_poi_caches(
             *list_key,
         );
         let sync_started = Instant::now();
-        match ingestor
-            .refresh_persisted_cache(db, identity.clone(), SystemTime::now())
-            .await
-        {
+        let artifact_refresh_started = Instant::now();
+        let preloaded_cache = preloaded_caches.remove(list_key);
+        let artifact_refresh = if let Some(preloaded_cache) = preloaded_cache {
+            ingestor
+                .refresh_persisted_cache_with_preloaded(
+                    db,
+                    identity.clone(),
+                    Some(preloaded_cache),
+                    0,
+                    SystemTime::now(),
+                )
+                .await
+        } else {
+            ingestor
+                .refresh_persisted_cache(db, identity.clone(), SystemTime::now())
+                .await
+        };
+        let artifact_refresh_elapsed_ms = artifact_refresh_started.elapsed().as_millis();
+        match artifact_refresh {
             Ok(refresh) => {
                 let manifest_sequence = refresh.manifest_sequence;
                 let artifact_tip_index = refresh.entry.current_tip_index;
                 let mut cache = refresh.cache;
+                let live_tail_started = Instant::now();
                 let live_tail = if let Some(client) = live_tail_client.as_ref() {
                     match sync_live_poi_event_tail(client, &mut cache).await {
                         Ok(outcome) => Some(outcome),
@@ -4016,8 +4090,14 @@ async fn sync_local_poi_caches(
                 } else {
                     None
                 };
+                let live_tail_elapsed_ms = live_tail_started.elapsed().as_millis();
                 let local_tip_index = cache.progress().next_event_index.saturating_sub(1);
-                local_caches.write().await.insert(*list_key, cache);
+                let install_started = Instant::now();
+                let install_lock_started = Instant::now();
+                let mut caches = local_caches.write().await;
+                let install_lock_wait_elapsed_ms = install_lock_started.elapsed().as_millis();
+                caches.insert(*list_key, cache);
+                drop(caches);
                 info!(
                     cache_key = %cfg.cache_key,
                     chain_id = cfg.chain.chain_id,
@@ -4032,6 +4112,10 @@ async fn sync_local_poi_caches(
                     base_cid = %refresh.entry.base.cid,
                     delta_count = refresh.entry.deltas.len(),
                     blocked_shields_cid = %refresh.entry.blocked_shields.cid,
+                    artifact_refresh_elapsed_ms,
+                    live_tail_elapsed_ms,
+                    install_lock_wait_elapsed_ms,
+                    install_elapsed_ms = install_started.elapsed().as_millis(),
                     elapsed_ms = sync_started.elapsed().as_millis(),
                     "artifact POI cache sync complete"
                 );
@@ -4073,6 +4157,87 @@ async fn sync_local_poi_caches(
             }
         }
     }
+}
+
+async fn install_persisted_local_poi_caches(
+    db: &DbStore,
+    cfg: &WalletConfig,
+    active_list_keys: &[FixedBytes<32>],
+) -> BTreeMap<FixedBytes<32>, PersistedPoiArtifactCache> {
+    if !matches!(cfg.poi_read_source, PoiReadSource::IndexedArtifacts(_)) {
+        return BTreeMap::new();
+    }
+    let Some(local_caches) = cfg.local_poi_caches.as_ref() else {
+        return BTreeMap::new();
+    };
+
+    let started = Instant::now();
+    let mut loaded = BTreeMap::new();
+    for list_key in active_list_keys {
+        let identity = PoiCacheIdentity::new(
+            EVM_CHAIN_TYPE,
+            cfg.chain.chain_id,
+            DEFAULT_TXID_VERSION,
+            *list_key,
+        );
+        match load_persisted_cache(db, &identity) {
+            Ok(Some(persisted)) => {
+                loaded.insert(*list_key, persisted);
+            }
+            Ok(None) => {}
+            Err(err) => warn!(
+                ?err,
+                cache_key = %cfg.cache_key,
+                chain_id = cfg.chain.chain_id,
+                list_key = %hex::encode(list_key),
+                "failed to load persisted artifact POI cache"
+            ),
+        }
+    }
+
+    let loaded_count = loaded.len();
+    if loaded_count > 0 {
+        let lock_started = Instant::now();
+        let mut caches = local_caches.write().await;
+        let lock_wait_elapsed_ms = lock_started.elapsed().as_millis();
+        for (list_key, persisted) in &loaded {
+            caches.insert(*list_key, persisted.cache.clone());
+        }
+        info!(
+            cache_key = %cfg.cache_key,
+            chain_id = cfg.chain.chain_id,
+            loaded_count,
+            lock_wait_elapsed_ms,
+            elapsed_ms = started.elapsed().as_millis(),
+            "installed persisted artifact POI cache"
+        );
+    }
+
+    loaded
+}
+
+async fn local_poi_caches_available_for_lists(
+    cfg: &WalletConfig,
+    active_list_keys: &[FixedBytes<32>],
+) -> bool {
+    if !matches!(cfg.poi_read_source, PoiReadSource::IndexedArtifacts(_)) {
+        return true;
+    }
+    if active_list_keys.is_empty() {
+        return true;
+    }
+    let Some(local_caches) = cfg.local_poi_caches.as_ref() else {
+        return false;
+    };
+    let caches = local_caches.read().await;
+    active_list_keys.iter().all(|list_key| {
+        caches.get(list_key).is_some_and(|cache| {
+            cache.identity().chain_type == EVM_CHAIN_TYPE
+                && cache.identity().chain_id == cfg.chain.chain_id
+                && cache.identity().txid_version == DEFAULT_TXID_VERSION
+                && cache.progress().next_event_index > 0
+        })
+    })
 }
 
 async fn sync_local_poi_live_tails(
@@ -4172,6 +4337,7 @@ fn spawn_startup_artifact_poi_cache_warmup(
     http_client: Option<reqwest::Client>,
     cfg: WalletConfig,
     active_list_keys: Vec<FixedBytes<32>>,
+    preloaded_caches: BTreeMap<FixedBytes<32>, PersistedPoiArtifactCache>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if !matches!(cfg.poi_read_source, PoiReadSource::IndexedArtifacts(_)) {
         return None;
@@ -4183,7 +4349,14 @@ fn spawn_startup_artifact_poi_cache_warmup(
         "warming artifact POI cache"
     );
     Some(tokio::spawn(async move {
-        sync_local_poi_caches(db.as_ref(), http_client.as_ref(), &cfg, &active_list_keys).await;
+        sync_local_poi_caches(
+            db.as_ref(),
+            http_client.as_ref(),
+            &cfg,
+            &active_list_keys,
+            preloaded_caches,
+        )
+        .await;
     }))
 }
 
@@ -4727,11 +4900,14 @@ pub(crate) fn spawn_wallet_worker(
         let poi_status_client = wallet_poi_status_client(http_client.as_ref());
         let active_poi_list_keys = default_active_poi_list_keys();
         let mut last_live_tail_poll = Instant::now();
+        let preloaded_poi_caches =
+            install_persisted_local_poi_caches(db.as_ref(), &cfg, &active_poi_list_keys).await;
         let mut startup_artifact_warmup = spawn_startup_artifact_poi_cache_warmup(
             Arc::clone(&db),
             http_client.clone(),
             cfg.clone(),
             active_poi_list_keys.clone(),
+            preloaded_poi_caches,
         );
 
         if poi_status_client.is_some() {
@@ -4739,7 +4915,7 @@ pub(crate) fn spawn_wallet_worker(
             debug!(
                 cache_key = %cfg.cache_key,
                 poi_refresh_needed = wallet_poi_status_refresh_needed(&locked, &active_poi_list_keys),
-                "startup wallet POI status refresh deferred until wallet ready"
+                "startup wallet POI status refresh will run after backfill if needed"
             );
         }
 
@@ -5055,17 +5231,70 @@ pub(crate) fn spawn_wallet_worker(
                             if should_persist {
                                 live_metadata_flush.mark_persisted(last_scanned, Instant::now());
                             }
+                            drop(snapshot);
+                            let mut pre_ready_poi_status_changed = false;
+                            let mut pre_ready_poi_status_refresh_elapsed_ms = 0_u128;
+                            let mut pre_ready_local_cache_available = false;
+                            if let Some(client) = poi_status_client.as_ref() {
+                                let refresh_needed = {
+                                    let locked = utxos.read().await;
+                                    wallet_poi_status_refresh_needed_for_selection(
+                                        &locked,
+                                        &active_poi_list_keys,
+                                        WalletPoiRefreshSelection::RequiredOrRecoverable,
+                                    )
+                                };
+                                if refresh_needed {
+                                    pre_ready_local_cache_available = local_poi_caches_available_for_lists(
+                                        &cfg,
+                                        &active_poi_list_keys,
+                                    ).await;
+                                    if pre_ready_local_cache_available {
+                                        let status_refresh_started = Instant::now();
+                                        pre_ready_poi_status_changed = refresh_wallet_poi_statuses_and_persist_with_config(
+                                            client,
+                                            db.as_ref(),
+                                            http_client.as_ref(),
+                                            WalletPoiStatusRefreshPersist {
+                                                cache_store: cache_store.as_ref(),
+                                                cfg: &cfg,
+                                                active_list_keys: &active_poi_list_keys,
+                                                utxos: &utxos,
+                                                last_scanned,
+                                                persist_state: &mut persist_state,
+                                            },
+                                            WalletPoiRefreshSelection::RequiredOrRecoverable,
+                                        )
+                                        .await;
+                                        pre_ready_poi_status_refresh_elapsed_ms =
+                                            status_refresh_started.elapsed().as_millis();
+                                        worker_handle.notify_if_changed(pre_ready_poi_status_changed);
+                                        debug!(
+                                            cache_key = %cfg.cache_key,
+                                            changed = pre_ready_poi_status_changed,
+                                            status_refresh_elapsed_ms = pre_ready_poi_status_refresh_elapsed_ms,
+                                            "pre-ready wallet POI status refresh visible"
+                                        );
+                                        tokio::task::yield_now().await;
+                                    }
+                                }
+                            }
+                            let snapshot = utxos.read().await;
                             let (unspent, spent) = wallet_utxo_counts(&snapshot);
                             backfill_complete_block = Some(last_block);
                             if let Err(err) = ready_tx.send(true) {
                                 debug!(?err, cache_key = %cfg.cache_key, "failed to send ready state");
                             }
+                            worker_handle.notify_if_changed(pre_ready_poi_status_changed);
                             info!(
                                 cache_key = %cfg.cache_key,
                                 last_scanned,
                                 total = snapshot.len(),
                                 unspent,
                                 spent,
+                                pre_ready_poi_status_changed,
+                                pre_ready_local_cache_available,
+                                pre_ready_poi_status_refresh_elapsed_ms,
                                 ready_elapsed_ms = readiness_started.elapsed().as_millis(),
                                 worker_elapsed_ms = worker_started.elapsed().as_millis(),
                                 "wallet backfill complete"
@@ -5096,11 +5325,23 @@ pub(crate) fn spawn_wallet_worker(
                                 if refresh_needed {
                                     set_poi_refreshing(&poi_refreshing_tx, true, &cfg.cache_key);
                                     let warmup_wait_started = Instant::now();
-                                    await_startup_artifact_poi_cache_warmup(
-                                        &mut startup_artifact_warmup,
+                                    let local_cache_available = local_poi_caches_available_for_lists(
                                         &cfg,
-                                        "post_ready_poi_refresh",
+                                        &active_poi_list_keys,
                                     ).await;
+                                    if local_cache_available {
+                                        debug!(
+                                            cache_key = %cfg.cache_key,
+                                            chain_id = cfg.chain.chain_id,
+                                            "post-ready POI refresh using installed local cache without waiting for artifact warmup"
+                                        );
+                                    } else {
+                                        await_startup_artifact_poi_cache_warmup(
+                                            &mut startup_artifact_warmup,
+                                            &cfg,
+                                            "post_ready_poi_refresh",
+                                        ).await;
+                                    }
                                     let warmup_wait_elapsed_ms =
                                         warmup_wait_started.elapsed().as_millis();
                                     let status_refresh_started = Instant::now();
@@ -5117,15 +5358,26 @@ pub(crate) fn spawn_wallet_worker(
                                             persist_state: &mut persist_state,
                                         },
                                         WalletPoiRefreshSelection::RequiredOrRecoverable,
-                                    ).await;
+                                    )
+                                    .await;
                                     let status_refresh_elapsed_ms =
                                         status_refresh_started.elapsed().as_millis();
+                                    worker_handle.notify_if_changed(changed);
+                                    debug!(
+                                        cache_key = %cfg.cache_key,
+                                        changed,
+                                        status_refresh_elapsed_ms,
+                                        elapsed_ms = post_ready_poi_started.elapsed().as_millis(),
+                                        "post-ready wallet POI status refresh visible"
+                                    );
+                                    tokio::task::yield_now().await;
                                     let pending_verification = verify_submitted_pending_output_pois_with_config(
                                         client,
                                         &cfg,
                                         db.as_ref(),
                                         &active_poi_list_keys,
-                                    ).await;
+                                    )
+                                    .await;
                                     let output_recovery_started = Instant::now();
                                     let recovered = recover_missing_output_pois_from_wallet(OutputPoiRecoveryRun {
                                         db: db.as_ref(),
@@ -5141,12 +5393,13 @@ pub(crate) fn spawn_wallet_worker(
                                     let output_recovery_elapsed_ms =
                                         output_recovery_started.elapsed().as_millis();
                                     set_poi_refreshing(&poi_refreshing_tx, false, &cfg.cache_key);
-                                    worker_handle.notify_if_changed(changed);
+                                    worker_handle.notify_if_changed(recovered > 0);
                                     info!(
                                         cache_key = %cfg.cache_key,
                                         changed,
                                         recovered,
                                         pending_observations_elapsed_ms,
+                                        local_cache_available,
                                         warmup_wait_elapsed_ms,
                                         status_refresh_elapsed_ms,
                                         output_recovery_elapsed_ms,
@@ -5379,7 +5632,8 @@ mod tests {
         apply_wallet_delta_to_vec_with_outcome,
         build_output_poi_recovery_chunk_from_public_transaction,
         discard_pending_output_poi_contexts_for_spent_outputs,
-        force_resubmit_matching_pending_output_pois, install_tailed_poi_cache_if_current,
+        force_resubmit_matching_pending_output_pois, install_persisted_local_poi_caches,
+        install_tailed_poi_cache_if_current, local_poi_caches_available_for_lists,
         output_poi_recovery_candidates, output_poi_recovery_proof_retry_after,
         output_start_global_position, pending_output_poi_context_matches_wallet_utxo,
         pending_output_poi_submit_identity, preflight_local_output_poi_input_proofs,
@@ -6811,9 +7065,14 @@ mod tests {
         });
         cfg.local_poi_caches = Some(Arc::clone(&local_caches));
 
-        let handle =
-            spawn_startup_artifact_poi_cache_warmup(Arc::clone(&db), None, cfg, vec![list_key])
-                .expect("startup warmup spawned");
+        let handle = spawn_startup_artifact_poi_cache_warmup(
+            Arc::clone(&db),
+            None,
+            cfg,
+            vec![list_key],
+            BTreeMap::new(),
+        )
+        .expect("startup warmup spawned");
         handle.await.expect("startup warmup joined");
 
         let request = requests
@@ -6833,6 +7092,74 @@ mod tests {
             .expect("read persisted artifact cache")
             .expect("persisted artifact cache");
         assert_eq!(persisted.last_accepted_manifest_sequence, 7);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[tokio::test]
+    async fn startup_installs_persisted_artifact_cache_before_warmup() {
+        let list_key = FixedBytes::from([0x11; 32]);
+        let identity = PoiCacheIdentity::new(EVM_CHAIN_TYPE, 1, DEFAULT_TXID_VERSION, list_key);
+        let mut cache = PoiCache::new(identity.clone());
+        cache
+            .apply_verified_artifact_events(&[poi::artifacts::SnapshotEvent {
+                event_index: 0,
+                blinded_commitment: [0x44; 32],
+                signature: [0_u8; 64],
+                event_type: PoiEventType::Transact,
+            }])
+            .expect("apply artifact event");
+        let expected_root = *cache.current_roots().get(&0).expect("current root");
+        cache.accept_current_roots();
+
+        let root_dir = temp_db_root();
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open temp db"),
+        );
+        let base_descriptor = ArtifactDescriptor::from_bytes("bafybase", b"");
+        let blocked_descriptor = ArtifactDescriptor::from_bytes("bafyblocked", b"");
+        db.put_poi_artifact_cache(&PoiArtifactCacheRecord {
+            chain_type: identity.chain_type,
+            chain_id: identity.chain_id,
+            txid_version: identity.txid_version.clone(),
+            list_key,
+            last_accepted_manifest_sequence: 6,
+            base_descriptor: descriptor_record(&base_descriptor),
+            applied_delta_descriptors: Vec::new(),
+            blocked_shields_descriptor: descriptor_record(&blocked_descriptor),
+            current_tip_index: 0,
+            current_tip_root: expected_root,
+            cache_payload: cache.to_bytes().expect("cache payload"),
+            updated_at: 1,
+        })
+        .expect("seed artifact cache");
+
+        let local_caches = Arc::new(RwLock::new(BTreeMap::new()));
+        let mut cfg = wallet_config(U256::ZERO);
+        cfg.poi_read_source = PoiReadSource::IndexedArtifacts(PoiArtifactSourceConfig {
+            trusted_publisher_pubkey: FixedBytes::from([0x22; 32]),
+            manifest_source: PoiArtifactManifestSource::Url(
+                Url::parse("http://127.0.0.1:1/manifest").expect("manifest URL"),
+            ),
+            gateway_urls: vec![Url::parse("http://127.0.0.1:1").expect("gateway URL")],
+            max_manifest_age: None,
+        });
+        cfg.local_poi_caches = Some(Arc::clone(&local_caches));
+
+        assert!(!local_poi_caches_available_for_lists(&cfg, &[list_key]).await);
+        let installed = install_persisted_local_poi_caches(db.as_ref(), &cfg, &[list_key]).await;
+
+        assert_eq!(installed.len(), 1);
+        assert!(installed.contains_key(&list_key));
+        assert!(local_poi_caches_available_for_lists(&cfg, &[list_key]).await);
+        let locked = local_caches.read().await;
+        let mut installed_cache = locked.get(&list_key).expect("installed cache").clone();
+        assert_eq!(
+            installed_cache.current_roots().get(&0),
+            Some(&expected_root)
+        );
         fs::remove_dir_all(root_dir).expect("remove temp db dir");
     }
 
