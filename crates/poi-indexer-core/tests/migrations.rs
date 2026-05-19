@@ -113,11 +113,25 @@ async fn migrations_apply_and_tables_roundtrip() -> Result<(), Box<dyn std::erro
     .execute(&pool)
     .await?;
 
+    sqlx::query(
+        "INSERT INTO published_manifests \
+         (cid, ipns_sequence, byte_size, content_hash, format_version, ipns_published_at) \
+         VALUES ($1, $2, $3, $4, $5, now())",
+    )
+    .bind("bafymanifestfixture")
+    .bind(1_i64)
+    .bind(96_i64)
+    .bind(vec![7_u8; 32])
+    .bind(2_i32)
+    .execute(&pool)
+    .await?;
+
     assert_eq!(row_count(&pool, "poi_events").await?, 1);
     assert_eq!(row_count(&pool, "blocked_shields").await?, 1);
     assert_eq!(row_count(&pool, "chain_tips").await?, 1);
     assert_eq!(row_count(&pool, "published_snapshots").await?, 1);
     assert_eq!(row_count(&pool, "published_blocked_shields").await?, 1);
+    assert_eq!(row_count(&pool, "published_manifests").await?, 1);
 
     Ok(())
 }
@@ -154,7 +168,7 @@ async fn migrations_skip_when_schema_version_is_current() -> Result<(), Box<dyn 
     .execute(&pool)
     .await?;
     sqlx::query(
-        "INSERT INTO poi_indexer_schema_version (id, version, applied_at) VALUES (TRUE, 4, now())",
+        "INSERT INTO poi_indexer_schema_version (id, version, applied_at) VALUES (TRUE, 5, now())",
     )
     .execute(&pool)
     .await?;
@@ -162,7 +176,7 @@ async fn migrations_skip_when_schema_version_is_current() -> Result<(), Box<dyn 
     run_migrations(&pool).await?;
 
     assert!(!table_exists(&pool, "poi_events").await?);
-    assert_eq!(schema_version(&pool).await?, 4);
+    assert_eq!(schema_version(&pool).await?, 5);
 
     Ok(())
 }
@@ -286,6 +300,10 @@ async fn store_methods_are_idempotent_and_monotonic() -> Result<(), Box<dyn std:
     let switched_upstream_base_cid = new_base_cid;
     let old_blocked_cid = raw_block_cid(b"old blocked")?;
     let new_blocked_cid = raw_block_cid(b"new blocked")?;
+    let old_manifest_cid = raw_block_cid(b"old manifest")?;
+    let new_manifest_cid = raw_block_cid(b"new manifest")?;
+    let abandoned_manifest_cid = raw_block_cid(b"abandoned manifest")?;
+    let failed_manifest_cid = raw_block_cid(b"failed manifest")?;
     let mut tx = store.begin().await?;
     Audit::record_publication(
         &mut tx,
@@ -369,6 +387,12 @@ async fn store_methods_are_idempotent_and_monotonic() -> Result<(), Box<dyn std:
         &[11_u8; 32],
     )
     .await?;
+    Audit::record_manifest_pin(&mut tx, &old_manifest_cid, 10, 96, &[12_u8; 32], 2).await?;
+    Audit::record_manifest_ipns_publication(&mut tx, &old_manifest_cid).await?;
+    Audit::record_manifest_pin(&mut tx, &new_manifest_cid, 11, 112, &[13_u8; 32], 2).await?;
+    Audit::record_manifest_ipns_publication(&mut tx, &new_manifest_cid).await?;
+    Audit::record_manifest_pin(&mut tx, &abandoned_manifest_cid, 12, 88, &[14_u8; 32], 2).await?;
+    Audit::record_manifest_pin(&mut tx, &failed_manifest_cid, 13, 80, &[15_u8; 32], 2).await?;
     tx.commit().await?;
 
     let (total_publications, superseded_publications): (i64, i64) = sqlx::query_as(
@@ -387,6 +411,19 @@ async fn store_methods_are_idempotent_and_monotonic() -> Result<(), Box<dyn std:
         .expect("active blocked-shields publication");
     assert_eq!(active_blocked.cid, new_blocked_cid.to_string());
     assert_eq!(active_blocked.content_hash, [11_u8; 32]);
+    let (total_manifests, active_manifests, superseded_manifests): (i64, i64, i64) =
+        sqlx::query_as(
+            "SELECT \
+             COUNT(*), \
+             COUNT(*) FILTER (WHERE ipns_published_at IS NOT NULL AND superseded_at IS NULL), \
+             COUNT(superseded_at) \
+             FROM published_manifests",
+        )
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(total_manifests, 4);
+    assert_eq!(active_manifests, 1);
+    assert_eq!(superseded_manifests, 2);
     assert!(
         store
             .active_publications(&list_key, 1, upstream_url)
@@ -417,6 +454,20 @@ async fn store_methods_are_idempotent_and_monotonic() -> Result<(), Box<dyn std:
     )
     .execute(&pool)
     .await?;
+    sqlx::query(
+        "UPDATE published_manifests \
+         SET superseded_at = to_timestamp(100) \
+         WHERE superseded_at IS NOT NULL",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "UPDATE published_manifests \
+         SET published_at = to_timestamp(100) \
+         WHERE ipns_published_at IS NULL",
+    )
+    .execute(&pool)
+    .await?;
 
     let ipfs_client = RecordingIpfsClient::default();
     let sweep = Retention::sweep(
@@ -428,7 +479,9 @@ async fn store_methods_are_idempotent_and_monotonic() -> Result<(), Box<dyn std:
     .await?;
     let mut unpinned = ipfs_client.unpinned_cids();
     let mut expected = vec![
+        abandoned_manifest_cid.to_string(),
         delta_cid.to_string(),
+        old_manifest_cid.to_string(),
         old_base_cid.to_string(),
         old_blocked_cid.to_string(),
     ];
@@ -437,6 +490,44 @@ async fn store_methods_are_idempotent_and_monotonic() -> Result<(), Box<dyn std:
     assert_eq!(unpinned, expected);
     assert_eq!(sorted_cids(sweep.unpinned_cids), expected);
     assert_eq!(row_count(&pool, "published_snapshots").await?, 4);
+    assert_eq!(row_count(&pool, "published_manifests").await?, 4);
+
+    let current_pending_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM published_manifests \
+         WHERE cid = $1 \
+             AND ipns_published_at IS NULL \
+             AND superseded_at IS NULL \
+             AND unpinned_at IS NULL",
+    )
+    .bind(failed_manifest_cid.to_string())
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(current_pending_count, 1);
+
+    let mut tx = store.begin().await?;
+    let unpinned_publication =
+        Audit::record_manifest_ipns_publication(&mut tx, &abandoned_manifest_cid)
+            .await
+            .expect_err("unpinned manifest must not be marked IPNS-published");
+    tx.rollback().await?;
+    assert!(matches!(
+        unpinned_publication,
+        poi_indexer_core::audit::AuditError::UnpinnedManifest { .. }
+    ));
+
+    let mut tx = store.begin().await?;
+    Audit::record_manifest_ipns_publication(&mut tx, &failed_manifest_cid).await?;
+    tx.commit().await?;
+    let invalid_published_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM published_manifests \
+         WHERE cid = $1 \
+             AND ipns_published_at IS NOT NULL \
+             AND unpinned_at IS NOT NULL",
+    )
+    .bind(failed_manifest_cid.to_string())
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(invalid_published_count, 0);
 
     let second_sweep = Retention::sweep(
         &pool,

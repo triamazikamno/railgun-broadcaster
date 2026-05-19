@@ -7,7 +7,7 @@ use thiserror::Error;
 use tracing::info;
 
 const IPNS_SEQUENCE_STATE_KEY: &str = "ipns_last_sequence";
-const CURRENT_SCHEMA_VERSION: i32 = 4;
+const CURRENT_SCHEMA_VERSION: i32 = 5;
 
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -593,7 +593,7 @@ CREATE TABLE IF NOT EXISTS poi_indexer_schema_version (
 )
 ";
 
-const VERSIONED_MIGRATIONS: &[(i32, &[&str])] = &[(4, V4_MIGRATIONS)];
+const VERSIONED_MIGRATIONS: &[(i32, &[&str])] = &[(4, V4_MIGRATIONS), (5, V5_MIGRATIONS)];
 
 const V4_MIGRATIONS: &[&str] = &[
     r"
@@ -801,6 +801,34 @@ const V4_MIGRATIONS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS published_blocked_shields_active_lookup ON published_blocked_shields (list_key, chain_id, upstream_url, id) WHERE superseded_at IS NULL",
     "CREATE INDEX IF NOT EXISTS published_blocked_shields_retention_lookup ON published_blocked_shields (superseded_at, unpinned_at, cid) WHERE superseded_at IS NOT NULL AND unpinned_at IS NULL",
     "CREATE INDEX IF NOT EXISTS published_blocked_shields_cid_live_lookup ON published_blocked_shields (cid) WHERE superseded_at IS NULL",
+];
+
+const V5_MIGRATIONS: &[&str] = &[
+    r"
+    CREATE TABLE IF NOT EXISTS published_manifests (
+        id BIGSERIAL PRIMARY KEY,
+        cid TEXT NOT NULL,
+        ipns_sequence BIGINT NOT NULL,
+        byte_size BIGINT NOT NULL,
+        content_hash BYTEA NOT NULL,
+        format_version INTEGER NOT NULL,
+        published_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        ipns_published_at TIMESTAMPTZ,
+        superseded_at TIMESTAMPTZ,
+        unpinned_at TIMESTAMPTZ
+    )
+    ",
+    r"
+    DO $$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'published_manifests_content_hash_len_check') THEN
+            ALTER TABLE published_manifests
+                ADD CONSTRAINT published_manifests_content_hash_len_check CHECK (octet_length(content_hash) = 32);
+        END IF;
+    END $$
+    ",
+    "CREATE INDEX IF NOT EXISTS published_manifests_retention_lookup ON published_manifests (superseded_at, published_at, unpinned_at, cid) WHERE unpinned_at IS NULL",
+    "CREATE INDEX IF NOT EXISTS published_manifests_cid_live_lookup ON published_manifests (cid) WHERE ipns_published_at IS NOT NULL AND superseded_at IS NULL",
 ];
 
 fn decode_fixed_hex<const N: usize>(

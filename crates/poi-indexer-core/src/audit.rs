@@ -135,6 +135,105 @@ impl Audit {
 
         Ok(())
     }
+
+    pub async fn record_manifest_pin(
+        tx: &mut Transaction<'_, Postgres>,
+        cid: &Cid,
+        sequence: u64,
+        byte_size: u64,
+        content_hash: &[u8; 32],
+        format_version: u16,
+    ) -> Result<(), AuditError> {
+        let sequence = u64_to_i64(sequence, "sequence")?;
+        let byte_size = u64_to_i64(byte_size, "byte_size")?;
+        let format_version = i32::from(format_version);
+
+        sqlx::query(
+            r"
+            UPDATE published_manifests
+            SET superseded_at = now()
+            WHERE ipns_published_at IS NULL
+                AND superseded_at IS NULL
+            ",
+        )
+        .execute(&mut **tx)
+        .await?;
+
+        sqlx::query(
+            r"
+            INSERT INTO published_manifests (
+                cid,
+                ipns_sequence,
+                byte_size,
+                content_hash,
+                format_version
+            )
+            VALUES ($1, $2, $3, $4, $5)
+            ",
+        )
+        .bind(cid.to_string())
+        .bind(sequence)
+        .bind(byte_size)
+        .bind(content_hash.as_slice())
+        .bind(format_version)
+        .execute(&mut **tx)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn record_manifest_ipns_publication(
+        tx: &mut Transaction<'_, Postgres>,
+        cid: &Cid,
+    ) -> Result<(), AuditError> {
+        let cid = cid.to_string();
+        let result = sqlx::query(
+            r"
+            UPDATE published_manifests
+            SET ipns_published_at = COALESCE(ipns_published_at, now())
+            WHERE cid = $1
+                AND superseded_at IS NULL
+                AND unpinned_at IS NULL
+            ",
+        )
+        .bind(&cid)
+        .execute(&mut **tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            let (superseded, unpinned): (bool, bool) = sqlx::query_as(
+                r"
+                SELECT
+                    EXISTS(SELECT 1 FROM published_manifests WHERE cid = $1 AND superseded_at IS NOT NULL),
+                    EXISTS(SELECT 1 FROM published_manifests WHERE cid = $1 AND unpinned_at IS NOT NULL)
+                ",
+            )
+            .bind(&cid)
+            .fetch_one(&mut **tx)
+            .await?;
+            if unpinned {
+                return Err(AuditError::UnpinnedManifest { cid });
+            }
+            if superseded {
+                return Err(AuditError::SupersededManifest { cid });
+            }
+            return Err(AuditError::UnrecordedManifest { cid });
+        }
+
+        sqlx::query(
+            r"
+            UPDATE published_manifests
+            SET superseded_at = now()
+            WHERE cid <> $1
+                AND ipns_published_at IS NOT NULL
+                AND superseded_at IS NULL
+            ",
+        )
+        .bind(&cid)
+        .execute(&mut **tx)
+        .await?;
+
+        Ok(())
+    }
 }
 
 pub struct Retention;
@@ -165,6 +264,12 @@ impl Retention {
                 WHERE superseded_at IS NOT NULL
                     AND superseded_at <= to_timestamp($1)
                     AND unpinned_at IS NULL
+                UNION
+                SELECT cid
+                FROM published_manifests
+                WHERE unpinned_at IS NULL
+                    AND superseded_at IS NOT NULL
+                    AND superseded_at <= to_timestamp($1)
             )
             SELECT DISTINCT candidates.cid
             FROM candidates
@@ -180,6 +285,13 @@ impl Retention {
                     WHERE active.cid = candidates.cid
                         AND active.superseded_at IS NULL
                 )
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM published_manifests AS active
+                    WHERE active.cid = candidates.cid
+                        AND active.ipns_published_at IS NOT NULL
+                        AND active.superseded_at IS NULL
+                )
             ORDER BY candidates.cid ASC
             ",
         )
@@ -192,7 +304,7 @@ impl Retention {
         for cid_text in cids {
             let cid = parse_cid(&cid_text)?;
             if let Err(error) = ipfs_client.unpin(&cid).await {
-                warn!(cid = %cid, error = %error, "failed to unpin superseded POI artifact CID");
+                warn!(cid = %cid, error = %error, "failed to unpin superseded POI publication CID");
                 failed_cids.push(RetentionFailure {
                     cid,
                     error: error.to_string(),
@@ -217,6 +329,13 @@ impl Retention {
                         SELECT 1
                         FROM published_blocked_shields AS active
                         WHERE active.cid = $2
+                            AND active.superseded_at IS NULL
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM published_manifests AS active
+                        WHERE active.cid = $2
+                            AND active.ipns_published_at IS NOT NULL
                             AND active.superseded_at IS NULL
                     )
                 ",
@@ -244,6 +363,47 @@ impl Retention {
                         SELECT 1
                         FROM published_blocked_shields AS active
                         WHERE active.cid = $2
+                            AND active.superseded_at IS NULL
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM published_manifests AS active
+                        WHERE active.cid = $2
+                            AND active.ipns_published_at IS NOT NULL
+                            AND active.superseded_at IS NULL
+                    )
+                ",
+            )
+            .bind(swept_at)
+            .bind(&cid_text)
+            .bind(cutoff)
+            .execute(pool)
+            .await?;
+            sqlx::query(
+                r"
+                UPDATE published_manifests
+                SET unpinned_at = to_timestamp($1)
+                WHERE cid = $2
+                    AND unpinned_at IS NULL
+                    AND superseded_at IS NOT NULL
+                    AND superseded_at <= to_timestamp($3)
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM published_snapshots AS active
+                        WHERE active.cid = $2
+                            AND active.superseded_at IS NULL
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM published_blocked_shields AS active
+                        WHERE active.cid = $2
+                            AND active.superseded_at IS NULL
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM published_manifests AS active
+                        WHERE active.cid = $2
+                            AND active.ipns_published_at IS NOT NULL
                             AND active.superseded_at IS NULL
                     )
                 ",
@@ -289,6 +449,12 @@ pub enum AuditError {
     IntegerOutOfRange { field: &'static str, value: String },
     #[error("retention cutoff is before unix epoch")]
     TimeBeforeUnixEpoch,
+    #[error("manifest CID {cid} was not recorded before IPNS publication")]
+    UnrecordedManifest { cid: String },
+    #[error("manifest CID {cid} was superseded before IPNS publication")]
+    SupersededManifest { cid: String },
+    #[error("manifest CID {cid} was unpinned before IPNS publication")]
+    UnpinnedManifest { cid: String },
 }
 
 const fn snapshot_kind_str(kind: SnapshotKind) -> &'static str {

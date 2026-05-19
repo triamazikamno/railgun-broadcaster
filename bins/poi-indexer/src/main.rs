@@ -39,6 +39,7 @@ const FILEBASE_BUCKET_ENV: &str = "POI_INDEXER_FILEBASE_BUCKET";
 const FILEBASE_REGION: &str = "us-east-1";
 const FILEBASE_KEY_PREFIX: &str = "poi-indexer";
 const EVM_CHAIN_TYPE: u8 = 0;
+const RETENTION_SWEEP_INTERVAL_CAP: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Parser)]
 #[command(name = "poi-indexer")]
@@ -286,7 +287,8 @@ async fn run_retention_sweeper(
     retention_interval: Duration,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    let mut interval = tokio::time::interval(retention_interval);
+    let sweep_interval = retention_interval.min(RETENTION_SWEEP_INTERVAL_CAP);
+    let mut interval = tokio::time::interval(sweep_interval);
     loop {
         if interval_tick_or_shutdown(&mut interval, &mut shutdown).await {
             return Ok(());
@@ -686,9 +688,42 @@ impl PublicationScheduler {
             .sign_manifest(&self.signing_key)
             .wrap_err("sign manifest")?;
         let manifest_bytes = serde_json::to_vec(&manifest).wrap_err("serialize manifest")?;
+        let byte_size =
+            u64::try_from(manifest_bytes.len()).wrap_err("manifest byte size overflow")?;
+        let manifest_hash = content_hash(&manifest_bytes);
         let manifest_cid = pin_manifest(self.ipfs_client.as_ref(), &manifest_bytes)
             .await
             .wrap_err("pin manifest to IPFS")?;
+        let audit_result = async {
+            let mut tx = self
+                .store
+                .begin()
+                .await
+                .wrap_err("begin manifest audit transaction")?;
+            Audit::record_manifest_pin(
+                &mut tx,
+                &manifest_cid,
+                sequence,
+                byte_size,
+                &manifest_hash,
+                FORMAT_VERSION,
+            )
+            .await
+            .wrap_err("record manifest pin")?;
+            tx.commit().await.wrap_err("commit manifest pin audit")?;
+            Ok::<(), eyre::Report>(())
+        }
+        .await;
+        if let Err(error) = audit_result {
+            if let Err(unpin_error) = self.ipfs_client.unpin(&manifest_cid).await {
+                warn!(
+                    cid = %manifest_cid,
+                    error = %unpin_error,
+                    "failed to unpin unaudited POI manifest CID"
+                );
+            }
+            return Err(error);
+        }
         let manifest_cid = manifest_cid.to_string();
 
         self.status
@@ -698,7 +733,8 @@ impl PublicationScheduler {
         info!(
             manifest_cid = %manifest_cid,
             sequence,
-            byte_size = manifest_bytes.len(),
+            byte_size,
+            sha256 = %prefixed_hex(&manifest_hash),
             "published POI manifest"
         );
         Ok(Some(PublishedManifest {
@@ -765,6 +801,18 @@ impl PublicationScheduler {
             .publish_manifest_cid(manifest_cid, sequence)
             .await
             .wrap_err("publish manifest CID to IPNS")?;
+        let parsed_cid = manifest_cid
+            .parse()
+            .wrap_err_with(|| format!("parse published manifest CID {manifest_cid}"))?;
+        let mut tx = self
+            .store
+            .begin()
+            .await
+            .wrap_err("begin manifest IPNS audit transaction")?;
+        Audit::record_manifest_ipns_publication(&mut tx, &parsed_cid)
+            .await
+            .wrap_err("record manifest IPNS publication")?;
+        tx.commit().await.wrap_err("commit manifest IPNS audit")?;
         info!(manifest_cid, sequence, "published POI manifest CID to IPNS");
         Ok(())
     }

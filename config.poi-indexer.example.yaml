@@ -58,7 +58,7 @@ delta_publish_interval: "10m"
 # Cadence for rebuilding the base snapshot and resetting the delta chain.
 base_rebuild_interval: "24h"
 
-# How long superseded snapshot CIDs should remain pinned after replacement.
+# How long superseded artifact and manifest CIDs should remain pinned after replacement.
 retention_interval: "168h"
 
 # Maximum number of (list_key, chain_id) pairs synced concurrently.

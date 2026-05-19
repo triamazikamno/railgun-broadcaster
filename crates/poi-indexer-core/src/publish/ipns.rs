@@ -100,6 +100,8 @@ pub struct IpnsPublisherTask {
 struct PublishRequest {
     manifest_cid: String,
     sequence: u64,
+    timeout: Duration,
+    deadline: time::Instant,
     response: oneshot::Sender<Result<IpnsPublication, IpnsError>>,
 }
 
@@ -142,18 +144,22 @@ impl IpnsPublisher {
         sequence: u64,
     ) -> Result<IpnsPublication, IpnsError> {
         let (response_tx, response_rx) = oneshot::channel();
-        self.requests
-            .send(PublishRequest {
-                manifest_cid: manifest_cid.to_string(),
-                sequence,
-                response: response_tx,
-            })
-            .await
-            .map_err(|_| IpnsError::PublisherUnavailable)?;
+        let deadline = time::Instant::now() + self.publish_timeout;
+        let request = PublishRequest {
+            manifest_cid: manifest_cid.to_string(),
+            sequence,
+            timeout: self.publish_timeout,
+            deadline,
+            response: response_tx,
+        };
 
-        time::timeout(self.publish_timeout, response_rx)
+        time::timeout_at(deadline, self.requests.send(request))
             .await
             .map_err(|_| IpnsError::Timeout(self.publish_timeout))?
+            .map_err(|_| IpnsError::PublisherUnavailable)?;
+
+        response_rx
+            .await
             .map_err(|_| IpnsError::PublisherResponseDropped)?
     }
 }
@@ -187,9 +193,12 @@ impl IpnsPublisherTask {
                 &mut pending,
                 &mut active,
                 bootstrap_completed,
+                time::Instant::now(),
             );
+            let pending_deadline = next_pending_deadline(&pending);
 
             tokio::select! {
+                () = sleep_until_deadline(pending_deadline), if pending_deadline.is_some() => {}
                 _ = bootstrap_interval.tick() => {
                     dial_bootstrap_peers(&mut swarm, &self.config)?;
                     start_bootstrap(&mut swarm);
@@ -236,6 +245,10 @@ struct ActivePublish {
 }
 
 impl PublishRequest {
+    fn is_expired(&self, now: time::Instant) -> bool {
+        now >= self.deadline
+    }
+
     fn respond(self, result: Result<IpnsPublication, IpnsError>) {
         let _ = self.response.send(result);
     }
@@ -331,7 +344,9 @@ fn maybe_start_publish(
     pending: &mut VecDeque<PublishRequest>,
     active: &mut Option<ActivePublish>,
     bootstrap_completed: bool,
+    now: time::Instant,
 ) {
+    discard_unpublishable_pending(pending, now);
     if active.is_some()
         || pending.is_empty()
         || !has_enough_connected_peers_for_publish(swarm, bootstrap_completed)
@@ -435,6 +450,7 @@ fn handle_swarm_event(
                 pending,
                 active,
                 *bootstrap_completed,
+                time::Instant::now(),
             );
         }
         SwarmEvent::Behaviour(IpnsBehaviourEvent::Kad(kad::Event::OutboundQueryProgressed {
@@ -460,6 +476,7 @@ fn handle_swarm_event(
                         pending,
                         active,
                         *bootstrap_completed,
+                        time::Instant::now(),
                     );
                 }
             }
@@ -476,6 +493,7 @@ fn handle_swarm_event(
                 pending,
                 active,
                 *bootstrap_completed,
+                time::Instant::now(),
             );
         }
         SwarmEvent::ConnectionClosed { peer_id, .. } => {
@@ -489,6 +507,44 @@ fn handle_swarm_event(
             );
         }
         _ => {}
+    }
+}
+
+fn discard_unpublishable_pending(pending: &mut VecDeque<PublishRequest>, now: time::Instant) {
+    let mut retained = VecDeque::with_capacity(pending.len());
+    while let Some(request) = pending.pop_front() {
+        if request.response.is_closed() {
+            debug!(
+                manifest_cid = %request.manifest_cid,
+                sequence = request.sequence,
+                "dropped canceled IPNS publish request"
+            );
+        } else if request.is_expired(now) {
+            debug!(
+                manifest_cid = %request.manifest_cid,
+                sequence = request.sequence,
+                "expired pending IPNS publish request"
+            );
+            let timeout = request.timeout;
+            request.respond(Err(IpnsError::Timeout(timeout)));
+        } else {
+            retained.push_back(request);
+        }
+    }
+    *pending = retained;
+}
+
+fn next_pending_deadline(pending: &VecDeque<PublishRequest>) -> Option<time::Instant> {
+    pending
+        .iter()
+        .filter(|request| !request.response.is_closed())
+        .map(|request| request.deadline)
+        .min()
+}
+
+async fn sleep_until_deadline(deadline: Option<time::Instant>) {
+    if let Some(deadline) = deadline {
+        time::sleep_until(deadline).await;
     }
 }
 
@@ -779,5 +835,72 @@ mod tests {
             manifest_ipfs_path(&format!("/ipfs/{EMPTY_RAW_CID}")).expect("valid cid"),
             format!("/ipfs/{EMPTY_RAW_CID}")
         );
+    }
+
+    #[tokio::test]
+    async fn expired_pending_publish_request_is_failed_and_removed() {
+        let now = time::Instant::now();
+        let timeout = Duration::from_secs(1);
+        let (response_tx, response_rx) = oneshot::channel();
+        let mut pending = VecDeque::from([PublishRequest {
+            manifest_cid: EMPTY_RAW_CID.to_string(),
+            sequence: 1,
+            timeout,
+            deadline: now,
+            response: response_tx,
+        }]);
+
+        discard_unpublishable_pending(&mut pending, now + Duration::from_millis(1));
+
+        assert!(pending.is_empty());
+        match response_rx.await.expect("timeout response") {
+            Err(IpnsError::Timeout(actual_timeout)) => assert_eq!(actual_timeout, timeout),
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn canceled_pending_publish_request_is_removed() {
+        let now = time::Instant::now();
+        let timeout = Duration::from_secs(1);
+        let (response_tx, response_rx) = oneshot::channel();
+        drop(response_rx);
+        let mut pending = VecDeque::from([PublishRequest {
+            manifest_cid: EMPTY_RAW_CID.to_string(),
+            sequence: 1,
+            timeout,
+            deadline: now + timeout,
+            response: response_tx,
+        }]);
+
+        discard_unpublishable_pending(&mut pending, now);
+
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn queued_publish_timeout_is_owned_by_publisher_task()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let timeout = Duration::from_millis(10);
+        let config = IpnsPublisherConfig {
+            bootstrap_peers: Vec::new(),
+            record_lifetime: Duration::from_secs(60 * 60),
+            record_ttl: Duration::from_secs(60),
+            publish_timeout: timeout,
+        };
+        let signing_key = SigningKey::from_bytes(&[11_u8; 32]);
+        let (publisher, publisher_task) = IpnsPublisher::new(&signing_key, config)?;
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let publisher_task = tokio::spawn(async move { publisher_task.run(shutdown_rx).await });
+
+        let result = publisher.publish_manifest_cid(EMPTY_RAW_CID, 1).await;
+
+        let _ = shutdown_tx.send(true);
+        publisher_task.await??;
+        match result {
+            Err(IpnsError::Timeout(actual_timeout)) => assert_eq!(actual_timeout, timeout),
+            other => panic!("unexpected publish result: {other:?}"),
+        }
+        Ok(())
     }
 }
