@@ -2417,6 +2417,11 @@ async fn prepare_desktop_unshield_public_broadcaster(
         return Err(eyre!("selected token does not support unwrap-to-native"));
     }
 
+    let mut grant = request
+        .vault_store
+        .create_spend_grant(request.vault_password.as_str())
+        .wrap_err("authorize public broadcaster unshield spend")?;
+
     let PublicBroadcasterSetup {
         chain_defaults,
         broadcaster,
@@ -2531,10 +2536,6 @@ async fn prepare_desktop_unshield_public_broadcaster(
         .as_ref()
         .map_or(U256::ZERO, |estimate| estimate.fee_amount);
 
-    let mut grant = request
-        .vault_store
-        .create_spend_grant(request.vault_password.as_str())
-        .wrap_err("authorize public broadcaster unshield spend")?;
     let signer = request
         .vault_store
         .railgun_spend_signer(&mut grant, request.view_session.wallet_id())
@@ -2738,6 +2739,11 @@ async fn prepare_desktop_send_public_broadcaster(
         ));
     }
 
+    let mut grant = request
+        .vault_store
+        .create_spend_grant(request.vault_password.as_str())
+        .wrap_err("authorize public broadcaster send spend")?;
+
     let recipient = parse_railgun_recipient(&request.recipient)?;
     let PublicBroadcasterSetup {
         chain_defaults,
@@ -2845,10 +2851,6 @@ async fn prepare_desktop_send_public_broadcaster(
         .as_ref()
         .map_or(U256::ZERO, |estimate| estimate.fee_amount);
 
-    let mut grant = request
-        .vault_store
-        .create_spend_grant(request.vault_password.as_str())
-        .wrap_err("authorize public broadcaster send spend")?;
     let signer = request
         .vault_store
         .railgun_spend_signer(&mut grant, request.view_session.wallet_id())

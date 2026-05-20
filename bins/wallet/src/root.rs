@@ -104,8 +104,9 @@ const LOGS_DRAWER_MIN_HEIGHT: Pixels = px(160.0);
 const LOGS_DRAWER_MAX_HEIGHT: Pixels = px(600.0);
 const BROADCASTER_PICKER_MAX_HEIGHT: Pixels = px(680.0);
 const BROADCASTER_PICKER_LIVE_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
-const PRIVATE_ACTION_FORM_MAX_HEIGHT: Pixels = px(760.0);
+const PRIVATE_ACTION_FORM_MAX_HEIGHT: Pixels = px(820.0);
 const PRIVATE_ASSET_LIST_WIDTH: Pixels = px(760.0);
+const PRIVATE_BROADCASTER_PROGRESS_DIALOG_WIDTH: Pixels = px(560.0);
 const PUBLIC_ACCOUNT_DIALOG_WIDTH: Pixels = px(460.0);
 const PUBLIC_ADDRESS_QR_DIALOG_WIDTH: Pixels = px(440.0);
 const PUBLIC_ACTION_DIALOG_WIDTH: Pixels = px(520.0);
@@ -132,6 +133,14 @@ const PUBLIC_ACCOUNT_IDENTICON_COLORS: [u32; 8] = [
     theme::BLUE,
     theme::OLIVE,
 ];
+const PRIVATE_BROADCASTER_PROGRESS_STAGES: [TransactionGenerationStage; 6] = [
+    TransactionGenerationStage::SelectingPrivateNotes,
+    TransactionGenerationStage::ProvingTransaction,
+    TransactionGenerationStage::EstimatingBroadcasterFee,
+    TransactionGenerationStage::GeneratingPoiProofs,
+    TransactionGenerationStage::PublishingToBroadcaster,
+    TransactionGenerationStage::WaitingForBroadcasterResponse,
+];
 const HERO_STAGE_MAX_WIDTH: Pixels = px(1440.0);
 const HERO_WIDE_BREAKPOINT: Pixels = px(1280.0);
 const HERO_MEDIUM_BREAKPOINT: Pixels = px(720.0);
@@ -145,6 +154,12 @@ const UNSHIELD_SPINNER_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const UTXO_AGE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const COST_ESTIMATE_DEBOUNCE: Duration = Duration::from_secs(1);
 const PUBLIC_BROADCASTER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
+const SEND_MISSING_PASSWORD_ERROR: &str = "Enter the vault password to prepare this send";
+const UNSHIELD_MISSING_PASSWORD_ERROR: &str = "Enter the vault password to prepare this unshield";
+const SEND_AUTHORIZATION_FAILED_ERROR: &str =
+    "authorize public broadcaster send spend: unlock failed";
+const UNSHIELD_AUTHORIZATION_FAILED_ERROR: &str =
+    "authorize public broadcaster unshield spend: unlock failed";
 const SECONDS_PER_MINUTE: u64 = 60;
 const SECONDS_PER_HOUR: u64 = 60 * SECONDS_PER_MINUTE;
 const SECONDS_PER_DAY: u64 = 24 * SECONDS_PER_HOUR;
@@ -1126,8 +1141,8 @@ enum WalletTab {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum DeliveryMode {
-    #[default]
     ManualCalldata,
+    #[default]
     PublicBroadcaster,
     SelfBroadcast,
 }
@@ -1158,6 +1173,28 @@ struct PublicActionStepState {
     status: PublicActionStepStatus,
     tx_hash: Option<Arc<str>>,
     message: Option<Arc<str>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PrivateBroadcasterProgressStepState {
+    stage: TransactionGenerationStage,
+    status: PublicActionStepStatus,
+    message: Option<Arc<str>>,
+}
+
+struct PrivateBroadcasterProgressState {
+    kind: DeliveryFormKind,
+    key: UnshieldAssetKey,
+    generation_id: u64,
+    asset_label: Arc<str>,
+    icon_path: Option<PathBuf>,
+    recipient: Arc<str>,
+    steps: Vec<PrivateBroadcasterProgressStepState>,
+    estimate: Option<PublicBroadcasterCostEstimate>,
+    result: Option<PublicBroadcasterSubmissionResult>,
+    error: Option<Arc<str>>,
+    dialog_open: bool,
+    stage_seen: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1212,6 +1249,11 @@ struct PublicAccountDialogContent {
 }
 
 struct PublicActionDialogContent {
+    root: Entity<WalletRoot>,
+    content_width: Pixels,
+}
+
+struct PrivateBroadcasterProgressDialogContent {
     root: Entity<WalletRoot>,
     content_width: Pixels,
 }
@@ -1284,6 +1326,24 @@ impl Render for PublicActionDialogContent {
         self.root
             .read(cx)
             .render_public_action_dialog_content(self.root.clone(), self.content_width)
+    }
+}
+
+impl PrivateBroadcasterProgressDialogContent {
+    fn new(root: Entity<WalletRoot>, content_width: Pixels, cx: &mut Context<'_, Self>) -> Self {
+        cx.observe(&root, |_this, _root, cx| cx.notify()).detach();
+        Self {
+            root,
+            content_width,
+        }
+    }
+}
+
+impl Render for PrivateBroadcasterProgressDialogContent {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        self.root
+            .read(cx)
+            .render_private_broadcaster_progress_dialog_content(self.content_width)
     }
 }
 
@@ -2086,6 +2146,7 @@ pub(crate) struct WalletRoot {
     unshield_generation_seq: u64,
     cost_estimate_seq: u64,
     unshield_forms: BTreeMap<UnshieldAssetKey, UnshieldFormState>,
+    private_broadcaster_progress: Option<PrivateBroadcasterProgressState>,
     broadcaster_picker: Option<BroadcasterPickerState>,
     unshield_spinner_tick: usize,
     repair_cache_block_input: Entity<InputState>,
@@ -2316,6 +2377,7 @@ impl WalletRoot {
             unshield_generation_seq: 0,
             cost_estimate_seq: 0,
             unshield_forms: BTreeMap::new(),
+            private_broadcaster_progress: None,
             broadcaster_picker: None,
             unshield_spinner_tick: 0,
             repair_cache_block_input,
@@ -2792,6 +2854,7 @@ impl WalletRoot {
         self.unshield_forms.clear();
         self.clear_public_wallet_runtime_state();
         self.private_action_form = None;
+        self.private_broadcaster_progress = None;
         self.broadcaster_picker = None;
         self.active_wallet_tab = WalletTab::default();
         for state in self.chain_states.values_mut() {
@@ -4431,6 +4494,7 @@ impl WalletRoot {
         self.send_forms.clear();
         self.unshield_forms.clear();
         self.private_action_form = None;
+        self.private_broadcaster_progress = None;
         self.broadcaster_picker = None;
         self.clear_public_chain_balance_state();
         self.sync_utxo_table(cx);
@@ -5374,6 +5438,7 @@ impl WalletRoot {
         self.unshield_forms.clear();
         self.reset_public_wallet_state(window, cx);
         self.private_action_form = None;
+        self.private_broadcaster_progress = None;
         self.broadcaster_picker = None;
         self.active_wallet_tab = WalletTab::default();
         self.setup_password = None;
@@ -5401,6 +5466,13 @@ impl WalletRoot {
             self.private_action_form = None;
             self.broadcaster_picker = None;
         }
+        if self
+            .private_broadcaster_progress
+            .as_ref()
+            .is_some_and(|progress| progress.kind == DeliveryFormKind::Send && progress.key == key)
+        {
+            self.private_broadcaster_progress = None;
+        }
         cx.notify();
     }
 
@@ -5413,6 +5485,15 @@ impl WalletRoot {
         {
             self.private_action_form = None;
             self.broadcaster_picker = None;
+        }
+        if self
+            .private_broadcaster_progress
+            .as_ref()
+            .is_some_and(|progress| {
+                progress.kind == DeliveryFormKind::Unshield && progress.key == key
+            })
+        {
+            self.private_broadcaster_progress = None;
         }
         cx.notify();
     }
@@ -5449,6 +5530,172 @@ impl WalletRoot {
                 })
                 .child(content.clone())
         });
+    }
+
+    fn start_private_broadcaster_progress(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        generation_id: u64,
+        asset_label: String,
+        icon_path: Option<PathBuf>,
+        recipient: String,
+        estimate: Option<PublicBroadcasterCostEstimate>,
+    ) {
+        let asset_label = Arc::<str>::from(asset_label);
+        let dialog_open = self
+            .private_broadcaster_progress
+            .as_ref()
+            .is_some_and(|progress| progress.dialog_open);
+        self.private_broadcaster_progress = Some(PrivateBroadcasterProgressState {
+            kind,
+            key,
+            generation_id,
+            asset_label: Arc::clone(&asset_label),
+            icon_path,
+            recipient: Arc::from(recipient),
+            steps: private_broadcaster_progress_steps(),
+            estimate,
+            result: None,
+            error: None,
+            dialog_open,
+            stage_seen: false,
+        });
+    }
+
+    fn show_private_broadcaster_progress_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(progress) = self.private_broadcaster_progress.as_mut() else {
+            return;
+        };
+        if progress.dialog_open {
+            return;
+        }
+        progress.dialog_open = true;
+        let kind = progress.kind;
+        let key = progress.key;
+        let generation_id = progress.generation_id;
+        let asset_label = Arc::clone(&progress.asset_label);
+        let icon_path = progress.icon_path.clone();
+        let content_root = cx.entity();
+        let dialog_width =
+            (window.viewport_size().width * 0.92).min(PRIVATE_BROADCASTER_PROGRESS_DIALOG_WIDTH);
+        let content_width = secondary_dialog_content_width(dialog_width);
+        let content = cx.new(|cx| {
+            PrivateBroadcasterProgressDialogContent::new(content_root, content_width, cx)
+        });
+        let close_root = cx.entity();
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            let close_root = close_root.clone();
+            dialog
+                .w(dialog_width)
+                .title(private_action_title_row(
+                    private_broadcaster_dialog_title_action(kind),
+                    asset_label.as_ref(),
+                    icon_path.clone(),
+                ))
+                .on_close(move |_event, _window, cx| {
+                    close_root.update(cx, |root, cx| {
+                        if let Some(progress) = root.private_broadcaster_progress.as_mut()
+                            && progress.kind == kind
+                            && progress.key == key
+                            && progress.generation_id == generation_id
+                        {
+                            progress.dialog_open = false;
+                            cx.notify();
+                        }
+                    });
+                })
+                .child(content.clone())
+        });
+    }
+
+    fn update_private_broadcaster_progress_stage(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        generation_id: u64,
+        stage: TransactionGenerationStage,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        let Some(progress) = self.private_broadcaster_progress.as_mut() else {
+            return false;
+        };
+        if progress.kind != kind
+            || progress.key != key
+            || progress.generation_id != generation_id
+            || progress.result.is_some()
+            || progress.error.is_some()
+        {
+            return false;
+        }
+        let should_open_dialog = !progress.stage_seen && !progress.dialog_open;
+        progress.stage_seen = true;
+        apply_private_broadcaster_progress_stage(&mut progress.steps, stage);
+        cx.notify();
+        should_open_dialog
+    }
+
+    fn finish_private_broadcaster_progress(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        generation_id: u64,
+        final_stage: TransactionGenerationStage,
+        result: PublicBroadcasterSubmissionResult,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(progress) = self.private_broadcaster_progress.as_mut() else {
+            return;
+        };
+        if progress.kind != kind
+            || progress.key != key
+            || progress.generation_id != generation_id
+            || progress.result.is_some()
+            || progress.error.is_some()
+        {
+            return;
+        }
+        finish_private_broadcaster_progress_steps_at_stage(
+            &mut progress.steps,
+            final_stage,
+            &result.result,
+        );
+        progress.result = Some(result);
+        progress.error = None;
+        cx.notify();
+    }
+
+    fn fail_private_broadcaster_progress(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        generation_id: u64,
+        final_stage: TransactionGenerationStage,
+        message: String,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(progress) = self.private_broadcaster_progress.as_mut() else {
+            return;
+        };
+        if progress.kind != kind
+            || progress.key != key
+            || progress.generation_id != generation_id
+            || progress.result.is_some()
+            || progress.error.is_some()
+        {
+            return;
+        }
+        fail_private_broadcaster_progress_steps_at_stage(
+            &mut progress.steps,
+            final_stage,
+            message.as_str(),
+        );
+        progress.error = Some(Arc::from(message));
+        cx.notify();
     }
 
     fn open_repair_cache_dialog(window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -5497,10 +5744,18 @@ impl WalletRoot {
         cx.subscribe_in(
             &password_input,
             window,
-            move |this, _input, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
+            move |this, _input, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { .. } => {
                     this.generate_send_calldata_from_form(key, window, cx);
                 }
+                InputEvent::Change => {
+                    this.clear_private_action_missing_password_error(
+                        DeliveryFormKind::Send,
+                        key,
+                        cx,
+                    );
+                }
+                _ => {}
             },
         )
         .detach();
@@ -5533,6 +5788,7 @@ impl WalletRoot {
         .detach();
         self.send_forms.clear();
         self.unshield_forms.clear();
+        self.private_broadcaster_progress = None;
         self.broadcaster_picker = None;
         let selected_fee_token =
             self.default_public_broadcaster_fee_token(key.chain_id, key.token, false, false);
@@ -5543,7 +5799,7 @@ impl WalletRoot {
                 recipient_input,
                 amount_input,
                 password_input,
-                delivery_mode: DeliveryMode::ManualCalldata,
+                delivery_mode: DeliveryMode::PublicBroadcaster,
                 selected_fee_token,
                 broadcaster_choice: BroadcasterChoice::Random,
                 broadcaster_fee_mode: PublicBroadcasterFeeMode::DeductFromAmount,
@@ -5565,6 +5821,8 @@ impl WalletRoot {
             kind: DeliveryFormKind::Send,
             key,
         });
+        self.refresh_public_broadcaster_anchor(DeliveryFormKind::Send, key, cx);
+        self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
         Self::open_private_action_dialog(
             DeliveryFormKind::Send,
             key,
@@ -5592,6 +5850,7 @@ impl WalletRoot {
         if form.generating
             || (form.result.is_none()
                 && form.error.is_none()
+                && form.cost_estimate.is_none()
                 && !form.cost_estimate_pending
                 && !form.estimating_cost)
         {
@@ -5599,6 +5858,7 @@ impl WalletRoot {
         }
         form.result = None;
         form.error = None;
+        form.cost_estimate = None;
         form.estimate_id = 0;
         form.cost_estimate_pending = false;
         form.estimating_cost = false;
@@ -5898,6 +6158,7 @@ impl WalletRoot {
             DeliveryFormKind::Send => {
                 if let Some(form) = self.send_forms.get_mut(&key) {
                     form.estimate_id = estimate_id;
+                    form.cost_estimate = None;
                     form.cost_estimate_pending = false;
                     form.estimating_cost = false;
                     form.error = None;
@@ -5906,6 +6167,7 @@ impl WalletRoot {
             DeliveryFormKind::Unshield => {
                 if let Some(form) = self.unshield_forms.get_mut(&key) {
                     form.estimate_id = estimate_id;
+                    form.cost_estimate = None;
                     form.cost_estimate_pending = false;
                     form.estimating_cost = false;
                     form.error = None;
@@ -5938,6 +6200,7 @@ impl WalletRoot {
             DeliveryFormKind::Send => {
                 if let Some(form) = self.send_forms.get_mut(&key) {
                     form.estimate_id = estimate_id;
+                    form.cost_estimate = None;
                     form.cost_estimate_pending = true;
                     form.estimating_cost = false;
                     form.error = None;
@@ -5946,6 +6209,7 @@ impl WalletRoot {
             DeliveryFormKind::Unshield => {
                 if let Some(form) = self.unshield_forms.get_mut(&key) {
                     form.estimate_id = estimate_id;
+                    form.cost_estimate = None;
                     form.cost_estimate_pending = true;
                     form.estimating_cost = false;
                     form.error = None;
@@ -6048,25 +6312,22 @@ impl WalletRoot {
             form.broadcaster_fee_mode,
         );
         let allow_suspicious_broadcasters = form.allow_suspicious_broadcasters;
-        if parse_railgun_recipient(recipient.as_str()).is_err() {
+        if let Some(error) = send_public_broadcaster_estimate_input_error(
+            recipient.as_str(),
+            amount_raw.as_str(),
+            &asset,
+        ) {
+            self.set_send_form_error(key, error, cx);
+            return;
+        }
+        if recipient.is_empty() {
             self.clear_pending_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
             return;
         }
-        let amount = match parse_send_amount(amount_raw.as_str(), asset.decimals) {
-            Ok(amount) if !amount.is_zero() => amount,
-            Ok(_) | Err(_) => {
-                self.clear_pending_public_broadcaster_cost_estimate(
-                    DeliveryFormKind::Send,
-                    key,
-                    cx,
-                );
-                return;
-            }
+        let Ok(amount) = parse_send_amount(amount_raw.as_str(), asset.decimals) else {
+            self.clear_pending_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
+            return;
         };
-        if amount > asset.max_batched {
-            self.clear_pending_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
-            return;
-        }
         let Some(ChainUtxoState::Ready { session, .. }) = self.chain_states.get(&asset.chain_id)
         else {
             self.clear_pending_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
@@ -6130,6 +6391,7 @@ impl WalletRoot {
                         form.cost_estimate = Some(estimate);
                     }
                     Err(error) => {
+                        form.cost_estimate = None;
                         form.error = Some(Arc::from(format_report_chain(&error)));
                     }
                 }
@@ -6299,6 +6561,41 @@ impl WalletRoot {
             }),
         };
         if changed {
+            cx.notify();
+        }
+    }
+
+    fn clear_private_action_missing_password_error(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let cleared = match kind {
+            DeliveryFormKind::Send => self.send_forms.get_mut(&key).is_some_and(|form| {
+                if form.generating
+                    || !form.error.as_deref().is_some_and(|error| {
+                        should_clear_private_action_error_on_password_change(kind, error)
+                    })
+                {
+                    return false;
+                }
+                form.error = None;
+                true
+            }),
+            DeliveryFormKind::Unshield => self.unshield_forms.get_mut(&key).is_some_and(|form| {
+                if form.generating
+                    || !form.error.as_deref().is_some_and(|error| {
+                        should_clear_private_action_error_on_password_change(kind, error)
+                    })
+                {
+                    return false;
+                }
+                form.error = None;
+                true
+            }),
+        };
+        if cleared {
             cx.notify();
         }
     }
@@ -6549,7 +6846,7 @@ impl WalletRoot {
 
         let password_empty = password_input.read(cx).value().trim().is_empty();
         if password_empty {
-            self.set_send_form_error(key, "Enter the vault password to prepare this send", cx);
+            self.set_send_form_error(key, SEND_MISSING_PASSWORD_ERROR, cx);
             return;
         }
         let vault_password = Self::read_and_clear_input(&password_input, window, cx);
@@ -6568,6 +6865,18 @@ impl WalletRoot {
             form.result = None;
         }
         cx.notify();
+
+        if delivery_mode == DeliveryMode::PublicBroadcaster {
+            self.start_private_broadcaster_progress(
+                DeliveryFormKind::Send,
+                key,
+                generation_id,
+                asset.label.clone(),
+                asset.icon_path.clone(),
+                recipient.clone(),
+                cost_estimate.clone(),
+            );
+        }
 
         let http = self.http.clone();
         let waku = Arc::clone(&self.waku);
@@ -6629,31 +6938,68 @@ impl WalletRoot {
                 return;
             }
         };
-        Self::watch_send_generation_stage(key, generation_id, progress_rx, cx);
+        let terminal_progress_rx = progress_rx.clone();
+        Self::watch_send_generation_stage(key, generation_id, progress_rx, window, cx);
         cx.spawn(async move |this, cx| {
             let result = join
                 .await
                 .unwrap_or_else(|error| Err(eyre::eyre!("send generation task failed: {error}")));
+            let final_stage = *terminal_progress_rx.borrow();
             let _ = this.update(cx, |root, cx| {
-                let Some(form) = root.send_forms.get_mut(&key) else {
-                    return;
-                };
-                if form.asset.chain_id != chain_id || form.asset.token != token {
-                    return;
-                }
-                if form.generation_id != generation_id || !form.generating {
-                    return;
-                }
-                form.generating = false;
-                match result {
-                    Ok(result) => {
-                        form.error = None;
-                        form.result = Some(result);
+                let mut progress_result = None;
+                let mut progress_error = None;
+                {
+                    let Some(form) = root.send_forms.get_mut(&key) else {
+                        return;
+                    };
+                    if form.asset.chain_id != chain_id || form.asset.token != token {
+                        return;
                     }
-                    Err(error) => {
-                        form.result = None;
-                        form.error = Some(Arc::from(format_report_chain(&error)));
+                    if form.generation_id != generation_id || !form.generating {
+                        return;
                     }
+                    form.generating = false;
+                    match result {
+                        Ok(result) => {
+                            if let SendResult::PublicBroadcaster(result) = &result {
+                                progress_result = Some((**result).clone());
+                            }
+                            form.error = None;
+                            form.result = Some(result);
+                        }
+                        Err(error) => {
+                            let message = format_report_chain(&error);
+                            progress_error = Some(message.clone());
+                            if form_error_clears_public_broadcaster_cost_estimate(
+                                DeliveryFormKind::Send,
+                                message.as_str(),
+                            ) {
+                                form.cost_estimate = None;
+                            }
+                            form.result = None;
+                            form.error = Some(Arc::from(message));
+                        }
+                    }
+                }
+                if let Some(result) = progress_result {
+                    root.finish_private_broadcaster_progress(
+                        DeliveryFormKind::Send,
+                        key,
+                        generation_id,
+                        final_stage,
+                        result,
+                        cx,
+                    );
+                }
+                if let Some(message) = progress_error {
+                    root.fail_private_broadcaster_progress(
+                        DeliveryFormKind::Send,
+                        key,
+                        generation_id,
+                        final_stage,
+                        message,
+                        cx,
+                    );
                 }
                 cx.notify();
             });
@@ -6665,20 +7011,48 @@ impl WalletRoot {
         key: UnshieldAssetKey,
         generation_id: u64,
         mut progress_rx: watch::Receiver<TransactionGenerationStage>,
+        window: &Window,
         cx: &Context<'_, Self>,
     ) {
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             while progress_rx.changed().await.is_ok() {
                 let stage = *progress_rx.borrow_and_update();
                 if this
-                    .update(cx, |root, cx| {
+                    .update_in(cx, |root, window, cx| {
                         let Some(form) = root.send_forms.get_mut(&key) else {
+                            if root.update_private_broadcaster_progress_stage(
+                                DeliveryFormKind::Send,
+                                key,
+                                generation_id,
+                                stage,
+                                cx,
+                            ) {
+                                root.show_private_broadcaster_progress_dialog(window, cx);
+                            }
                             return;
                         };
                         if form.generation_id != generation_id || !form.generating {
+                            if root.update_private_broadcaster_progress_stage(
+                                DeliveryFormKind::Send,
+                                key,
+                                generation_id,
+                                stage,
+                                cx,
+                            ) {
+                                root.show_private_broadcaster_progress_dialog(window, cx);
+                            }
                             return;
                         }
                         form.generation_stage = stage;
+                        if root.update_private_broadcaster_progress_stage(
+                            DeliveryFormKind::Send,
+                            key,
+                            generation_id,
+                            stage,
+                            cx,
+                        ) {
+                            root.show_private_broadcaster_progress_dialog(window, cx);
+                        }
                         cx.notify();
                     })
                     .is_err()
@@ -6696,13 +7070,20 @@ impl WalletRoot {
         message: impl Into<Arc<str>>,
         cx: &mut Context<'_, Self>,
     ) {
+        let message = message.into();
         if let Some(form) = self.send_forms.get_mut(&key) {
             form.generating = false;
+            if form_error_clears_public_broadcaster_cost_estimate(
+                DeliveryFormKind::Send,
+                message.as_ref(),
+            ) {
+                form.cost_estimate = None;
+            }
             form.cost_estimate_pending = false;
             form.estimating_cost = false;
             form.estimate_id = 0;
             form.result = None;
-            form.error = Some(message.into());
+            form.error = Some(message);
             cx.notify();
         }
     }
@@ -6733,10 +7114,18 @@ impl WalletRoot {
         cx.subscribe_in(
             &password_input,
             window,
-            move |this, _input, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
+            move |this, _input, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { .. } => {
                     this.generate_unshield_calldata_from_form(key, window, cx);
                 }
+                InputEvent::Change => {
+                    this.clear_private_action_missing_password_error(
+                        DeliveryFormKind::Unshield,
+                        key,
+                        cx,
+                    );
+                }
+                _ => {}
             },
         )
         .detach();
@@ -6777,6 +7166,7 @@ impl WalletRoot {
         .detach();
         self.send_forms.clear();
         self.unshield_forms.clear();
+        self.private_broadcaster_progress = None;
         self.broadcaster_picker = None;
         let selected_fee_token =
             self.default_public_broadcaster_fee_token(key.chain_id, key.token, false, false);
@@ -6788,7 +7178,7 @@ impl WalletRoot {
                 amount_input,
                 password_input,
                 unwrap: false,
-                delivery_mode: DeliveryMode::ManualCalldata,
+                delivery_mode: DeliveryMode::PublicBroadcaster,
                 selected_fee_token,
                 broadcaster_choice: BroadcasterChoice::Random,
                 broadcaster_fee_mode: PublicBroadcasterFeeMode::DeductFromAmount,
@@ -6810,6 +7200,8 @@ impl WalletRoot {
             kind: DeliveryFormKind::Unshield,
             key,
         });
+        self.refresh_public_broadcaster_anchor(DeliveryFormKind::Unshield, key, cx);
+        self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
         Self::open_private_action_dialog(
             DeliveryFormKind::Unshield,
             key,
@@ -6904,6 +7296,7 @@ impl WalletRoot {
         if form.generating
             || (form.result.is_none()
                 && form.error.is_none()
+                && form.cost_estimate.is_none()
                 && !form.cost_estimate_pending
                 && !form.estimating_cost)
         {
@@ -6911,6 +7304,7 @@ impl WalletRoot {
         }
         form.result = None;
         form.error = None;
+        form.cost_estimate = None;
         form.estimate_id = 0;
         form.cost_estimate_pending = false;
         form.estimating_cost = false;
@@ -7108,6 +7502,22 @@ impl WalletRoot {
             form.broadcaster_fee_mode,
         );
         let allow_suspicious_broadcasters = form.allow_suspicious_broadcasters;
+        if let Some(error) = unshield_public_broadcaster_estimate_input_error(
+            recipient_raw.as_str(),
+            amount_raw.as_str(),
+            &asset,
+        ) {
+            self.set_unshield_form_error(key, error, cx);
+            return;
+        }
+        if recipient_raw.trim().is_empty() {
+            self.clear_pending_public_broadcaster_cost_estimate(
+                DeliveryFormKind::Unshield,
+                key,
+                cx,
+            );
+            return;
+        }
         let Ok(recipient) = recipient_raw.trim().parse::<Address>() else {
             self.clear_pending_public_broadcaster_cost_estimate(
                 DeliveryFormKind::Unshield,
@@ -7116,25 +7526,14 @@ impl WalletRoot {
             );
             return;
         };
-        let amount = match parse_unshield_amount(amount_raw.as_str(), asset.decimals) {
-            Ok(amount) if !amount.is_zero() => amount,
-            Ok(_) | Err(_) => {
-                self.clear_pending_public_broadcaster_cost_estimate(
-                    DeliveryFormKind::Unshield,
-                    key,
-                    cx,
-                );
-                return;
-            }
-        };
-        if amount > asset.max_batched {
+        let Ok(amount) = parse_unshield_amount(amount_raw.as_str(), asset.decimals) else {
             self.clear_pending_public_broadcaster_cost_estimate(
                 DeliveryFormKind::Unshield,
                 key,
                 cx,
             );
             return;
-        }
+        };
         let Some(ChainUtxoState::Ready { session, .. }) = self.chain_states.get(&asset.chain_id)
         else {
             self.clear_pending_public_broadcaster_cost_estimate(
@@ -7207,6 +7606,7 @@ impl WalletRoot {
                         form.cost_estimate = Some(estimate);
                     }
                     Err(error) => {
+                        form.cost_estimate = None;
                         form.error = Some(Arc::from(format_report_chain(&error)));
                     }
                 }
@@ -7328,11 +7728,7 @@ impl WalletRoot {
 
         let password_empty = password_input.read(cx).value().trim().is_empty();
         if password_empty {
-            self.set_unshield_form_error(
-                key,
-                "Enter the vault password to prepare this unshield",
-                cx,
-            );
+            self.set_unshield_form_error(key, UNSHIELD_MISSING_PASSWORD_ERROR, cx);
             return;
         }
         let vault_password = Self::read_and_clear_input(&password_input, window, cx);
@@ -7351,6 +7747,18 @@ impl WalletRoot {
             form.result = None;
         }
         cx.notify();
+
+        if delivery_mode == DeliveryMode::PublicBroadcaster {
+            self.start_private_broadcaster_progress(
+                DeliveryFormKind::Unshield,
+                key,
+                generation_id,
+                asset.label.clone(),
+                asset.icon_path.clone(),
+                recipient.to_checksum(None),
+                cost_estimate.clone(),
+            );
+        }
 
         let http = self.http.clone();
         let waku = Arc::clone(&self.waku);
@@ -7414,31 +7822,68 @@ impl WalletRoot {
                 return;
             }
         };
-        Self::watch_unshield_generation_stage(key, generation_id, progress_rx, cx);
+        let terminal_progress_rx = progress_rx.clone();
+        Self::watch_unshield_generation_stage(key, generation_id, progress_rx, window, cx);
         cx.spawn(async move |this, cx| {
             let result = join.await.unwrap_or_else(|error| {
                 Err(eyre::eyre!("unshield generation task failed: {error}"))
             });
+            let final_stage = *terminal_progress_rx.borrow();
             let _ = this.update(cx, |root, cx| {
-                let Some(form) = root.unshield_forms.get_mut(&key) else {
-                    return;
-                };
-                if form.asset.chain_id != chain_id || form.asset.token != token {
-                    return;
-                }
-                if form.generation_id != generation_id || !form.generating {
-                    return;
-                }
-                form.generating = false;
-                match result {
-                    Ok(result) => {
-                        form.error = None;
-                        form.result = Some(result);
+                let mut progress_result = None;
+                let mut progress_error = None;
+                {
+                    let Some(form) = root.unshield_forms.get_mut(&key) else {
+                        return;
+                    };
+                    if form.asset.chain_id != chain_id || form.asset.token != token {
+                        return;
                     }
-                    Err(error) => {
-                        form.result = None;
-                        form.error = Some(Arc::from(format_report_chain(&error)));
+                    if form.generation_id != generation_id || !form.generating {
+                        return;
                     }
+                    form.generating = false;
+                    match result {
+                        Ok(result) => {
+                            if let UnshieldResult::PublicBroadcaster(result) = &result {
+                                progress_result = Some((**result).clone());
+                            }
+                            form.error = None;
+                            form.result = Some(result);
+                        }
+                        Err(error) => {
+                            let message = format_report_chain(&error);
+                            progress_error = Some(message.clone());
+                            if form_error_clears_public_broadcaster_cost_estimate(
+                                DeliveryFormKind::Unshield,
+                                message.as_str(),
+                            ) {
+                                form.cost_estimate = None;
+                            }
+                            form.result = None;
+                            form.error = Some(Arc::from(message));
+                        }
+                    }
+                }
+                if let Some(result) = progress_result {
+                    root.finish_private_broadcaster_progress(
+                        DeliveryFormKind::Unshield,
+                        key,
+                        generation_id,
+                        final_stage,
+                        result,
+                        cx,
+                    );
+                }
+                if let Some(message) = progress_error {
+                    root.fail_private_broadcaster_progress(
+                        DeliveryFormKind::Unshield,
+                        key,
+                        generation_id,
+                        final_stage,
+                        message,
+                        cx,
+                    );
                 }
                 cx.notify();
             });
@@ -7450,20 +7895,48 @@ impl WalletRoot {
         key: UnshieldAssetKey,
         generation_id: u64,
         mut progress_rx: watch::Receiver<TransactionGenerationStage>,
+        window: &Window,
         cx: &Context<'_, Self>,
     ) {
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             while progress_rx.changed().await.is_ok() {
                 let stage = *progress_rx.borrow_and_update();
                 if this
-                    .update(cx, |root, cx| {
+                    .update_in(cx, |root, window, cx| {
                         let Some(form) = root.unshield_forms.get_mut(&key) else {
+                            if root.update_private_broadcaster_progress_stage(
+                                DeliveryFormKind::Unshield,
+                                key,
+                                generation_id,
+                                stage,
+                                cx,
+                            ) {
+                                root.show_private_broadcaster_progress_dialog(window, cx);
+                            }
                             return;
                         };
                         if form.generation_id != generation_id || !form.generating {
+                            if root.update_private_broadcaster_progress_stage(
+                                DeliveryFormKind::Unshield,
+                                key,
+                                generation_id,
+                                stage,
+                                cx,
+                            ) {
+                                root.show_private_broadcaster_progress_dialog(window, cx);
+                            }
                             return;
                         }
                         form.generation_stage = stage;
+                        if root.update_private_broadcaster_progress_stage(
+                            DeliveryFormKind::Unshield,
+                            key,
+                            generation_id,
+                            stage,
+                            cx,
+                        ) {
+                            root.show_private_broadcaster_progress_dialog(window, cx);
+                        }
                         cx.notify();
                     })
                     .is_err()
@@ -7481,13 +7954,20 @@ impl WalletRoot {
         message: impl Into<Arc<str>>,
         cx: &mut Context<'_, Self>,
     ) {
+        let message = message.into();
         if let Some(form) = self.unshield_forms.get_mut(&key) {
             form.generating = false;
+            if form_error_clears_public_broadcaster_cost_estimate(
+                DeliveryFormKind::Unshield,
+                message.as_ref(),
+            ) {
+                form.cost_estimate = None;
+            }
             form.cost_estimate_pending = false;
             form.estimating_cost = false;
             form.estimate_id = 0;
             form.result = None;
-            form.error = Some(message.into());
+            form.error = Some(message);
             cx.notify();
         }
     }
@@ -8542,9 +9022,14 @@ impl WalletRoot {
         let metrics_root = root.clone();
         let chooser_root = root.clone();
         let estimate_root = root.clone();
-        let result_root = root.clone();
+        let progress_root = root.clone();
         let submit_root = root;
         let mut public_broadcaster_submit_disabled = false;
+        let public_broadcaster_submitted = matches!(
+            form.result.as_ref(),
+            Some(SendResult::PublicBroadcaster(result))
+                if matches!(result.result, PublicBroadcasterResultKind::Submitted { .. })
+        );
 
         let mut card =
             div()
@@ -8687,6 +9172,8 @@ impl WalletRoot {
                             send_element_id(key, "generate"),
                             if form.generating {
                                 "Preparing..."
+                            } else if public_broadcaster_submitted {
+                                "Submitted"
                             } else if form.delivery_mode == DeliveryMode::PublicBroadcaster {
                                 "Submit via broadcaster"
                             } else {
@@ -8695,7 +9182,11 @@ impl WalletRoot {
                         )
                         .primary()
                         .loading(form.generating)
-                        .disabled(form.generating || public_broadcaster_submit_disabled)
+                        .disabled(
+                            form.generating
+                                || public_broadcaster_submit_disabled
+                                || public_broadcaster_submitted,
+                        )
                         .on_click(move |_event, window, cx| {
                             submit_root.update(cx, |root, cx| {
                                 root.generate_send_calldata_from_form(key, window, cx);
@@ -8704,7 +9195,11 @@ impl WalletRoot {
                     ),
             );
 
-        if form.delivery_mode == DeliveryMode::PublicBroadcaster && form.result.is_none() {
+        if should_render_public_broadcaster_cost_preview(
+            form.delivery_mode,
+            form.result.is_some(),
+            form.error.is_some(),
+        ) {
             if let Some(estimate) = form.cost_estimate.as_ref() {
                 let anchor_rate = self
                     .public_broadcaster_anchor_cache
@@ -8729,7 +9224,24 @@ impl WalletRoot {
             }
         }
 
-        if form.generating {
+        if form.generating
+            && form.delivery_mode == DeliveryMode::PublicBroadcaster
+            && let Some(stage) = private_broadcaster_closed_active_stage(
+                self.private_broadcaster_progress.as_ref(),
+                DeliveryFormKind::Send,
+                key,
+                form.generation_id,
+            )
+        {
+            card = card.child(render_private_broadcaster_active_status_notice(
+                progress_root.clone(),
+                key,
+                DeliveryFormKind::Send,
+                stage,
+            ));
+        }
+
+        if form.generating && form.delivery_mode != DeliveryMode::PublicBroadcaster {
             card = card.child(render_unshield_generating_status(
                 self.unshield_spinner_tick,
                 form.generation_stage,
@@ -8747,22 +9259,19 @@ impl WalletRoot {
         }
 
         if let Some(result) = form.result.as_ref() {
-            card = card.child(match result {
-                SendResult::Manual(result) => render_send_result(key, result),
+            match result {
+                SendResult::Manual(result) => {
+                    card = card.child(render_send_result(key, result));
+                }
                 SendResult::PublicBroadcaster(result) => {
-                    let anchor_rate = self
-                        .public_broadcaster_anchor_cache
-                        .cached_rate(asset.chain_id, result.fee_token);
-                    render_public_broadcaster_result(
-                        result_root,
+                    card = card.child(render_private_broadcaster_status_notice(
+                        progress_root,
                         key,
                         DeliveryFormKind::Send,
-                        result,
-                        anchor_rate,
-                        form.transaction_fee_breakdown_open,
-                    )
+                        &result.result,
+                    ));
                 }
-            });
+            }
         }
 
         card
@@ -8784,9 +9293,14 @@ impl WalletRoot {
         let chooser_root = root.clone();
         let output_root = root.clone();
         let estimate_root = root.clone();
-        let result_root = root.clone();
+        let progress_root = root.clone();
         let submit_root = root;
         let mut public_broadcaster_submit_disabled = false;
+        let public_broadcaster_submitted = matches!(
+            form.result.as_ref(),
+            Some(UnshieldResult::PublicBroadcaster(result))
+                if matches!(result.result, PublicBroadcasterResultKind::Submitted { .. })
+        );
 
         let mut card =
             div()
@@ -8941,6 +9455,8 @@ impl WalletRoot {
                             unshield_element_id(key, "generate"),
                             if form.generating {
                                 "Preparing..."
+                            } else if public_broadcaster_submitted {
+                                "Submitted"
                             } else if form.delivery_mode == DeliveryMode::PublicBroadcaster {
                                 "Submit via broadcaster"
                             } else {
@@ -8949,7 +9465,11 @@ impl WalletRoot {
                         )
                         .primary()
                         .loading(form.generating)
-                        .disabled(form.generating || public_broadcaster_submit_disabled)
+                        .disabled(
+                            form.generating
+                                || public_broadcaster_submit_disabled
+                                || public_broadcaster_submitted,
+                        )
                         .on_click(move |_event, window, cx| {
                             submit_root.update(cx, |root, cx| {
                                 root.generate_unshield_calldata_from_form(key, window, cx);
@@ -8958,7 +9478,11 @@ impl WalletRoot {
                     ),
             );
 
-        if form.delivery_mode == DeliveryMode::PublicBroadcaster && form.result.is_none() {
+        if should_render_public_broadcaster_cost_preview(
+            form.delivery_mode,
+            form.result.is_some(),
+            form.error.is_some(),
+        ) {
             if let Some(estimate) = form.cost_estimate.as_ref() {
                 let anchor_rate = self
                     .public_broadcaster_anchor_cache
@@ -8983,7 +9507,24 @@ impl WalletRoot {
             }
         }
 
-        if form.generating {
+        if form.generating
+            && form.delivery_mode == DeliveryMode::PublicBroadcaster
+            && let Some(stage) = private_broadcaster_closed_active_stage(
+                self.private_broadcaster_progress.as_ref(),
+                DeliveryFormKind::Unshield,
+                key,
+                form.generation_id,
+            )
+        {
+            card = card.child(render_private_broadcaster_active_status_notice(
+                progress_root.clone(),
+                key,
+                DeliveryFormKind::Unshield,
+                stage,
+            ));
+        }
+
+        if form.generating && form.delivery_mode != DeliveryMode::PublicBroadcaster {
             card = card.child(render_unshield_generating_status(
                 self.unshield_spinner_tick,
                 form.generation_stage,
@@ -9001,22 +9542,19 @@ impl WalletRoot {
         }
 
         if let Some(result) = form.result.as_ref() {
-            card = card.child(match result {
-                UnshieldResult::Manual(result) => render_unshield_result(key, result),
+            match result {
+                UnshieldResult::Manual(result) => {
+                    card = card.child(render_unshield_result(key, result));
+                }
                 UnshieldResult::PublicBroadcaster(result) => {
-                    let anchor_rate = self
-                        .public_broadcaster_anchor_cache
-                        .cached_rate(asset.chain_id, result.fee_token);
-                    render_public_broadcaster_result(
-                        result_root,
+                    card = card.child(render_private_broadcaster_status_notice(
+                        progress_root,
                         key,
                         DeliveryFormKind::Unshield,
-                        result,
-                        anchor_rate,
-                        form.transaction_fee_breakdown_open,
-                    )
+                        &result.result,
+                    ));
                 }
-            });
+            }
         }
 
         card
@@ -10022,6 +10560,99 @@ impl WalletRoot {
             ));
         }
         content
+    }
+
+    fn render_private_broadcaster_progress_dialog_content(
+        &self,
+        content_width: Pixels,
+    ) -> gpui::Div {
+        let Some(progress) = self.private_broadcaster_progress.as_ref() else {
+            return div()
+                .w(content_width)
+                .child(app_muted_text("No active broadcaster submission."));
+        };
+        let (title, detail, color) = private_broadcaster_progress_summary(progress);
+        let mut content = div()
+            .w(content_width)
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(app_strong_text(title).text_color(rgb(color)))
+                    .child(app_muted_text(detail).whitespace_normal()),
+            )
+            .child(render_private_broadcaster_progress_stepper(&progress.steps));
+
+        if let Some(context) = self.private_broadcaster_progress_context(progress) {
+            content = content.child(render_private_broadcaster_progress_context(
+                progress, &context,
+            ));
+        } else {
+            content = content.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p(px(12.0))
+                    .rounded_md()
+                    .bg(rgb(theme::SURFACE_ELEVATED))
+                    .border_1()
+                    .border_color(rgb(theme::BORDER))
+                    .child(app_strong_text("Transaction context"))
+                    .child(private_broadcaster_context_row(
+                        "Broadcaster",
+                        "Selecting during preparation".to_string(),
+                    ))
+                    .child(private_broadcaster_context_row(
+                        "Recipient",
+                        progress.recipient.to_string(),
+                    ))
+                    .child(cost_estimate_detail_text(
+                        "Fee and gas cost will appear after the broadcaster fee is calculated.",
+                    )),
+            );
+        }
+
+        if let Some(result) = progress.result.as_ref()
+            && let PublicBroadcasterResultKind::Submitted { tx_hash } = &result.result
+        {
+            content = content.child(render_public_broadcaster_tx_hash_row(
+                tx_hash.clone(),
+                delivery_element_id(progress.key, progress.kind, "progress-copy-public-tx"),
+            ));
+        }
+        content
+    }
+
+    fn private_broadcaster_progress_context<'a>(
+        &self,
+        progress: &'a PrivateBroadcasterProgressState,
+    ) -> Option<PrivateBroadcasterProgressContext<'a>> {
+        if let Some(result) = progress.result.as_ref() {
+            let anchor_rate = self
+                .public_broadcaster_anchor_cache
+                .cached_rate(result.broadcaster.chain_id, result.fee_token);
+            return Some(PrivateBroadcasterProgressContext {
+                display: PublicBroadcasterCostDisplay::from_result(result, anchor_rate),
+                settled: true,
+            });
+        }
+        let estimate = progress.estimate.as_ref()?;
+        let anchor_rate = self
+            .public_broadcaster_anchor_cache
+            .cached_rate(progress.key.chain_id, estimate.fee_token);
+        Some(PrivateBroadcasterProgressContext {
+            display: PublicBroadcasterCostDisplay::from_estimate_chain(
+                progress.key.chain_id,
+                estimate,
+                anchor_rate,
+            ),
+            settled: false,
+        })
     }
 
     fn public_account_visible_balances(
@@ -11748,6 +12379,76 @@ fn format_form_error_for_asset(error: &str, asset: &UnshieldAsset, fee_token: Ad
     }
 }
 
+fn should_clear_private_action_error_on_password_change(
+    kind: DeliveryFormKind,
+    error: &str,
+) -> bool {
+    matches!(
+        (kind, error),
+        (
+            DeliveryFormKind::Send,
+            SEND_MISSING_PASSWORD_ERROR | SEND_AUTHORIZATION_FAILED_ERROR,
+        ) | (
+            DeliveryFormKind::Unshield,
+            UNSHIELD_MISSING_PASSWORD_ERROR | UNSHIELD_AUTHORIZATION_FAILED_ERROR,
+        )
+    )
+}
+
+fn form_error_clears_public_broadcaster_cost_estimate(kind: DeliveryFormKind, error: &str) -> bool {
+    !should_clear_private_action_error_on_password_change(kind, error)
+}
+
+const fn should_render_public_broadcaster_cost_preview(
+    delivery_mode: DeliveryMode,
+    has_result: bool,
+    has_error: bool,
+) -> bool {
+    matches!(delivery_mode, DeliveryMode::PublicBroadcaster) && !has_result && !has_error
+}
+
+fn send_public_broadcaster_estimate_input_error(
+    recipient: &str,
+    amount_raw: &str,
+    asset: &UnshieldAsset,
+) -> Option<String> {
+    let recipient = recipient.trim();
+    if !recipient.is_empty()
+        && let Err(error) = parse_railgun_recipient(recipient)
+    {
+        return Some(error.to_string());
+    }
+    private_action_amount_input_error(amount_raw, asset, parse_send_amount)
+}
+
+fn unshield_public_broadcaster_estimate_input_error(
+    recipient: &str,
+    amount_raw: &str,
+    asset: &UnshieldAsset,
+) -> Option<String> {
+    let recipient = recipient.trim();
+    if !recipient.is_empty() && recipient.parse::<Address>().is_err() {
+        return Some("Enter a valid public EVM recipient address".to_string());
+    }
+    private_action_amount_input_error(amount_raw, asset, parse_unshield_amount)
+}
+
+fn private_action_amount_input_error(
+    amount_raw: &str,
+    asset: &UnshieldAsset,
+    parse_amount: fn(&str, Option<u8>) -> Result<U256, eyre::Report>,
+) -> Option<String> {
+    match parse_amount(amount_raw, asset.decimals) {
+        Ok(amount) if amount.is_zero() => Some("Enter an amount greater than zero".to_string()),
+        Ok(amount) if amount > asset.max_batched => Some(format!(
+            "Amount exceeds max POI-verified batched transaction: {}",
+            format_send_amount_input(asset.max_batched, asset.decimals)
+        )),
+        Ok(_) => None,
+        Err(error) => Some(error.to_string()),
+    }
+}
+
 fn format_report_chain(error: &eyre::Report) -> String {
     let mut parts = error.chain().map(ToString::to_string);
     let Some(mut message) = parts.next() else {
@@ -12306,6 +13007,149 @@ fn private_action_metric_id_suffix(label: &'static str) -> &'static str {
     }
 }
 
+const fn private_broadcaster_dialog_title_action(kind: DeliveryFormKind) -> &'static str {
+    match kind {
+        DeliveryFormKind::Send => "Send via broadcaster",
+        DeliveryFormKind::Unshield => "Unshield via broadcaster",
+    }
+}
+
+fn private_broadcaster_progress_steps() -> Vec<PrivateBroadcasterProgressStepState> {
+    PRIVATE_BROADCASTER_PROGRESS_STAGES
+        .into_iter()
+        .enumerate()
+        .map(|(index, stage)| PrivateBroadcasterProgressStepState {
+            stage,
+            status: if index == 0 {
+                PublicActionStepStatus::Pending
+            } else {
+                PublicActionStepStatus::NotStarted
+            },
+            message: None,
+        })
+        .collect()
+}
+
+fn private_broadcaster_closed_active_stage(
+    progress: Option<&PrivateBroadcasterProgressState>,
+    kind: DeliveryFormKind,
+    key: UnshieldAssetKey,
+    generation_id: u64,
+) -> Option<TransactionGenerationStage> {
+    let progress = progress?;
+    if progress.kind != kind
+        || progress.key != key
+        || progress.generation_id != generation_id
+        || progress.dialog_open
+        || !progress.stage_seen
+        || progress.result.is_some()
+        || progress.error.is_some()
+    {
+        return None;
+    }
+    progress
+        .steps
+        .iter()
+        .find(|step| step.status == PublicActionStepStatus::Pending)
+        .map(|step| step.stage)
+}
+
+fn apply_private_broadcaster_progress_stage(
+    steps: &mut [PrivateBroadcasterProgressStepState],
+    stage: TransactionGenerationStage,
+) {
+    let active_index = private_broadcaster_progress_stage_index(stage);
+    for (index, step) in steps.iter_mut().enumerate() {
+        step.status = match index.cmp(&active_index) {
+            std::cmp::Ordering::Less => PublicActionStepStatus::Done,
+            std::cmp::Ordering::Equal => PublicActionStepStatus::Pending,
+            std::cmp::Ordering::Greater => PublicActionStepStatus::NotStarted,
+        };
+        step.message = None;
+    }
+}
+
+fn finish_private_broadcaster_progress_steps(
+    steps: &mut [PrivateBroadcasterProgressStepState],
+    result: &PublicBroadcasterResultKind,
+) {
+    match result {
+        PublicBroadcasterResultKind::Submitted { .. } => {
+            for step in steps {
+                step.status = PublicActionStepStatus::Done;
+                step.message = None;
+            }
+        }
+        PublicBroadcasterResultKind::Failed { error } => {
+            let message = format!("Broadcaster returned an error: {error}");
+            fail_private_broadcaster_progress_steps(steps, &message);
+        }
+        PublicBroadcasterResultKind::TimedOut => fail_private_broadcaster_progress_steps(
+            steps,
+            "No decryptable broadcaster response arrived before the timeout.",
+        ),
+    }
+}
+
+fn finish_private_broadcaster_progress_steps_at_stage(
+    steps: &mut [PrivateBroadcasterProgressStepState],
+    final_stage: TransactionGenerationStage,
+    result: &PublicBroadcasterResultKind,
+) {
+    apply_private_broadcaster_progress_stage(steps, final_stage);
+    finish_private_broadcaster_progress_steps(steps, result);
+}
+
+fn fail_private_broadcaster_progress_steps_at_stage(
+    steps: &mut [PrivateBroadcasterProgressStepState],
+    final_stage: TransactionGenerationStage,
+    message: &str,
+) {
+    apply_private_broadcaster_progress_stage(steps, final_stage);
+    fail_private_broadcaster_progress_steps(steps, message);
+}
+
+fn fail_private_broadcaster_progress_steps(
+    steps: &mut [PrivateBroadcasterProgressStepState],
+    message: &str,
+) {
+    let message = Arc::<str>::from(message);
+    let error_index = steps
+        .iter()
+        .position(|step| step.status == PublicActionStepStatus::Pending)
+        .or_else(|| {
+            steps
+                .iter()
+                .position(|step| step.status == PublicActionStepStatus::NotStarted)
+        })
+        .or_else(|| steps.len().checked_sub(1));
+    if let Some(error_index) = error_index {
+        for (index, step) in steps.iter_mut().enumerate() {
+            if index < error_index && step.status != PublicActionStepStatus::Error {
+                step.status = PublicActionStepStatus::Done;
+                step.message = None;
+            } else if index == error_index {
+                step.status = PublicActionStepStatus::Error;
+                step.message = Some(Arc::clone(&message));
+            } else if step.status != PublicActionStepStatus::Error {
+                step.status = PublicActionStepStatus::NotStarted;
+                step.message = None;
+            }
+        }
+    }
+}
+
+const fn private_broadcaster_progress_stage_index(stage: TransactionGenerationStage) -> usize {
+    match stage {
+        TransactionGenerationStage::SelectingPrivateNotes => 0,
+        TransactionGenerationStage::ProvingTransaction => 1,
+        TransactionGenerationStage::EstimatingBroadcasterFee => 2,
+        TransactionGenerationStage::GeneratingPoiProofs => 3,
+        TransactionGenerationStage::PublishingToBroadcaster => 4,
+        TransactionGenerationStage::WaitingForBroadcasterResponse => 5,
+    }
+}
+
 fn render_unshield_generating_status(_tick: usize, stage: TransactionGenerationStage) -> gpui::Div {
     div()
         .flex()
@@ -12337,6 +13181,92 @@ fn render_unshield_generating_status(_tick: usize, stage: TransactionGenerationS
         )
 }
 
+fn render_private_broadcaster_status_notice(
+    root: Entity<WalletRoot>,
+    key: UnshieldAssetKey,
+    kind: DeliveryFormKind,
+    result: &PublicBroadcasterResultKind,
+) -> gpui::Div {
+    let (title, detail, border) = match result {
+        PublicBroadcasterResultKind::Submitted { .. } => (
+            "Submitted via public broadcaster",
+            "Open the broadcaster status dialog for the transaction details.",
+            theme::SUCCESS,
+        ),
+        PublicBroadcasterResultKind::Failed { .. } => (
+            "Public broadcaster failed",
+            "Open the broadcaster status dialog for the returned error.",
+            theme::DANGER,
+        ),
+        PublicBroadcasterResultKind::TimedOut => (
+            "Public broadcaster timed out",
+            "Open the broadcaster status dialog for the timeout details.",
+            theme::WARNING,
+        ),
+    };
+    render_private_broadcaster_status_notice_box(root, key, kind, title, detail, border)
+}
+
+fn render_private_broadcaster_active_status_notice(
+    root: Entity<WalletRoot>,
+    key: UnshieldAssetKey,
+    kind: DeliveryFormKind,
+    stage: TransactionGenerationStage,
+) -> gpui::Div {
+    render_private_broadcaster_status_notice_box(
+        root,
+        key,
+        kind,
+        "Public broadcaster in progress",
+        format!("{}: {}", stage.label(), stage.detail()),
+        theme::INFO,
+    )
+}
+
+fn render_private_broadcaster_status_notice_box(
+    root: Entity<WalletRoot>,
+    key: UnshieldAssetKey,
+    kind: DeliveryFormKind,
+    title: impl Into<SharedString>,
+    detail: impl Into<SharedString>,
+    border: u32,
+) -> gpui::Div {
+    let button_root = root;
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .p(px(10.0))
+        .rounded_md()
+        .bg(rgb(theme::SURFACE_ELEVATED))
+        .border_1()
+        .border_color(rgb(border))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(app_strong_text(title))
+                .child(app_muted_text(detail).whitespace_normal()),
+        )
+        .child(
+            app_button(
+                delivery_element_id(key, kind, "view-broadcaster-progress"),
+                "View status",
+            )
+            .outline()
+            .small()
+            .on_click(move |_event, window, cx| {
+                button_root.update(cx, |root, cx| {
+                    root.show_private_broadcaster_progress_dialog(window, cx);
+                });
+            }),
+        )
+}
+
 fn render_delivery_selector(
     root: Entity<WalletRoot>,
     key: UnshieldAssetKey,
@@ -12345,53 +13275,48 @@ fn render_delivery_selector(
     generating: bool,
 ) -> gpui::Div {
     let selector_root = root;
-    div()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .child(app_muted_text("Delivery mode"))
-        .child(
-            ButtonGroup::new(delivery_element_id(key, kind, "mode-toggle"))
-                .w_full()
-                .children([
-                    private_action_segment_button(
-                        delivery_element_id(key, kind, "manual"),
-                        "Manual calldata",
-                        mode == DeliveryMode::ManualCalldata,
-                    )
-                    .disabled(generating),
-                    private_action_segment_button(
-                        delivery_element_id(key, kind, "public"),
-                        "Public broadcaster",
-                        mode == DeliveryMode::PublicBroadcaster,
-                    )
-                    .disabled(generating),
-                    private_action_segment_button(
-                        delivery_element_id(key, kind, "self"),
-                        "Self-broadcast",
-                        mode == DeliveryMode::SelfBroadcast,
-                    )
-                    .disabled(true),
-                ])
-                .on_click(move |selected, window, cx| {
-                    let Some(index) = selected.first() else {
-                        return;
-                    };
-                    let mode = match *index {
-                        0 => DeliveryMode::ManualCalldata,
-                        1 => DeliveryMode::PublicBroadcaster,
-                        _ => return,
-                    };
-                    selector_root.update(cx, |root, cx| match kind {
-                        DeliveryFormKind::Send => {
-                            root.set_send_delivery_mode(key, mode, window, cx);
-                        }
-                        DeliveryFormKind::Unshield => {
-                            root.set_unshield_delivery_mode(key, mode, window, cx);
-                        }
-                    });
-                }),
-        )
+    div().flex().flex_col().gap_2().child(
+        ButtonGroup::new(delivery_element_id(key, kind, "mode-toggle"))
+            .w_full()
+            .children([
+                private_action_segment_button(
+                    delivery_element_id(key, kind, "public"),
+                    "Public broadcaster",
+                    mode == DeliveryMode::PublicBroadcaster,
+                )
+                .disabled(generating),
+                private_action_segment_button(
+                    delivery_element_id(key, kind, "self"),
+                    "Self-broadcast",
+                    mode == DeliveryMode::SelfBroadcast,
+                )
+                .disabled(true),
+                private_action_segment_button(
+                    delivery_element_id(key, kind, "manual"),
+                    "Manual calldata",
+                    mode == DeliveryMode::ManualCalldata,
+                )
+                .disabled(generating),
+            ])
+            .on_click(move |selected, window, cx| {
+                let Some(index) = selected.first() else {
+                    return;
+                };
+                let mode = match *index {
+                    0 => DeliveryMode::PublicBroadcaster,
+                    2 => DeliveryMode::ManualCalldata,
+                    _ => return,
+                };
+                selector_root.update(cx, |root, cx| match kind {
+                    DeliveryFormKind::Send => {
+                        root.set_send_delivery_mode(key, mode, window, cx);
+                    }
+                    DeliveryFormKind::Unshield => {
+                        root.set_unshield_delivery_mode(key, mode, window, cx);
+                    }
+                });
+            }),
+    )
 }
 
 fn render_public_broadcaster_settings(
@@ -12957,6 +13882,11 @@ struct PublicBroadcasterCostDisplay<'a> {
     fee_anchor_rate: Option<U256>,
 }
 
+struct PrivateBroadcasterProgressContext<'a> {
+    display: PublicBroadcasterCostDisplay<'a>,
+    settled: bool,
+}
+
 impl<'a> PublicBroadcasterCostDisplay<'a> {
     const fn from_result(
         result: &'a PublicBroadcasterSubmissionResult,
@@ -12986,9 +13916,17 @@ impl<'a> PublicBroadcasterCostDisplay<'a> {
         estimate: &'a PublicBroadcasterCostEstimate,
         fee_anchor_rate: Option<U256>,
     ) -> Self {
+        Self::from_estimate_chain(asset.chain_id, estimate, fee_anchor_rate)
+    }
+
+    const fn from_estimate_chain(
+        chain_id: u64,
+        estimate: &'a PublicBroadcasterCostEstimate,
+        fee_anchor_rate: Option<U256>,
+    ) -> Self {
         Self {
             broadcaster: &estimate.broadcaster,
-            chain_id: asset.chain_id,
+            chain_id,
             action_token: estimate.action_token,
             fee_token: estimate.fee_token,
             entered_amount: estimate.entered_amount,
@@ -13078,16 +14016,9 @@ impl<'a> PublicBroadcasterCostDisplay<'a> {
     }
 }
 
-#[derive(Clone, Copy)]
-enum PrivateSpendRowMode {
-    Always,
-    WhenDistinct,
-}
-
 struct PublicBroadcasterCostRowsOptions {
     show_broadcaster: bool,
     show_entered_amount: bool,
-    private_spend: PrivateSpendRowMode,
 }
 
 fn append_public_broadcaster_cost_rows(
@@ -13117,8 +14048,7 @@ fn append_public_broadcaster_cost_rows(
             display.action_amount(display.recipient_amount),
         ))
         .when(
-            matches!(options.private_spend, PrivateSpendRowMode::Always)
-                || should_show_distinct_amount(display.entered_amount, display.total_private_spend),
+            should_show_distinct_amount(display.entered_amount, display.total_private_spend),
             |card| {
                 card.child(cost_estimate_row(
                     display.private_spend_label(),
@@ -13231,72 +14161,6 @@ fn render_transaction_fee_breakdown(
         )
 }
 
-fn render_public_broadcaster_result(
-    root: Entity<WalletRoot>,
-    key: UnshieldAssetKey,
-    kind: DeliveryFormKind,
-    result: &PublicBroadcasterSubmissionResult,
-    fee_anchor_rate: Option<U256>,
-    transaction_fee_breakdown_open: bool,
-) -> gpui::Div {
-    let (title, detail, border, tx_hash) = match &result.result {
-        PublicBroadcasterResultKind::Submitted { tx_hash } => (
-            "Submitted via public broadcaster",
-            format!(
-                "{} accepted the transaction.",
-                broadcaster_candidate_label(&result.broadcaster)
-            ),
-            theme::SUCCESS,
-            Some(tx_hash.clone()),
-        ),
-        PublicBroadcasterResultKind::Failed { error } => (
-            "Public broadcaster failed",
-            error.clone(),
-            theme::DANGER,
-            None,
-        ),
-        PublicBroadcasterResultKind::TimedOut => (
-            "Public broadcaster timed out",
-            "No decryptable broadcaster response arrived before the timeout.".to_string(),
-            theme::WARNING,
-            None,
-        ),
-    };
-    let display = PublicBroadcasterCostDisplay::from_result(result, fee_anchor_rate);
-    let card = div()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .p(px(12.0))
-        .rounded_md()
-        .bg(rgb(theme::SURFACE_ELEVATED))
-        .border_1()
-        .border_color(rgb(border))
-        .child(app_strong_text(title))
-        .child(app_muted_text(detail));
-    let mut card = append_public_broadcaster_cost_rows(
-        card,
-        root,
-        key,
-        kind,
-        &display,
-        &PublicBroadcasterCostRowsOptions {
-            show_broadcaster: false,
-            show_entered_amount: true,
-            private_spend: PrivateSpendRowMode::Always,
-        },
-        transaction_fee_breakdown_open,
-    )
-    .child(app_muted_text(display.fee_mode_summary()));
-    if let Some(tx_hash) = tx_hash {
-        card = card.child(render_public_broadcaster_tx_hash_row(
-            tx_hash,
-            delivery_element_id(key, kind, "copy-public-tx"),
-        ));
-    }
-    card
-}
-
 fn render_public_broadcaster_tx_hash_row(tx_hash: String, button_id: SharedString) -> gpui::Div {
     div()
         .flex()
@@ -13376,7 +14240,6 @@ fn render_public_broadcaster_cost_estimate(
         &PublicBroadcasterCostRowsOptions {
             show_broadcaster: true,
             show_entered_amount: false,
-            private_spend: PrivateSpendRowMode::WhenDistinct,
         },
         transaction_fee_breakdown_open,
     )
@@ -13898,6 +14761,267 @@ const fn public_account_status_id(status: PublicAccountStatus) -> &'static str {
         PublicAccountStatus::Active => "active",
         PublicAccountStatus::Inactive => "inactive",
     }
+}
+
+fn private_broadcaster_progress_summary(
+    progress: &PrivateBroadcasterProgressState,
+) -> (&'static str, String, u32) {
+    if let Some(result) = progress.result.as_ref() {
+        return match &result.result {
+            PublicBroadcasterResultKind::Submitted { .. } => (
+                "Submitted via public broadcaster",
+                format!(
+                    "{} accepted the private {} request.",
+                    broadcaster_candidate_label(&result.broadcaster),
+                    private_broadcaster_action_noun(progress.kind),
+                ),
+                theme::SUCCESS,
+            ),
+            PublicBroadcasterResultKind::Failed { error } => {
+                ("Public broadcaster failed", error.clone(), theme::DANGER)
+            }
+            PublicBroadcasterResultKind::TimedOut => (
+                "Public broadcaster timed out",
+                "No decryptable broadcaster response arrived before the timeout.".to_string(),
+                theme::WARNING,
+            ),
+        };
+    }
+    if let Some(error) = progress.error.as_ref() {
+        return ("Submission failed", error.to_string(), theme::DANGER);
+    }
+    (
+        "Submitting via public broadcaster",
+        format!(
+            "Preparing and publishing a private {} for {}.",
+            private_broadcaster_action_noun(progress.kind),
+            progress.asset_label.as_ref()
+        ),
+        theme::INFO,
+    )
+}
+
+const fn private_broadcaster_action_noun(kind: DeliveryFormKind) -> &'static str {
+    match kind {
+        DeliveryFormKind::Send => "send",
+        DeliveryFormKind::Unshield => "unshield",
+    }
+}
+
+fn render_private_broadcaster_progress_stepper(
+    steps: &[PrivateBroadcasterProgressStepState],
+) -> gpui::Div {
+    let mut stepper = div()
+        .flex()
+        .flex_col()
+        .gap_0()
+        .p(px(10.0))
+        .rounded_md()
+        .bg(rgb(theme::SURFACE_HOVER_SUBTLE))
+        .border_1()
+        .border_color(rgb(theme::BORDER_SUBTLE));
+    let last_index = steps.len().saturating_sub(1);
+    for (index, step) in steps.iter().enumerate() {
+        stepper = stepper.child(render_private_broadcaster_progress_step(
+            step,
+            index == last_index,
+        ));
+    }
+    stepper
+}
+
+fn render_private_broadcaster_progress_step(
+    step: &PrivateBroadcasterProgressStepState,
+    is_last: bool,
+) -> gpui::Div {
+    let color = public_action_step_color(step.status);
+    let mut body = div()
+        .flex_1()
+        .min_w(px(0.0))
+        .flex()
+        .flex_col()
+        .gap_1()
+        .pb(if is_last { px(0.0) } else { px(12.0) })
+        .child(
+            app_strong_text(step.stage.label())
+                .text_color(rgb(color))
+                .line_height(gpui::relative(1.0)),
+        );
+    if step.status == PublicActionStepStatus::Error {
+        let message = step
+            .message
+            .as_deref()
+            .unwrap_or("This broadcaster submission step failed.");
+        let copy_id = SharedString::from(format!(
+            "wallet-private-broadcaster-{}-error-copy",
+            private_broadcaster_stage_id(step.stage),
+        ));
+        body = body.child(
+            div()
+                .flex()
+                .items_start()
+                .gap_1()
+                .child(
+                    app_muted_text(message.to_string())
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .whitespace_normal()
+                        .text_color(rgb(theme::DANGER))
+                        .line_height(gpui::relative(1.0)),
+                )
+                .child(clipboard_with_toast(copy_id, message.to_string())),
+        );
+    } else {
+        body = body.child(
+            app_muted_text(private_broadcaster_stage_detail(step.stage, step.status))
+                .text_color(rgb(color))
+                .line_height(gpui::relative(1.0)),
+        );
+    }
+
+    div()
+        .flex()
+        .items_start()
+        .gap_3()
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .child(render_public_action_step_marker(step.status, color))
+                .children((!is_last).then(|| {
+                    div()
+                        .w(px(2.0))
+                        .flex_1()
+                        .min_h(px(32.0))
+                        .my(px(3.0))
+                        .rounded_full()
+                        .bg(rgb(color))
+                })),
+        )
+        .child(body)
+}
+
+const fn private_broadcaster_stage_detail(
+    stage: TransactionGenerationStage,
+    status: PublicActionStepStatus,
+) -> &'static str {
+    match status {
+        PublicActionStepStatus::NotStarted => match stage {
+            TransactionGenerationStage::SelectingPrivateNotes => "Waiting to select private notes.",
+            TransactionGenerationStage::ProvingTransaction => "Waiting to generate the proof.",
+            TransactionGenerationStage::EstimatingBroadcasterFee => {
+                "Waiting to settle the broadcaster fee."
+            }
+            TransactionGenerationStage::GeneratingPoiProofs => "Waiting to generate POI proofs.",
+            TransactionGenerationStage::PublishingToBroadcaster => {
+                "Waiting to publish the encrypted request."
+            }
+            TransactionGenerationStage::WaitingForBroadcasterResponse => {
+                "Waiting to listen for broadcaster response."
+            }
+        },
+        PublicActionStepStatus::Pending => stage.detail(),
+        PublicActionStepStatus::Done => "Complete.",
+        PublicActionStepStatus::Error => "Failed.",
+    }
+}
+
+const fn private_broadcaster_stage_id(stage: TransactionGenerationStage) -> &'static str {
+    match stage {
+        TransactionGenerationStage::SelectingPrivateNotes => "select-notes",
+        TransactionGenerationStage::ProvingTransaction => "prove",
+        TransactionGenerationStage::EstimatingBroadcasterFee => "estimate-fee",
+        TransactionGenerationStage::GeneratingPoiProofs => "poi-proofs",
+        TransactionGenerationStage::PublishingToBroadcaster => "publish",
+        TransactionGenerationStage::WaitingForBroadcasterResponse => "wait-response",
+    }
+}
+
+fn render_private_broadcaster_progress_context(
+    progress: &PrivateBroadcasterProgressState,
+    context: &PrivateBroadcasterProgressContext<'_>,
+) -> gpui::Div {
+    let display = &context.display;
+    let breakdown = display.fee_breakdown();
+    let fee_label = if context.settled {
+        "Settled fee"
+    } else {
+        "Estimated fee"
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .p(px(12.0))
+        .rounded_md()
+        .bg(rgb(theme::SURFACE_ELEVATED))
+        .border_1()
+        .border_color(rgb(theme::BORDER_STRONG))
+        .child(app_strong_text("Transaction context"))
+        .child(private_broadcaster_context_row(
+            "Broadcaster",
+            broadcaster_candidate_label(display.broadcaster),
+        ))
+        .child(private_broadcaster_context_row(
+            "Recipient",
+            progress.recipient.to_string(),
+        ))
+        .child(private_broadcaster_context_row(
+            "Entered amount",
+            display.action_amount(display.entered_amount),
+        ))
+        .child(private_broadcaster_context_row(
+            "Recipient receives",
+            display.action_amount(display.recipient_amount),
+        ))
+        .when(
+            should_show_distinct_amount(display.entered_amount, display.total_private_spend),
+            |card| {
+                card.child(private_broadcaster_context_row(
+                    display.private_spend_label(),
+                    display.action_amount(display.total_private_spend),
+                ))
+            },
+        )
+        .when(!display.protocol_fee_bps.is_zero(), |card| {
+            card.child(private_broadcaster_context_row(
+                "RAILGUN protocol fee",
+                display.protocol_fee_value(),
+            ))
+        })
+        .child(private_broadcaster_context_row(
+            fee_label,
+            display.fee_amount(),
+        ))
+        .child(private_broadcaster_context_row(
+            "Tx gas cost",
+            display.native_gas_cost_value(&breakdown),
+        ))
+        .child(private_broadcaster_context_row(
+            "Broadcaster fee",
+            display.broadcaster_fee_value(&breakdown),
+        ))
+        .child(private_broadcaster_context_row(
+            "Network gas",
+            display.gas_value(),
+        ))
+        .child(cost_estimate_detail_text(display.fee_mode_summary()))
+}
+
+fn private_broadcaster_context_row(label: &'static str, value: String) -> gpui::Div {
+    div()
+        .flex()
+        .items_start()
+        .justify_between()
+        .gap_3()
+        .child(app_muted_text(label).flex_none())
+        .child(
+            app_strong_text(value)
+                .min_w(px(0.0))
+                .text_align(gpui::TextAlign::Right)
+                .whitespace_normal(),
+        )
 }
 
 fn merge_public_balance_snapshot(
@@ -14424,8 +15548,9 @@ mod tests {
         BroadcasterFeePolicy, ListUtxosOutput, PublicAccountBalance, PublicActionProgressStep,
         PublicAssetId, PublicBalanceAmount, PublicBalanceAsset, PublicBalanceEntry,
         PublicBalanceSnapshot, PublicBroadcasterCandidate, PublicBroadcasterCostEstimate,
-        PublicBroadcasterFeeMargin, PublicBroadcasterFeeMode, PublicBroadcasterSelection,
-        SyncProgressStage, SyncProgressUpdate, TransactionGenerationStage, UtxoOutput,
+        PublicBroadcasterFeeMargin, PublicBroadcasterFeeMode, PublicBroadcasterResultKind,
+        PublicBroadcasterSelection, SyncProgressStage, SyncProgressUpdate,
+        TransactionGenerationStage, UtxoOutput,
         vault::{
             PublicAccountMetadata, PublicAccountScope, PublicAccountSource, PublicAccountStatus,
             WalletMetadataBundle, WalletSource, WalletStatus,
@@ -14433,38 +15558,47 @@ mod tests {
     };
 
     use super::{
-        Activity, BroadcasterChoice, ChainUtxoState, CostEstimateStatus,
-        PUBLIC_ACCOUNT_IDENTICON_CELL_COUNT, PUBLIC_ACCOUNT_IDENTICON_GRID_SIZE,
-        PUBLIC_ADDRESS_QR_QUIET_ZONE_MODULES, PrivateActionMetric, PublicActionMode,
-        PublicBroadcasterFeeTokenOption, SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_MINUTE,
-        SECONDS_PER_MONTH, SECONDS_PER_YEAR, UnshieldAsset, UnshieldAssetKey, WalletRoot,
-        WalletSelectItem, WalletTab, adjusted_amount_for_max_change,
-        broadcaster_choice_supported_by_candidates, build_send_asset, build_unshield_asset,
-        display_rows_from_output, effective_public_broadcaster_fee_mode,
-        fee_token_option_has_eligible_broadcaster, format_compact_age,
+        Activity, BroadcasterChoice, ChainUtxoState, CostEstimateStatus, DeliveryFormKind,
+        DeliveryMode, PUBLIC_ACCOUNT_IDENTICON_CELL_COUNT, PUBLIC_ACCOUNT_IDENTICON_GRID_SIZE,
+        PUBLIC_ADDRESS_QR_QUIET_ZONE_MODULES, PrivateActionMetric, PrivateBroadcasterProgressState,
+        PublicActionMode, PublicActionStepStatus, PublicBroadcasterFeeTokenOption, SECONDS_PER_DAY,
+        SECONDS_PER_HOUR, SECONDS_PER_MINUTE, SECONDS_PER_MONTH, SECONDS_PER_YEAR,
+        SEND_AUTHORIZATION_FAILED_ERROR, SEND_MISSING_PASSWORD_ERROR,
+        UNSHIELD_AUTHORIZATION_FAILED_ERROR, UNSHIELD_MISSING_PASSWORD_ERROR, UnshieldAsset,
+        UnshieldAssetKey, WalletRoot, WalletSelectItem, WalletTab, adjusted_amount_for_max_change,
+        apply_private_broadcaster_progress_stage, broadcaster_choice_supported_by_candidates,
+        build_send_asset, build_unshield_asset, display_rows_from_output,
+        effective_public_broadcaster_fee_mode, fail_private_broadcaster_progress_steps_at_stage,
+        fee_token_option_has_eligible_broadcaster, finish_private_broadcaster_progress_steps,
+        finish_private_broadcaster_progress_steps_at_stage,
+        form_error_clears_public_broadcaster_cost_estimate, format_compact_age,
         format_exact_asset_amount_for_display, format_form_error_for_asset,
         format_native_token_amount_for_display, format_private_asset_rows,
         format_public_broadcaster_fee_margin, format_report_chain, format_send_amount_input,
         format_total, format_unshield_amount_input, loading_summary, max_send_amount_from_snapshot,
         max_unshield_amount_from_snapshot, merge_public_balance_snapshot,
         native_token_display_label, native_wrapped_output_labels, next_public_account_label_number,
-        parse_repair_cache_block, private_action_metrics, progress_detail,
-        public_account_identicon_color, public_account_identicon_pattern,
-        public_account_matches_search, public_account_visible_balances_for_chain,
-        public_action_asset_label, public_action_error_copy_value, public_action_error_details,
-        public_action_error_summary, public_action_max_amount_after_reserve,
-        public_action_max_label, public_action_progress_steps, public_address_qr_module_range,
-        public_address_qr_payload, public_balance_entry_for_chain,
-        public_broadcaster_candidates_for_asset, public_broadcaster_cost_status,
-        public_broadcaster_cost_status_text, public_broadcaster_fee_token_options_from_snapshot,
-        public_broadcaster_fee_token_warning,
+        parse_repair_cache_block, private_action_metrics, private_broadcaster_closed_active_stage,
+        private_broadcaster_progress_steps, progress_detail, public_account_identicon_color,
+        public_account_identicon_pattern, public_account_matches_search,
+        public_account_visible_balances_for_chain, public_action_asset_label,
+        public_action_error_copy_value, public_action_error_details, public_action_error_summary,
+        public_action_max_amount_after_reserve, public_action_max_label,
+        public_action_progress_steps, public_address_qr_module_range, public_address_qr_payload,
+        public_balance_entry_for_chain, public_broadcaster_candidates_for_asset,
+        public_broadcaster_cost_status, public_broadcaster_cost_status_text,
+        public_broadcaster_fee_token_options_from_snapshot, public_broadcaster_fee_token_warning,
         public_broadcaster_submit_disabled_for_fee_token_options, refresh_form_asset_from_snapshot,
         repair_cache_help_text, resolve_selected_public_broadcaster_fee_token,
         send_asset_key_from_formatted, send_element_id, send_key_matches_asset,
-        should_focus_utxo_table, should_preserve_estimate_after_broadcaster_policy_change,
-        should_show_broadcaster_fee_mode_toggle, should_show_distinct_amount,
-        should_show_pending_poi_amount, unshield_asset_key_from_formatted, unshield_element_id,
-        unshield_key_matches_asset, wallet_generation_matches, wallet_options_from_metadata,
+        send_public_broadcaster_estimate_input_error,
+        should_clear_private_action_error_on_password_change, should_focus_utxo_table,
+        should_preserve_estimate_after_broadcaster_policy_change,
+        should_render_public_broadcaster_cost_preview, should_show_broadcaster_fee_mode_toggle,
+        should_show_distinct_amount, should_show_pending_poi_amount,
+        unshield_asset_key_from_formatted, unshield_element_id, unshield_key_matches_asset,
+        unshield_public_broadcaster_estimate_input_error, wallet_generation_matches,
+        wallet_options_from_metadata,
     };
 
     fn utxo_output(token: &str, value: &str, is_spent: bool) -> UtxoOutput {
@@ -14882,6 +16016,147 @@ mod tests {
             entered,
             entered + uint!(1_U256)
         ));
+    }
+
+    #[test]
+    fn public_broadcaster_cost_preview_hides_on_form_error() {
+        assert!(should_render_public_broadcaster_cost_preview(
+            DeliveryMode::PublicBroadcaster,
+            false,
+            false,
+        ));
+        assert!(!should_render_public_broadcaster_cost_preview(
+            DeliveryMode::PublicBroadcaster,
+            false,
+            true,
+        ));
+        assert!(!should_render_public_broadcaster_cost_preview(
+            DeliveryMode::PublicBroadcaster,
+            true,
+            false,
+        ));
+        assert!(!should_render_public_broadcaster_cost_preview(
+            DeliveryMode::ManualCalldata,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn public_broadcaster_missing_password_errors_preserve_estimate() {
+        assert!(!form_error_clears_public_broadcaster_cost_estimate(
+            DeliveryFormKind::Send,
+            SEND_MISSING_PASSWORD_ERROR,
+        ));
+        assert!(!form_error_clears_public_broadcaster_cost_estimate(
+            DeliveryFormKind::Unshield,
+            UNSHIELD_MISSING_PASSWORD_ERROR,
+        ));
+        assert!(!form_error_clears_public_broadcaster_cost_estimate(
+            DeliveryFormKind::Send,
+            SEND_AUTHORIZATION_FAILED_ERROR,
+        ));
+        assert!(!form_error_clears_public_broadcaster_cost_estimate(
+            DeliveryFormKind::Unshield,
+            UNSHIELD_AUTHORIZATION_FAILED_ERROR,
+        ));
+        assert!(form_error_clears_public_broadcaster_cost_estimate(
+            DeliveryFormKind::Send,
+            "invalid recipient 0zk address",
+        ));
+        assert!(form_error_clears_public_broadcaster_cost_estimate(
+            DeliveryFormKind::Unshield,
+            SEND_MISSING_PASSWORD_ERROR,
+        ));
+    }
+
+    #[test]
+    fn password_change_only_clears_missing_password_errors() {
+        assert!(should_clear_private_action_error_on_password_change(
+            DeliveryFormKind::Send,
+            SEND_MISSING_PASSWORD_ERROR,
+        ));
+        assert!(should_clear_private_action_error_on_password_change(
+            DeliveryFormKind::Unshield,
+            UNSHIELD_MISSING_PASSWORD_ERROR,
+        ));
+        assert!(should_clear_private_action_error_on_password_change(
+            DeliveryFormKind::Send,
+            SEND_AUTHORIZATION_FAILED_ERROR,
+        ));
+        assert!(should_clear_private_action_error_on_password_change(
+            DeliveryFormKind::Unshield,
+            UNSHIELD_AUTHORIZATION_FAILED_ERROR,
+        ));
+        assert!(!should_clear_private_action_error_on_password_change(
+            DeliveryFormKind::Send,
+            "invalid recipient 0zk address",
+        ));
+        assert!(!should_clear_private_action_error_on_password_change(
+            DeliveryFormKind::Unshield,
+            SEND_MISSING_PASSWORD_ERROR,
+        ));
+    }
+
+    #[test]
+    fn public_broadcaster_estimate_validation_reports_invalid_send_recipient() {
+        let asset = UnshieldAsset {
+            chain_id: 1,
+            token: Address::ZERO,
+            label: "DAI".to_string(),
+            decimals: Some(18),
+            total: uint!(10_000_000_000_000_000_000_U256),
+            poi_verified_total: uint!(10_000_000_000_000_000_000_U256),
+            max_batched: uint!(10_000_000_000_000_000_000_U256),
+            icon_path: None,
+        };
+
+        let error = send_public_broadcaster_estimate_input_error("not-0zk", "1", &asset)
+            .expect("invalid recipient should be reported");
+
+        assert!(error.contains("invalid recipient 0zk address"));
+    }
+
+    #[test]
+    fn public_broadcaster_estimate_validation_reports_invalid_unshield_recipient() {
+        let asset = UnshieldAsset {
+            chain_id: 1,
+            token: Address::ZERO,
+            label: "DAI".to_string(),
+            decimals: Some(18),
+            total: uint!(10_000_000_000_000_000_000_U256),
+            poi_verified_total: uint!(10_000_000_000_000_000_000_U256),
+            max_batched: uint!(10_000_000_000_000_000_000_U256),
+            icon_path: None,
+        };
+
+        assert_eq!(
+            unshield_public_broadcaster_estimate_input_error("not-0x", "1", &asset),
+            Some("Enter a valid public EVM recipient address".to_string())
+        );
+    }
+
+    #[test]
+    fn public_broadcaster_estimate_validation_allows_empty_recipient_prompt_state() {
+        let asset = UnshieldAsset {
+            chain_id: 1,
+            token: Address::ZERO,
+            label: "DAI".to_string(),
+            decimals: Some(18),
+            total: uint!(10_000_000_000_000_000_000_U256),
+            poi_verified_total: uint!(10_000_000_000_000_000_000_U256),
+            max_batched: uint!(10_000_000_000_000_000_000_U256),
+            icon_path: None,
+        };
+
+        assert_eq!(
+            send_public_broadcaster_estimate_input_error("", "1", &asset),
+            None
+        );
+        assert_eq!(
+            unshield_public_broadcaster_estimate_input_error("", "1", &asset),
+            None
+        );
     }
 
     #[test]
@@ -15419,6 +16694,188 @@ mod tests {
         assert_eq!(
             TransactionGenerationStage::WaitingForBroadcasterResponse.detail(),
             "Waiting for the selected broadcaster to respond."
+        );
+    }
+
+    #[test]
+    fn private_broadcaster_progress_stage_marks_prior_steps_done() {
+        let mut steps = private_broadcaster_progress_steps();
+
+        apply_private_broadcaster_progress_stage(
+            &mut steps,
+            TransactionGenerationStage::EstimatingBroadcasterFee,
+        );
+
+        let statuses = steps.iter().map(|step| step.status).collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            vec![
+                PublicActionStepStatus::Done,
+                PublicActionStepStatus::Done,
+                PublicActionStepStatus::Pending,
+                PublicActionStepStatus::NotStarted,
+                PublicActionStepStatus::NotStarted,
+                PublicActionStepStatus::NotStarted,
+            ]
+        );
+    }
+
+    #[test]
+    fn private_broadcaster_progress_submitted_marks_all_steps_done() {
+        let mut steps = private_broadcaster_progress_steps();
+        apply_private_broadcaster_progress_stage(
+            &mut steps,
+            TransactionGenerationStage::WaitingForBroadcasterResponse,
+        );
+
+        finish_private_broadcaster_progress_steps(
+            &mut steps,
+            &PublicBroadcasterResultKind::Submitted {
+                tx_hash: "0xabc".to_string(),
+            },
+        );
+
+        assert!(
+            steps
+                .iter()
+                .all(|step| step.status == PublicActionStepStatus::Done)
+        );
+    }
+
+    #[test]
+    fn private_broadcaster_progress_timeout_marks_waiting_step_error() {
+        let mut steps = private_broadcaster_progress_steps();
+        apply_private_broadcaster_progress_stage(
+            &mut steps,
+            TransactionGenerationStage::WaitingForBroadcasterResponse,
+        );
+
+        finish_private_broadcaster_progress_steps(
+            &mut steps,
+            &PublicBroadcasterResultKind::TimedOut,
+        );
+
+        assert_eq!(
+            steps.last().map(|step| step.status),
+            Some(PublicActionStepStatus::Error)
+        );
+        assert!(
+            steps
+                .last()
+                .and_then(|step| step.message.as_ref())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn private_broadcaster_terminal_failure_applies_latest_stage() {
+        let mut steps = private_broadcaster_progress_steps();
+
+        fail_private_broadcaster_progress_steps_at_stage(
+            &mut steps,
+            TransactionGenerationStage::PublishingToBroadcaster,
+            "publish failed",
+        );
+
+        let statuses = steps.iter().map(|step| step.status).collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            vec![
+                PublicActionStepStatus::Done,
+                PublicActionStepStatus::Done,
+                PublicActionStepStatus::Done,
+                PublicActionStepStatus::Done,
+                PublicActionStepStatus::Error,
+                PublicActionStepStatus::NotStarted,
+            ]
+        );
+        assert_eq!(steps[4].message.as_deref(), Some("publish failed"));
+    }
+
+    #[test]
+    fn private_broadcaster_terminal_result_applies_latest_stage_before_timeout() {
+        let mut steps = private_broadcaster_progress_steps();
+
+        finish_private_broadcaster_progress_steps_at_stage(
+            &mut steps,
+            TransactionGenerationStage::WaitingForBroadcasterResponse,
+            &PublicBroadcasterResultKind::TimedOut,
+        );
+
+        assert_eq!(
+            steps.last().map(|step| step.status),
+            Some(PublicActionStepStatus::Error)
+        );
+        assert!(
+            steps[..steps.len() - 1]
+                .iter()
+                .all(|step| step.status == PublicActionStepStatus::Done)
+        );
+    }
+
+    #[test]
+    fn closed_private_broadcaster_progress_exposes_active_stage() {
+        let key = UnshieldAssetKey::new(1, Address::from([0x11; 20]));
+        let mut progress = PrivateBroadcasterProgressState {
+            kind: DeliveryFormKind::Send,
+            key,
+            generation_id: 7,
+            asset_label: Arc::from("ETH"),
+            icon_path: None,
+            recipient: Arc::from("0zk"),
+            steps: private_broadcaster_progress_steps(),
+            estimate: None,
+            result: None,
+            error: None,
+            dialog_open: false,
+            stage_seen: false,
+        };
+        assert_eq!(
+            private_broadcaster_closed_active_stage(
+                Some(&progress),
+                DeliveryFormKind::Send,
+                key,
+                7,
+            ),
+            None
+        );
+        apply_private_broadcaster_progress_stage(
+            &mut progress.steps,
+            TransactionGenerationStage::PublishingToBroadcaster,
+        );
+        progress.stage_seen = true;
+
+        assert_eq!(
+            private_broadcaster_closed_active_stage(
+                Some(&progress),
+                DeliveryFormKind::Send,
+                key,
+                7,
+            ),
+            Some(TransactionGenerationStage::PublishingToBroadcaster)
+        );
+
+        progress.dialog_open = true;
+        assert_eq!(
+            private_broadcaster_closed_active_stage(
+                Some(&progress),
+                DeliveryFormKind::Send,
+                key,
+                7,
+            ),
+            None
+        );
+
+        progress.dialog_open = false;
+        progress.error = Some(Arc::from("failed"));
+        assert_eq!(
+            private_broadcaster_closed_active_stage(
+                Some(&progress),
+                DeliveryFormKind::Send,
+                key,
+                7,
+            ),
+            None
         );
     }
 
