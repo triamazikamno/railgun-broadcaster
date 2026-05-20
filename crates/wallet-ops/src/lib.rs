@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -51,7 +51,8 @@ use reqwest::Url;
 use serde::Serialize;
 use sync_service::{
     ChainConfig, ChainConfigDefaults, ChainKey, LocalPoiMerkleProofSource, SyncManager,
-    SyncProgressSender, WalletConfig, WalletHandle, WalletLocalPoiCaches,
+    SyncProgressSender, WalletConfig, WalletHandle, WalletLocalPoiCaches, WalletPendingOverlay,
+    WalletPendingSpent,
 };
 pub use sync_service::{
     PoiArtifactManifestSource, PoiArtifactSourceConfig, PoiCacheService, PoiReadSource,
@@ -100,6 +101,7 @@ pub use public_wallet::{
     submit_public_send, submit_public_send_with_progress, submit_public_shield,
     submit_public_shield_with_progress,
 };
+use utxos::apply_pending_overlay_to_outputs;
 pub use utxos::{
     ListUtxosOutput, TokenTotal, UtxoOutput, max_broadcaster_fee_token_amount_from_outputs,
     max_send_amount_from_outputs, max_unshield_amount_from_outputs,
@@ -740,8 +742,17 @@ impl WalletSession {
     }
 
     pub async fn unspent_utxos(&self) -> Vec<Utxo> {
-        let utxos = self.handle.utxos.read().await;
-        poi_verified_unspent_utxos_from_records(&utxos)
+        let utxos = self.handle.utxos.read().await.clone();
+        let pending_overlay = self.handle.pending_overlay().await;
+        poi_verified_unspent_utxos_from_records(&utxos, &pending_overlay)
+    }
+
+    async fn mark_pending_spent_utxos(&self, utxos: &[Utxo], tx_hash: Option<FixedBytes<32>>) {
+        self.handle.mark_pending_spent_utxos(utxos, tx_hash).await;
+    }
+
+    pub async fn clear_local_pending_spent(&self) -> bool {
+        self.handle.clear_local_pending_spent().await
     }
 
     pub async fn refresh_poi_statuses(&self) -> bool {
@@ -749,13 +760,27 @@ impl WalletSession {
     }
 }
 
-fn poi_verified_unspent_utxos_from_records(utxos: &[WalletUtxo]) -> Vec<Utxo> {
+fn poi_verified_unspent_utxos_from_records(
+    utxos: &[WalletUtxo],
+    pending_overlay: &WalletPendingOverlay,
+) -> Vec<Utxo> {
     let active_poi_list_keys = default_active_poi_list_keys();
+    let pending_spent_keys = pending_spent_keys(pending_overlay);
     utxos
         .iter()
         .filter(|entry| !entry.is_spent())
+        .filter(|entry| !pending_spent_keys.contains(&(entry.utxo.tree, entry.utxo.position)))
         .filter(|entry| entry.utxo.poi.is_valid_for_lists(&active_poi_list_keys))
         .map(|entry| entry.utxo.clone())
+        .collect()
+}
+
+fn pending_spent_keys(pending_overlay: &WalletPendingOverlay) -> HashSet<(u32, u64)> {
+    pending_overlay
+        .pending_spent
+        .iter()
+        .chain(pending_overlay.local_pending_spent.iter())
+        .map(WalletPendingSpent::key)
         .collect()
 }
 
@@ -1835,8 +1860,9 @@ pub async fn unshield(
     let mut forest = chain_handle.forest.read().await.clone();
     forest.compute_roots();
 
-    let wallet_utxos = synced.handle.utxos.read().await;
-    let utxos = poi_verified_unspent_utxos_from_records(&wallet_utxos);
+    let wallet_utxos = synced.handle.utxos.read().await.clone();
+    let pending_overlay = synced.handle.pending_overlay().await;
+    let utxos = poi_verified_unspent_utxos_from_records(&wallet_utxos, &pending_overlay);
     let tx_builder = TransactionBuilder {
         chain_type: 0,
         chain_id: request.chain_id,
@@ -2345,8 +2371,15 @@ pub async fn submit_desktop_unshield_public_broadcaster(
     let waku = Arc::clone(&request.waku);
     let timeout = request.response_timeout;
     let progress_tx = request.progress_tx.clone();
+    let session = Arc::clone(&request.session);
     let prepared = prepare_desktop_unshield_public_broadcaster(request, http).await?;
-    submit_public_broadcaster_plan(
+    let pending_spent_inputs = prepared
+        .plan
+        .inputs
+        .iter()
+        .map(|input| input.utxo.clone())
+        .collect::<Vec<_>>();
+    let result = submit_public_broadcaster_plan(
         waku,
         prepared.plan.call.to,
         prepared.plan.call.data,
@@ -2367,7 +2400,9 @@ pub async fn submit_desktop_unshield_public_broadcaster(
         progress_tx,
         timeout,
     )
-    .await
+    .await?;
+    mark_submitted_inputs_pending_spent(&session, &pending_spent_inputs, &result).await;
+    Ok(result)
 }
 
 pub async fn submit_desktop_send_public_broadcaster(
@@ -2377,8 +2412,15 @@ pub async fn submit_desktop_send_public_broadcaster(
     let waku = Arc::clone(&request.waku);
     let timeout = request.response_timeout;
     let progress_tx = request.progress_tx.clone();
+    let session = Arc::clone(&request.session);
     let prepared = prepare_desktop_send_public_broadcaster(request, http).await?;
-    submit_public_broadcaster_plan(
+    let pending_spent_inputs = prepared
+        .plan
+        .inputs
+        .iter()
+        .map(|input| input.utxo.clone())
+        .collect::<Vec<_>>();
+    let result = submit_public_broadcaster_plan(
         waku,
         prepared.plan.call.to,
         prepared.plan.call.data,
@@ -2399,7 +2441,26 @@ pub async fn submit_desktop_send_public_broadcaster(
         progress_tx,
         timeout,
     )
-    .await
+    .await?;
+    mark_submitted_inputs_pending_spent(&session, &pending_spent_inputs, &result).await;
+    Ok(result)
+}
+
+async fn mark_submitted_inputs_pending_spent(
+    session: &WalletSession,
+    inputs: &[Utxo],
+    result: &PublicBroadcasterSubmissionResult,
+) {
+    let PublicBroadcasterResultKind::Submitted { tx_hash } = &result.result else {
+        return;
+    };
+    session
+        .mark_pending_spent_utxos(inputs, parse_submitted_tx_hash(tx_hash))
+        .await;
+}
+
+fn parse_submitted_tx_hash(tx_hash: &str) -> Option<FixedBytes<32>> {
+    tx_hash.parse().ok()
 }
 
 async fn prepare_desktop_unshield_public_broadcaster(
@@ -3319,7 +3380,12 @@ async fn submit_public_broadcaster_plan(
 
 async fn snapshot_from_handle(chain_id: u64, handle: &WalletHandle) -> ListUtxosOutput {
     let utxos = handle.utxos.read().await.clone();
+    let pending_overlay = handle.pending_overlay().await;
+    let local_pending_spent_count = pending_overlay.local_pending_spent.len();
+    let confirmed_utxos = utxos.clone();
     let (utxo_outputs, totals) = utxo_outputs_from_utxos(utxos);
+    let mut utxo_outputs = utxo_outputs;
+    apply_pending_overlay_to_outputs(&confirmed_utxos, pending_overlay, &mut utxo_outputs);
     let unspent_count = utxo_outputs.iter().filter(|utxo| !utxo.is_spent).count();
     let spent_count = utxo_outputs.len().saturating_sub(unspent_count);
 
@@ -3329,6 +3395,7 @@ async fn snapshot_from_handle(chain_id: u64, handle: &WalletHandle) -> ListUtxos
         utxo_count: utxo_outputs.len(),
         unspent_count,
         spent_count,
+        local_pending_spent_count,
         utxos: utxo_outputs,
         totals,
     }
@@ -3880,7 +3947,8 @@ mod tests {
         EvmTransactionSigner, ListUtxosOutput, PublicBroadcasterCandidate,
         PublicBroadcasterFeeMargin, PublicBroadcasterFeeMode, PublicBroadcasterResultKind,
         PublicBroadcasterSelection, RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS, SoftwareEvmSigner,
-        TokenTotal, UtxoOutput, approximate_public_broadcaster_cost,
+        TokenTotal, UtxoOutput, WalletPendingOverlay, WalletPendingSpent,
+        apply_pending_overlay_to_outputs, approximate_public_broadcaster_cost,
         approximate_public_broadcaster_gas, broadcaster_fee_amount, broadcaster_fee_covers,
         buffered_public_broadcaster_fee, decode_public_broadcaster_response,
         eligible_public_broadcasters, fee_policy_eligible_public_broadcasters,
@@ -4270,11 +4338,91 @@ mod tests {
             .insert(default_active_poi_list_keys()[0], PoiStatus::ShieldBlocked);
         let spent = spent_utxo(token, 9, 0, 4);
 
-        let selected =
-            super::poi_verified_unspent_utxos_from_records(&[valid, unknown, blocked, spent]);
+        let selected = super::poi_verified_unspent_utxos_from_records(
+            &[valid, unknown, blocked, spent],
+            &WalletPendingOverlay::default(),
+        );
 
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].note.value, uint!(5_U256));
+    }
+
+    #[test]
+    fn pending_spent_utxos_filter_planner_inputs() {
+        let token = address(0x11);
+        let valid = utxo(token, 5, 0, 1);
+        let pending = WalletPendingOverlay {
+            pending_spent: vec![WalletPendingSpent {
+                tree: 0,
+                position: 1,
+                tx_hash: Some(FixedBytes::from([0x99; 32])),
+                block_number: Some(20),
+                block_timestamp: Some(1_700_000_020),
+            }],
+            ..WalletPendingOverlay::default()
+        };
+
+        let selected = super::poi_verified_unspent_utxos_from_records(&[valid], &pending);
+
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn pending_overlay_rows_are_not_spendable() {
+        let token = address(0x11);
+        let confirmed = utxo(token, 5, 0, 1);
+        let pending_new = utxo(token, 7, 0, 2);
+        let mut pending_spent_overlay = WalletPendingOverlay {
+            pending_spent: vec![WalletPendingSpent {
+                tree: 0,
+                position: 1,
+                tx_hash: Some(FixedBytes::from([0x99; 32])),
+                block_number: Some(20),
+                block_timestamp: Some(1_700_000_020),
+            }],
+            ..WalletPendingOverlay::default()
+        };
+        pending_spent_overlay.new_utxos.push(pending_new);
+        let (mut outputs, _) = utxo_outputs_from_utxos(vec![confirmed.clone()]);
+
+        apply_pending_overlay_to_outputs(&[confirmed], pending_spent_overlay, &mut outputs);
+
+        assert_eq!(outputs.len(), 2);
+        assert!(outputs.iter().any(|output| output.pending_spent));
+        assert!(outputs.iter().any(|output| output.pending_new));
+        assert_eq!(max_send_amount_from_outputs(&outputs, token), U256::ZERO);
+        assert_eq!(
+            max_unshield_amount_from_outputs(&outputs, token),
+            U256::ZERO
+        );
+    }
+
+    #[test]
+    fn local_pending_spent_rows_are_not_spendable() {
+        let token = address(0x11);
+        let confirmed = utxo(token, 5, 0, 1);
+        let local_pending_overlay = WalletPendingOverlay {
+            local_pending_spent: vec![WalletPendingSpent {
+                tree: 0,
+                position: 1,
+                tx_hash: Some(FixedBytes::from([0x99; 32])),
+                block_number: None,
+                block_timestamp: Some(1_700_000_020),
+            }],
+            ..WalletPendingOverlay::default()
+        };
+        let (mut outputs, _) = utxo_outputs_from_utxos(vec![confirmed.clone()]);
+
+        apply_pending_overlay_to_outputs(&[confirmed], local_pending_overlay, &mut outputs);
+
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].local_pending_spent);
+        assert!(!outputs[0].pending_spent);
+        assert_eq!(max_send_amount_from_outputs(&outputs, token), U256::ZERO);
+        assert_eq!(
+            max_unshield_amount_from_outputs(&outputs, token),
+            U256::ZERO
+        );
     }
 
     #[test]
@@ -4819,6 +4967,7 @@ mod tests {
             utxo_count: 1,
             unspent_count: 0,
             spent_count: 1,
+            local_pending_spent_count: 0,
             utxos: vec![UtxoOutput {
                 tree: 2,
                 position: 3,
@@ -4841,6 +4990,9 @@ mod tests {
                 source_block_number: 11,
                 source_block_timestamp: 1_700_000_011,
                 is_spent: true,
+                pending_new: false,
+                pending_spent: false,
+                local_pending_spent: false,
                 spent_tx_hash: Some(
                     "0x2222222222222222222222222222222222222222222222222222222222222222"
                         .to_string(),
@@ -4862,6 +5014,7 @@ mod tests {
                 "utxo_count": 1,
                 "unspent_count": 0,
                 "spent_count": 1,
+                "local_pending_spent_count": 0,
                 "utxos": [{
                     "tree": 2,
                     "position": 3,
@@ -4879,6 +5032,9 @@ mod tests {
                     "source_block_number": 11,
                     "source_block_timestamp": 1_700_000_011,
                     "is_spent": true,
+                    "pending_new": false,
+                    "pending_spent": false,
+                    "local_pending_spent": false,
                     "spent_tx_hash": "0x2222222222222222222222222222222222222222222222222222222222222222",
                     "spent_block_number": 21,
                 }],

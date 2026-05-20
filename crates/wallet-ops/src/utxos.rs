@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct UtxoOutput {
@@ -16,13 +17,21 @@ pub struct UtxoOutput {
     pub source_block_number: u64,
     pub source_block_timestamp: u64,
     pub is_spent: bool,
+    pub pending_new: bool,
+    pub pending_spent: bool,
+    pub local_pending_spent: bool,
     pub spent_tx_hash: Option<String>,
     pub spent_block_number: Option<u64>,
 }
 
 impl UtxoOutput {
     fn planner_utxo_for_token(&self, token: Address) -> Option<Utxo> {
-        if self.is_spent || !self.poi_spendable {
+        if self.is_spent
+            || self.pending_new
+            || self.pending_spent
+            || self.local_pending_spent
+            || !self.poi_spendable
+        {
             return None;
         }
         let row_token = self.token.parse::<Address>().ok()?;
@@ -61,6 +70,7 @@ pub struct ListUtxosOutput {
     pub utxo_count: usize,
     pub unspent_count: usize,
     pub spent_count: usize,
+    pub local_pending_spent_count: usize,
     pub utxos: Vec<UtxoOutput>,
     pub totals: Vec<TokenTotal>,
 }
@@ -134,6 +144,9 @@ pub(crate) fn utxo_outputs_from_utxos(
                 source_block_number: source.block_number,
                 source_block_timestamp: source.block_timestamp,
                 is_spent: wallet_utxo.spent.is_some(),
+                pending_new: false,
+                pending_spent: false,
+                local_pending_spent: false,
                 spent_tx_hash: spent.map(|source| hex::encode_prefixed(source.tx_hash)),
                 spent_block_number: spent.map(|source| source.block_number),
             }
@@ -153,6 +166,95 @@ pub(crate) fn utxo_outputs_from_utxos(
         .collect();
 
     (utxo_outputs, totals)
+}
+
+pub(crate) fn apply_pending_overlay_to_outputs(
+    confirmed_utxos: &[WalletUtxo],
+    overlay: WalletPendingOverlay,
+    outputs: &mut Vec<UtxoOutput>,
+) {
+    let confirmed_spent: HashSet<_> = confirmed_utxos
+        .iter()
+        .filter(|utxo| utxo.is_spent())
+        .map(|utxo| (utxo.utxo.tree, utxo.utxo.position))
+        .collect();
+    let mut local_pending_spent = BTreeMap::new();
+    for spent in overlay.local_pending_spent {
+        local_pending_spent.insert(spent.key(), spent);
+    }
+    let mut pending_spent = BTreeMap::new();
+    for spent in overlay.pending_spent {
+        pending_spent.insert(spent.key(), spent);
+    }
+
+    for output in outputs.iter_mut() {
+        if output.is_spent {
+            continue;
+        }
+        if let Some(spent) = pending_spent.get(&(output.tree, output.position)) {
+            mark_output_pending_spent(output, spent);
+        } else if let Some(spent) = local_pending_spent.get(&(output.tree, output.position)) {
+            mark_output_local_pending_spent(output, spent);
+        }
+    }
+
+    for pending in overlay.new_utxos {
+        if confirmed_spent.contains(&(pending.utxo.tree, pending.utxo.position))
+            || outputs.iter().any(|output| {
+                output.tree == pending.utxo.tree && output.position == pending.utxo.position
+            })
+        {
+            continue;
+        }
+        outputs.push(pending_utxo_output(pending));
+    }
+}
+
+fn mark_output_pending_spent(output: &mut UtxoOutput, spent: &WalletPendingSpent) {
+    output.pending_spent = true;
+    output.poi_spendable = false;
+    if output.spent_tx_hash.is_none() {
+        output.spent_tx_hash = spent.tx_hash.map(hex::encode_prefixed);
+    }
+    if output.spent_block_number.is_none() {
+        output.spent_block_number = spent.block_number;
+    }
+}
+
+fn mark_output_local_pending_spent(output: &mut UtxoOutput, spent: &WalletPendingSpent) {
+    output.local_pending_spent = true;
+    output.poi_spendable = false;
+    if output.spent_tx_hash.is_none() {
+        output.spent_tx_hash = spent.tx_hash.map(hex::encode_prefixed);
+    }
+}
+
+fn pending_utxo_output(wallet_utxo: WalletUtxo) -> UtxoOutput {
+    let utxo = wallet_utxo.utxo;
+    let token_addr = utxo.token_address();
+    let spent = wallet_utxo.spent.as_ref();
+    let source = &utxo.source;
+    UtxoOutput {
+        tree: utxo.tree,
+        position: utxo.position,
+        token: token_addr.to_checksum(None),
+        value: utxo.note.value.to_string(),
+        commitment_kind: commitment_kind_label(utxo.poi.commitment_kind).to_string(),
+        commitment: hex::encode_prefixed(utxo.poi.commitment),
+        npk: hex::encode_prefixed(utxo.poi.npk),
+        blinded_commitment: hex::encode_prefixed(utxo.poi.blinded_commitment),
+        poi_statuses: BTreeMap::new(),
+        poi_spendable: false,
+        source_tx_hash: hex::encode_prefixed(source.tx_hash),
+        source_block_number: source.block_number,
+        source_block_timestamp: source.block_timestamp,
+        is_spent: false,
+        pending_new: true,
+        pending_spent: spent.is_some(),
+        local_pending_spent: false,
+        spent_tx_hash: spent.map(|source| hex::encode_prefixed(source.tx_hash)),
+        spent_block_number: spent.map(|source| source.block_number),
+    }
 }
 
 const fn commitment_kind_label(kind: UtxoCommitmentKind) -> &'static str {

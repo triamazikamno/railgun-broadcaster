@@ -14,4 +14,6 @@ pub use types::{
     PoiArtifactManifestSource, PoiArtifactSourceConfig, PoiReadSource, SyncProgressSender,
     SyncProgressStage, SyncProgressUpdate, WalletCacheStore, WalletConfig, WalletLocalPoiCaches,
 };
-pub use wallet::{LocalPoiMerkleProofSource, WalletHandle};
+pub use wallet::{
+    LocalPoiMerkleProofSource, WalletHandle, WalletPendingOverlay, WalletPendingSpent,
+};

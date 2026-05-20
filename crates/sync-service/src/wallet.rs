@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::hex;
@@ -68,6 +69,7 @@ const WALLET_POI_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 const WALLET_POI_LIVE_TAIL_INTERVAL: Duration = Duration::from_secs(60);
 const WALLET_METADATA_LIVE_FLUSH_INTERVAL: Duration = Duration::from_secs(60);
 const WALLET_METADATA_LIVE_FLUSH_BLOCKS: u64 = 25;
+const LOCAL_PENDING_SPENT_TTL: Duration = Duration::from_secs(10 * 60);
 const OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER: Duration = Duration::from_secs(10 * 60);
 const OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 const OUTPUT_POI_RECOVERY_SUBMITTED_RETRY_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
@@ -141,6 +143,8 @@ impl WalletPoiRefreshSelection {
 pub struct WalletHandle {
     pub cache_key: String,
     pub utxos: Arc<RwLock<Vec<WalletUtxo>>>,
+    pub pending_overlay: Arc<RwLock<WalletPendingOverlay>>,
+    last_scanned: Arc<AtomicU64>,
     pub ready_rx: watch::Receiver<bool>,
     pub rev_rx: watch::Receiver<u64>,
     pub poi_refreshing_rx: watch::Receiver<bool>,
@@ -150,7 +154,138 @@ pub struct WalletHandle {
     rev_tx: watch::Sender<u64>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct WalletPendingOverlay {
+    pub new_utxos: Vec<WalletUtxo>,
+    pub pending_spent: Vec<WalletPendingSpent>,
+    pub local_pending_spent: Vec<WalletPendingSpent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletPendingSpent {
+    pub tree: u32,
+    pub position: u64,
+    pub tx_hash: Option<FixedBytes<32>>,
+    pub block_number: Option<u64>,
+    pub block_timestamp: Option<u64>,
+}
+
+impl WalletPendingSpent {
+    #[must_use]
+    pub const fn key(&self) -> (u32, u64) {
+        (self.tree, self.position)
+    }
+
+    fn from_source(utxo: &Utxo, source: UtxoSource) -> Self {
+        Self {
+            tree: utxo.tree,
+            position: utxo.position,
+            tx_hash: Some(source.tx_hash),
+            block_number: Some(source.block_number),
+            block_timestamp: Some(source.block_timestamp),
+        }
+    }
+
+    fn submitted(utxo: &Utxo, tx_hash: Option<FixedBytes<32>>, now: u64) -> Self {
+        Self {
+            tree: utxo.tree,
+            position: utxo.position,
+            tx_hash,
+            block_number: None,
+            block_timestamp: Some(now),
+        }
+    }
+}
+
 impl WalletHandle {
+    #[must_use]
+    pub fn last_scanned(&self) -> u64 {
+        self.last_scanned.load(Ordering::Relaxed)
+    }
+
+    fn set_last_scanned(&self, block: u64) {
+        self.last_scanned.store(block, Ordering::Relaxed);
+    }
+
+    pub async fn pending_overlay(&self) -> WalletPendingOverlay {
+        self.pending_overlay.read().await.clone()
+    }
+
+    pub async fn clear_local_pending_spent(&self) -> bool {
+        let changed = {
+            let mut overlay = self.pending_overlay.write().await;
+            let changed = !overlay.local_pending_spent.is_empty();
+            overlay.local_pending_spent.clear();
+            changed
+        };
+        self.notify_if_changed(changed);
+        changed
+    }
+
+    pub async fn mark_pending_spent_utxos(&self, utxos: &[Utxo], tx_hash: Option<FixedBytes<32>>) {
+        if utxos.is_empty() {
+            return;
+        }
+        let now = now_epoch_secs();
+        let changed = {
+            let mut overlay = self.pending_overlay.write().await;
+            let mut existing: HashSet<_> = overlay
+                .pending_spent
+                .iter()
+                .chain(overlay.local_pending_spent.iter())
+                .map(WalletPendingSpent::key)
+                .collect();
+            let before = overlay.local_pending_spent.len();
+            for utxo in utxos {
+                if existing.insert((utxo.tree, utxo.position)) {
+                    overlay
+                        .local_pending_spent
+                        .push(WalletPendingSpent::submitted(utxo, tx_hash, now));
+                }
+            }
+            overlay
+                .local_pending_spent
+                .sort_by_key(WalletPendingSpent::key);
+            overlay.local_pending_spent.len() != before
+        };
+        self.notify_if_changed(changed);
+    }
+
+    pub(crate) async fn set_chain_pending_overlay(&self, next: WalletPendingOverlay) {
+        let now = now_epoch_secs();
+        let confirmed_spent: HashSet<_> = {
+            let utxos = self.utxos.read().await;
+            utxos
+                .iter()
+                .filter(|utxo| utxo.is_spent())
+                .map(|utxo| (utxo.utxo.tree, utxo.utxo.position))
+                .collect()
+        };
+        let chain_pending_spent: HashSet<_> = next
+            .pending_spent
+            .iter()
+            .map(WalletPendingSpent::key)
+            .collect();
+        let changed = {
+            let mut overlay = self.pending_overlay.write().await;
+            let chain_changed = !chain_pending_overlay_matches(&overlay, &next);
+            let before_local = overlay.local_pending_spent.len();
+            overlay.local_pending_spent.retain(|spent| {
+                let key = spent.key();
+                if confirmed_spent.contains(&key) || chain_pending_spent.contains(&key) {
+                    return false;
+                }
+                let submitted_at = spent.block_timestamp.unwrap_or(now);
+                now.saturating_sub(submitted_at) < LOCAL_PENDING_SPENT_TTL.as_secs()
+            });
+            let local_changed = overlay.local_pending_spent.len() != before_local;
+            overlay.new_utxos = next.new_utxos;
+            overlay.pending_spent = next.pending_spent;
+            chain_changed || local_changed
+        };
+        self.notify_if_changed(changed);
+    }
+
     pub async fn refresh_poi_statuses(&self) -> bool {
         self.poi_refresh_tx
             .send(WalletPoiRefreshRequest {
@@ -577,6 +712,56 @@ pub(crate) fn apply_wallet_delta_to_vec(
     apply_wallet_delta_to_vec_with_outcome(cfg, wallet_utxos, delta).changed
 }
 
+pub(crate) fn pending_overlay_from_delta(
+    cfg: &WalletConfig,
+    wallet_utxos: &[WalletUtxo],
+    delta: WalletLogDelta,
+) -> WalletPendingOverlay {
+    let WalletLogDelta {
+        utxos: delta_utxos,
+        nullifiers,
+        ..
+    } = delta;
+    let nullifier_sources: HashMap<_, _> = nullifiers
+        .into_iter()
+        .map(|spent| ((spent.tree, spent.nullifier), spent.source))
+        .collect();
+
+    let mut pending_spent = wallet_utxos
+        .iter()
+        .filter(|entry| !entry.is_spent())
+        .filter_map(|entry| {
+            spent_source_for_utxo(
+                &entry.utxo,
+                cfg.scan_keys.nullifying_key,
+                &nullifier_sources,
+            )
+            .map(|source| WalletPendingSpent::from_source(&entry.utxo, source))
+        })
+        .collect::<Vec<_>>();
+    pending_spent.sort_by_key(WalletPendingSpent::key);
+
+    let mut existing: HashSet<_> = wallet_utxos
+        .iter()
+        .map(|wallet_utxo| (wallet_utxo.utxo.tree, wallet_utxo.utxo.position))
+        .collect();
+    let mut new_utxos = Vec::new();
+    for utxo in delta_utxos {
+        if existing.insert((utxo.tree, utxo.position)) {
+            let spent =
+                spent_source_for_utxo(&utxo, cfg.scan_keys.nullifying_key, &nullifier_sources);
+            new_utxos.push(WalletUtxo { utxo, spent });
+        }
+    }
+    new_utxos.sort_by_key(|wallet_utxo| (wallet_utxo.utxo.tree, wallet_utxo.utxo.position));
+
+    WalletPendingOverlay {
+        new_utxos,
+        pending_spent,
+        local_pending_spent: Vec::new(),
+    }
+}
+
 fn apply_wallet_delta_to_vec_with_outcome(
     cfg: &WalletConfig,
     wallet_utxos: &mut Vec<WalletUtxo>,
@@ -681,6 +866,27 @@ fn spent_source_for_utxo(
     nullifier_sources
         .get(&(utxo.tree, utxo.nullifier(nullifying_key)))
         .cloned()
+}
+
+fn chain_pending_overlay_matches(
+    current: &WalletPendingOverlay,
+    next: &WalletPendingOverlay,
+) -> bool {
+    current.pending_spent == next.pending_spent
+        && wallet_utxo_keys_match(&current.new_utxos, &next.new_utxos)
+}
+
+fn wallet_utxo_keys_match(left: &[WalletUtxo], right: &[WalletUtxo]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.utxo.tree == right.utxo.tree
+                && left.utxo.position == right.utxo.position
+                && left.utxo.poi.commitment == right.utxo.poi.commitment
+                && left.spent.as_ref().map(|source| source.tx_hash)
+                    == right.spent.as_ref().map(|source| source.tx_hash)
+                && left.spent.as_ref().map(|source| source.block_number)
+                    == right.spent.as_ref().map(|source| source.block_number)
+        })
 }
 
 pub(crate) async fn process_pending_output_poi_observations(
@@ -4879,6 +5085,8 @@ pub(crate) fn spawn_wallet_worker(
     initial_last_scanned: u64,
 ) -> WalletHandle {
     let utxos = Arc::new(RwLock::new(initial_utxos));
+    let pending_overlay = Arc::new(RwLock::new(WalletPendingOverlay::default()));
+    let last_scanned_state = Arc::new(AtomicU64::new(initial_last_scanned));
     let WalletWorkerServices {
         db,
         rpcs,
@@ -4893,6 +5101,8 @@ pub(crate) fn spawn_wallet_worker(
     let handle = WalletHandle {
         cache_key: cfg.cache_key.clone(),
         utxos: utxos.clone(),
+        pending_overlay,
+        last_scanned: last_scanned_state,
         ready_rx,
         rev_rx,
         poi_refreshing_rx,
@@ -5179,6 +5389,7 @@ pub(crate) fn spawn_wallet_worker(
                             );
                             let changed = outcome.changed;
                             last_scanned = to_block;
+                            worker_handle.set_last_scanned(last_scanned);
                             let snapshot = utxos.read().await;
                             let (unspent, spent) = wallet_utxo_counts(&snapshot);
                             let persist_outcome = persist_wallet_snapshot(WalletSnapshotPersist {
@@ -5223,6 +5434,7 @@ pub(crate) fn spawn_wallet_worker(
                             match apply_wallet_logs(db.as_ref(), None, &cfg, &utxos, &batch, last_scanned).await {
                                 Ok((updated_last_scanned, changed)) => {
                                     last_scanned = updated_last_scanned;
+                                    worker_handle.set_last_scanned(last_scanned);
                                     let snapshot = utxos.read().await;
                                     let (unspent, spent) = wallet_utxo_counts(&snapshot);
                                     let persist_outcome = persist_wallet_snapshot(WalletSnapshotPersist {
@@ -5261,6 +5473,7 @@ pub(crate) fn spawn_wallet_worker(
                                 || persist_state.pending_cache_reset.is_some();
                             if last_scanned < last_block {
                                 last_scanned = last_block;
+                                worker_handle.set_last_scanned(last_scanned);
                             }
                             let snapshot = utxos.read().await;
                             if should_persist
@@ -5465,6 +5678,7 @@ pub(crate) fn spawn_wallet_worker(
                         BackfillEvent::Reset { from_block } => {
                             readiness_started = Instant::now();
                             last_scanned = from_block.saturating_sub(1);
+                            worker_handle.set_last_scanned(last_scanned);
                             let (changed, snapshot) = {
                                 let mut locked = utxos.write().await;
                                 let changed = rewind_wallet_utxos(&mut locked, from_block);
@@ -5519,6 +5733,7 @@ pub(crate) fn spawn_wallet_worker(
                             }
                             if batch.logs.is_empty() {
                                 last_scanned = batch.to_block;
+                                worker_handle.set_last_scanned(last_scanned);
                                 let should_persist = persist_state.needs_full_persist
                                     || persist_state.pending_cache_reset.is_some()
                                     || live_metadata_flush
@@ -5554,6 +5769,7 @@ pub(crate) fn spawn_wallet_worker(
                             match apply_wallet_logs(db.as_ref(), poi_submitter, &cfg, &utxos, &batch, last_scanned).await {
                                 Ok((updated_last_scanned, mut changed)) => {
                                     last_scanned = updated_last_scanned;
+                                    worker_handle.set_last_scanned(last_scanned);
                                     if changed
                                         && let Some(client) = poi_status_client.as_ref()
                                     {
@@ -5664,23 +5880,25 @@ fn wallet_utxo_counts(utxos: &[WalletUtxo]) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_TXID_VERSION, EVM_CHAIN_TYPE, LocalPoiMerkleProofSource, LocalPoiStatusReader,
-        OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER, OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
-        PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER, PendingOutputPoiSubmitter, PoiStatusReader,
-        PublicCacheTxidRecoveryRequest, RecoveryGraphRailgunTransaction,
-        WALLET_METADATA_LIVE_FLUSH_BLOCKS, WALLET_METADATA_LIVE_FLUSH_INTERVAL,
-        WALLET_POI_RECOVERABLE_REFRESH_AFTER, WALLET_POI_STATUS_BATCH_SIZE, WalletHandle,
-        WalletLiveMetadataFlush, WalletNullifierIndex, WalletPersistState, WalletPoiRefreshRequest,
+        DEFAULT_TXID_VERSION, EVM_CHAIN_TYPE, LOCAL_PENDING_SPENT_TTL, LocalPoiMerkleProofSource,
+        LocalPoiStatusReader, OUTPUT_POI_RECOVERY_PROOF_FAILURE_RETRY_AFTER,
+        OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER, PENDING_OUTPUT_POI_SUBMITTED_RETRY_AFTER,
+        PendingOutputPoiSubmitter, PoiStatusReader, PublicCacheTxidRecoveryRequest,
+        RecoveryGraphRailgunTransaction, WALLET_METADATA_LIVE_FLUSH_BLOCKS,
+        WALLET_METADATA_LIVE_FLUSH_INTERVAL, WALLET_POI_RECOVERABLE_REFRESH_AFTER,
+        WALLET_POI_STATUS_BATCH_SIZE, WalletHandle, WalletLiveMetadataFlush, WalletNullifierIndex,
+        WalletPendingOverlay, WalletPendingSpent, WalletPersistState, WalletPoiRefreshRequest,
         WalletPoiRefreshSelection, WalletProgressPersist, apply_wallet_delta_to_vec,
         apply_wallet_delta_to_vec_with_outcome,
         build_output_poi_recovery_chunk_from_public_transaction,
         discard_pending_output_poi_contexts_for_spent_outputs,
         force_resubmit_matching_pending_output_pois, install_persisted_local_poi_caches,
-        install_tailed_poi_cache_if_current, local_poi_caches_available_for_lists,
+        install_tailed_poi_cache_if_current, local_poi_caches_available_for_lists, now_epoch_secs,
         output_poi_recovery_candidates, output_poi_recovery_proof_retry_after,
         output_start_global_position, pending_output_poi_context_matches_wallet_utxo,
-        pending_output_poi_submit_identity, preflight_local_output_poi_input_proofs,
-        process_pending_output_poi_observations, process_pending_output_poi_observations_inner,
+        pending_output_poi_submit_identity, pending_overlay_from_delta,
+        preflight_local_output_poi_input_proofs, process_pending_output_poi_observations,
+        process_pending_output_poi_observations_inner,
         recovered_output_txid_data_from_public_cache, recovery_input_merkle_tree_for_root,
         refresh_wallet_poi_statuses_selected, refresh_wallet_poi_statuses_selected_with_config,
         rewind_wallet_utxos, spawn_startup_artifact_poi_cache_warmup, spent_source_for_utxo,
@@ -5790,6 +6008,37 @@ mod tests {
 
     fn test_wallet_utxo(position: u64) -> WalletUtxo {
         test_wallet_utxo_with_kind(position, UtxoCommitmentKind::Transact)
+    }
+
+    fn test_wallet_handle(utxos: Vec<WalletUtxo>) -> WalletHandle {
+        let (ready_tx, ready_rx) = watch::channel(false);
+        drop(ready_tx);
+        let (rev_tx, rev_rx) = watch::channel(0_u64);
+        let (poi_refresh_tx, _poi_refresh_rx) = mpsc::channel(1);
+        let (_poi_refreshing_tx, poi_refreshing_rx) = watch::channel(false);
+        WalletHandle {
+            cache_key: "cache-key".to_string(),
+            utxos: Arc::new(RwLock::new(utxos)),
+            pending_overlay: Arc::new(RwLock::new(WalletPendingOverlay::default())),
+            last_scanned: Arc::new(AtomicU64::new(0)),
+            ready_rx,
+            rev_rx,
+            poi_refreshing_rx,
+            poi_read_source: PoiReadSource::PoiProxy,
+            local_poi_caches: None,
+            poi_refresh_tx,
+            rev_tx,
+        }
+    }
+
+    fn local_pending_spent_for(utxo: &WalletUtxo, submitted_at: u64) -> WalletPendingSpent {
+        WalletPendingSpent {
+            tree: utxo.utxo.tree,
+            position: utxo.utxo.position,
+            tx_hash: Some(FixedBytes::from([0x77; 32])),
+            block_number: None,
+            block_timestamp: Some(submitted_at),
+        }
     }
 
     fn test_wallet_utxo_with_kind(position: u64, kind: UtxoCommitmentKind) -> WalletUtxo {
@@ -8736,6 +8985,8 @@ mod tests {
         let handle = WalletHandle {
             cache_key: "cache-key".to_string(),
             utxos: Arc::new(RwLock::new(Vec::new())),
+            pending_overlay: Arc::new(RwLock::new(WalletPendingOverlay::default())),
+            last_scanned: Arc::new(AtomicU64::new(0)),
             ready_rx,
             rev_rx,
             poi_refreshing_rx,
@@ -8762,6 +9013,8 @@ mod tests {
         let handle = WalletHandle {
             cache_key: "cache-key".to_string(),
             utxos: Arc::new(RwLock::new(Vec::new())),
+            pending_overlay: Arc::new(RwLock::new(WalletPendingOverlay::default())),
+            last_scanned: Arc::new(AtomicU64::new(0)),
             ready_rx,
             rev_rx,
             poi_refreshing_rx,
@@ -8881,6 +9134,148 @@ mod tests {
 
         assert!(outcome.changed);
         assert_eq!(outcome.spent_output_commitments, vec![output_commitment]);
+    }
+
+    #[test]
+    fn pending_overlay_marks_matching_confirmed_utxo_pending_spent() {
+        let nullifying_key = uint!(42_U256);
+        let cfg = wallet_config(nullifying_key);
+        let wallet_utxo = test_wallet_utxo(7);
+        let nullifier = wallet_utxo.utxo.nullifier(nullifying_key);
+        let spent_source = source(9);
+        let delta = WalletLogDelta {
+            utxos: Vec::new(),
+            nullifiers: vec![SpentNullifier {
+                tree: wallet_utxo.utxo.tree,
+                nullifier,
+                source: spent_source.clone(),
+            }],
+            commitment_observations: Vec::new(),
+        };
+
+        let overlay = pending_overlay_from_delta(&cfg, &[wallet_utxo], delta);
+
+        assert!(overlay.new_utxos.is_empty());
+        assert_eq!(overlay.pending_spent.len(), 1);
+        assert_eq!(overlay.pending_spent[0].key(), (2, 7));
+        assert_eq!(overlay.pending_spent[0].tx_hash, Some(spent_source.tx_hash));
+        assert_eq!(
+            overlay.pending_spent[0].block_number,
+            Some(spent_source.block_number)
+        );
+    }
+
+    #[tokio::test]
+    async fn local_pending_spent_expires_after_successful_overlay_refresh() {
+        let wallet_utxo = test_wallet_utxo(7);
+        let handle = test_wallet_handle(vec![wallet_utxo.clone()]);
+        let submitted_at = now_epoch_secs().saturating_sub(LOCAL_PENDING_SPENT_TTL.as_secs() + 1);
+        {
+            let mut overlay = handle.pending_overlay.write().await;
+            overlay
+                .local_pending_spent
+                .push(local_pending_spent_for(&wallet_utxo, submitted_at));
+        }
+
+        handle
+            .set_chain_pending_overlay(WalletPendingOverlay::default())
+            .await;
+
+        assert!(
+            handle
+                .pending_overlay()
+                .await
+                .local_pending_spent
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn local_pending_spent_retains_recent_submissions() {
+        let wallet_utxo = test_wallet_utxo(7);
+        let handle = test_wallet_handle(vec![wallet_utxo.clone()]);
+        let submitted_at = now_epoch_secs();
+        {
+            let mut overlay = handle.pending_overlay.write().await;
+            overlay
+                .local_pending_spent
+                .push(local_pending_spent_for(&wallet_utxo, submitted_at));
+        }
+
+        handle
+            .set_chain_pending_overlay(WalletPendingOverlay::default())
+            .await;
+
+        assert_eq!(handle.pending_overlay().await.local_pending_spent.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn local_pending_spent_prunes_when_chain_pending_covers_key() {
+        let wallet_utxo = test_wallet_utxo(7);
+        let handle = test_wallet_handle(vec![wallet_utxo.clone()]);
+        let submitted_at = now_epoch_secs();
+        let pending_spent = local_pending_spent_for(&wallet_utxo, submitted_at);
+        {
+            let mut overlay = handle.pending_overlay.write().await;
+            overlay.local_pending_spent.push(pending_spent.clone());
+        }
+
+        handle
+            .set_chain_pending_overlay(WalletPendingOverlay {
+                pending_spent: vec![pending_spent],
+                ..WalletPendingOverlay::default()
+            })
+            .await;
+
+        let overlay = handle.pending_overlay().await;
+        assert!(overlay.local_pending_spent.is_empty());
+        assert_eq!(overlay.pending_spent.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn local_pending_spent_prunes_when_confirmed_spent_covers_key() {
+        let mut wallet_utxo = test_wallet_utxo(7);
+        let pending_spent = local_pending_spent_for(&wallet_utxo, now_epoch_secs());
+        wallet_utxo.spent = Some(source(9));
+        let handle = test_wallet_handle(vec![wallet_utxo]);
+        {
+            let mut overlay = handle.pending_overlay.write().await;
+            overlay.local_pending_spent.push(pending_spent);
+        }
+
+        handle
+            .set_chain_pending_overlay(WalletPendingOverlay::default())
+            .await;
+
+        assert!(
+            handle
+                .pending_overlay()
+                .await
+                .local_pending_spent
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_local_pending_spent_removes_manual_locks() {
+        let wallet_utxo = test_wallet_utxo(7);
+        let handle = test_wallet_handle(vec![wallet_utxo.clone()]);
+        {
+            let mut overlay = handle.pending_overlay.write().await;
+            overlay
+                .local_pending_spent
+                .push(local_pending_spent_for(&wallet_utxo, now_epoch_secs()));
+        }
+
+        assert!(handle.clear_local_pending_spent().await);
+        assert!(
+            handle
+                .pending_overlay()
+                .await
+                .local_pending_spent
+                .is_empty()
+        );
+        assert!(!handle.clear_local_pending_spent().await);
     }
 
     #[test]

@@ -4,8 +4,9 @@ use crate::types::{
     SyncProgressStage, SyncProgressUpdate, WalletConfig,
 };
 use crate::wallet::{
-    WalletHandle, WalletWorkerServices, apply_wallet_delta_to_vec,
-    process_pending_output_poi_observations, spawn_wallet_worker, wallet_cache_store,
+    WalletHandle, WalletPendingOverlay, WalletWorkerServices, apply_wallet_delta_to_vec,
+    pending_overlay_from_delta, process_pending_output_poi_observations, spawn_wallet_worker,
+    wallet_cache_store,
 };
 use alloy::eips::BlockNumberOrTag;
 use alloy::primitives::{Address, FixedBytes};
@@ -35,7 +36,7 @@ use railgun_wallet::UtxoSource;
 use railgun_wallet::scan::{
     IndexedLegacyEncryptedCommitmentInput, IndexedLegacyGeneratedCommitmentInput,
     IndexedNullifierInput, IndexedShieldCommitmentInput, IndexedTransactCommitmentInput,
-    WalletScanError, parse_indexed_wallet_delta,
+    WalletLogDelta, WalletScanError, parse_indexed_wallet_delta, parse_wallet_delta_from_logs,
 };
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
@@ -172,6 +173,19 @@ impl ChainError {
     pub(crate) const fn should_mark_rpc_unhealthy(&self) -> bool {
         !matches!(self, Self::ArchiveRpcRequired(_) | Self::NoHealthyRpc)
     }
+
+    fn is_block_range_beyond_current_head(&self) -> bool {
+        matches!(self, Self::Rpc(TransportError::ErrorResp(resp)) if resp.message.contains("block range extends beyond current head block"))
+    }
+}
+
+#[derive(Clone)]
+struct PendingTipWalletRegistration {
+    cache_key: String,
+    cfg: WalletConfig,
+    handle: WalletHandle,
+    from_block: u64,
+    target_block: u64,
 }
 
 #[derive(Debug)]
@@ -185,6 +199,7 @@ pub struct ChainHandle {
 
 struct WalletRegistration {
     handle: WalletHandle,
+    cfg: WalletConfig,
     cancel: CancellationToken,
     backfill_sender: mpsc::Sender<BackfillEvent>,
     start_block: u64,
@@ -271,6 +286,14 @@ impl ChainService {
             cancel.clone(),
         );
         spawn_txid_public_cache_loop(service.clone(), cancel.clone());
+        spawn_pending_tip_loop(
+            service.clone(),
+            rpcs.clone(),
+            archive_provider.clone(),
+            service.head_tx.subscribe(),
+            safe_head_rx.clone(),
+            cancel.clone(),
+        );
         spawn_backfill_loop(
             service.clone(),
             backfill_rx,
@@ -402,6 +425,7 @@ impl ChainService {
             cache_key,
             WalletRegistration {
                 handle: handle.clone(),
+                cfg: cfg.clone(),
                 cancel: cancel.clone(),
                 backfill_sender: backfill_sender.clone(),
                 start_block,
@@ -1879,6 +1903,235 @@ fn spawn_head_poller(service: Arc<ChainService>, rpcs: Arc<QueryRpcPool>) {
     );
 }
 
+fn spawn_pending_tip_loop(
+    service: Arc<ChainService>,
+    rpcs: Arc<QueryRpcPool>,
+    archive_provider: Option<DynProvider>,
+    mut head_rx: watch::Receiver<u64>,
+    mut safe_head_rx: watch::Receiver<u64>,
+    cancel: CancellationToken,
+) {
+    let chain_id = service.chain.chain_id;
+    tokio::spawn(
+        async move {
+            loop {
+                let safe_head = *safe_head_rx.borrow();
+                let head = *head_rx.borrow();
+                refresh_pending_tip_overlays(
+                    &service,
+                    &rpcs,
+                    archive_provider.as_ref(),
+                    safe_head,
+                    head,
+                )
+                .await;
+
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = head_rx.changed() => {},
+                    _ = safe_head_rx.changed() => {},
+                    _ = tokio::time::sleep(service.chain.poll_interval) => {},
+                }
+            }
+        }
+        .instrument(tracing::info_span!("pending_tip", chain_id)),
+    );
+}
+
+async fn refresh_pending_tip_overlays(
+    service: &Arc<ChainService>,
+    rpcs: &Arc<QueryRpcPool>,
+    archive_provider: Option<&DynProvider>,
+    safe_head: u64,
+    head: u64,
+) {
+    let registrations = {
+        let wallets = service.wallets.read().await;
+        wallets
+            .iter()
+            .map(|(cache_key, registration)| {
+                let handle = registration.handle.clone();
+                let from_block = pending_tip_from_block(
+                    safe_head,
+                    handle.last_scanned(),
+                    service.chain.block_range,
+                );
+                let target_block = registration
+                    .sync_to_block
+                    .map_or(head, |limit| limit.min(head));
+                PendingTipWalletRegistration {
+                    cache_key: cache_key.clone(),
+                    cfg: registration.cfg.clone(),
+                    handle,
+                    from_block,
+                    target_block,
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    if registrations.is_empty() {
+        return;
+    }
+
+    let Some(fetch_to_block) = registrations
+        .iter()
+        .filter(|registration| registration.target_block >= registration.from_block)
+        .map(|registration| registration.target_block)
+        .max()
+    else {
+        clear_pending_tip_overlays(registrations).await;
+        return;
+    };
+
+    let Some(rpc) = rpcs.random_provider() else {
+        warn!(
+            safe_head,
+            head, "no healthy rpc providers available for pending wallet tip"
+        );
+        return;
+    };
+
+    let provider_head = match rpc.provider.get_block_number().await {
+        Ok(provider_head) => provider_head,
+        Err(err) => {
+            warn!(
+                ?err,
+                rpc = rpc.url.as_str(),
+                "failed to fetch pending wallet tip provider head"
+            );
+            rpcs.mark_bad_provider(&rpc);
+            return;
+        }
+    };
+    if !pending_tip_provider_covers_target(provider_head, fetch_to_block) {
+        debug!(
+            rpc = rpc.url.as_str(),
+            provider_head,
+            fetch_to_block,
+            "pending wallet tip provider is behind; preserving existing overlay"
+        );
+        return;
+    }
+
+    let from_block = registrations
+        .iter()
+        .filter(|registration| registration.target_block >= registration.from_block)
+        .map(|registration| registration.from_block)
+        .min()
+        .unwrap_or(fetch_to_block);
+    let mut logs = match service
+        .chain
+        .fetch_logs_for_range(&rpc.provider, archive_provider, from_block, fetch_to_block)
+        .await
+    {
+        Ok(logs) => logs,
+        Err(err) => {
+            warn!(
+                ?err,
+                from_block,
+                to_block = fetch_to_block,
+                "failed to fetch pending wallet tip logs"
+            );
+            if err.should_mark_rpc_unhealthy() && !err.is_block_range_beyond_current_head() {
+                rpcs.mark_bad_provider(&rpc);
+            }
+            return;
+        }
+    };
+    sort_logs(&mut logs);
+
+    let block_timestamps = match service
+        .chain
+        .fetch_log_block_timestamps(&rpc.provider, archive_provider, &logs)
+        .await
+    {
+        Ok(block_timestamps) => block_timestamps,
+        Err(err) => {
+            warn!(
+                ?err,
+                from_block,
+                to_block = fetch_to_block,
+                "failed to fetch pending wallet tip timestamps"
+            );
+            if err.should_mark_rpc_unhealthy() {
+                rpcs.mark_bad_provider(&rpc);
+            }
+            return;
+        }
+    };
+
+    for registration in registrations {
+        if registration.target_block < registration.from_block {
+            registration
+                .handle
+                .set_chain_pending_overlay(WalletPendingOverlay::default())
+                .await;
+            continue;
+        }
+
+        let wallet_logs = logs
+            .iter()
+            .filter(|log| {
+                log.block_number.is_some_and(|block| {
+                    block >= registration.from_block && block <= registration.target_block
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let delta = if wallet_logs.is_empty() {
+            WalletLogDelta {
+                utxos: Vec::new(),
+                nullifiers: Vec::new(),
+                commitment_observations: Vec::new(),
+            }
+        } else {
+            match parse_wallet_delta_from_logs(
+                &wallet_logs,
+                &block_timestamps,
+                &registration.cfg.scan_keys,
+            ) {
+                Ok(delta) => delta,
+                Err(err) => {
+                    warn!(?err, cache_key = %registration.cache_key, from_block = registration.from_block, to_block = registration.target_block, "failed to parse pending wallet tip logs");
+                    continue;
+                }
+            }
+        };
+
+        let confirmed = registration.handle.utxos.read().await;
+        let overlay = pending_overlay_from_delta(&registration.cfg, &confirmed, delta);
+        drop(confirmed);
+        registration.handle.set_chain_pending_overlay(overlay).await;
+    }
+}
+
+async fn clear_pending_tip_overlays(registrations: Vec<PendingTipWalletRegistration>) {
+    for registration in registrations {
+        registration
+            .handle
+            .set_chain_pending_overlay(WalletPendingOverlay::default())
+            .await;
+    }
+}
+
+fn pending_tip_from_block(
+    safe_head: u64,
+    wallet_last_scanned: u64,
+    sticky_block_range: u64,
+) -> u64 {
+    if wallet_last_scanned < safe_head
+        && safe_head.saturating_sub(wallet_last_scanned) <= sticky_block_range
+    {
+        wallet_last_scanned.saturating_add(1)
+    } else {
+        safe_head.saturating_add(1)
+    }
+}
+
+const fn pending_tip_provider_covers_target(provider_head: u64, target_block: u64) -> bool {
+    provider_head >= target_block
+}
+
 fn spawn_txid_public_cache_loop(service: Arc<ChainService>, cancel: CancellationToken) {
     let Some(endpoint) = service.chain.quick_sync_endpoint.clone() else {
         return;
@@ -2876,7 +3129,8 @@ mod tests {
         CommitmentBatch, ForestReorgDecision, GeneratedCommitmentBatch, IndexedWalletPageKind,
         Nullified, Nullifiers, Shield, ShieldLegacyPreMar23, Transact,
         combined_log_event_signatures_for_range, complete_stream_checkpoint, forest_reorg_decision,
-        indexed_wallet_page_kind, indexed_wallet_to_block, should_hedge_wallet_startup,
+        indexed_wallet_page_kind, indexed_wallet_to_block, pending_tip_from_block,
+        pending_tip_provider_covers_target, should_hedge_wallet_startup,
         wallet_backfill_from_block, wallet_reorg_backfill_from_block,
         wallet_startup_hedge_block_count, wallet_sync_target,
     };
@@ -2905,6 +3159,25 @@ mod tests {
     fn wallet_reorg_backfill_starts_after_forest_reset() {
         assert_eq!(wallet_reorg_backfill_from_block(250, 100), 250);
         assert_eq!(wallet_reorg_backfill_from_block(50, 100), 100);
+    }
+
+    #[test]
+    fn pending_tip_sticks_to_slightly_lagging_wallet_progress() {
+        assert_eq!(pending_tip_from_block(1_000, 995, 500), 996);
+        assert_eq!(pending_tip_from_block(1_000, 1_000, 500), 1_001);
+        assert_eq!(pending_tip_from_block(1_000, 1_001, 500), 1_001);
+    }
+
+    #[test]
+    fn pending_tip_does_not_expand_to_historical_wallet_lag() {
+        assert_eq!(pending_tip_from_block(1_000, 100, 500), 1_001);
+    }
+
+    #[test]
+    fn pending_tip_provider_must_cover_target() {
+        assert!(pending_tip_provider_covers_target(1_010, 1_010));
+        assert!(pending_tip_provider_covers_target(1_011, 1_010));
+        assert!(!pending_tip_provider_covers_target(1_009, 1_010));
     }
 
     #[test]

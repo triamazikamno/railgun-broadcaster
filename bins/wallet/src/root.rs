@@ -2153,6 +2153,7 @@ pub(crate) struct WalletRoot {
     tx_search_input: Entity<InputState>,
     tx_search_query: Arc<str>,
     show_spent_utxos: bool,
+    local_pending_spent_clear_confirming: bool,
     utxo_table: Entity<TableState<UtxoDelegate>>,
     focus_vault_input_on_render: bool,
     focus_utxo_table_on_render: bool,
@@ -2384,6 +2385,7 @@ impl WalletRoot {
             tx_search_input: tx_search_input.clone(),
             tx_search_query: Arc::from(""),
             show_spent_utxos: false,
+            local_pending_spent_clear_confirming: false,
             utxo_table,
             focus_vault_input_on_render,
             focus_utxo_table_on_render: false,
@@ -4496,6 +4498,7 @@ impl WalletRoot {
         self.private_action_form = None;
         self.private_broadcaster_progress = None;
         self.broadcaster_picker = None;
+        self.local_pending_spent_clear_confirming = false;
         self.clear_public_chain_balance_state();
         self.sync_utxo_table(cx);
         if self.active_wallet_tab == WalletTab::Public {
@@ -4873,6 +4876,45 @@ impl WalletRoot {
         self.show_spent_utxos = show_spent;
         self.sync_utxo_table(cx);
         cx.notify();
+    }
+
+    fn begin_clear_local_pending_spent_confirmation(&mut self, cx: &mut Context<'_, Self>) {
+        self.local_pending_spent_clear_confirming = true;
+        cx.notify();
+    }
+
+    fn cancel_clear_local_pending_spent_confirmation(&mut self, cx: &mut Context<'_, Self>) {
+        self.local_pending_spent_clear_confirming = false;
+        cx.notify();
+    }
+
+    fn clear_local_pending_spent_locks(&mut self, cx: &mut Context<'_, Self>) {
+        let Some(session) = self.selected_chain_session() else {
+            self.local_pending_spent_clear_confirming = false;
+            cx.notify();
+            return;
+        };
+        self.local_pending_spent_clear_confirming = false;
+        let clear = self
+            .runtime
+            .spawn(async move { session.clear_local_pending_spent().await });
+        cx.spawn(async move |this, cx| {
+            let changed = clear.await.unwrap_or(false);
+            let _ = this.update(cx, |root, cx| {
+                if changed {
+                    root.sync_utxo_table(cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn selected_chain_session(&self) -> Option<Arc<wallet_ops::WalletSession>> {
+        self.chain_states
+            .get(&self.selected_chain)
+            .and_then(ChainUtxoState::poi_refresh_session)
     }
 
     fn repair_wallet_cache_from_input(&mut self, cx: &mut Context<'_, Self>) -> bool {
@@ -8848,7 +8890,7 @@ impl WalletRoot {
         syncing: bool,
         progress: Option<SyncProgressUpdate>,
     ) -> gpui::AnyElement {
-        let assets = format_private_asset_rows(snapshot.chain_id, &snapshot.totals);
+        let assets = format_private_asset_rows_from_snapshot(snapshot);
         if assets.is_empty() {
             return centered_message(if syncing {
                 loading_summary(progress)
@@ -8914,6 +8956,10 @@ impl WalletRoot {
         let unshield_opacity = if can_unshield { 1.0 } else { 0.5 };
         let show_pending_poi = should_show_pending_poi_amount(asset.pending_poi_total);
         let pending_poi_amount = asset.pending_poi_amount.clone();
+        let show_pending_incoming = should_show_pending_amount(asset.pending_incoming_total);
+        let show_pending_outgoing = should_show_pending_amount(asset.pending_outgoing_total);
+        let pending_incoming_amount = asset.pending_incoming_amount.clone();
+        let pending_outgoing_amount = asset.pending_outgoing_amount.clone();
         let send_root = root.clone();
         let unshield_root = root;
 
@@ -8957,6 +9003,20 @@ impl WalletRoot {
                     .when(show_pending_poi, |column| {
                         column.child(
                             app_muted_text(format!("*Pending POI: {pending_poi_amount}"))
+                                .whitespace_nowrap()
+                                .text_align(gpui::TextAlign::Right),
+                        )
+                    })
+                    .when(show_pending_incoming, |column| {
+                        column.child(
+                            app_muted_text(format!("Pending: +{pending_incoming_amount}"))
+                                .whitespace_nowrap()
+                                .text_align(gpui::TextAlign::Right),
+                        )
+                    })
+                    .when(show_pending_outgoing, |column| {
+                        column.child(
+                            app_muted_text(format!("Pending: -{pending_outgoing_amount}"))
                                 .whitespace_nowrap()
                                 .text_align(gpui::TextAlign::Right),
                         )
@@ -10694,7 +10754,7 @@ impl WalletRoot {
                 .flex()
                 .flex_col()
                 .gap_2()
-                .child(self.render_utxo_controls(root.clone()))
+                .child(self.render_utxo_controls(root))
                 .child(
                     div()
                         .flex_1()
@@ -10718,8 +10778,13 @@ impl WalletRoot {
         }
     }
 
-    fn render_utxo_controls(&self, root: Entity<Self>) -> impl IntoElement {
+    fn render_utxo_controls(&self, root: &Entity<Self>) -> impl IntoElement {
         let search_active = !self.tx_search_query.is_empty();
+        let local_pending_spent_count = self
+            .chain_states
+            .get(&self.selected_chain)
+            .and_then(ChainUtxoState::snapshot)
+            .map_or(0, |snapshot| snapshot.local_pending_spent_count);
         let clear_search_input = self.tx_search_input.clone();
         let clear_search_table = self.utxo_table.clone();
         let search_input = app_input(&self.tx_search_input)
@@ -10741,6 +10806,7 @@ impl WalletRoot {
                         }),
                 )
             });
+        let spent_toggle_root = root.clone();
         let spent_toggle = Checkbox::new("wallet-toggle-spent-utxos")
             .label("Show spent")
             .checked(self.show_spent_utxos)
@@ -10749,7 +10815,7 @@ impl WalletRoot {
             .opacity(if search_active { 0.45 } else { 1.0 })
             .on_click(move |checked, _window, cx| {
                 let checked = *checked;
-                root.update(cx, |root, cx| {
+                spent_toggle_root.update(cx, |root, cx| {
                     root.set_spent_visibility(checked, cx);
                 });
             });
@@ -10757,11 +10823,117 @@ impl WalletRoot {
         div()
             .flex_none()
             .flex()
-            .items_center()
-            .justify_start()
+            .flex_col()
             .gap_2()
-            .child(div().w(px(280.0)).child(search_input))
-            .child(spent_toggle)
+            .when(local_pending_spent_count > 0, |this| {
+                this.child(
+                    self.render_local_pending_spent_summary(
+                        root.clone(),
+                        local_pending_spent_count,
+                    ),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_start()
+                    .gap_2()
+                    .child(div().w(px(280.0)).child(search_input))
+                    .child(spent_toggle),
+            )
+    }
+
+    fn render_local_pending_spent_summary(
+        &self,
+        root: Entity<Self>,
+        count: usize,
+    ) -> impl IntoElement {
+        let confirming = self.local_pending_spent_clear_confirming;
+        let begin_root = root.clone();
+        let cancel_root = root.clone();
+        let clear_root = root;
+        let noun = if count == 1 { "UTXO" } else { "UTXOs" };
+
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(if confirming {
+                theme::DANGER
+            } else {
+                theme::BORDER
+            }))
+            .bg(if confirming {
+                rgb_with_alpha(theme::DANGER, 0.08)
+            } else {
+                rgb(theme::SURFACE)
+            })
+            .p(px(10.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        app_muted_text(format!(
+                            "Locally locked pending submission: {count} {noun}"
+                        ))
+                        .line_height(px(18.0)),
+                    )
+                    .child(div().flex_1())
+                    .when(!confirming, |this| {
+                        this.child(
+                            app_button("wallet-clear-local-pending-spent", "Clear local locks")
+                                .outline()
+                                .small()
+                                .danger()
+                                .on_click(move |_event, _window, cx| {
+                                    begin_root.update(cx, |root, cx| {
+                                        root.begin_clear_local_pending_spent_confirmation(cx);
+                                    });
+                                }),
+                        )
+                    }),
+            )
+            .when(confirming, |this| {
+                this.child(
+                    div()
+                        .text_size(px(12.0))
+                        .line_height(px(17.0))
+                        .text_color(rgb(theme::DANGER))
+                        .child("This only clears local submitted-transaction locks. If the original transaction later confirms, these UTXOs may fail simulation or become spent again."),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            app_button("wallet-cancel-clear-local-pending-spent", "Cancel")
+                                .outline()
+                                .small()
+                                .on_click(move |_event, _window, cx| {
+                                    cancel_root.update(cx, |root, cx| {
+                                        root.cancel_clear_local_pending_spent_confirmation(cx);
+                                    });
+                                }),
+                        )
+                        .child(
+                            app_button("wallet-confirm-clear-local-pending-spent", "Clear local locks")
+                                .small()
+                                .danger()
+                                .on_click(move |_event, _window, cx| {
+                                    clear_root.update(cx, |root, cx| {
+                                        root.clear_local_pending_spent_locks(cx);
+                                    });
+                                }),
+                        ),
+                )
+            })
     }
 
     fn on_action_utxo_page_up(
@@ -11022,6 +11194,9 @@ struct UtxoDisplayRow {
     spent_tx_hash: Option<String>,
     token_address: String,
     is_spent: bool,
+    pending_new: bool,
+    pending_spent: bool,
+    local_pending_spent: bool,
 }
 
 struct UtxoDelegate {
@@ -11171,6 +11346,13 @@ impl TableDelegate for UtxoDelegate {
         _cx: &mut Context<'_, TableState<Self>>,
     ) -> gpui::Stateful<gpui::Div> {
         let row = div().id(("row", row_ix));
+        if self
+            .rows
+            .get(row_ix)
+            .is_some_and(|row| row.pending_new || row.pending_spent || row.local_pending_spent)
+        {
+            return row.bg(rgb(theme::WARNING_BG));
+        }
         if self.rows.get(row_ix).is_some_and(|row| row.is_spent) {
             return row.bg(rgb(theme::SPENT_ROW_BG));
         }
@@ -11357,6 +11539,8 @@ fn tx_hash_cell(
 fn utxo_cell_text_color(row: &UtxoDisplayRow, color: gpui::Rgba) -> gpui::Rgba {
     if row.is_spent {
         rgb(theme::SPENT_TEXT)
+    } else if row.pending_new || row.pending_spent || row.local_pending_spent {
+        rgb(theme::WARNING)
     } else {
         color
     }
@@ -11809,11 +11993,21 @@ struct FormattedTokenTotal {
     label: String,
     amount: String,
     pending_poi_amount: String,
+    pending_incoming_amount: String,
+    pending_outgoing_amount: String,
     total: Option<U256>,
     poi_verified_total: Option<U256>,
     pending_poi_total: Option<U256>,
+    pending_incoming_total: Option<U256>,
+    pending_outgoing_total: Option<U256>,
     decimals: Option<u8>,
     icon_path: Option<PathBuf>,
+}
+
+fn format_private_asset_rows_from_snapshot(snapshot: &ListUtxosOutput) -> Vec<FormattedTokenTotal> {
+    let mut rows = format_private_asset_rows(snapshot.chain_id, &snapshot.totals);
+    apply_pending_asset_amounts(snapshot, &mut rows);
+    rows
 }
 
 fn format_private_asset_rows(chain_id: u64, totals: &[TokenTotal]) -> Vec<FormattedTokenTotal> {
@@ -11840,9 +12034,13 @@ fn format_total_parts(chain_id: u64, total: &TokenTotal) -> FormattedTokenTotal 
             label: total.token.clone(),
             amount: total.total.clone(),
             pending_poi_amount: format_pending_poi_amount(pending_poi_total, None),
+            pending_incoming_amount: "0".to_string(),
+            pending_outgoing_amount: "0".to_string(),
             total: total_raw,
             poi_verified_total: poi_verified_total_raw,
             pending_poi_total,
+            pending_incoming_total: Some(U256::ZERO),
+            pending_outgoing_total: Some(U256::ZERO),
             decimals: None,
             icon_path: None,
         };
@@ -11854,9 +12052,13 @@ fn format_total_parts(chain_id: u64, total: &TokenTotal) -> FormattedTokenTotal 
             label: short_address(&address),
             amount: total.total.clone(),
             pending_poi_amount: format_pending_poi_amount(pending_poi_total, None),
+            pending_incoming_amount: "0".to_string(),
+            pending_outgoing_amount: "0".to_string(),
             total: total_raw,
             poi_verified_total: poi_verified_total_raw,
             pending_poi_total,
+            pending_incoming_total: Some(U256::ZERO),
+            pending_outgoing_total: Some(U256::ZERO),
             decimals: None,
             icon_path: None,
         };
@@ -11871,11 +12073,58 @@ fn format_total_parts(chain_id: u64, total: &TokenTotal) -> FormattedTokenTotal 
         label: token.symbol.to_owned(),
         amount,
         pending_poi_amount: format_pending_poi_amount(pending_poi_total, Some(token.decimals)),
+        pending_incoming_amount: "0".to_string(),
+        pending_outgoing_amount: "0".to_string(),
         total: total_raw,
         poi_verified_total: poi_verified_total_raw,
         pending_poi_total,
+        pending_incoming_total: Some(U256::ZERO),
+        pending_outgoing_total: Some(U256::ZERO),
         decimals: Some(token.decimals),
         icon_path: token_icon_path(chain_id, &address),
+    }
+}
+
+fn apply_pending_asset_amounts(snapshot: &ListUtxosOutput, rows: &mut Vec<FormattedTokenTotal>) {
+    let mut pending: BTreeMap<Address, (U256, U256)> = BTreeMap::new();
+    for row in &snapshot.utxos {
+        if !row.pending_new && !row.pending_spent && !row.local_pending_spent {
+            continue;
+        }
+        let Some(token) = parse_address(&row.token) else {
+            continue;
+        };
+        let Ok(value) = U256::from_str_radix(&row.value, 10) else {
+            continue;
+        };
+        let entry = pending.entry(token).or_default();
+        if row.pending_new {
+            entry.0 += value;
+        }
+        if row.pending_spent || row.local_pending_spent {
+            entry.1 += value;
+        }
+    }
+
+    for (token, (incoming, outgoing)) in pending {
+        let index = rows.iter().position(|row| row.token == Some(token));
+        let row = if let Some(index) = index {
+            &mut rows[index]
+        } else {
+            rows.push(format_total_parts(
+                snapshot.chain_id,
+                &TokenTotal {
+                    token: token.to_checksum(None),
+                    total: "0".to_string(),
+                    poi_verified_total: "0".to_string(),
+                },
+            ));
+            rows.last_mut().expect("pending row inserted")
+        };
+        row.pending_incoming_total = Some(incoming);
+        row.pending_outgoing_total = Some(outgoing);
+        row.pending_incoming_amount = format_pending_amount(incoming, row.decimals);
+        row.pending_outgoing_amount = format_pending_amount(outgoing, row.decimals);
     }
 }
 
@@ -11898,8 +12147,19 @@ fn format_pending_poi_amount(pending_poi_total: Option<U256>, decimals: Option<u
     )
 }
 
+fn format_pending_amount(value: U256, decimals: Option<u8>) -> String {
+    decimals.map_or_else(
+        || value.to_string(),
+        |decimals| format_token_amount(value, decimals),
+    )
+}
+
 fn should_show_pending_poi_amount(pending_poi_total: Option<U256>) -> bool {
     pending_poi_total.is_some_and(|amount| !amount.is_zero())
+}
+
+fn should_show_pending_amount(pending_total: Option<U256>) -> bool {
+    pending_total.is_some_and(|amount| !amount.is_zero())
 }
 
 fn build_unshield_asset(
@@ -14462,7 +14722,7 @@ fn display_rows_from_output(
 
 fn matches_utxo_filters(row: &UtxoOutput, tx_query: &str, show_spent_utxos: bool) -> bool {
     if tx_query.is_empty() {
-        return show_spent_utxos || !row.is_spent;
+        return show_spent_utxos || !row.is_spent || row.pending_spent || row.local_pending_spent;
     }
 
     row.source_tx_hash.to_ascii_lowercase().contains(tx_query)
@@ -14486,6 +14746,9 @@ fn display_row_from_utxo(chain_id: u64, row: &UtxoOutput) -> UtxoDisplayRow {
             spent_tx_hash: row.spent_tx_hash.clone(),
             token_address: row.token.clone(),
             is_spent: row.is_spent,
+            pending_new: row.pending_new,
+            pending_spent: row.pending_spent,
+            local_pending_spent: row.local_pending_spent,
         };
     };
 
@@ -14515,10 +14778,22 @@ fn display_row_from_utxo(chain_id: u64, row: &UtxoOutput) -> UtxoDisplayRow {
         spent_tx_hash: row.spent_tx_hash.clone(),
         token_address: address.to_checksum(None),
         is_spent: row.is_spent,
+        pending_new: row.pending_new,
+        pending_spent: row.pending_spent,
+        local_pending_spent: row.local_pending_spent,
     }
 }
 
 fn format_poi_status(row: &UtxoOutput) -> String {
+    if row.pending_spent {
+        return "Pending spend".to_string();
+    }
+    if row.local_pending_spent {
+        return "Locally locked".to_string();
+    }
+    if row.pending_new {
+        return "Pending receive".to_string();
+    }
     if row.poi_statuses.is_empty() {
         return "Unknown".to_string();
     }
@@ -15574,20 +15849,21 @@ mod tests {
         form_error_clears_public_broadcaster_cost_estimate, format_compact_age,
         format_exact_asset_amount_for_display, format_form_error_for_asset,
         format_native_token_amount_for_display, format_private_asset_rows,
-        format_public_broadcaster_fee_margin, format_report_chain, format_send_amount_input,
-        format_total, format_unshield_amount_input, loading_summary, max_send_amount_from_snapshot,
-        max_unshield_amount_from_snapshot, merge_public_balance_snapshot,
-        native_token_display_label, native_wrapped_output_labels, next_public_account_label_number,
-        parse_repair_cache_block, private_action_metrics, private_broadcaster_closed_active_stage,
-        private_broadcaster_progress_steps, progress_detail, public_account_identicon_color,
-        public_account_identicon_pattern, public_account_matches_search,
-        public_account_visible_balances_for_chain, public_action_asset_label,
-        public_action_error_copy_value, public_action_error_details, public_action_error_summary,
-        public_action_max_amount_after_reserve, public_action_max_label,
-        public_action_progress_steps, public_address_qr_module_range, public_address_qr_payload,
-        public_balance_entry_for_chain, public_broadcaster_candidates_for_asset,
-        public_broadcaster_cost_status, public_broadcaster_cost_status_text,
-        public_broadcaster_fee_token_options_from_snapshot, public_broadcaster_fee_token_warning,
+        format_private_asset_rows_from_snapshot, format_public_broadcaster_fee_margin,
+        format_report_chain, format_send_amount_input, format_total, format_unshield_amount_input,
+        loading_summary, max_send_amount_from_snapshot, max_unshield_amount_from_snapshot,
+        merge_public_balance_snapshot, native_token_display_label, native_wrapped_output_labels,
+        next_public_account_label_number, parse_repair_cache_block, private_action_metrics,
+        private_broadcaster_closed_active_stage, private_broadcaster_progress_steps,
+        progress_detail, public_account_identicon_color, public_account_identicon_pattern,
+        public_account_matches_search, public_account_visible_balances_for_chain,
+        public_action_asset_label, public_action_error_copy_value, public_action_error_details,
+        public_action_error_summary, public_action_max_amount_after_reserve,
+        public_action_max_label, public_action_progress_steps, public_address_qr_module_range,
+        public_address_qr_payload, public_balance_entry_for_chain,
+        public_broadcaster_candidates_for_asset, public_broadcaster_cost_status,
+        public_broadcaster_cost_status_text, public_broadcaster_fee_token_options_from_snapshot,
+        public_broadcaster_fee_token_warning,
         public_broadcaster_submit_disabled_for_fee_token_options, refresh_form_asset_from_snapshot,
         repair_cache_help_text, resolve_selected_public_broadcaster_fee_token,
         send_asset_key_from_formatted, send_element_id, send_key_matches_asset,
@@ -15595,7 +15871,7 @@ mod tests {
         should_clear_private_action_error_on_password_change, should_focus_utxo_table,
         should_preserve_estimate_after_broadcaster_policy_change,
         should_render_public_broadcaster_cost_preview, should_show_broadcaster_fee_mode_toggle,
-        should_show_distinct_amount, should_show_pending_poi_amount,
+        should_show_distinct_amount, should_show_pending_amount, should_show_pending_poi_amount,
         unshield_asset_key_from_formatted, unshield_element_id, unshield_key_matches_asset,
         unshield_public_broadcaster_estimate_input_error, wallet_generation_matches,
         wallet_options_from_metadata,
@@ -15643,6 +15919,9 @@ mod tests {
             source_block_number: 11,
             source_block_timestamp: 1_700_000_011,
             is_spent,
+            pending_new: false,
+            pending_spent: false,
+            local_pending_spent: false,
             spent_tx_hash: spent_tx_hash.map(str::to_string),
             spent_block_number: spent_tx_hash.map(|_| 21),
         }
@@ -15670,6 +15949,9 @@ mod tests {
             source_block_number: 11,
             source_block_timestamp: 1_700_000_011,
             is_spent: false,
+            pending_new: false,
+            pending_spent: false,
+            local_pending_spent: false,
             spent_tx_hash: None,
             spent_block_number: None,
         }
@@ -15817,6 +16099,7 @@ mod tests {
             utxo_count: 1,
             unspent_count: 1,
             spent_count: 0,
+            local_pending_spent_count: 0,
             utxos: vec![utxo_output(
                 "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
                 "1234567",
@@ -15873,6 +16156,7 @@ mod tests {
             utxo_count: 1,
             unspent_count: 1,
             spent_count: 0,
+            local_pending_spent_count: 0,
             utxos: vec![utxo_output(
                 "0x1111111111111111111111111111111111111111",
                 "42",
@@ -16185,6 +16469,7 @@ mod tests {
             utxo_count: 2,
             unspent_count: 2,
             spent_count: 0,
+            local_pending_spent_count: 0,
             utxos: vec![
                 unshield_utxo_output(token_a, 5, 0, 1),
                 unshield_utxo_output(token_b, 7, 0, 2),
@@ -16242,6 +16527,7 @@ mod tests {
             utxo_count: 20,
             unspent_count: 20,
             spent_count: 0,
+            local_pending_spent_count: 0,
             utxos: (0..20)
                 .map(|position| unshield_utxo_output(token, 1, 0, position))
                 .collect(),
@@ -16276,6 +16562,7 @@ mod tests {
             utxo_count: 1,
             unspent_count: 1,
             spent_count: 0,
+            local_pending_spent_count: 0,
             utxos: vec![unshield_utxo_output(token, 1, 0, 1)],
             totals: vec![wallet_ops::TokenTotal {
                 token: token.to_checksum(None),
@@ -16652,6 +16939,68 @@ mod tests {
     }
 
     #[test]
+    fn private_asset_rows_show_separate_pending_amounts() {
+        let token = Address::from([0x11; 20]);
+        let mut pending_in = unshield_utxo_output(token, 7, 0, 2);
+        pending_in.pending_new = true;
+        pending_in.poi_spendable = false;
+        let mut pending_out = unshield_utxo_output(token, 5, 0, 1);
+        pending_out.pending_spent = true;
+        pending_out.poi_spendable = false;
+        let snapshot = ListUtxosOutput {
+            chain_id: 1,
+            cache_key: "cache".to_string(),
+            utxo_count: 2,
+            unspent_count: 2,
+            spent_count: 0,
+            local_pending_spent_count: 0,
+            utxos: vec![pending_out, pending_in],
+            totals: vec![wallet_ops::TokenTotal {
+                token: token.to_checksum(None),
+                total: "5".to_string(),
+                poi_verified_total: "5".to_string(),
+            }],
+        };
+
+        let rows = format_private_asset_rows_from_snapshot(&snapshot);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].total, Some(uint!(5_U256)));
+        assert_eq!(rows[0].pending_incoming_total, Some(uint!(7_U256)));
+        assert_eq!(rows[0].pending_outgoing_total, Some(uint!(5_U256)));
+        assert!(should_show_pending_amount(rows[0].pending_incoming_total));
+        assert!(should_show_pending_amount(rows[0].pending_outgoing_total));
+    }
+
+    #[test]
+    fn private_asset_rows_include_local_pending_outgoing_amount() {
+        let token = Address::from([0x11; 20]);
+        let mut local_pending_out = unshield_utxo_output(token, 5, 0, 1);
+        local_pending_out.local_pending_spent = true;
+        local_pending_out.poi_spendable = false;
+        let snapshot = ListUtxosOutput {
+            chain_id: 1,
+            cache_key: "cache".to_string(),
+            utxo_count: 1,
+            unspent_count: 1,
+            spent_count: 0,
+            local_pending_spent_count: 1,
+            utxos: vec![local_pending_out],
+            totals: vec![wallet_ops::TokenTotal {
+                token: token.to_checksum(None),
+                total: "5".to_string(),
+                poi_verified_total: "5".to_string(),
+            }],
+        };
+
+        let rows = format_private_asset_rows_from_snapshot(&snapshot);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].pending_outgoing_total, Some(uint!(5_U256)));
+        assert!(should_show_pending_amount(rows[0].pending_outgoing_total));
+    }
+
+    #[test]
     fn unshield_amount_input_formats_exact_token_units() {
         assert_eq!(
             format_unshield_amount_input(uint!(1_230_000_U256), Some(6)),
@@ -17006,6 +17355,7 @@ mod tests {
             utxo_count: utxos.len(),
             unspent_count: utxos.len(),
             spent_count: 0,
+            local_pending_spent_count: 0,
             utxos,
             totals: Vec::new(),
         };
@@ -17025,6 +17375,7 @@ mod tests {
             utxo_count: 1,
             unspent_count: 1,
             spent_count: 0,
+            local_pending_spent_count: 0,
             utxos: vec![unshield_utxo_output(token, 5, 0, 1)],
             totals: vec![wallet_ops::TokenTotal {
                 token: token.to_checksum(None),
@@ -17043,6 +17394,7 @@ mod tests {
             utxo_count: 2,
             unspent_count: 2,
             spent_count: 0,
+            local_pending_spent_count: 0,
             utxos: vec![
                 unshield_utxo_output(token, 5, 0, 1),
                 unshield_utxo_output(token, 3, 0, 2),
@@ -17086,6 +17438,7 @@ mod tests {
             utxo_count: 1,
             unspent_count: 0,
             spent_count: 1,
+            local_pending_spent_count: 0,
             utxos: vec![spent],
             totals: Vec::new(),
         };
@@ -17118,6 +17471,7 @@ mod tests {
             utxo_count: utxos.len(),
             unspent_count: utxos.len(),
             spent_count: 0,
+            local_pending_spent_count: 0,
             utxos,
             totals: Vec::new(),
         };
@@ -17137,6 +17491,7 @@ mod tests {
             utxo_count: 2,
             unspent_count: 2,
             spent_count: 0,
+            local_pending_spent_count: 0,
             utxos: vec![
                 unshield_utxo_output(token, 5, 0, 1),
                 unshield_utxo_output(token, 7, 0, 2),
@@ -17167,6 +17522,7 @@ mod tests {
             utxo_count: 2,
             unspent_count: 2,
             spent_count: 0,
+            local_pending_spent_count: 0,
             utxos: vec![
                 unshield_utxo_output(token, 5, 0, 1),
                 unshield_utxo_output(token, 7, 0, 2),
@@ -17600,6 +17956,7 @@ mod tests {
             utxo_count: 3,
             unspent_count: 3,
             spent_count: 0,
+            local_pending_spent_count: 0,
             utxos: vec![
                 utxo_output("0x1111111111111111111111111111111111111111", "1", false),
                 utxo_output("0x2222222222222222222222222222222222222222", "2", false),
@@ -17621,6 +17978,7 @@ mod tests {
             utxo_count: 2,
             unspent_count: 1,
             spent_count: 1,
+            local_pending_spent_count: 0,
             utxos: vec![
                 utxo_output("0x1111111111111111111111111111111111111111", "42", true),
                 utxo_output("0x2222222222222222222222222222222222222222", "7", false),
@@ -17649,6 +18007,7 @@ mod tests {
             utxo_count: 2,
             unspent_count: 1,
             spent_count: 1,
+            local_pending_spent_count: 0,
             utxos: vec![
                 utxo_output("0x1111111111111111111111111111111111111111", "42", true),
                 utxo_output("0x2222222222222222222222222222222222222222", "7", false),
@@ -17663,6 +18022,56 @@ mod tests {
     }
 
     #[test]
+    fn display_rows_keep_pending_spent_visible_when_spent_toggle_off() {
+        let mut pending_spent =
+            utxo_output("0x1111111111111111111111111111111111111111", "42", false);
+        pending_spent.pending_spent = true;
+        pending_spent.poi_spendable = false;
+        let output = ListUtxosOutput {
+            chain_id: 1,
+            cache_key: "cache".to_string(),
+            utxo_count: 1,
+            unspent_count: 1,
+            spent_count: 0,
+            local_pending_spent_count: 0,
+            utxos: vec![pending_spent],
+            totals: Vec::new(),
+        };
+
+        let rows = display_rows_from_output(&output, "", false);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].amount, "42");
+        assert!(rows[0].pending_spent);
+        assert_eq!(rows[0].poi_status, "Pending spend");
+    }
+
+    #[test]
+    fn display_rows_keep_local_pending_spent_visible_when_spent_toggle_off() {
+        let mut local_pending =
+            utxo_output("0x1111111111111111111111111111111111111111", "42", false);
+        local_pending.local_pending_spent = true;
+        local_pending.poi_spendable = false;
+        let output = ListUtxosOutput {
+            chain_id: 1,
+            cache_key: "cache".to_string(),
+            utxo_count: 1,
+            unspent_count: 1,
+            spent_count: 0,
+            local_pending_spent_count: 1,
+            utxos: vec![local_pending],
+            totals: Vec::new(),
+        };
+
+        let rows = display_rows_from_output(&output, "", false);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].amount, "42");
+        assert!(rows[0].local_pending_spent);
+        assert_eq!(rows[0].poi_status, "Locally locked");
+    }
+
+    #[test]
     fn display_rows_search_matches_source_tx_hash() {
         let output = ListUtxosOutput {
             chain_id: 1,
@@ -17670,6 +18079,7 @@ mod tests {
             utxo_count: 2,
             unspent_count: 2,
             spent_count: 0,
+            local_pending_spent_count: 0,
             utxos: vec![
                 utxo_output_with_hashes(
                     "0x1111111111111111111111111111111111111111",
@@ -17702,6 +18112,7 @@ mod tests {
             utxo_count: 2,
             unspent_count: 1,
             spent_count: 1,
+            local_pending_spent_count: 0,
             utxos: vec![
                 utxo_output_with_hashes(
                     "0x1111111111111111111111111111111111111111",
@@ -17735,6 +18146,7 @@ mod tests {
             utxo_count: 1,
             unspent_count: 0,
             spent_count: 1,
+            local_pending_spent_count: 0,
             utxos: vec![utxo_output_with_hashes(
                 "0x1111111111111111111111111111111111111111",
                 "42",
