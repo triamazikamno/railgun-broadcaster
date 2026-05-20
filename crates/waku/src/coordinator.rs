@@ -1433,7 +1433,7 @@ impl WakuNode {
         self.inner.peer_book.read().connected_peers()
     }
 
-    /// Read-only peer snapshot for viewer-style consumers.
+    /// Read-only peer snapshot for monitor-style consumers.
     #[must_use]
     pub fn peer_snapshots(&self) -> Vec<PeerSnapshot> {
         self.inner.peer_book.read().peer_snapshots()

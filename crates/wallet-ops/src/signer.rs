@@ -16,11 +16,6 @@ pub(crate) struct SoftwareEvmSigner {
 }
 
 impl SoftwareEvmSigner {
-    pub(crate) fn from_private_key_hex(private_key: &str) -> Result<Self> {
-        let private_key = parse_private_key(private_key)?;
-        Self::from_private_key(private_key)
-    }
-
     pub(crate) fn from_private_key(private_key: [u8; 32]) -> Result<Self> {
         let signer = PrivateKeySigner::from(
             SigningKey::from_bytes((&private_key).into()).wrap_err("invalid signing key")?,
@@ -52,9 +47,4 @@ impl Drop for SoftwareEvmSigner {
     fn drop(&mut self) {
         self.private_key.zeroize();
     }
-}
-
-fn parse_private_key(private_key: &str) -> Result<[u8; 32]> {
-    let pk_hex = private_key.strip_prefix("0x").unwrap_or(private_key);
-    hex::decode_to_array(pk_hex).wrap_err("invalid private key hex")
 }

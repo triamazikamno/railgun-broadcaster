@@ -1,4 +1,4 @@
-//! Shared copy affordance for the viewer UI.
+//! Shared copy affordance for GPUI surfaces.
 
 use gpui::{App, ClipboardItem, ElementId, SharedString, Window};
 use gpui_component::{WindowExt, clipboard::Clipboard, notification::Notification};

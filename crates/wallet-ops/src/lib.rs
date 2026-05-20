@@ -14,9 +14,7 @@ use alloy::signers::k256::ecdsa::SigningKey;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::uint;
 use alloy_provider::DynProvider;
-use broadcaster_core::contracts::shield::{
-    build_approve_calldata, build_shield_calldata, derive_shield_private_key,
-};
+use broadcaster_core::contracts::shield::derive_shield_private_key;
 use broadcaster_core::crypto::railgun::{Address as RailgunAddress, AddressData};
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use broadcaster_core::transact::{
@@ -41,10 +39,9 @@ use railgun_wallet::tx::{
     unshield_selection_info_with_broadcaster_fee_token,
     unshield_selection_info_with_separate_broadcaster_fee_seed,
 };
-use railgun_wallet::wallet_cache::wallet_cache_key;
 use railgun_wallet::{
     Note, PoiStatus, ProverService, TransactionBuilder, Utxo, UtxoCommitmentKind, UtxoSource,
-    WalletKeys, WalletUtxo,
+    WalletUtxo,
 };
 use rand::seq::IndexedRandom;
 use reqwest::Url;
@@ -154,7 +151,6 @@ pub(crate) use poi_contexts::{
     active_list_pre_transaction_pois, persist_pending_send_output_poi_contexts,
     persist_pending_unshield_output_poi_contexts, public_broadcaster_pre_transaction_pois,
 };
-pub(crate) use signer::{EvmMessageSigner, EvmTransactionSigner, SoftwareEvmSigner};
 pub(crate) use utxos::utxo_outputs_from_utxos;
 
 #[cfg(test)]
@@ -194,39 +190,6 @@ pub const RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS: U256 = uint!(25_U256);
 /// amount.
 const WETH_DEPOSIT_SELECTOR: [u8; 4] = [0xd0, 0xe3, 0x0d, 0xb0];
 
-pub struct ListUtxosRequest {
-    pub mnemonic: String,
-    pub chain_id: u64,
-    pub db_path: PathBuf,
-    pub init_block_number: Option<u64>,
-    pub sync_to_block: Option<u64>,
-    pub use_indexed_wallet_catch_up: bool,
-    pub poi_read_source: PoiReadSource,
-}
-
-pub struct WalletSessionRequest {
-    pub mnemonic: String,
-    pub chain_id: u64,
-    pub db_path: PathBuf,
-    pub init_block_number: Option<u64>,
-    pub sync_to_block: Option<u64>,
-    pub use_indexed_wallet_catch_up: bool,
-    pub poi_read_source: PoiReadSource,
-    pub local_poi_caches: Option<WalletLocalPoiCaches>,
-    pub progress_tx: Option<SyncProgressSender>,
-}
-
-pub struct WalletChainSessionRequest {
-    pub mnemonic: String,
-    pub chain_id: u64,
-    pub init_block_number: Option<u64>,
-    pub sync_to_block: Option<u64>,
-    pub use_indexed_wallet_catch_up: bool,
-    pub poi_read_source: PoiReadSource,
-    pub local_poi_caches: Option<WalletLocalPoiCaches>,
-    pub progress_tx: Option<SyncProgressSender>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DesktopWalletSyncStartPolicy {
     ImportedHistoricalBackfill,
@@ -253,60 +216,6 @@ pub struct ViewWalletChainSessionRequest {
     pub local_poi_caches: Option<WalletLocalPoiCaches>,
     pub rewind_wallet_cache: bool,
     pub progress_tx: Option<SyncProgressSender>,
-}
-
-impl From<ListUtxosRequest> for WalletSessionRequest {
-    fn from(value: ListUtxosRequest) -> Self {
-        Self {
-            mnemonic: value.mnemonic,
-            chain_id: value.chain_id,
-            db_path: value.db_path,
-            init_block_number: value.init_block_number,
-            sync_to_block: value.sync_to_block,
-            use_indexed_wallet_catch_up: value.use_indexed_wallet_catch_up,
-            poi_read_source: value.poi_read_source,
-            local_poi_caches: None,
-            progress_tx: None,
-        }
-    }
-}
-
-impl From<WalletSessionRequest> for WalletChainSessionRequest {
-    fn from(value: WalletSessionRequest) -> Self {
-        Self {
-            mnemonic: value.mnemonic,
-            chain_id: value.chain_id,
-            init_block_number: value.init_block_number,
-            sync_to_block: value.sync_to_block,
-            use_indexed_wallet_catch_up: value.use_indexed_wallet_catch_up,
-            poi_read_source: value.poi_read_source,
-            local_poi_caches: value.local_poi_caches,
-            progress_tx: value.progress_tx,
-        }
-    }
-}
-
-pub struct ShieldRequest {
-    pub chain_id: u64,
-    pub token: Address,
-    pub amount: String,
-    pub recipient: String,
-    pub private_key: String,
-    pub wrap: bool,
-    pub send: bool,
-}
-
-pub struct UnshieldRequest {
-    pub mnemonic: String,
-    pub chain_id: u64,
-    pub token: Address,
-    pub amount: String,
-    pub recipient: Address,
-    pub db_path: PathBuf,
-    pub init_block_number: Option<u64>,
-    pub unwrap: bool,
-    pub private_key: Option<String>,
-    pub poi_read_source: PoiReadSource,
 }
 
 pub struct DesktopUnshieldCalldataRequest {
@@ -628,12 +537,6 @@ struct PreparedPublicBroadcasterPlan<P> {
     min_gas_price: u128,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct UnshieldOutput {
-    pub to: Address,
-    pub data: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedUnshieldCall {
     pub chain_id: u64,
@@ -666,33 +569,6 @@ pub struct PreparedSendCall {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct UnshieldSendOutput {
-    pub tx_hash: String,
-    pub status: bool,
-    pub block_number: u64,
-    pub gas_used: u64,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct TxOutput {
-    pub to: Address,
-    pub data: String,
-    /// ETH value to send with the transaction, in wei as a decimal string.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub value: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct ShieldOutput {
-    /// Present only when wrapping is requested: calls `WETH.deposit()` with ETH
-    /// value.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub wrap: Option<TxOutput>,
-    pub approve: TxOutput,
-    pub shield: TxOutput,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct TxReceiptOutput {
     pub tx_hash: String,
     pub status: bool,
@@ -706,18 +582,6 @@ pub struct ShieldSendOutput {
     pub wrap: Option<TxReceiptOutput>,
     pub approve: TxReceiptOutput,
     pub shield: TxReceiptOutput,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ShieldResult {
-    Calldata(ShieldOutput),
-    Sent(ShieldSendOutput),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UnshieldResult {
-    Calldata(UnshieldOutput),
-    Sent(UnshieldSendOutput),
 }
 
 pub struct WalletSession {
@@ -790,7 +654,7 @@ pub fn eligible_public_broadcasters_for_asset(
     token: Address,
     unwrap: bool,
 ) -> Result<Vec<PublicBroadcasterCandidate>> {
-    let chain_defaults = chain_defaults_for_chain(chain_id, UnsupportedChainMessage::Generic)?;
+    let chain_defaults = chain_defaults_for_chain(chain_id)?;
     Ok(eligible_public_broadcasters(
         rows,
         chain_id,
@@ -812,7 +676,7 @@ pub fn public_broadcaster_candidates_for_asset(
     policy: BroadcasterFeePolicy,
     anchor_rate: Option<U256>,
 ) -> Result<Vec<PublicBroadcasterCandidate>> {
-    let chain_defaults = chain_defaults_for_chain(chain_id, UnsupportedChainMessage::Generic)?;
+    let chain_defaults = chain_defaults_for_chain(chain_id)?;
     Ok(public_broadcaster_candidates(
         rows,
         chain_id,
@@ -1192,7 +1056,7 @@ async fn public_broadcaster_setup(
     anchor_cache: Option<&Arc<TokenAnchorRateCache>>,
     http: &HttpContext,
 ) -> Result<PublicBroadcasterSetup> {
-    let chain_defaults = chain_defaults_for_chain(chain_id, UnsupportedChainMessage::Generic)?;
+    let chain_defaults = chain_defaults_for_chain(chain_id)?;
     let anchor_rate = public_broadcaster_anchor_rate_for_policy(anchor_cache, chain_id, token);
     let candidates = public_broadcaster_candidates(
         fee_rows,
@@ -1522,33 +1386,6 @@ impl WalletSessionStore {
         Self { db, sync_manager }
     }
 
-    pub async fn start_wallet_session(
-        &self,
-        request: WalletChainSessionRequest,
-        rpc_url_override: Option<Url>,
-        http: &HttpContext,
-    ) -> Result<WalletSession> {
-        let chain_id = request.chain_id;
-        let synced = setup_synced_wallet_with_store(
-            &request.mnemonic,
-            chain_id,
-            request.init_block_number,
-            request.sync_to_block,
-            request.use_indexed_wallet_catch_up,
-            request.poi_read_source.clone(),
-            request.local_poi_caches.clone(),
-            rpc_url_override,
-            http,
-            UnsupportedChainMessage::WalletCliV1,
-            request.progress_tx.clone(),
-            Arc::clone(&self.db),
-            Arc::clone(&self.sync_manager),
-        )
-        .await?;
-
-        wallet_session_from_synced(chain_id, synced).await
-    }
-
     pub async fn start_view_wallet_session(
         &self,
         request: ViewWalletChainSessionRequest,
@@ -1589,7 +1426,6 @@ impl WalletSessionStore {
             request.rewind_wallet_cache,
             rpc_url_override,
             http,
-            UnsupportedChainMessage::WalletCliV1,
             request.progress_tx.clone(),
             wait_until_ready,
             Arc::clone(&self.db),
@@ -1603,41 +1439,6 @@ impl WalletSessionStore {
     pub async fn shutdown(&self) {
         self.sync_manager.shutdown().await;
     }
-}
-
-pub async fn list_utxos(
-    request: ListUtxosRequest,
-    rpc_url_override: Option<Url>,
-    http: &HttpContext,
-) -> Result<ListUtxosOutput> {
-    let session = start_wallet_session(request.into(), rpc_url_override, http).await?;
-    Ok(session.snapshots_rx.borrow().as_ref().clone())
-}
-
-pub async fn start_wallet_session(
-    request: WalletSessionRequest,
-    rpc_url_override: Option<Url>,
-    http: &HttpContext,
-) -> Result<WalletSession> {
-    let db_path = request.db_path.clone();
-    let request = WalletChainSessionRequest::from(request);
-    let store = WalletSessionStore::open(db_path)?;
-
-    store
-        .start_wallet_session(request, rpc_url_override, http)
-        .await
-}
-
-async fn wallet_session_from_synced(chain_id: u64, synced: SyncedWallet) -> Result<WalletSession> {
-    wallet_session_from_parts(
-        chain_id,
-        synced.db,
-        synced.sync_manager,
-        synced.chain_key,
-        synced.start_block,
-        synced.handle,
-    )
-    .await
 }
 
 async fn wallet_session_from_view_synced(
@@ -1696,240 +1497,6 @@ async fn wallet_session_from_parts(
     })
 }
 
-pub async fn shield(
-    request: ShieldRequest,
-    rpc_url_override: Option<Url>,
-    http: &HttpContext,
-) -> Result<ShieldResult> {
-    let amount = U256::from_str_radix(&request.amount, 10)
-        .map_err(|e| eyre!("invalid amount '{}': {e}", request.amount))?;
-
-    let chain_defaults =
-        chain_defaults_for_chain(request.chain_id, UnsupportedChainMessage::Generic)?;
-    let rpc_url = rpc_url_override.unwrap_or_else(|| chain_defaults.rpc_url.clone());
-
-    let railgun_addr = RailgunAddress::from(request.recipient.as_str());
-    let addr_data =
-        AddressData::try_from(&railgun_addr).wrap_err("invalid recipient 0zk address")?;
-
-    let evm_signer = SoftwareEvmSigner::from_private_key_hex(&request.private_key)?;
-    let shield_private_key = evm_signer.derive_shield_private_key()?;
-
-    let approve_data = build_approve_calldata(chain_defaults.contract, amount);
-    let shield_data = build_shield_calldata(
-        addr_data.master_public_key,
-        &addr_data.viewing_public_key,
-        request.token,
-        amount,
-        &shield_private_key,
-    )
-    .wrap_err("build shield calldata")?;
-
-    if !request.send {
-        let wrap = if request.wrap {
-            Some(TxOutput {
-                to: request.token,
-                data: hex::encode_prefixed(WETH_DEPOSIT_SELECTOR),
-                value: Some(amount.to_string()),
-            })
-        } else {
-            None
-        };
-
-        return Ok(ShieldResult::Calldata(ShieldOutput {
-            wrap,
-            approve: TxOutput {
-                to: request.token,
-                data: hex::encode_prefixed(&approve_data),
-                value: None,
-            },
-            shield: TxOutput {
-                to: chain_defaults.contract,
-                data: hex::encode_prefixed(&shield_data),
-                value: None,
-            },
-        }));
-    }
-
-    let from_address = evm_signer.address();
-    let provider = ProviderBuilder::new()
-        .connect_reqwest(http.client.clone(), rpc_url)
-        .erased();
-
-    let gas_price = buffered_gas_price(&provider).await?;
-    let mut nonce = provider
-        .get_transaction_count(from_address)
-        .await
-        .wrap_err("fetch nonce")?;
-    let wallet = evm_signer.ethereum_wallet();
-
-    let wrap_receipt = if request.wrap {
-        let tx_req = TransactionRequest::default()
-            .with_chain_id(request.chain_id)
-            .with_from(from_address)
-            .with_to(request.token)
-            .with_input(WETH_DEPOSIT_SELECTOR.to_vec())
-            .with_value(amount)
-            .with_gas_price(gas_price)
-            .with_nonce(nonce);
-
-        let receipt = sign_send_wait(&provider, &wallet, tx_req, "wrap").await?;
-        if !receipt.status {
-            return Err(eyre!("wrap transaction reverted ({})", receipt.tx_hash));
-        }
-        nonce += 1;
-        Some(receipt)
-    } else {
-        None
-    };
-
-    let approve_tx = TransactionRequest::default()
-        .with_chain_id(request.chain_id)
-        .with_from(from_address)
-        .with_to(request.token)
-        .with_input(approve_data)
-        .with_gas_price(gas_price)
-        .with_nonce(nonce);
-
-    let approve_receipt = sign_send_wait(&provider, &wallet, approve_tx, "approve").await?;
-    if !approve_receipt.status {
-        return Err(eyre!(
-            "approve transaction reverted ({})",
-            approve_receipt.tx_hash
-        ));
-    }
-    nonce += 1;
-
-    let shield_tx = TransactionRequest::default()
-        .with_chain_id(request.chain_id)
-        .with_from(from_address)
-        .with_to(chain_defaults.contract)
-        .with_input(shield_data)
-        .with_gas_price(gas_price)
-        .with_nonce(nonce);
-
-    let shield_receipt = sign_send_wait(&provider, &wallet, shield_tx, "shield").await?;
-    if !shield_receipt.status {
-        return Err(eyre!(
-            "shield transaction reverted ({})",
-            shield_receipt.tx_hash
-        ));
-    }
-
-    Ok(ShieldResult::Sent(ShieldSendOutput {
-        wrap: wrap_receipt,
-        approve: approve_receipt,
-        shield: shield_receipt,
-    }))
-}
-
-pub async fn unshield(
-    request: UnshieldRequest,
-    rpc_url_override: Option<Url>,
-    http: &HttpContext,
-) -> Result<UnshieldResult> {
-    let amount = U256::from_str_radix(&request.amount, 10)
-        .map_err(|e| eyre!("invalid amount '{}': {e}", request.amount))?;
-    if request.unwrap && !is_wrapped_native_token(request.chain_id, request.token) {
-        return Err(eyre!("selected token does not support unwrap-to-native"));
-    }
-
-    let synced = setup_synced_wallet(
-        &request.mnemonic,
-        request.chain_id,
-        request.db_path,
-        request.init_block_number,
-        None,
-        true,
-        request.poi_read_source,
-        None,
-        rpc_url_override,
-        http,
-        UnsupportedChainMessage::Generic,
-    )
-    .await?;
-
-    let artifact_source = artifact_source(http);
-    let prover = ProverService::new_with_db(artifact_source, Arc::clone(&synced.db));
-
-    let chain_handle = synced
-        .sync_manager
-        .chain_handle(&synced.chain_key)
-        .await
-        .ok_or_else(|| eyre!("chain handle not found for chain {}", request.chain_id))?;
-    let mut forest = chain_handle.forest.read().await.clone();
-    forest.compute_roots();
-
-    let wallet_utxos = synced.handle.utxos.read().await.clone();
-    let pending_overlay = synced.handle.pending_overlay().await;
-    let utxos = poi_verified_unspent_utxos_from_records(&wallet_utxos, &pending_overlay);
-    let tx_builder = TransactionBuilder {
-        chain_type: 0,
-        chain_id: request.chain_id,
-        railgun_contract: synced.chain_defaults.contract,
-        relay_adapt_contract: synced.chain_defaults.relay_adapt_contract,
-    };
-
-    let mode = if request.unwrap {
-        UnshieldMode::UnwrapBase
-    } else {
-        UnshieldMode::Token
-    };
-
-    let unshield_request = RailgunUnshieldRequest {
-        token_address: request.token,
-        amount,
-        recipient: request.recipient,
-        mode,
-        verify_proof: true,
-        spend_up_to: false,
-        broadcaster_fee: None,
-        min_gas_price: 0,
-    };
-
-    let plan = tx_builder
-        .build_unshield_plan(&synced.wallet, &forest, &utxos, unshield_request, &prover)
-        .await
-        .wrap_err("build unshield plan")?;
-
-    let Some(private_key) = request.private_key.as_deref() else {
-        return Ok(UnshieldResult::Calldata(UnshieldOutput {
-            to: plan.call.to,
-            data: hex::encode_prefixed(&plan.call.data),
-        }));
-    };
-
-    let evm_signer = SoftwareEvmSigner::from_private_key_hex(private_key)?;
-    let from_address = evm_signer.address();
-    let provider = ProviderBuilder::new()
-        .connect_reqwest(http.client.clone(), synced.rpc_url)
-        .erased();
-
-    let gas_price = buffered_gas_price(&provider).await?;
-    let nonce = provider
-        .get_transaction_count(from_address)
-        .await
-        .wrap_err("fetch nonce")?;
-
-    let tx_req = TransactionRequest::default()
-        .with_chain_id(request.chain_id)
-        .with_from(from_address)
-        .with_to(plan.call.to)
-        .with_input(plan.call.data.clone())
-        .with_gas_price(gas_price)
-        .with_nonce(nonce);
-
-    let wallet = evm_signer.ethereum_wallet();
-    let receipt = sign_send_wait(&provider, &wallet, tx_req, "unshield").await?;
-
-    Ok(UnshieldResult::Sent(UnshieldSendOutput {
-        tx_hash: receipt.tx_hash,
-        status: receipt.status,
-        block_number: receipt.block_number,
-        gas_used: receipt.gas_used,
-    }))
-}
-
 pub async fn prepare_desktop_unshield_calldata(
     request: DesktopUnshieldCalldataRequest,
     http: &HttpContext,
@@ -1945,8 +1512,7 @@ pub async fn prepare_desktop_unshield_calldata(
         return Err(eyre!("selected token does not support unwrap-to-native"));
     }
 
-    let chain_defaults =
-        chain_defaults_for_chain(request.chain_id, UnsupportedChainMessage::Generic)?;
+    let chain_defaults = chain_defaults_for_chain(request.chain_id)?;
     let artifact_source = artifact_source(http);
     let prover = ProverService::new_with_db(artifact_source, Arc::clone(&request.session.db));
     let chain_handle = request
@@ -2068,8 +1634,7 @@ pub async fn prepare_desktop_send_calldata(
 
     let recipient = request.recipient.trim().to_string();
     let recipient_data = parse_railgun_recipient(&recipient)?;
-    let chain_defaults =
-        chain_defaults_for_chain(request.chain_id, UnsupportedChainMessage::Generic)?;
+    let chain_defaults = chain_defaults_for_chain(request.chain_id)?;
     let artifact_source = artifact_source(http);
     let prover = ProverService::new_with_db(artifact_source, Arc::clone(&request.session.db));
     let chain_handle = request
@@ -2185,8 +1750,7 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
         return Err(eyre!("selected token does not support unwrap-to-native"));
     }
 
-    let chain_defaults =
-        chain_defaults_for_chain(request.chain_id, UnsupportedChainMessage::Generic)?;
+    let chain_defaults = chain_defaults_for_chain(request.chain_id)?;
     let policy = BroadcasterFeePolicy::default()
         .with_allow_suspicious_broadcasters(request.allow_suspicious_broadcasters);
     let anchor_rate = public_broadcaster_anchor_rate_for_policy(
@@ -2287,8 +1851,7 @@ pub async fn estimate_desktop_send_public_broadcaster_cost(
     }
     parse_railgun_recipient(&request.recipient)?;
 
-    let chain_defaults =
-        chain_defaults_for_chain(request.chain_id, UnsupportedChainMessage::Generic)?;
+    let chain_defaults = chain_defaults_for_chain(request.chain_id)?;
     let policy = BroadcasterFeePolicy::default()
         .with_allow_suspicious_broadcasters(request.allow_suspicious_broadcasters);
     let anchor_rate = public_broadcaster_anchor_rate_for_policy(
@@ -3401,17 +2964,6 @@ async fn snapshot_from_handle(chain_id: u64, handle: &WalletHandle) -> ListUtxos
     }
 }
 
-struct SyncedWallet {
-    db: Arc<DbStore>,
-    sync_manager: Arc<SyncManager>,
-    chain_key: ChainKey,
-    chain_defaults: ChainConfigDefaults,
-    rpc_url: Url,
-    wallet: WalletKeys,
-    start_block: u64,
-    handle: WalletHandle,
-}
-
 struct SyncedViewWallet {
     db: Arc<DbStore>,
     sync_manager: Arc<SyncManager>,
@@ -3474,124 +3026,6 @@ fn resolve_desktop_wallet_chain_start(
     }
 }
 
-async fn setup_synced_wallet(
-    mnemonic: &str,
-    chain_id: u64,
-    db_path: PathBuf,
-    init_block_number: Option<u64>,
-    sync_to_block: Option<u64>,
-    use_indexed_wallet_catch_up: bool,
-    poi_read_source: PoiReadSource,
-    local_poi_caches: Option<WalletLocalPoiCaches>,
-    rpc_url_override: Option<Url>,
-    http: &HttpContext,
-    unsupported_chain_message: UnsupportedChainMessage,
-) -> Result<SyncedWallet> {
-    let store = WalletSessionStore::open(db_path)?;
-
-    setup_synced_wallet_with_store(
-        mnemonic,
-        chain_id,
-        init_block_number,
-        sync_to_block,
-        use_indexed_wallet_catch_up,
-        poi_read_source,
-        local_poi_caches,
-        rpc_url_override,
-        http,
-        unsupported_chain_message,
-        None,
-        store.db,
-        store.sync_manager,
-    )
-    .await
-}
-
-async fn setup_synced_wallet_with_store(
-    mnemonic: &str,
-    chain_id: u64,
-    init_block_number: Option<u64>,
-    sync_to_block: Option<u64>,
-    use_indexed_wallet_catch_up: bool,
-    poi_read_source: PoiReadSource,
-    shared_local_poi_caches: Option<WalletLocalPoiCaches>,
-    rpc_url_override: Option<Url>,
-    http: &HttpContext,
-    unsupported_chain_message: UnsupportedChainMessage,
-    progress_tx: Option<SyncProgressSender>,
-    db: Arc<DbStore>,
-    sync_manager: Arc<SyncManager>,
-) -> Result<SyncedWallet> {
-    let chain_defaults = chain_defaults_for_chain(chain_id, unsupported_chain_message)?;
-    let rpc_url = rpc_url_override.unwrap_or_else(|| chain_defaults.rpc_url.clone());
-    let chain_key = ChainKey {
-        chain_id: chain_defaults.chain_id,
-        contract: chain_defaults.contract,
-    };
-
-    let chain_cfg = chain_config(&chain_defaults, rpc_url.clone(), http, progress_tx.clone());
-    sync_manager
-        .add_chain(chain_cfg)
-        .await
-        .wrap_err("register chain sync service")?;
-
-    let wallet = WalletKeys::from_mnemonic(mnemonic, 0).wrap_err("derive wallet keys")?;
-    let scan_keys = wallet.viewing;
-    let poi_recovery_prover = ProverService::new_with_db(artifact_source(http), Arc::clone(&db));
-    let wallet_id = scan_keys
-        .derive_address(None)
-        .wrap_err("derive wallet id")?;
-    let cache_key = wallet_cache_key(wallet_id.as_ref(), chain_id, chain_key.contract);
-    let start_block = init_block_number.unwrap_or(chain_defaults.deployment_block);
-    let (local_poi_caches, manage_local_poi_cache) = wallet_local_poi_caches(
-        &poi_read_source,
-        chain_id,
-        &cache_key,
-        shared_local_poi_caches,
-    );
-    tracing::info!(
-        chain_id,
-        start_block,
-        sync_to_block,
-        use_indexed_wallet_catch_up,
-        poi_read_source = ?poi_read_source,
-        "starting mnemonic wallet sync"
-    );
-    let wallet_cfg = WalletConfig {
-        chain: chain_key,
-        cache_key,
-        start_block: Some(start_block),
-        sync_to_block,
-        quick_sync_endpoint: chain_defaults.quick_sync_endpoint.clone(),
-        scan_keys,
-        spending_public_key: Some(wallet.spending_public_key),
-        progress_tx,
-        cache_store: None,
-        poi_recovery_prover: Some(poi_recovery_prover),
-        poi_read_source,
-        local_poi_caches,
-        manage_local_poi_cache,
-        use_indexed_wallet_catch_up,
-    };
-
-    let mut handle = sync_manager
-        .add_wallet(wallet_cfg)
-        .await
-        .wrap_err("register wallet sync worker")?;
-    handle.wait_until_ready().await;
-
-    Ok(SyncedWallet {
-        db,
-        sync_manager,
-        chain_key,
-        chain_defaults,
-        rpc_url,
-        wallet,
-        start_block,
-        handle,
-    })
-}
-
 async fn setup_synced_view_wallet_with_store(
     view_session: Arc<vault::DesktopViewSession>,
     chain_id: u64,
@@ -3604,13 +3038,12 @@ async fn setup_synced_view_wallet_with_store(
     rewind_wallet_cache: bool,
     rpc_url_override: Option<Url>,
     http: &HttpContext,
-    unsupported_chain_message: UnsupportedChainMessage,
     progress_tx: Option<SyncProgressSender>,
     wait_until_ready: bool,
     db: Arc<DbStore>,
     sync_manager: Arc<SyncManager>,
 ) -> Result<SyncedViewWallet> {
-    let chain_defaults = chain_defaults_for_chain(chain_id, unsupported_chain_message)?;
+    let chain_defaults = chain_defaults_for_chain(chain_id)?;
     let rpc_url = rpc_url_override.unwrap_or_else(|| chain_defaults.rpc_url.clone());
     let chain_key = ChainKey {
         chain_id: chain_defaults.chain_id,
@@ -3737,22 +3170,8 @@ async fn setup_synced_view_wallet_with_store(
     })
 }
 
-#[derive(Clone, Copy)]
-enum UnsupportedChainMessage {
-    Generic,
-    WalletCliV1,
-}
-
-fn chain_defaults_for_chain(
-    chain_id: u64,
-    unsupported_chain_message: UnsupportedChainMessage,
-) -> Result<ChainConfigDefaults> {
-    ChainConfigDefaults::for_chain(chain_id).ok_or_else(|| match unsupported_chain_message {
-        UnsupportedChainMessage::Generic => eyre!("unsupported chain id {chain_id}"),
-        UnsupportedChainMessage::WalletCliV1 => {
-            eyre!("unsupported chain id {chain_id} for wallet-cli v1")
-        }
-    })
+fn chain_defaults_for_chain(chain_id: u64) -> Result<ChainConfigDefaults> {
+    ChainConfigDefaults::for_chain(chain_id).ok_or_else(|| eyre!("unsupported chain id {chain_id}"))
 }
 
 fn chain_config(
@@ -3832,15 +3251,6 @@ fn artifact_source(http: &HttpContext) -> ArtifactSource {
 async fn buffered_gas_price(provider: &(impl Provider + Clone)) -> Result<u128> {
     let gas_price = provider.get_gas_price().await.wrap_err("fetch gas price")?;
     Ok(gas_price * GAS_PRICE_BUFFER_NUMERATOR / GAS_PRICE_BUFFER_DENOMINATOR)
-}
-
-async fn sign_send_wait(
-    provider: &(impl Provider + Clone),
-    wallet: &EthereumWallet,
-    tx_req: TransactionRequest,
-    label: &str,
-) -> Result<TxReceiptOutput> {
-    sign_send_wait_with_sent(provider, wallet, tx_req, label, |_| {}).await
 }
 
 pub(crate) async fn sign_send_wait_with_sent(
@@ -3941,12 +3351,12 @@ mod tests {
     use railgun_wallet::{PoiStatus, Utxo, UtxoCommitmentKind, UtxoSource, WalletKeys, WalletUtxo};
     use serde_json::json;
 
+    use super::signer::{EvmMessageSigner, EvmTransactionSigner, SoftwareEvmSigner};
     use super::{
         ApproximateTransactionShape, BroadcasterFeePolicy, BroadcasterFeePolicyStatus,
-        DesktopWalletChainStart, DesktopWalletSyncStartPolicy, EvmMessageSigner,
-        EvmTransactionSigner, ListUtxosOutput, PublicBroadcasterCandidate,
-        PublicBroadcasterFeeMargin, PublicBroadcasterFeeMode, PublicBroadcasterResultKind,
-        PublicBroadcasterSelection, RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS, SoftwareEvmSigner,
+        DesktopWalletChainStart, DesktopWalletSyncStartPolicy, ListUtxosOutput,
+        PublicBroadcasterCandidate, PublicBroadcasterFeeMargin, PublicBroadcasterFeeMode,
+        PublicBroadcasterResultKind, PublicBroadcasterSelection, RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
         TokenTotal, UtxoOutput, WalletPendingOverlay, WalletPendingSpent,
         apply_pending_overlay_to_outputs, approximate_public_broadcaster_cost,
         approximate_public_broadcaster_gas, broadcaster_fee_amount, broadcaster_fee_covers,
@@ -5060,13 +4470,9 @@ mod tests {
             assert_ne!(shield_key, [0u8; 32]);
         }
 
-        let signer = SoftwareEvmSigner::from_private_key_hex(
-            "0x0101010101010101010101010101010101010101010101010101010101010101",
-        )
-        .expect("software EVM signer");
+        let signer = SoftwareEvmSigner::from_private_key([1; 32]).expect("software EVM signer");
 
         exercise_boundaries(&signer);
-        assert!(SoftwareEvmSigner::from_private_key_hex("0x1234").is_err());
     }
 
     #[test]

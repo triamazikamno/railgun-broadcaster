@@ -1,11 +1,9 @@
 [workspace]
 members = [
     "bins/broadcaster",
-    "bins/broadcaster-viewer",
     "bins/db-cli",
     "bins/poi-indexer",
     "bins/wallet",
-    "bins/wallet-cli",
     "crates/config",
     "crates/core",
     "crates/fees",

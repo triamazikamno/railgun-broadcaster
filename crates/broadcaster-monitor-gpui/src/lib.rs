@@ -6,4 +6,4 @@ mod peers_view;
 mod root;
 
 pub use fees_view::FeeAnchorLookup;
-pub use root::{BroadcasterMonitorPane, open_monitor_window};
+pub use root::BroadcasterMonitorPane;

@@ -16,7 +16,7 @@ pub const DEFAULT_MAX_PEERS: usize = 10;
 pub const DEFAULT_PEER_CONNECTION_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Debug, Clone, Default)]
-pub struct WakuViewerConfig {
+pub struct WakuMonitorConfig {
     pub chain_ids: Vec<u64>,
     pub cluster_id: Option<u32>,
     pub shard_id: Option<u32>,
@@ -27,9 +27,9 @@ pub struct WakuViewerConfig {
     pub network: RelayNetworkConfig,
 }
 
-impl WakuViewerConfig {
+impl WakuMonitorConfig {
     /// Build a `config::Waku` from explicit monitor settings. The standalone
-    /// viewer fills these from CLI flags; wallet apps can pass their own values.
+    /// wallet monitor fills these from the active wallet network context.
     #[must_use]
     pub fn to_waku_config(&self) -> config::Waku {
         let doh = self
@@ -71,9 +71,9 @@ const fn default_doh_endpoint(network_mode: RelayNetworkMode) -> &'static str {
 /// Interval for refreshing peer snapshots from the Waku node.
 const PEER_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Spawn the viewer's background Waku + fees workers on the current runtime.
+/// Spawn the monitor's background Waku + fees workers on the current runtime.
 pub async fn spawn_workers(
-    opts: WakuViewerConfig,
+    opts: WakuMonitorConfig,
     waku: Arc<Client>,
     shared: Shared,
     events: EventTx,
@@ -315,7 +315,7 @@ mod tests {
 
     #[test]
     fn waku_config_defaults_apply_when_flags_are_absent() {
-        let opts = WakuViewerConfig::default();
+        let opts = WakuMonitorConfig::default();
         let cfg = opts.to_waku_config();
         assert_eq!(cfg.cluster_id, Some(DEFAULT_CLUSTER_ID));
         assert_eq!(cfg.shard_id, Some(DEFAULT_SHARD_ID));
@@ -332,13 +332,13 @@ mod tests {
 
     #[test]
     fn waku_config_uses_tor_doh_default_in_tor_mode() {
-        let opts = WakuViewerConfig {
+        let opts = WakuMonitorConfig {
             network: RelayNetworkConfig {
                 mode: RelayNetworkMode::Tor,
                 http_client: None,
                 tor_client: None,
             },
-            ..WakuViewerConfig::default()
+            ..WakuMonitorConfig::default()
         };
         let cfg = opts.to_waku_config();
         assert_eq!(cfg.doh_endpoint.as_deref(), Some(DEFAULT_TOR_DOH_ENDPOINT));
@@ -346,7 +346,7 @@ mod tests {
 
     #[test]
     fn waku_config_overrides_apply_when_flags_present() {
-        let opts = WakuViewerConfig {
+        let opts = WakuMonitorConfig {
             chain_ids: Vec::new(),
             cluster_id: Some(7),
             shard_id: Some(3),
@@ -374,14 +374,14 @@ mod tests {
 
     #[test]
     fn waku_config_doh_override_wins_in_tor_mode() {
-        let opts = WakuViewerConfig {
+        let opts = WakuMonitorConfig {
             doh_endpoint: Some("https://example.invalid/dns-query".to_string()),
             network: RelayNetworkConfig {
                 mode: RelayNetworkMode::Tor,
                 http_client: None,
                 tor_client: None,
             },
-            ..WakuViewerConfig::default()
+            ..WakuMonitorConfig::default()
         };
         let cfg = opts.to_waku_config();
         assert_eq!(
@@ -392,10 +392,10 @@ mod tests {
 
     #[tokio::test]
     async fn proxy_mode_worker_publishes_disabled_waku_status() {
-        let opts = WakuViewerConfig {
+        let opts = WakuMonitorConfig {
             chain_ids: vec![1],
             network: RelayNetworkConfig::proxy(reqwest::Client::new()),
-            ..WakuViewerConfig::default()
+            ..WakuMonitorConfig::default()
         };
         let waku = opts.build_client().expect("proxy Waku client");
         let shared = shared();

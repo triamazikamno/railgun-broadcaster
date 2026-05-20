@@ -741,7 +741,7 @@ fn public_send_transaction_request(
 }
 
 fn chain_defaults_for_public_chain(chain_id: u64) -> Result<ChainConfigDefaults> {
-    chain_defaults_for_chain(chain_id, crate::UnsupportedChainMessage::Generic)
+    chain_defaults_for_chain(chain_id)
 }
 
 #[cfg(test)]

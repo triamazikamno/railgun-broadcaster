@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, U256};
 use broadcaster_monitor::{EventRx, EventTx, Shared};
-use broadcaster_monitor_waku::{RelayNetworkConfig, WakuViewerConfig, spawn_workers};
+use broadcaster_monitor_waku::{RelayNetworkConfig, WakuMonitorConfig, spawn_workers};
 use chrono::{DateTime, Local, Utc};
 use eyre::WrapErr;
 use gpui::ObjectFit;
@@ -1065,7 +1065,7 @@ async fn build_wallet_startup(
         WalletNetworkMode::Proxy => RelayNetworkConfig::proxy(http.client.clone()),
         WalletNetworkMode::Direct => RelayNetworkConfig::direct(),
     };
-    let waku_config = WakuViewerConfig {
+    let waku_config = WakuMonitorConfig {
         chain_ids: chain_ids.clone(),
         cluster_id: None,
         shard_id: None,
