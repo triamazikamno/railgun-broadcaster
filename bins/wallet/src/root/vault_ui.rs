@@ -2,6 +2,7 @@ use gpui::{
     Entity, IntoElement, ParentElement, SharedString, Styled, Window, div,
     prelude::FluentBuilder as _, px, rgb,
 };
+use gpui_component::progress::Progress as UiProgress;
 use gpui_component::{Disableable, IconName, WindowExt, button::ButtonVariants};
 use ui::controls::{app_button, app_button_base, app_input, app_muted_text, app_strong_text};
 use ui::theme::{self, APP_TEXT_SIZE};
@@ -141,7 +142,7 @@ impl WalletRoot {
     }
 
     fn render_create_vault(&self, root: Entity<Self>) -> gpui::Div {
-        let submit_root = root;
+        let submit_root = root.clone();
         let mut body = vault_dialog_body(
             "Choose one password for this desktop wallet vault. It will be required every time the app starts.",
         );
@@ -161,12 +162,92 @@ impl WalletRoot {
                         });
                     }),
             )
-            .child(
-                div()
-                    .text_size(APP_TEXT_SIZE)
-                    .text_color(rgb(theme::TEXT_MUTED))
-                    .child("No OS keychain or mnemonic startup argument is used in v1."),
-            )
+            .child(self.render_create_vault_cache_offer(root))
+    }
+
+    fn render_create_vault_cache_offer(&self, root: Entity<Self>) -> gpui::Div {
+        let start_root = root;
+        let progress = self.prover_cache_build_progress.clone();
+        let completed = self.prover_cache_build_completed;
+        let percent = progress
+            .as_ref()
+            .map_or(0, wallet_ops::ProverCacheBuildProgress::percent);
+        let progress_text = progress.as_ref().map(|progress| {
+            if progress.total_variants == 0 {
+                "Preparing prover cache...".to_string()
+            } else {
+                format!(
+                    "Building prover cache: {} of {} variants complete ({percent}%)",
+                    progress.completed_variants, progress.total_variants
+                )
+            }
+        });
+
+        div()
+            .w_full()
+            .mt(px(4.0))
+            .p(px(14.0))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(theme::BORDER))
+            .bg(rgb_with_alpha(theme::SURFACE, 0.72))
+            .child(app_strong_text("Prepare prover cache in the background"))
+            .child(app_muted_text(
+                "Private transactions and POI proofs need prover artifacts. Building the cache now parses zkeys and compiles circuit WASM ahead of time. It can take a long time and uses about 2.5 GB of disk space in this wallet database.",
+            ))
+            .child(app_muted_text(
+                "If you skip this, nothing breaks. The wallet will build missing cache entries on demand, so the first private action for each circuit may take much longer.",
+            ))
+            .when_some(progress_text, |this, text| {
+                this.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            app_muted_text(SharedString::from(text))
+                                .text_color(rgb(theme::INFO)),
+                        )
+                        .child(
+                            UiProgress::new()
+                                .h(px(7.0))
+                                .value(f32::from(percent)),
+                        ),
+                )
+            })
+            .when(progress.is_none() && !completed, |this| {
+                this.child(
+                    app_button("create-vault-build-prover-cache", "Build cache in background")
+                        .outline()
+                        .w_full()
+                        .on_click(move |_event, _window, cx| {
+                            start_root.update(cx, |root, cx| {
+                                root.start_background_prover_cache_build(cx);
+                            });
+                        }),
+                )
+            })
+            .when(progress.is_some(), |this| {
+                this.child(
+                    app_button("create-vault-build-prover-cache-running", "Building prover cache")
+                        .outline()
+                        .w_full()
+                        .loading(true)
+                        .disabled(true),
+                )
+            })
+            .when(completed && progress.is_none(), |this| {
+                this.child(
+                    app_muted_text("Prover cache is ready for this wallet database.")
+                        .text_color(rgb(theme::SUCCESS)),
+                )
+            })
+            .child(app_muted_text(
+                "You can also start this later from Settings.",
+            ))
     }
 
     fn render_unlock_vault(&self, root: Entity<Self>) -> gpui::Div {

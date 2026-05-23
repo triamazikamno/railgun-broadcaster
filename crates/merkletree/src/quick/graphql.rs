@@ -1,9 +1,12 @@
 use std::num::NonZeroUsize;
+use std::time::Duration;
 
 use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::time::sleep;
+use tracing::warn;
 use url::Url;
 
 use crate::errors::SyncError;
@@ -15,6 +18,7 @@ use crate::quick::types::{
 
 pub const DEFAULT_PAGE_SIZE: NonZeroUsize =
     NonZeroUsize::new(10_000).expect("default page size is non-zero");
+const GRAPHQL_MAX_ATTEMPTS: usize = 4;
 
 pub(crate) const COMMITMENTS_QUERY: &str = r"
 query Commitments($blockNumber: BigInt = 0, $limit: Int = 10000) {
@@ -561,6 +565,37 @@ where
     T: DeserializeOwned,
     V: Serialize,
 {
+    for attempt in 1..=GRAPHQL_MAX_ATTEMPTS {
+        match post_graphql_data_once(client, endpoint, query, variables).await {
+            Ok(data) => return Ok(data),
+            Err(error) if attempt < GRAPHQL_MAX_ATTEMPTS && error.is_retryable() => {
+                let delay = graphql_retry_delay(attempt);
+                warn!(
+                    endpoint = %endpoint,
+                    attempt,
+                    max_attempts = GRAPHQL_MAX_ATTEMPTS,
+                    delay_ms = delay.as_millis(),
+                    error = %error,
+                    "quick-sync GraphQL request failed; retrying"
+                );
+                sleep(delay).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("quick-sync GraphQL retry loop always returns")
+}
+
+async fn post_graphql_data_once<T, V>(
+    client: &Client,
+    endpoint: &Url,
+    query: &str,
+    variables: &V,
+) -> Result<T, GraphPostError>
+where
+    T: DeserializeOwned,
+    V: Serialize,
+{
     let request = GraphRequest { query, variables };
     let response = client
         .post(endpoint.clone())
@@ -585,6 +620,16 @@ where
     parsed.data.ok_or(GraphPostError::MissingData)
 }
 
+#[cfg(not(test))]
+const fn graphql_retry_delay(failed_attempt: usize) -> Duration {
+    Duration::from_secs(1 << (failed_attempt - 1))
+}
+
+#[cfg(test)]
+const fn graphql_retry_delay(_failed_attempt: usize) -> Duration {
+    Duration::from_millis(1)
+}
+
 #[derive(Debug, Error)]
 pub enum GraphPostError {
     #[error("graphql request failed: {0}")]
@@ -599,6 +644,26 @@ pub enum GraphPostError {
     Graphql(String),
     #[error("graphql response missing data field")]
     MissingData,
+}
+
+impl GraphPostError {
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Request(error) => error.is_timeout() || error.is_connect(),
+            Self::ReadBody(_) => true,
+            Self::HttpStatus { status, .. } => matches!(
+                *status,
+                StatusCode::REQUEST_TIMEOUT
+                    | StatusCode::TOO_MANY_REQUESTS
+                    | StatusCode::INTERNAL_SERVER_ERROR
+                    | StatusCode::BAD_GATEWAY
+                    | StatusCode::SERVICE_UNAVAILABLE
+                    | StatusCode::GATEWAY_TIMEOUT
+            ),
+            Self::Json(_) | Self::Graphql(_) | Self::MissingData => false,
+        }
+    }
 }
 
 impl From<GraphPostError> for SyncError {

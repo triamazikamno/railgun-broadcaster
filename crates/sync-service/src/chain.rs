@@ -141,6 +141,14 @@ pub enum ChainError {
     Rpc(#[from] TransportError),
     #[error("archive rpc url required for blocks <= {0}")]
     ArchiveRpcRequired(u64),
+    #[error(
+        "indexed catch-up unavailable from block {from_block}; archive RPC fallback required through block {archive_until_block}: {reason}"
+    )]
+    IndexedCatchUpUnavailable {
+        from_block: u64,
+        archive_until_block: u64,
+        reason: String,
+    },
     #[error("snapshot error: {0}")]
     Snapshot(#[from] PersistError),
     #[error("wallet scan error: {0}")]
@@ -171,7 +179,12 @@ impl ChainError {
     }
 
     pub(crate) const fn should_mark_rpc_unhealthy(&self) -> bool {
-        !matches!(self, Self::ArchiveRpcRequired(_) | Self::NoHealthyRpc)
+        !matches!(
+            self,
+            Self::ArchiveRpcRequired(_)
+                | Self::IndexedCatchUpUnavailable { .. }
+                | Self::NoHealthyRpc
+        )
     }
 
     fn is_block_range_beyond_current_head(&self) -> bool {
@@ -1597,6 +1610,33 @@ async fn send_wallet_startup_events(
     true
 }
 
+fn missing_archive_for_rpc_fallback(
+    chain: &ChainConfig,
+    last_processed: u64,
+    archive_provider: Option<&DynProvider>,
+) -> Option<(u64, u64)> {
+    let from_block = last_processed.saturating_add(1).max(chain.deployment_block);
+    (archive_provider.is_none()
+        && chain.archive_until_block > 0
+        && from_block <= chain.archive_until_block)
+        .then_some((from_block, chain.archive_until_block))
+}
+
+fn indexed_catch_up_unavailable(
+    chain: &ChainConfig,
+    last_processed: u64,
+    archive_provider: Option<&DynProvider>,
+    source: impl std::fmt::Display,
+) -> Option<ChainError> {
+    missing_archive_for_rpc_fallback(chain, last_processed, archive_provider).map(
+        |(from_block, archive_until_block)| ChainError::IndexedCatchUpUnavailable {
+            from_block,
+            archive_until_block,
+            reason: source.to_string(),
+        },
+    )
+}
+
 #[async_trait]
 pub trait MerkleForestDbExt {
     async fn load_or_initialize_forest(
@@ -1767,6 +1807,14 @@ impl MerkleForestDbExt for DbStore {
                                             );
                                         }
                                         Err(err) => {
+                                            if let Some(error) = indexed_catch_up_unavailable(
+                                                chain,
+                                                last_processed,
+                                                archive_provider,
+                                                &err,
+                                            ) {
+                                                return Err(error);
+                                            }
                                             warn!(
                                                 ?err,
                                                 fallback_from = last_processed,
@@ -1776,6 +1824,14 @@ impl MerkleForestDbExt for DbStore {
                                     }
                                 }
                                 Err(err) => {
+                                    if let Some(error) = indexed_catch_up_unavailable(
+                                        chain,
+                                        last_processed,
+                                        archive_provider,
+                                        &err,
+                                    ) {
+                                        return Err(error);
+                                    }
                                     warn!(
                                         ?err,
                                         fallback_from = last_processed,
@@ -1787,6 +1843,11 @@ impl MerkleForestDbExt for DbStore {
                     }
                 }
                 Err(err) => {
+                    if let Some(error) =
+                        indexed_catch_up_unavailable(chain, last_processed, archive_provider, &err)
+                    {
+                        return Err(error);
+                    }
                     warn!(
                         ?err,
                         "indexed forest status query failed; falling back to RPC"

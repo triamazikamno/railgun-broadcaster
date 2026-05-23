@@ -2,12 +2,12 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, U256, address};
 use gpui::Context;
 use wallet_ops::{
     BroadcasterFeePolicy, BroadcasterFeePolicyStatus, ListUtxosOutput, PublicBroadcasterCandidate,
     PublicBroadcasterCostEstimate, PublicBroadcasterFeeMode,
-    fee_policy_eligible_public_broadcasters,
+    eligible_public_broadcasters_for_asset, fee_policy_eligible_public_broadcasters,
     max_broadcaster_fee_token_amount_from_outputs as planner_max_broadcaster_fee_token_amount_from_outputs,
     public_broadcaster_candidates_for_asset,
     settings::{EffectiveChainConfig, EffectiveTokenRegistry},
@@ -18,6 +18,9 @@ use super::{
     DeliveryFormKind, DeliveryMode, SendFormState, UnshieldAssetKey, UnshieldFormState, WalletRoot,
     parse_address,
 };
+
+const ETHEREUM_CHAIN_ID: u64 = 1;
+const ETHEREUM_WETH_TOKEN: Address = address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct PublicBroadcasterFeeTokenOption {
@@ -256,6 +259,13 @@ pub(super) fn fee_token_option_has_eligible_broadcaster(
     options
         .iter()
         .any(|option| option.token == token && option.eligible_broadcaster_count > 0)
+}
+
+pub(super) fn ethereum_weth_public_broadcaster_count(
+    fee_rows: &[broadcaster_monitor::FeeRow],
+) -> usize {
+    eligible_public_broadcasters_for_asset(fee_rows, ETHEREUM_CHAIN_ID, ETHEREUM_WETH_TOKEN, None)
+        .map_or(0, |candidates| candidates.len())
 }
 
 fn selected_fee_token_eligible_broadcaster_count(

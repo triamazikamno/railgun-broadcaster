@@ -52,9 +52,9 @@ use super::{
     display_chain_contract_settings, display_chain_quick_sync_endpoint,
     display_chain_rpc_endpoints, display_price_anchor_entries, display_rows_from_output,
     display_token_entries, display_waku_doh_endpoint, display_waku_doh_fallback_endpoints,
-    effective_public_broadcaster_fee_mode, fail_private_broadcaster_progress_steps_at_stage,
-    fee_token_option_has_eligible_broadcaster, finish_private_broadcaster_progress_steps,
-    finish_private_broadcaster_progress_steps_at_stage,
+    effective_public_broadcaster_fee_mode, ethereum_weth_public_broadcaster_count,
+    fail_private_broadcaster_progress_steps_at_stage, fee_token_option_has_eligible_broadcaster,
+    finish_private_broadcaster_progress_steps, finish_private_broadcaster_progress_steps_at_stage,
     form_error_clears_public_broadcaster_cost_estimate, format_anchor_bps_exact_range,
     format_anchor_bps_percent, format_anchor_bps_percent_range, format_anchor_premium_range,
     format_compact_age, format_exact_asset_amount_for_display, format_form_error_for_asset,
@@ -813,6 +813,42 @@ fn fee_token_options_include_known_token_icons() {
 
     assert_eq!(options.len(), 1);
     assert!(options[0].icon_path.is_some());
+}
+
+#[test]
+fn ethereum_weth_public_broadcaster_count_filters_available_broadcasters() {
+    let weth = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+        .parse::<Address>()
+        .expect("weth address");
+    let other_token = Address::from([0x77; 20]);
+    let mut unavailable = fee_row(1, weth, "unavailable");
+    unavailable.available_wallets = 0;
+    let mut expired = fee_row(1, weth, "expired");
+    expired.fee_expiration = SystemTime::now() - Duration::from_secs(1);
+    let mut invalid_signature = fee_row(1, weth, "invalid-signature");
+    invalid_signature.signature_valid = false;
+    let rows = vec![
+        fee_row(1, weth, "available-weth"),
+        fee_row(42161, weth, "wrong-chain"),
+        fee_row(1, other_token, "wrong-token"),
+        unavailable,
+        expired,
+        invalid_signature,
+    ];
+
+    assert_eq!(ethereum_weth_public_broadcaster_count(&rows), 1);
+}
+
+#[test]
+fn ethereum_weth_public_broadcaster_count_is_zero_without_available_broadcasters() {
+    let weth = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+        .parse::<Address>()
+        .expect("weth address");
+    let mut unavailable = fee_row(1, weth, "unavailable");
+    unavailable.available_wallets = 0;
+
+    assert_eq!(ethereum_weth_public_broadcaster_count(&[]), 0);
+    assert_eq!(ethereum_weth_public_broadcaster_count(&[unavailable]), 0);
 }
 
 #[test]

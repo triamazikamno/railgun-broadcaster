@@ -1,8 +1,8 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use alloy::eips::Encodable2718;
@@ -28,7 +28,10 @@ use local_db::{DbConfig, DbStore, PendingOutputPoiContextRecord, PendingOutputPo
 use merkletree::tree::MerkleForest;
 use poi::poi::{DEFAULT_WALLET_POI_RPC_URL, PoiRpcClient, default_active_poi_list_keys};
 use railgun_wallet::artifacts::ArtifactSource;
-use railgun_wallet::prover::{ProverCacheBuildReport, build_prover_cache};
+use railgun_wallet::prover::build_prover_cache_with_progress;
+pub use railgun_wallet::prover::{
+    ProverCacheBuildProgress, ProverCacheBuildReport, ProverCacheBuildStage,
+};
 use railgun_wallet::tx::{
     BroadcasterFeeOutput, BuildError, PoiMerkleProofSource, PreTransactionPoiGenerationRequest,
     PreTransactionPoiMap, SendPlan, SendRequest as RailgunSendRequest, TransactionPlanChunk,
@@ -60,7 +63,12 @@ use waku_relay::client::Client as WakuClient;
 use waku_relay::msg::ContentTopic;
 use zeroize::{Zeroize, Zeroizing};
 
+pub use local_db::DbStore as WalletDbStore;
 pub use waku_relay::client::Client as PublicBroadcasterWakuClient;
+
+static ACTIVE_PROVER_CACHE_BUILDS: LazyLock<
+    Mutex<HashMap<PathBuf, watch::Sender<Option<ProverCacheBuildProgress>>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 mod amounts;
 mod anchors;
@@ -112,7 +120,66 @@ pub struct BuildCacheRequest {
     pub proxy: Option<Url>,
 }
 
+pub struct ProverCacheBuildSession {
+    db_path: PathBuf,
+    progress_tx: watch::Sender<Option<ProverCacheBuildProgress>>,
+}
+
+impl Drop for ProverCacheBuildSession {
+    fn drop(&mut self) {
+        let _ = self.progress_tx.send(None);
+        let mut active = ACTIVE_PROVER_CACHE_BUILDS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        active.remove(&self.db_path);
+    }
+}
+
+impl ProverCacheBuildSession {
+    fn publish(&self, progress: ProverCacheBuildProgress) {
+        let _ = self.progress_tx.send(Some(progress));
+    }
+}
+
+fn prover_cache_build_key(db_path: &Path) -> PathBuf {
+    db_path
+        .canonicalize()
+        .unwrap_or_else(|_| db_path.to_path_buf())
+}
+
+pub fn begin_prover_cache_build(db_path: &Path) -> Result<ProverCacheBuildSession> {
+    let db_path = prover_cache_build_key(db_path);
+    let (progress_tx, _) = watch::channel(Some(ProverCacheBuildProgress::preparing()));
+    {
+        let mut active = ACTIVE_PROVER_CACHE_BUILDS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if active.contains_key(&db_path) {
+            return Err(eyre!(
+                "prover cache build is already running for {}",
+                db_path.display()
+            ));
+        }
+        active.insert(db_path.clone(), progress_tx.clone());
+    }
+    Ok(ProverCacheBuildSession {
+        db_path,
+        progress_tx,
+    })
+}
+
+pub fn subscribe_prover_cache_build(
+    db_path: &Path,
+) -> Option<watch::Receiver<Option<ProverCacheBuildProgress>>> {
+    let db_path = prover_cache_build_key(db_path);
+    let active = ACTIVE_PROVER_CACHE_BUILDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    active.get(&db_path).map(watch::Sender::subscribe)
+}
+
 pub async fn build_cache(request: BuildCacheRequest) -> Result<ProverCacheBuildReport> {
+    let session = begin_prover_cache_build(&request.db_path)?;
     let db = Arc::new(
         DbStore::open(DbConfig {
             root_dir: request.db_path.clone(),
@@ -125,12 +192,33 @@ pub async fn build_cache(request: BuildCacheRequest) -> Result<ProverCacheBuildR
         data_dir: &request.db_path,
     })
     .await?;
-    build_cache_with_context(db, &http).await
+    build_cache_with_context_and_progress_with_session(db, &http, session, |_| {}).await
 }
 
 pub async fn build_cache_with_context(
     db: Arc<DbStore>,
     http: &HttpContext,
+) -> Result<ProverCacheBuildReport> {
+    build_cache_with_context_and_progress(db, http, |_| {}).await
+}
+
+pub async fn build_cache_with_context_and_progress(
+    db: Arc<DbStore>,
+    http: &HttpContext,
+    mut on_progress: impl FnMut(ProverCacheBuildProgress) + Send + 'static,
+) -> Result<ProverCacheBuildReport> {
+    let session = begin_prover_cache_build(db.root_dir())?;
+    build_cache_with_context_and_progress_with_session(db, http, session, move |progress| {
+        on_progress(progress);
+    })
+    .await
+}
+
+pub async fn build_cache_with_context_and_progress_with_session(
+    db: Arc<DbStore>,
+    http: &HttpContext,
+    session: ProverCacheBuildSession,
+    mut on_progress: impl FnMut(ProverCacheBuildProgress) + Send + 'static,
 ) -> Result<ProverCacheBuildReport> {
     let source = artifact_source(http);
     let db_path = db.root_dir().to_path_buf();
@@ -140,10 +228,14 @@ pub async fn build_cache_with_context(
         artifact_dir = %source.out_dir.display(),
         "starting wallet cache build"
     );
-    let report =
-        tokio::task::spawn_blocking(move || build_prover_cache(&source, Some(db.as_ref())))
-            .await
-            .wrap_err("join prover cache build task")??;
+    let report = tokio::task::spawn_blocking(move || {
+        build_prover_cache_with_progress(&source, Some(db.as_ref()), |progress| {
+            session.publish(progress.clone());
+            on_progress(progress);
+        })
+    })
+    .await
+    .wrap_err("join prover cache build task")??;
     tracing::info!(
         railgun_variants = report.railgun_variants,
         poi_variants = report.poi_variants,

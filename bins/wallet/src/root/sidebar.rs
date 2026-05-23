@@ -1,13 +1,17 @@
 use gpui::{
-    Entity, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement, Styled,
-    div, img, prelude::FluentBuilder as _, px, rgb,
+    Entity, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled, div, img, prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
     Icon, IconName, Sizable,
     button::{Button, ButtonVariants},
     popover::Popover,
+    progress::Progress as UiProgress,
     sidebar::{Sidebar, SidebarMenu, SidebarMenuItem},
+    spinner::Spinner,
 };
+use ui::theme;
+use wallet_ops::ProverCacheBuildProgress;
 
 use crate::assets::{
     LOGO_ICON_PATH, RailgunNetworkStatusIcon, RailgunSidebarIcon, SIDEBAR_WORDMARK_PATH,
@@ -40,6 +44,10 @@ impl WalletRoot {
         let settings_root = root.clone();
         let logs_root = root.clone();
         let network_root = root.clone();
+        let cache_root = root.clone();
+        let public_broadcaster_count = self.sidebar_public_broadcaster_count;
+        let public_broadcaster_color =
+            Self::public_broadcaster_status_color(public_broadcaster_count);
 
         Sidebar::left()
             .w(SIDEBAR_WIDTH)
@@ -71,9 +79,18 @@ impl WalletRoot {
                             }),
                     )
                     .child(
-                        SidebarMenuItem::new("Public broadcasters")
-                            .icon(Icon::new(RailgunSidebarIcon::Broadcaster).size_4())
+                        SidebarMenuItem::new("Broadcasters")
+                            .icon(
+                                Icon::new(RailgunSidebarIcon::Broadcaster)
+                                    .size_4()
+                                    .text_color(rgb(public_broadcaster_color)),
+                            )
                             .active(self.active_activity == Activity::Broadcaster)
+                            .when(public_broadcaster_count > 0, |item| {
+                                item.suffix(Self::render_public_broadcaster_count_badge(
+                                    public_broadcaster_count,
+                                ))
+                            })
                             .on_click(move |_event, window, cx| {
                                 broadcaster_root.update(cx, |root, cx| {
                                     root.sync_broadcaster_monitor_chain_filter(
@@ -106,6 +123,16 @@ impl WalletRoot {
                     .gap_1()
                     .when(!collapsed, Styled::items_start)
                     .when(collapsed, Styled::items_center)
+                    .when_some(
+                        self.prover_cache_build_progress.clone(),
+                        |this, progress| {
+                            this.child(self.render_prover_cache_build_pill(
+                                &cache_root,
+                                collapsed,
+                                progress,
+                            ))
+                        },
+                    )
                     .child(self.render_network_status_pill(&network_root, collapsed))
                     .child(
                         SidebarMenuItem::new("Logs")
@@ -120,6 +147,30 @@ impl WalletRoot {
                             }),
                     ),
             )
+    }
+
+    const fn public_broadcaster_status_color(count: usize) -> u32 {
+        if count > 0 {
+            theme::SUCCESS
+        } else {
+            theme::WARNING
+        }
+    }
+
+    fn render_public_broadcaster_count_badge(count: usize) -> impl IntoElement {
+        let color = theme::SUCCESS;
+        div()
+            .px(px(6.0))
+            .py(px(1.0))
+            .rounded_full()
+            .border_1()
+            .border_color(rgb(color))
+            .bg(rgb_with_alpha(color, 0.10))
+            .text_color(rgb(color))
+            .text_size(px(11.0))
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .line_height(gpui::relative(1.0))
+            .child(count.to_string())
     }
 
     fn render_network_status_pill(&self, root: &Entity<Self>, collapsed: bool) -> impl IntoElement {
@@ -217,6 +268,202 @@ impl WalletRoot {
                     .child(label),
             )
             .into_any_element()
+    }
+
+    fn render_prover_cache_build_pill(
+        &self,
+        root: &Entity<Self>,
+        collapsed: bool,
+        progress: ProverCacheBuildProgress,
+    ) -> impl IntoElement {
+        let popover_root = root.clone();
+        let content_progress = progress;
+        let trigger = Button::new("wallet-prover-cache-build-pill-trigger")
+            .text()
+            .tab_stop(false)
+            .tooltip("Building prover cache")
+            .child(Self::render_prover_cache_build_chip(collapsed));
+
+        Popover::new("wallet-prover-cache-build-popover")
+            .open(self.prover_cache_build_popover_open)
+            .on_open_change(move |open, _window, cx| {
+                popover_root.update(cx, |root, cx| {
+                    root.set_prover_cache_build_popover_open(*open, cx);
+                });
+            })
+            .trigger(trigger)
+            .content(move |_state, _window, _cx| {
+                Self::render_prover_cache_build_popover_content(&content_progress)
+            })
+    }
+
+    fn render_prover_cache_build_chip(collapsed: bool) -> gpui::AnyElement {
+        let color = theme::INFO;
+        let spinner = Spinner::new()
+            .icon(IconName::LoaderCircle)
+            .color(rgb(color).into())
+            .with_size(px(14.0));
+
+        if collapsed {
+            return div()
+                .id("wallet-prover-cache-build-pill-collapsed")
+                .h(px(32.0))
+                .px_2()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(color))
+                .bg(rgb_with_alpha(color, 0.08))
+                .cursor_pointer()
+                .hover(|this| this.bg(rgb_with_alpha(color, 0.14)))
+                .child(spinner)
+                .into_any_element();
+        }
+
+        div()
+            .id("wallet-prover-cache-build-pill")
+            .h_7()
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_2()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(color))
+            .bg(rgb_with_alpha(color, 0.08))
+            .text_color(rgb(color))
+            .cursor_pointer()
+            .hover(|this| this.bg(rgb_with_alpha(color, 0.14)))
+            .child(spinner)
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(13.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .line_height(gpui::relative(1.0))
+                    .text_color(rgb(color))
+                    .child("Building prover cache"),
+            )
+            .into_any_element()
+    }
+
+    fn render_prover_cache_build_popover_content(progress: &ProverCacheBuildProgress) -> gpui::Div {
+        let percent = progress.percent();
+        let variant = progress
+            .current_variant
+            .as_deref()
+            .unwrap_or("Preparing variants");
+        let variant_kind = match progress.current_variant_is_poi {
+            Some(true) => "POI",
+            Some(false) => "Railgun",
+            None => "Variant",
+        };
+        let count_text = if progress.total_variants == 0 {
+            "Preparing variant list...".to_string()
+        } else {
+            format!(
+                "{} of {} variants complete",
+                progress.completed_variants, progress.total_variants
+            )
+        };
+
+        div()
+            .w(px(320.0))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .text_size(px(13.0))
+            .text_color(rgb(theme::TEXT))
+            .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                cx.stop_propagation();
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Spinner::new()
+                            .icon(IconName::LoaderCircle)
+                            .color(rgb(theme::INFO).into())
+                            .with_size(px(16.0)),
+                    )
+                    .child(
+                        div()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(theme::INFO))
+                            .child(progress.stage.label()),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        UiProgress::new()
+                            .flex_1()
+                            .h(px(7.0))
+                            .value(f32::from(percent)),
+                    )
+                    .child(
+                        div()
+                            .w(px(42.0))
+                            .text_color(rgb(theme::INFO))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(SharedString::from(format!("{percent}%"))),
+                    ),
+            )
+            .child(
+                div()
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .line_height(px(18.0))
+                    .child(SharedString::from(count_text)),
+            )
+            .child(
+                div()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(theme::BORDER))
+                    .bg(rgb(theme::SURFACE))
+                    .p(px(10.0))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .child(variant_kind),
+                    )
+                    .child(
+                        div()
+                            .font_family(theme::APP_MONO_FONT_FAMILY)
+                            .text_size(px(12.0))
+                            .line_height(px(17.0))
+                            .text_color(rgb(theme::TEXT))
+                            .child(SharedString::from(variant.to_string())),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .text_size(px(12.0))
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .child(SharedString::from(format!(
+                        "Succeeded: {}",
+                        progress.succeeded_variants
+                    )))
+                    .child(SharedString::from(format!(
+                        "Failed: {}",
+                        progress.failed_variants
+                    ))),
+            )
     }
 
     fn render_sidebar_header(

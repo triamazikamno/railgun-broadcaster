@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,10 +17,11 @@ use tokio::sync::{OnceCell, watch};
 use ui::logs::LogsPane;
 use ui::theme::APP_TEXT_SIZE;
 use wallet_ops::{
-    BroadcasterFeePolicy, HttpContext, PoiCacheService, PoiReadSource, PublicBalanceSnapshot,
-    PublicBroadcasterWakuClient, TokenAnchorRateCache, TokenAnchorRefreshHandle,
-    WalletNetworkHealth, WalletSessionStore,
+    BroadcasterFeePolicy, HttpContext, PoiCacheService, PoiReadSource, ProverCacheBuildProgress,
+    PublicBalanceSnapshot, PublicBroadcasterWakuClient, TokenAnchorRateCache,
+    TokenAnchorRefreshHandle, WalletNetworkHealth, WalletSessionStore,
     settings::{EffectiveChainConfig, EffectiveTokenRegistry, load_wallet_settings},
+    subscribe_prover_cache_build,
     vault::{
         DesktopVaultStore, DesktopViewSession, GeneratedSeedMaterial, PublicAccountMetadata,
         WalletMetadataBundle,
@@ -73,10 +75,10 @@ use public_balances::{
 };
 use public_broadcaster::{
     PublicBroadcasterFeeTokenOption, broadcaster_candidate_anchor_rate,
-    effective_public_broadcaster_fee_mode, public_broadcaster_fee_token_warning,
-    public_broadcaster_submit_disabled_for_fee_token_options, send_form_max_entered_amount,
-    should_show_broadcaster_fee_mode_toggle, should_show_distinct_amount,
-    unshield_form_max_entered_amount,
+    effective_public_broadcaster_fee_mode, ethereum_weth_public_broadcaster_count,
+    public_broadcaster_fee_token_warning, public_broadcaster_submit_disabled_for_fee_token_options,
+    send_form_max_entered_amount, should_show_broadcaster_fee_mode_toggle,
+    should_show_distinct_amount, unshield_form_max_entered_amount,
 };
 use settings::WalletSettingsEditor;
 use shell::WalletTab;
@@ -212,6 +214,7 @@ const SECONDS_PER_DAY: u64 = 24 * SECONDS_PER_HOUR;
 const SECONDS_PER_MONTH: u64 = 30 * SECONDS_PER_DAY;
 const SECONDS_PER_YEAR: u64 = 365 * SECONDS_PER_DAY;
 const TABLE_KEY_CONTEXT: &str = "Table";
+const PROVER_CACHE_BUILD_DISCOVERY_INTERVAL: Duration = Duration::from_secs(1);
 pub(crate) struct WalletRoot {
     options: WalletAppOptions,
     vault_store: Option<Arc<DesktopVaultStore>>,
@@ -238,6 +241,10 @@ pub(crate) struct WalletRoot {
     network_status_error: Option<Arc<str>>,
     tor_exit_ip_query: TorExitIpQueryState,
     tor_state_reset_confirming: bool,
+    prover_cache_build_progress: Option<ProverCacheBuildProgress>,
+    prover_cache_build_popover_open: bool,
+    prover_cache_build_monitor_active: bool,
+    prover_cache_build_completed: bool,
     runtime: Handle,
     monitor_state: Shared,
     waku: Arc<PublicBroadcasterWakuClient>,
@@ -251,6 +258,7 @@ pub(crate) struct WalletRoot {
     active_wallet_tab: WalletTab,
     sidebar_manually_collapsed: bool,
     sidebar_narrow_expanded: bool,
+    sidebar_public_broadcaster_count: usize,
     wallet_select: Entity<SelectState<SearchableVec<WalletSelectItem>>>,
     wallet_metadata: Vec<WalletMetadataBundle>,
     wallet_options: Vec<WalletOption>,
@@ -309,6 +317,104 @@ impl Drop for WalletRoot {
             self.runtime.spawn(async move {
                 store.shutdown().await;
             });
+        }
+    }
+}
+
+impl WalletRoot {
+    const fn is_prover_cache_building(&self) -> bool {
+        self.prover_cache_build_progress.is_some()
+    }
+
+    fn wallet_db_root_dir(&self) -> Option<PathBuf> {
+        self.vault_store
+            .as_ref()
+            .map(|store| store.db().root_dir().to_path_buf())
+    }
+
+    fn ensure_prover_cache_build_monitor(&mut self, cx: &Context<'_, Self>) {
+        if self.prover_cache_build_monitor_active {
+            return;
+        }
+        let Some(db_path) = self.wallet_db_root_dir() else {
+            return;
+        };
+        self.prover_cache_build_monitor_active = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                if let Some(mut progress_rx) = subscribe_prover_cache_build(&db_path) {
+                    let progress = progress_rx.borrow().clone();
+                    if this
+                        .update(cx, |root, cx| {
+                            root.set_prover_cache_build_progress(progress, cx);
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+
+                    loop {
+                        if progress_rx.changed().await.is_err() {
+                            let _ = this.update(cx, |root, cx| {
+                                root.set_prover_cache_build_progress(None, cx);
+                            });
+                            break;
+                        }
+                        let progress = progress_rx.borrow().clone();
+                        let is_complete = progress.is_none();
+                        if this
+                            .update(cx, |root, cx| {
+                                root.set_prover_cache_build_progress(progress, cx);
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                        if is_complete {
+                            break;
+                        }
+                    }
+                }
+
+                cx.background_executor()
+                    .timer(PROVER_CACHE_BUILD_DISCOVERY_INTERVAL)
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    fn set_prover_cache_build_progress(
+        &mut self,
+        progress: Option<ProverCacheBuildProgress>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.prover_cache_build_progress = progress;
+        if self.prover_cache_build_progress.is_none() {
+            self.prover_cache_build_popover_open = false;
+        }
+        cx.notify();
+    }
+
+    fn update_prover_cache_build_progress(
+        &mut self,
+        progress: ProverCacheBuildProgress,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.prover_cache_build_progress = Some(progress);
+        cx.notify();
+    }
+
+    fn finish_prover_cache_build_progress(&mut self, cx: &mut Context<'_, Self>) {
+        self.prover_cache_build_progress = None;
+        self.prover_cache_build_popover_open = false;
+        cx.notify();
+    }
+
+    fn set_prover_cache_build_popover_open(&mut self, open: bool, cx: &mut Context<'_, Self>) {
+        if self.prover_cache_build_popover_open != open {
+            self.prover_cache_build_popover_open = open;
+            cx.notify();
         }
     }
 }
@@ -501,6 +607,8 @@ impl WalletRoot {
         let utxo_table =
             cx.new(|cx| TableState::new(UtxoDelegate::new(tx_search_input.clone()), window, cx));
         let network_health = http.network_health();
+        let sidebar_public_broadcaster_count =
+            ethereum_weth_public_broadcaster_count(&monitor_state.read().fee_rows());
         let root = Self {
             selected_chain: initial_chain_id,
             options,
@@ -528,6 +636,10 @@ impl WalletRoot {
             network_status_error: None,
             tor_exit_ip_query: TorExitIpQueryState::Idle,
             tor_state_reset_confirming: false,
+            prover_cache_build_progress: None,
+            prover_cache_build_popover_open: false,
+            prover_cache_build_monitor_active: false,
+            prover_cache_build_completed: false,
             runtime,
             monitor_state,
             waku,
@@ -541,6 +653,7 @@ impl WalletRoot {
             active_wallet_tab: WalletTab::default(),
             sidebar_manually_collapsed: false,
             sidebar_narrow_expanded: false,
+            sidebar_public_broadcaster_count,
             wallet_select: wallet_select.clone(),
             wallet_metadata: Vec::new(),
             wallet_options: Vec::new(),
@@ -702,6 +815,12 @@ impl WalletRoot {
             while monitor_event_rx.changed().await.is_ok() {
                 if this
                     .update(cx, |root, cx| {
+                        let current_public_broadcaster_count =
+                            ethereum_weth_public_broadcaster_count(&root.monitor_fee_rows());
+                        let public_broadcaster_count_changed = root
+                            .sidebar_public_broadcaster_count
+                            != current_public_broadcaster_count;
+                        root.sidebar_public_broadcaster_count = current_public_broadcaster_count;
                         if root
                             .send_forms
                             .values()
@@ -710,6 +829,7 @@ impl WalletRoot {
                                 .unshield_forms
                                 .values()
                                 .any(|form| form.delivery_mode == DeliveryMode::PublicBroadcaster)
+                            || public_broadcaster_count_changed
                         {
                             cx.notify();
                         }

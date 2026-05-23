@@ -152,6 +152,7 @@ impl WalletRoot {
 impl Render for WalletRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         self.apply_public_broadcaster_error_amount_adjustments(window, cx);
+        self.ensure_prover_cache_build_monitor(cx);
         self.focus_vault_input_if_requested(window, cx);
         self.focus_utxo_table_if_requested(window, cx);
         self.focus_public_account_search_if_requested(window, cx);

@@ -401,6 +401,63 @@ pub struct ProverCacheBuildReport {
     pub elapsed_ms: u128,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ProverCacheBuildStage {
+    Preparing,
+    BuildingVariant,
+    VariantReady,
+}
+
+impl ProverCacheBuildStage {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Preparing => "Preparing prover cache",
+            Self::BuildingVariant => "Building prover cache",
+            Self::VariantReady => "Prover cache variant ready",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ProverCacheBuildProgress {
+    pub stage: ProverCacheBuildStage,
+    pub railgun_variants: usize,
+    pub poi_variants: usize,
+    pub total_variants: usize,
+    pub completed_variants: usize,
+    pub succeeded_variants: usize,
+    pub failed_variants: usize,
+    pub current_variant: Option<String>,
+    pub current_variant_is_poi: Option<bool>,
+}
+
+impl ProverCacheBuildProgress {
+    #[must_use]
+    pub const fn preparing() -> Self {
+        Self {
+            stage: ProverCacheBuildStage::Preparing,
+            railgun_variants: 0,
+            poi_variants: 0,
+            total_variants: 0,
+            completed_variants: 0,
+            succeeded_variants: 0,
+            failed_variants: 0,
+            current_variant: None,
+            current_variant_is_poi: None,
+        }
+    }
+
+    #[must_use]
+    pub fn percent(&self) -> u8 {
+        if self.total_variants == 0 {
+            return 0;
+        }
+        let percent = self.completed_variants.saturating_mul(100) / self.total_variants;
+        u8::try_from(percent.min(100)).unwrap_or(100)
+    }
+}
+
 struct ProverCacheVariant {
     variant: String,
     poi_shape: Option<(usize, usize)>,
@@ -665,6 +722,14 @@ pub fn build_prover_cache(
     source: &ArtifactSource,
     db_store: Option<&DbStore>,
 ) -> Result<ProverCacheBuildReport, ProverError> {
+    build_prover_cache_with_progress(source, db_store, |_| {})
+}
+
+pub fn build_prover_cache_with_progress(
+    source: &ArtifactSource,
+    db_store: Option<&DbStore>,
+    mut on_progress: impl FnMut(ProverCacheBuildProgress),
+) -> Result<ProverCacheBuildReport, ProverError> {
     let started = Instant::now();
     let mut variants = source
         .list_variants()?
@@ -687,6 +752,18 @@ pub fn build_prover_cache(
     ]);
     let poi_variants = variants.len() - railgun_variants;
     let total_variants = variants.len();
+    let mut progress = ProverCacheBuildProgress {
+        stage: ProverCacheBuildStage::Preparing,
+        railgun_variants,
+        poi_variants,
+        total_variants,
+        completed_variants: 0,
+        succeeded_variants: 0,
+        failed_variants: 0,
+        current_variant: None,
+        current_variant_is_poi: None,
+    };
+    on_progress(progress.clone());
 
     info!(
         railgun_variants,
@@ -698,10 +775,18 @@ pub fn build_prover_cache(
     let mut succeeded_variants = 0_usize;
     let mut failed_variants = 0_usize;
     for variant in &variants {
+        progress.stage = ProverCacheBuildStage::BuildingVariant;
+        progress.current_variant = Some(variant.variant.clone());
+        progress.current_variant_is_poi = Some(variant.poi_shape.is_some());
+        on_progress(progress.clone());
         match build_prover_variant_cache(source, db_store, variant) {
-            Ok(()) => succeeded_variants += 1,
+            Ok(()) => {
+                succeeded_variants += 1;
+                progress.succeeded_variants = succeeded_variants;
+            }
             Err(error) => {
                 failed_variants += 1;
+                progress.failed_variants = failed_variants;
                 warn!(
                     %error,
                     variant = %variant.variant,
@@ -712,6 +797,9 @@ pub fn build_prover_cache(
                 );
             }
         }
+        progress.stage = ProverCacheBuildStage::VariantReady;
+        progress.completed_variants += 1;
+        on_progress(progress.clone());
     }
     if succeeded_variants == 0 && failed_variants > 0 {
         return Err(ProverError::CacheBuildFailed { total_variants });

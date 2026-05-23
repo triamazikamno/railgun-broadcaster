@@ -351,6 +351,27 @@ mod tests {
 
         assert!(message.contains("status 400"));
         assert!(message.contains("bad wallet query"));
+        let request = mock.requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(request.contains("transactCommitments"));
+        assert!(mock.requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn transient_graphql_status_is_retried() {
+        let mock = spawn_graphql_with_status(vec![
+            (502, "error code: 502"),
+            (200, r#"{"data":{"squidStatus":{"height":"789"}}}"#),
+        ]);
+        let client = QuickSyncClient::new(mock.url);
+
+        let height = client.fetch_squid_height().await.expect("height");
+
+        assert_eq!(height, 789);
+        let first = mock.requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        let second = mock.requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(first.contains("squidStatus"));
+        assert!(second.contains("squidStatus"));
+        assert!(mock.requests.try_recv().is_err());
     }
 
     #[tokio::test]
