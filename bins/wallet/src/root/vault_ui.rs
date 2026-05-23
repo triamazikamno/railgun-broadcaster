@@ -9,7 +9,7 @@ use ui::theme::{self, APP_TEXT_SIZE};
 
 use super::settings::settings_dialog_dimensions;
 use super::shell::render_wallet_hero_screen;
-use super::{VaultState, WalletRoot, WalletSetupMode, rgb_with_alpha};
+use super::{Activity, VaultState, WalletRoot, WalletSetupMode, rgb_with_alpha};
 
 impl WalletRoot {
     pub(super) const fn titlebar_color(&self) -> u32 {
@@ -108,6 +108,7 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut gpui::Context<'_, Self>,
     ) {
+        window.close_all_dialogs(cx);
         let (dialog_width, content_height, dialog_max_height) = settings_dialog_dimensions(window);
         let editor = self.settings_editor.clone();
         let settings_error = self.settings_error.clone();
@@ -139,6 +140,30 @@ impl WalletRoot {
                 .title(app_strong_text("Settings"))
                 .child(content)
         });
+    }
+
+    pub(super) fn open_settings_from_shortcut(
+        &mut self,
+        window: &mut Window,
+        cx: &mut gpui::Context<'_, Self>,
+    ) {
+        if matches!(self.vault_state, VaultState::ViewUnlocked) {
+            window.close_all_dialogs(cx);
+            self.active_activity = Activity::Settings;
+            cx.notify();
+        } else if should_show_pre_unlock_settings_action(&self.vault_state) {
+            self.open_pre_unlock_settings_dialog(window, cx);
+        }
+    }
+
+    pub(super) fn lock_vault_from_shortcut(
+        &mut self,
+        window: &mut Window,
+        cx: &mut gpui::Context<'_, Self>,
+    ) {
+        if matches!(self.vault_state, VaultState::ViewUnlocked) {
+            self.lock_vault(window, cx);
+        }
     }
 
     fn render_create_vault(&self, root: Entity<Self>) -> gpui::Div {

@@ -339,6 +339,7 @@ impl WalletStartupRoot {
     }
 
     fn open_startup_settings_dialog(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        window.close_all_dialogs(cx);
         let root = cx.entity();
         let (editor, summary) = match self.vault_store.clone() {
             Some(store) => {
@@ -602,6 +603,28 @@ impl WalletStartupRoot {
                     });
                 }),
         )
+    }
+
+    pub(super) fn open_settings_from_shortcut(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if let Some(root) = self.wallet_root.clone() {
+            root.update(cx, |root, cx| {
+                root.open_settings_from_shortcut(window, cx);
+            });
+        } else {
+            self.open_startup_settings_dialog(window, cx);
+        }
+    }
+
+    pub(super) fn lock_vault_from_shortcut(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if let Some(root) = self.wallet_root.clone() {
+            root.update(cx, |root, cx| {
+                root.lock_vault_from_shortcut(window, cx);
+            });
+        }
     }
 }
 

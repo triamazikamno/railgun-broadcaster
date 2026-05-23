@@ -21,6 +21,7 @@ use ui::theme::{self, APP_FONT_FAMILY, APP_TEXT_SIZE};
 
 use crate::assets::{HEMATITE_HERO_PATH, HERO_WORDMARK_PATH, LOGO_ICON_PATH, WARM_GLOW_PATH};
 
+use super::actions::register_wallet_shortcut_root;
 use super::chain_load::sync_status_bar;
 use super::utxo::should_focus_utxo_table;
 use super::{
@@ -104,6 +105,7 @@ pub(crate) fn open_wallet_window(
                 options, runtime, monitor, event_tx, event_rx, &chain_ids, logs, window, cx,
             )
         });
+        register_wallet_shortcut_root(window, &root, cx);
         cx.new(|cx| Root::new(root, window, cx))
     }) {
         tracing::error!(%error, "failed to open wallet window");

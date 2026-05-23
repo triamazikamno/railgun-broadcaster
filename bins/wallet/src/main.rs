@@ -17,7 +17,10 @@ use ui::logs::{DEFAULT_LOG_CAPACITY, LogStore, UiLogLayer};
 
 use crate::assets::WalletAssets;
 use crate::cli::Options;
-use crate::root::{WalletAppOptions, install_utxo_navigation_bindings, open_wallet_window};
+use crate::root::{
+    WalletAppOptions, install_utxo_navigation_bindings, install_wallet_action_bindings,
+    open_wallet_window,
+};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, gpui::Action)]
 #[action(no_json)]
@@ -45,6 +48,7 @@ fn main() -> Result<()> {
         gpui_component::init(app);
         ui::theme::apply_zenburn_component_theme(app);
         install_quit_behavior(app);
+        install_wallet_action_bindings(app);
         install_utxo_navigation_bindings(app);
         open_wallet_window(
             app,

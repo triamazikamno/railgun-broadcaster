@@ -56,7 +56,7 @@ mod wallet_header;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use actions::install_utxo_navigation_bindings;
+pub(crate) use actions::{install_utxo_navigation_bindings, install_wallet_action_bindings};
 pub(crate) use shell::{WalletAppOptions, open_wallet_window};
 
 use broadcaster_picker::BroadcasterPickerState;
