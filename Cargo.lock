@@ -15448,6 +15448,7 @@ dependencies = [
  "tokio",
  "tor-rtcompat",
  "tracing",
+ "waku",
  "waku-relay",
  "zeroize",
 ]

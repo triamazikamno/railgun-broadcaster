@@ -17,6 +17,7 @@ use crate::{
     public_balance_refresh_interval_secs,
 };
 use sync_service::ChainConfigDefaults;
+use waku::{RAILGUN_TREE, parse_multiaddr, parse_peer_id};
 
 pub const WALLET_SETTINGS_KEY: &str = "wallet-settings";
 pub const WALLET_SETTINGS_VERSION: u32 = 1;
@@ -34,6 +35,9 @@ pub const DEFAULT_WAKU_SHARD_ID: u32 = 1;
 pub const DEFAULT_WAKU_MAX_PEERS: usize = 10;
 pub const DEFAULT_WAKU_PEER_CONNECTION_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_PUBLIC_BROADCASTER_RESPONSE_TIMEOUT_SECS: u64 = 120;
+pub const DEFAULT_WAKU_DIRECT_PEER_ID: &str =
+    "16Uiu2HAkwhijhoc4UxAJD4fmYgSX91FzSDqehAaxJogYFcyo736a";
+pub const DEFAULT_WAKU_DIRECT_PEER_ADDR: &str = "/dns4/baaamooobaaa.mooo.com/tcp/8000/wss";
 
 const MAX_FINALITY_DEPTH: u64 = 1_000_000;
 const MAX_BLOCK_RANGE: u64 = 5_000_000;
@@ -1041,11 +1045,20 @@ impl RuntimeSettings {
 pub struct WakuSettings {
     pub cluster_id: u32,
     pub shard_id: u32,
+    pub dns_enr_trees: Option<Vec<String>>,
+    pub direct_peers: Option<Vec<WakuDirectPeerSetting>>,
     pub doh_endpoint: Option<String>,
     pub doh_fallback_endpoints: Option<Vec<String>>,
     pub max_peers: usize,
     pub peer_connection_timeout_secs: u64,
     pub nwaku_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct WakuDirectPeerSetting {
+    pub peer_id: String,
+    pub addr: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1108,6 +1121,8 @@ impl Default for WakuSettings {
         Self {
             cluster_id: DEFAULT_WAKU_CLUSTER_ID,
             shard_id: DEFAULT_WAKU_SHARD_ID,
+            dns_enr_trees: None,
+            direct_peers: None,
             doh_endpoint: None,
             doh_fallback_endpoints: None,
             max_peers: DEFAULT_WAKU_MAX_PEERS,
@@ -1119,6 +1134,16 @@ impl Default for WakuSettings {
 
 impl WakuSettings {
     fn validate(&self, errors: &mut Vec<String>) {
+        if let Some(dns_enr_trees) = self.dns_enr_trees.as_deref() {
+            for (index, tree) in dns_enr_trees.iter().enumerate() {
+                validate_enr_tree(&format!("waku.dns_enr_trees[{index}]"), tree, errors);
+            }
+        }
+        if let Some(direct_peers) = self.direct_peers.as_deref() {
+            for (index, peer) in direct_peers.iter().enumerate() {
+                validate_waku_direct_peer(index, peer, errors);
+            }
+        }
         if let Some(doh_endpoint) = self.doh_endpoint.as_deref() {
             validate_url_scheme(
                 "waku.doh_endpoint",
@@ -1307,6 +1332,19 @@ pub fn default_chain_quick_sync_endpoint(chain_id: u64) -> Option<String> {
     ChainConfigDefaults::for_chain(chain_id)
         .and_then(|defaults| defaults.quick_sync_endpoint)
         .map(|endpoint| endpoint.to_string())
+}
+
+#[must_use]
+pub fn default_waku_dns_enr_trees() -> Vec<String> {
+    vec![RAILGUN_TREE.to_string()]
+}
+
+#[must_use]
+pub fn default_waku_direct_peers() -> Vec<WakuDirectPeerSetting> {
+    vec![WakuDirectPeerSetting {
+        peer_id: DEFAULT_WAKU_DIRECT_PEER_ID.to_string(),
+        addr: DEFAULT_WAKU_DIRECT_PEER_ADDR.to_string(),
+    }]
 }
 
 #[must_use]
@@ -1508,6 +1546,36 @@ fn validate_url_scheme(field: &str, value: &str, schemes: &[&str], errors: &mut 
     }
 }
 
+fn validate_enr_tree(field: &str, value: &str, errors: &mut Vec<String>) {
+    let value = value.trim();
+    if value.is_empty() {
+        errors.push(format!("{field} must not be empty"));
+    } else if !value.starts_with("enrtree://") {
+        errors.push(format!("{field} must start with enrtree://"));
+    }
+}
+
+fn validate_waku_direct_peer(index: usize, peer: &WakuDirectPeerSetting, errors: &mut Vec<String>) {
+    let peer_id = peer.peer_id.trim();
+    let addr = peer.addr.trim();
+    if peer_id.is_empty() {
+        errors.push(format!(
+            "waku.direct_peers[{index}].peer_id must not be empty"
+        ));
+    } else if parse_peer_id(peer_id).is_err() {
+        errors.push(format!(
+            "waku.direct_peers[{index}].peer_id must be a valid libp2p peer ID"
+        ));
+    }
+    if addr.is_empty() {
+        errors.push(format!("waku.direct_peers[{index}].addr must not be empty"));
+    } else if parse_multiaddr(addr).is_err() {
+        errors.push(format!(
+            "waku.direct_peers[{index}].addr must be a valid libp2p multiaddr"
+        ));
+    }
+}
+
 fn validate_optional_range(
     field: &str,
     value: Option<u64>,
@@ -1549,10 +1617,10 @@ mod tests {
     use super::{
         OFFICIAL_POI_ARTIFACT_GATEWAYS, OFFICIAL_POI_ARTIFACT_IPNS_NAME,
         OFFICIAL_POI_ARTIFACT_PUBLISHER_PUBKEY, PoiArtifactManifestSourceSetting,
-        PoiReadSourceSetting, WALLET_SETTINGS_KEY, WALLET_SETTINGS_VERSION, WalletSettings,
-        WalletSettingsError, build_effective_chain_configs, build_effective_token_registry,
-        decode_wallet_settings, encode_wallet_settings, load_wallet_settings, save_wallet_settings,
-        should_show_chain_deployment_metadata_settings,
+        PoiReadSourceSetting, WALLET_SETTINGS_KEY, WALLET_SETTINGS_VERSION, WakuDirectPeerSetting,
+        WalletSettings, WalletSettingsError, build_effective_chain_configs,
+        build_effective_token_registry, decode_wallet_settings, encode_wallet_settings,
+        load_wallet_settings, save_wallet_settings, should_show_chain_deployment_metadata_settings,
     };
     use sync_service::ChainConfigDefaults;
 
@@ -2051,12 +2119,62 @@ mod tests {
         let settings = WalletSettings::default();
         assert_eq!(settings.waku.cluster_id, super::DEFAULT_WAKU_CLUSTER_ID);
         assert_eq!(settings.waku.shard_id, super::DEFAULT_WAKU_SHARD_ID);
+        assert!(settings.waku.dns_enr_trees.is_none());
+        assert!(settings.waku.direct_peers.is_none());
         assert!(settings.waku.doh_endpoint.is_none());
         assert!(settings.waku.doh_fallback_endpoints.is_none());
         assert_eq!(settings.waku.max_peers, super::DEFAULT_WAKU_MAX_PEERS);
         assert_eq!(
             settings.waku.peer_connection_timeout_secs,
             super::DEFAULT_WAKU_PEER_CONNECTION_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn waku_dns_enr_trees_validate_scheme() {
+        let mut settings = WalletSettings::default();
+        settings.waku.dns_enr_trees = Some(vec!["https://bad.example".to_string()]);
+
+        let err = settings.validate().expect_err("bad DNS ENR tree rejected");
+
+        assert!(
+            err.messages
+                .iter()
+                .any(|message| message.contains("waku.dns_enr_trees[0]"))
+        );
+    }
+
+    #[test]
+    fn default_waku_direct_peer_is_valid() {
+        let peers = super::default_waku_direct_peers();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].peer_id, super::DEFAULT_WAKU_DIRECT_PEER_ID);
+        assert_eq!(peers[0].addr, super::DEFAULT_WAKU_DIRECT_PEER_ADDR);
+
+        let mut settings = WalletSettings::default();
+        settings.waku.direct_peers = Some(peers);
+        settings.validate().expect("default direct peer is valid");
+    }
+
+    #[test]
+    fn waku_direct_peers_validate_peer_id_and_multiaddr() {
+        let mut settings = WalletSettings::default();
+        settings.waku.direct_peers = Some(vec![WakuDirectPeerSetting {
+            peer_id: "not-a-peer-id".to_string(),
+            addr: "not-a-multiaddr".to_string(),
+        }]);
+
+        let err = settings.validate().expect_err("bad direct peer rejected");
+
+        assert!(
+            err.messages
+                .iter()
+                .any(|message| message.contains("waku.direct_peers[0].peer_id"))
+        );
+        assert!(
+            err.messages
+                .iter()
+                .any(|message| message.contains("waku.direct_peers[0].addr"))
         );
     }
 

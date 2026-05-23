@@ -38,10 +38,11 @@ use wallet_ops::{
     settings::{
         BuiltInTokenOverride, ChainContractSettings, ChainDeploymentSettings,
         ChainSettingsOverride, CustomTokenSettings, NetworkModeSetting, PoiReadSourceSetting,
-        PriceAnchorSettings, TokenKey, TokenPriceAnchorOverride, WalletSettings,
-        build_effective_chain_configs, build_effective_token_registry,
+        PriceAnchorSettings, TokenKey, TokenPriceAnchorOverride, WakuDirectPeerSetting,
+        WalletSettings, build_effective_chain_configs, build_effective_token_registry,
         default_chain_contract_settings, default_chain_quick_sync_endpoint,
-        default_chain_rpc_endpoints, default_token_price_anchor_overrides, save_wallet_settings,
+        default_chain_rpc_endpoints, default_token_price_anchor_overrides,
+        default_waku_direct_peers, default_waku_dns_enr_trees, save_wallet_settings,
         should_show_chain_deployment_metadata_settings,
     },
     vault::DesktopVaultStore,
@@ -175,11 +176,13 @@ const ANCHOR_BPS_SLIDER_MIN: f32 = 0.0;
 const ANCHOR_BPS_SLIDER_MAX: f32 = 100_000.0;
 const ANCHOR_BPS_SLIDER_STEP: f32 = 10.0;
 const ANCHOR_BPS_SLIDER_MAX_BPS: u64 = 100_000;
+const PROXY_WAKU_DISCLAIMER: &str = "Proxy mode disables embedded Waku libp2p transports to prevent proxy bypass. Public broadcaster discovery and Waku relay are unavailable in Proxy mode.";
 
 #[derive(Clone)]
 enum SettingsUrlListKind {
     ChainRpc { chain_id: u64, chain_label: String },
     PoiGateway,
+    WakuDnsEnrTree,
     WakuDohFallback,
 }
 
@@ -188,6 +191,7 @@ impl SettingsUrlListKind {
         match self {
             Self::ChainRpc { .. } => "No RPC endpoints configured.",
             Self::PoiGateway => "No artifact gateways configured.",
+            Self::WakuDnsEnrTree => "No DNS ENR trees configured. DNS bootstrap is disabled.",
             Self::WakuDohFallback => "No DoH fallback endpoints configured.",
         }
     }
@@ -196,6 +200,7 @@ impl SettingsUrlListKind {
         match self {
             Self::ChainRpc { .. } => "Enter an HTTP(S) RPC endpoint for this chain.",
             Self::PoiGateway => "Enter an HTTP(S) gateway URL for indexed POI artifact reads.",
+            Self::WakuDnsEnrTree => "Enter an enrtree:// DNS discovery tree URL.",
             Self::WakuDohFallback => "Enter an HTTP(S) DNS-over-HTTPS fallback endpoint.",
         }
     }
@@ -204,6 +209,7 @@ impl SettingsUrlListKind {
         SharedString::from(match self {
             Self::ChainRpc { chain_id, .. } => format!("wallet-settings-rpc-add-{chain_id}"),
             Self::PoiGateway => "wallet-settings-poi-gateway-add".to_string(),
+            Self::WakuDnsEnrTree => "wallet-settings-waku-dns-enr-tree-add".to_string(),
             Self::WakuDohFallback => "wallet-settings-waku-doh-fallback-add".to_string(),
         })
     }
@@ -214,6 +220,7 @@ impl SettingsUrlListKind {
                 format!("wallet-settings-rpc-row-{chain_id}-{index}")
             }
             Self::PoiGateway => format!("wallet-settings-poi-gateway-row-{index}"),
+            Self::WakuDnsEnrTree => format!("wallet-settings-waku-dns-enr-tree-row-{index}"),
             Self::WakuDohFallback => format!("wallet-settings-waku-doh-fallback-row-{index}"),
         })
     }
@@ -224,6 +231,7 @@ impl SettingsUrlListKind {
                 format!("wallet-settings-rpc-edit-{chain_id}-{index}")
             }
             Self::PoiGateway => format!("wallet-settings-poi-gateway-edit-{index}"),
+            Self::WakuDnsEnrTree => format!("wallet-settings-waku-dns-enr-tree-edit-{index}"),
             Self::WakuDohFallback => format!("wallet-settings-waku-doh-fallback-edit-{index}"),
         })
     }
@@ -234,6 +242,7 @@ impl SettingsUrlListKind {
                 format!("wallet-settings-rpc-remove-{chain_id}-{index}")
             }
             Self::PoiGateway => format!("wallet-settings-poi-gateway-remove-{index}"),
+            Self::WakuDnsEnrTree => format!("wallet-settings-waku-dns-enr-tree-remove-{index}"),
             Self::WakuDohFallback => format!("wallet-settings-waku-doh-fallback-remove-{index}"),
         })
     }
@@ -254,6 +263,13 @@ impl SettingsUrlListKind {
                     "Add artifact gateway".to_string()
                 }
             }
+            Self::WakuDnsEnrTree => {
+                if is_edit {
+                    "Edit DNS ENR tree".to_string()
+                } else {
+                    "Add DNS ENR tree".to_string()
+                }
+            }
             Self::WakuDohFallback => {
                 if is_edit {
                     "Edit DoH fallback endpoint".to_string()
@@ -268,6 +284,7 @@ impl SettingsUrlListKind {
         match self {
             Self::ChainRpc { chain_id, .. } => display_chain_rpc_endpoints(settings, *chain_id),
             Self::PoiGateway => settings.poi.artifact.gateway_urls.clone(),
+            Self::WakuDnsEnrTree => display_waku_dns_enr_trees(settings),
             Self::WakuDohFallback => display_waku_doh_fallback_endpoints(settings),
         }
     }
@@ -278,6 +295,7 @@ impl SettingsUrlListKind {
                 set_chain_rpc_endpoint(settings, *chain_id, index, value);
             }
             Self::PoiGateway => set_poi_gateway_url(settings, index, value),
+            Self::WakuDnsEnrTree => set_waku_dns_enr_tree(settings, index, value),
             Self::WakuDohFallback => set_waku_doh_fallback_endpoint(settings, index, value),
         }
     }
@@ -286,6 +304,7 @@ impl SettingsUrlListKind {
         match self {
             Self::ChainRpc { chain_id, .. } => add_chain_rpc_endpoint(settings, *chain_id, value),
             Self::PoiGateway => add_poi_gateway_url(settings, value),
+            Self::WakuDnsEnrTree => add_waku_dns_enr_tree(settings, value),
             Self::WakuDohFallback => add_waku_doh_fallback_endpoint(settings, value),
         }
     }
@@ -296,6 +315,7 @@ impl SettingsUrlListKind {
                 remove_chain_rpc_endpoint(settings, *chain_id, index);
             }
             Self::PoiGateway => remove_poi_gateway_url(settings, index),
+            Self::WakuDnsEnrTree => remove_waku_dns_enr_tree(settings, index),
             Self::WakuDohFallback => remove_waku_doh_fallback_endpoint(settings, index),
         }
     }
@@ -350,6 +370,12 @@ struct TokenDialogInputs {
     symbol: Entity<InputState>,
     decimals: Entity<InputState>,
     icon_path: Entity<InputState>,
+}
+
+#[derive(Clone)]
+struct WakuDirectPeerDialogInputs {
+    peer_id: Entity<InputState>,
+    addr: Entity<InputState>,
 }
 
 #[derive(Clone)]
@@ -1358,6 +1384,194 @@ impl WalletSettingsEditor {
         .layout(Axis::Vertical)
     }
 
+    fn open_waku_direct_peer_dialog(
+        &self,
+        index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let initial = index
+            .and_then(|index| display_waku_direct_peers(&self.draft).get(index).cloned())
+            .unwrap_or_default();
+        let inputs = WakuDirectPeerDialogInputs {
+            peer_id: cx.new(|cx| InputState::new(window, cx).default_value(initial.peer_id)),
+            addr: cx.new(|cx| InputState::new(window, cx).default_value(initial.addr)),
+        };
+        let title = if index.is_some() {
+            "Edit direct peer"
+        } else {
+            "Add direct peer"
+        };
+        let action_label = SharedString::from(if index.is_some() { "Save" } else { "Add" });
+        let dialog_width = (window.viewport_size().width * 0.92).min(px(620.0));
+        let content_width = secondary_dialog_content_width(dialog_width);
+        let editor = cx.entity();
+        let dialog_inputs = inputs.clone();
+        let save_inputs = inputs.clone();
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            let save_editor = editor.clone();
+            let save_inputs = save_inputs.clone();
+            dialog
+                .w(dialog_width)
+                .title(app_strong_text(title))
+                .button_props(DialogButtonProps::default().ok_text(action_label.clone()))
+                .footer(|ok, cancel, window, cx| vec![cancel(window, cx), ok(window, cx)])
+                .on_ok(move |_event, _window, cx| {
+                    let peer = waku_direct_peer_from_dialog_inputs(&save_inputs, cx);
+                    save_editor.update(cx, |editor, cx| {
+                        match index {
+                            Some(index) => set_waku_direct_peer(&mut editor.draft, index, peer),
+                            None => add_waku_direct_peer(&mut editor.draft, peer),
+                        }
+                        editor.programmatic_draft_changed(cx);
+                    });
+                    true
+                })
+                .child(render_waku_direct_peer_dialog_content(
+                    &dialog_inputs,
+                    content_width,
+                ))
+        });
+        let focus_input = inputs.peer_id;
+        cx.defer_in(window, move |_editor, window, cx| {
+            focus_input.read(cx).focus_handle(cx).focus(window);
+        });
+    }
+
+    fn render_waku_direct_peer_list(
+        editor: &Entity<Self>,
+        peers: Vec<WakuDirectPeerSetting>,
+    ) -> gpui::Div {
+        let add_editor = editor.clone();
+        let body = div().w_full().flex().flex_col().gap_2().child(
+            div().flex().justify_end().child(
+                settings_icon_button(
+                    "wallet-settings-waku-direct-peer-add",
+                    IconName::Plus,
+                    "Add",
+                )
+                .on_click(move |_event, window, cx| {
+                    add_editor.update(cx, |editor, cx| {
+                        editor.open_waku_direct_peer_dialog(None, window, cx);
+                    });
+                }),
+            ),
+        );
+
+        let peer_count = peers.len();
+        let mut list = div().w_full().flex().flex_col();
+        if peers.is_empty() {
+            list = list.child(app_muted_text("No additional direct peers configured.").py(px(8.0)));
+        }
+        for (index, peer) in peers.into_iter().enumerate() {
+            let edit_editor = editor.clone();
+            let remove_editor = editor.clone();
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "wallet-settings-waku-direct-peer-row-{index}"
+                    )))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px(px(2.0))
+                    .py(px(9.0))
+                    .hover(|this| this.bg(rgb(theme::SURFACE_HOVER_SUBTLE)))
+                    .when(index + 1 < peer_count, |this| {
+                        this.border_b_1()
+                            .border_color(rgb_with_alpha(theme::BORDER_SUBTLE, 0.45))
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .font_family(APP_MONO_FONT_FAMILY)
+                                    .text_size(px(13.0))
+                                    .line_height(px(18.0))
+                                    .text_color(rgb(theme::TEXT))
+                                    .child(SharedString::from(peer.peer_id)),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .font_family(APP_MONO_FONT_FAMILY)
+                                    .text_size(px(12.0))
+                                    .line_height(px(16.0))
+                                    .text_color(rgb(theme::TEXT_SUBTLE))
+                                    .child(SharedString::from(peer.addr)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                settings_icon_button(
+                                    SharedString::from(format!(
+                                        "wallet-settings-waku-direct-peer-edit-{index}"
+                                    )),
+                                    Icon::new(RailgunActionIcon::Pencil),
+                                    "Edit",
+                                )
+                                .on_click(
+                                    move |_event, window, cx| {
+                                        edit_editor.update(cx, |editor, cx| {
+                                            editor.open_waku_direct_peer_dialog(
+                                                Some(index),
+                                                window,
+                                                cx,
+                                            );
+                                        });
+                                    },
+                                ),
+                            )
+                            .child(
+                                settings_danger_icon_button(
+                                    SharedString::from(format!(
+                                        "wallet-settings-waku-direct-peer-remove-{index}"
+                                    )),
+                                    Icon::new(RailgunActionIcon::Trash2),
+                                    "Remove",
+                                )
+                                .on_click(
+                                    move |_event, _window, cx| {
+                                        remove_editor.update(cx, |editor, cx| {
+                                            remove_waku_direct_peer(&mut editor.draft, index);
+                                            editor.programmatic_draft_changed(cx);
+                                        });
+                                    },
+                                ),
+                            ),
+                    ),
+            );
+        }
+        body.child(list)
+    }
+
+    fn waku_direct_peer_list_item(
+        editor: Entity<Self>,
+        peers: Vec<WakuDirectPeerSetting>,
+    ) -> SettingItem {
+        SettingItem::new(
+            "Direct peers",
+            SettingField::<SharedString>::render(move |_options, _window, _cx| {
+                Self::render_waku_direct_peer_list(&editor, peers.clone())
+            }),
+        )
+        .description(
+            "Additional libp2p peers to dial directly. Each row is one peer ID and one multiaddr.",
+        )
+        .layout(Axis::Vertical)
+    }
+
     fn open_token_dialog(
         &self,
         target: &TokenEditTarget,
@@ -2270,6 +2484,11 @@ impl Render for WalletSettingsEditor {
             |settings| settings.waku.nwaku_url.clone().unwrap_or_default(),
             |settings, value| settings.waku.nwaku_url = non_empty_setting(&value),
         );
+        let waku_dns_enr_kind = SettingsUrlListKind::WakuDnsEnrTree;
+        let waku_dns_enr_trees = waku_dns_enr_kind.endpoints(&self.draft);
+        let waku_dns_enr_editor = editor.clone();
+        let waku_direct_peers = display_waku_direct_peers(&self.draft);
+        let waku_direct_peers_editor = editor.clone();
         let waku_doh_fallback_kind = SettingsUrlListKind::WakuDohFallback;
         let waku_doh_fallback_endpoints = waku_doh_fallback_kind.endpoints(&self.draft);
         let waku_doh_fallback_editor = editor.clone();
@@ -2548,6 +2767,11 @@ impl Render for WalletSettingsEditor {
         let apply_editor = editor.clone();
         let mut privacy_group =
             settings_group().item(SettingItem::new("Network mode", network_mode));
+        if should_show_proxy_waku_disclaimer(self.draft.network.mode) {
+            privacy_group = privacy_group.item(SettingItem::render(|_options, _window, _cx| {
+                settings_warning_banner(PROXY_WAKU_DISCLAIMER)
+            }));
+        }
         if should_show_proxy_url_setting(self.draft.network.mode) {
             privacy_group =
                 privacy_group.item(SettingItem::new("Proxy URL", proxy_url).layout(Axis::Vertical));
@@ -2612,6 +2836,16 @@ impl Render for WalletSettingsEditor {
                     .item(settings_section_header("Waku connectivity"))
                     .item(SettingItem::new("Cluster ID", waku_cluster))
                     .item(SettingItem::new("Shard ID", waku_shard))
+                    .item(Self::settings_url_list_item(
+                        "DNS ENR trees",
+                        waku_dns_enr_editor,
+                        waku_dns_enr_kind,
+                        waku_dns_enr_trees,
+                    ))
+                    .item(Self::waku_direct_peer_list_item(
+                        waku_direct_peers_editor,
+                        waku_direct_peers,
+                    ))
                     .item(SettingItem::new("DoH endpoint", waku_doh).layout(Axis::Vertical))
                     .item(Self::settings_url_list_item(
                         "DoH fallback endpoints",
@@ -2936,11 +3170,15 @@ fn settings_info_banner(message: impl Into<SharedString>) -> gpui::Div {
     settings_banner(message, theme::BORDER, theme::SURFACE_HOVER_SUBTLE)
 }
 
+fn settings_warning_banner(message: impl Into<SharedString>) -> gpui::Div {
+    settings_banner(message, theme::WARNING, theme::WARNING_BG)
+}
+
 fn settings_banner(message: impl Into<SharedString>, border: u32, bg: u32) -> gpui::Div {
     div()
         .w_full()
         .flex()
-        .items_center()
+        .items_start()
         .gap_2()
         .rounded_md()
         .border_1()
@@ -2951,7 +3189,13 @@ fn settings_banner(message: impl Into<SharedString>, border: u32, bg: u32) -> gp
         .text_size(px(12.0))
         .line_height(px(16.0))
         .text_color(rgb(theme::TEXT))
-        .child(message.into())
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .whitespace_normal()
+                .child(message.into()),
+        )
 }
 
 fn settings_text_input(input: &Entity<InputState>) -> Input {
@@ -3426,6 +3670,32 @@ fn render_settings_url_dialog_content(
         .child(settings_text_input(input))
 }
 
+fn render_waku_direct_peer_dialog_content(
+    inputs: &WakuDirectPeerDialogInputs,
+    content_width: Pixels,
+) -> gpui::Div {
+    div()
+        .w(content_width)
+        .flex()
+        .flex_col()
+        .gap_3()
+        .child(app_muted_text(
+            "Enter one libp2p peer ID and one multiaddr. Add another row for additional addresses.",
+        ))
+        .child(dialog_text_field("Peer ID", &inputs.peer_id))
+        .child(dialog_text_field("Multiaddr", &inputs.addr))
+}
+
+fn dialog_text_field(label: &'static str, input: &Entity<InputState>) -> gpui::Div {
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(app_muted_text(label))
+        .child(settings_text_input(input))
+}
+
 fn price_anchor_type_select_items() -> Vec<PriceAnchorTypeSelectItem> {
     vec![
         PriceAnchorTypeSelectItem {
@@ -3879,6 +4149,16 @@ fn token_dialog_values_from_inputs(
     })
 }
 
+fn waku_direct_peer_from_dialog_inputs(
+    inputs: &WakuDirectPeerDialogInputs,
+    cx: &App,
+) -> WakuDirectPeerSetting {
+    WakuDirectPeerSetting {
+        peer_id: inputs.peer_id.read(cx).value().trim().to_string(),
+        addr: inputs.addr.read(cx).value().trim().to_string(),
+    }
+}
+
 fn price_anchor_override_from_dialog_inputs(
     inputs: &PriceAnchorDialogInputs,
     cx: &App,
@@ -4238,6 +4518,22 @@ pub(super) fn display_waku_doh_fallback_endpoints(settings: &WalletSettings) -> 
         .unwrap_or_else(|| default_waku_doh_fallback_endpoints(settings.network.mode))
 }
 
+pub(super) fn display_waku_dns_enr_trees(settings: &WalletSettings) -> Vec<String> {
+    settings
+        .waku
+        .dns_enr_trees
+        .clone()
+        .unwrap_or_else(default_waku_dns_enr_trees)
+}
+
+pub(super) fn display_waku_direct_peers(settings: &WalletSettings) -> Vec<WakuDirectPeerSetting> {
+    settings
+        .waku
+        .direct_peers
+        .clone()
+        .unwrap_or_else(default_waku_direct_peers)
+}
+
 fn default_waku_doh_fallback_endpoints(mode: NetworkModeSetting) -> Vec<String> {
     match mode {
         NetworkModeSetting::Tor => vec![DEFAULT_DOH_ENDPOINT.to_string()],
@@ -4268,6 +4564,28 @@ fn materialize_waku_doh_fallback_endpoints(settings: &mut WalletSettings) -> &mu
         .expect("fallback endpoints were just initialized")
 }
 
+fn materialize_waku_dns_enr_trees(settings: &mut WalletSettings) -> &mut Vec<String> {
+    if settings.waku.dns_enr_trees.is_none() {
+        settings.waku.dns_enr_trees = Some(default_waku_dns_enr_trees());
+    }
+    settings
+        .waku
+        .dns_enr_trees
+        .as_mut()
+        .expect("DNS ENR trees were just initialized")
+}
+
+fn materialize_waku_direct_peers(settings: &mut WalletSettings) -> &mut Vec<WakuDirectPeerSetting> {
+    if settings.waku.direct_peers.is_none() {
+        settings.waku.direct_peers = Some(default_waku_direct_peers());
+    }
+    settings
+        .waku
+        .direct_peers
+        .as_mut()
+        .expect("direct peers were just initialized")
+}
+
 pub(super) fn set_chain_rpc_endpoint(
     settings: &mut WalletSettings,
     chain_id: u64,
@@ -4293,12 +4611,24 @@ pub(super) fn set_waku_doh_fallback_endpoint(
     endpoints[index] = value.trim().to_string();
 }
 
+pub(super) fn set_waku_dns_enr_tree(settings: &mut WalletSettings, index: usize, value: &str) {
+    let trees = materialize_waku_dns_enr_trees(settings);
+    if trees.len() <= index {
+        trees.resize(index + 1, String::new());
+    }
+    trees[index] = value.trim().to_string();
+}
+
 pub(super) fn add_chain_rpc_endpoint(settings: &mut WalletSettings, chain_id: u64, value: &str) {
     materialize_chain_rpc_endpoints(settings, chain_id).push(value.trim().to_string());
 }
 
 pub(super) fn add_waku_doh_fallback_endpoint(settings: &mut WalletSettings, value: &str) {
     materialize_waku_doh_fallback_endpoints(settings).push(value.trim().to_string());
+}
+
+pub(super) fn add_waku_dns_enr_tree(settings: &mut WalletSettings, value: &str) {
+    materialize_waku_dns_enr_trees(settings).push(value.trim().to_string());
 }
 
 pub(super) fn remove_chain_rpc_endpoint(
@@ -4316,6 +4646,36 @@ pub(super) fn remove_waku_doh_fallback_endpoint(settings: &mut WalletSettings, i
     let endpoints = materialize_waku_doh_fallback_endpoints(settings);
     if index < endpoints.len() {
         endpoints.remove(index);
+    }
+}
+
+pub(super) fn remove_waku_dns_enr_tree(settings: &mut WalletSettings, index: usize) {
+    let trees = materialize_waku_dns_enr_trees(settings);
+    if index < trees.len() {
+        trees.remove(index);
+    }
+}
+
+pub(super) fn set_waku_direct_peer(
+    settings: &mut WalletSettings,
+    index: usize,
+    peer: WakuDirectPeerSetting,
+) {
+    let peers = materialize_waku_direct_peers(settings);
+    if peers.len() <= index {
+        peers.resize(index + 1, WakuDirectPeerSetting::default());
+    }
+    peers[index] = peer;
+}
+
+pub(super) fn add_waku_direct_peer(settings: &mut WalletSettings, peer: WakuDirectPeerSetting) {
+    materialize_waku_direct_peers(settings).push(peer);
+}
+
+pub(super) fn remove_waku_direct_peer(settings: &mut WalletSettings, index: usize) {
+    let peers = materialize_waku_direct_peers(settings);
+    if index < peers.len() {
+        peers.remove(index);
     }
 }
 
@@ -4356,6 +4716,10 @@ fn network_mode_from_value(value: &str) -> NetworkModeSetting {
 }
 
 pub(super) const fn should_show_proxy_url_setting(mode: NetworkModeSetting) -> bool {
+    matches!(mode, NetworkModeSetting::Proxy)
+}
+
+pub(super) const fn should_show_proxy_waku_disclaimer(mode: NetworkModeSetting) -> bool {
     matches!(mode, NetworkModeSetting::Proxy)
 }
 

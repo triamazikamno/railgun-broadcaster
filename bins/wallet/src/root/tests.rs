@@ -19,9 +19,10 @@ use wallet_ops::{
     settings::{
         BuiltInTokenOverride, CustomTokenSettings, NetworkModeSetting, PoiReadSourceSetting,
         PriceAnchorSettings, TokenKey, TokenPriceAnchorOverride, WALLET_SETTINGS_KEY,
-        WalletSettings, build_effective_chain_configs, build_effective_token_registry,
-        default_chain_contract_settings, default_chain_quick_sync_endpoint,
-        default_chain_rpc_endpoints, encode_wallet_settings,
+        WakuDirectPeerSetting, WalletSettings, build_effective_chain_configs,
+        build_effective_token_registry, default_chain_contract_settings,
+        default_chain_quick_sync_endpoint, default_chain_rpc_endpoints, default_waku_direct_peers,
+        default_waku_dns_enr_trees, encode_wallet_settings,
     },
     vault::{
         DesktopVaultStore, PublicAccountMetadata, PublicAccountScope, PublicAccountSource,
@@ -46,12 +47,13 @@ use super::{
     SEND_AUTHORIZATION_FAILED_ERROR, SEND_MISSING_PASSWORD_ERROR, SettingsApplyMode,
     UNSHIELD_AUTHORIZATION_FAILED_ERROR, UNSHIELD_MISSING_PASSWORD_ERROR, UnshieldAsset,
     UnshieldAssetKey, VaultState, WalletAppOptions, WalletRoot, WalletSelectItem, WalletTab,
-    add_chain_rpc_endpoint, add_poi_gateway_url, add_waku_doh_fallback_endpoint,
-    adjusted_amount_for_max_change, apply_private_broadcaster_progress_stage,
-    broadcaster_choice_supported_by_candidates, classify_settings_apply_mode,
-    display_chain_contract_settings, display_chain_quick_sync_endpoint,
-    display_chain_rpc_endpoints, display_price_anchor_entries, display_rows_from_output,
-    display_token_entries, display_waku_doh_endpoint, display_waku_doh_fallback_endpoints,
+    add_chain_rpc_endpoint, add_poi_gateway_url, add_waku_direct_peer, add_waku_dns_enr_tree,
+    add_waku_doh_fallback_endpoint, adjusted_amount_for_max_change,
+    apply_private_broadcaster_progress_stage, broadcaster_choice_supported_by_candidates,
+    classify_settings_apply_mode, display_chain_contract_settings,
+    display_chain_quick_sync_endpoint, display_chain_rpc_endpoints, display_price_anchor_entries,
+    display_rows_from_output, display_token_entries, display_waku_direct_peers,
+    display_waku_dns_enr_trees, display_waku_doh_endpoint, display_waku_doh_fallback_endpoints,
     effective_public_broadcaster_fee_mode, ethereum_weth_public_broadcaster_count,
     fail_private_broadcaster_progress_steps_at_stage, fee_token_option_has_eligible_broadcaster,
     finish_private_broadcaster_progress_steps, finish_private_broadcaster_progress_steps_at_stage,
@@ -75,18 +77,20 @@ use super::{
     public_broadcaster_candidates_for_asset, public_broadcaster_cost_status_text,
     public_broadcaster_fee_token_options_from_snapshot, public_broadcaster_fee_token_warning,
     public_broadcaster_submit_disabled_for_fee_token_options, refresh_form_asset_from_snapshot,
-    remove_chain_rpc_endpoint, remove_poi_gateway_url, remove_waku_doh_fallback_endpoint,
-    repair_cache_help_text, required_relay_adapt_for_unwrap,
-    resolve_selected_public_broadcaster_fee_token, send_asset_key_from_formatted, send_element_id,
-    send_key_matches_asset, send_public_broadcaster_estimate_input_error, set_chain_rpc_endpoint,
-    set_poi_gateway_url, set_price_anchor_override, set_waku_doh_fallback_endpoint,
-    settings_draft_after_discard, settings_restart_action_enabled,
+    remove_chain_rpc_endpoint, remove_poi_gateway_url, remove_waku_direct_peer,
+    remove_waku_dns_enr_tree, remove_waku_doh_fallback_endpoint, repair_cache_help_text,
+    required_relay_adapt_for_unwrap, resolve_selected_public_broadcaster_fee_token,
+    send_asset_key_from_formatted, send_element_id, send_key_matches_asset,
+    send_public_broadcaster_estimate_input_error, set_chain_rpc_endpoint, set_poi_gateway_url,
+    set_price_anchor_override, set_waku_direct_peer, set_waku_dns_enr_tree,
+    set_waku_doh_fallback_endpoint, settings_draft_after_discard, settings_restart_action_enabled,
     settings_restart_reuses_active_network, settings_save_action_enabled,
     should_clear_private_action_error_on_password_change, should_focus_utxo_table,
     should_preserve_estimate_after_broadcaster_policy_change,
     should_render_public_broadcaster_cost_preview, should_show_broadcaster_fee_mode_toggle,
     should_show_distinct_amount, should_show_pre_unlock_settings_action,
-    should_show_proxy_url_setting, sidebar_primary_activity_order, startup_settings_action_state,
+    should_show_proxy_url_setting, should_show_proxy_waku_disclaimer,
+    sidebar_primary_activity_order, startup_settings_action_state,
     unshield_asset_key_from_formatted, unshield_element_id, unshield_key_matches_asset,
     unshield_public_broadcaster_estimate_input_error, wallet_generation_matches,
     wallet_options_from_metadata,
@@ -1440,6 +1444,15 @@ fn proxy_url_setting_only_shows_for_proxy_mode() {
 }
 
 #[test]
+fn proxy_waku_disclaimer_only_shows_for_proxy_mode() {
+    assert!(!should_show_proxy_waku_disclaimer(NetworkModeSetting::Tor));
+    assert!(should_show_proxy_waku_disclaimer(NetworkModeSetting::Proxy));
+    assert!(!should_show_proxy_waku_disclaimer(
+        NetworkModeSetting::Direct
+    ));
+}
+
+#[test]
 fn waku_doh_settings_display_presets_until_customized() {
     let settings = WalletSettings::default();
 
@@ -1496,6 +1509,65 @@ fn waku_doh_fallback_mutations_materialize_presets() {
         settings.waku.doh_fallback_endpoints.as_deref(),
         Some(["https://edited.example/dns-query".to_string()].as_slice())
     );
+}
+
+#[test]
+fn waku_dns_enr_tree_settings_display_presets_until_customized() {
+    let mut settings = WalletSettings::default();
+
+    assert_eq!(
+        display_waku_dns_enr_trees(&settings),
+        default_waku_dns_enr_trees()
+    );
+    assert!(settings.waku.dns_enr_trees.is_none());
+
+    remove_waku_dns_enr_tree(&mut settings, 0);
+    assert_eq!(settings.waku.dns_enr_trees, Some(Vec::new()));
+    assert!(display_waku_dns_enr_trees(&settings).is_empty());
+
+    add_waku_dns_enr_tree(&mut settings, " enrtree://custom@example.invalid ");
+    assert_eq!(
+        settings.waku.dns_enr_trees.as_deref(),
+        Some(["enrtree://custom@example.invalid".to_string()].as_slice())
+    );
+
+    set_waku_dns_enr_tree(&mut settings, 0, " enrtree://edited@example.invalid ");
+    assert_eq!(
+        settings.waku.dns_enr_trees.as_deref(),
+        Some(["enrtree://edited@example.invalid".to_string()].as_slice())
+    );
+}
+
+#[test]
+fn waku_direct_peer_settings_mutations_update_rows() {
+    let mut settings = WalletSettings::default();
+    assert_eq!(
+        display_waku_direct_peers(&settings),
+        default_waku_direct_peers()
+    );
+    assert!(settings.waku.direct_peers.is_none());
+
+    remove_waku_direct_peer(&mut settings, 0);
+    assert_eq!(settings.waku.direct_peers, Some(Vec::new()));
+    assert!(display_waku_direct_peers(&settings).is_empty());
+
+    let first = WakuDirectPeerSetting {
+        peer_id: "16Uiu2HAkwNeQVY32bUrL1eM68ryMa48PXY5Bhfxfg9e2byYcc46m".to_string(),
+        addr: "/dns4/prod.rootedinprivacy.com/tcp/30304/p2p/16Uiu2HAkwNeQVY32bUrL1eM68ryMa48PXY5Bhfxfg9e2byYcc46m".to_string(),
+    };
+    let edited = WakuDirectPeerSetting {
+        peer_id: first.peer_id.clone(),
+        addr: "/dns4/prod.rootedinprivacy.com/tcp/8000/wss/p2p/16Uiu2HAkwNeQVY32bUrL1eM68ryMa48PXY5Bhfxfg9e2byYcc46m".to_string(),
+    };
+
+    add_waku_direct_peer(&mut settings, first);
+    assert_eq!(display_waku_direct_peers(&settings).len(), 1);
+
+    set_waku_direct_peer(&mut settings, 0, edited.clone());
+    assert_eq!(settings.waku.direct_peers, Some(vec![edited]));
+
+    remove_waku_direct_peer(&mut settings, 0);
+    assert_eq!(settings.waku.direct_peers, Some(Vec::new()));
 }
 
 #[test]

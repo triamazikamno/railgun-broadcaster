@@ -34,6 +34,7 @@ poi = { path = "../poi" }
 railgun-wallet = { path = "../railgun-wallet" }
 railgun-ui = { path = "../railgun-ui" }
 sync-service = { path = "../sync-service" }
+waku = { path = "../waku" }
 waku-relay = { path = "../waku-relay" }
 
 [dev-dependencies]

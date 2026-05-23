@@ -20,12 +20,20 @@ pub struct WakuMonitorConfig {
     pub chain_ids: Vec<u64>,
     pub cluster_id: Option<u32>,
     pub shard_id: Option<u32>,
+    pub dns_enr_trees: Option<Vec<String>>,
+    pub direct_peers: Vec<WakuMonitorDirectPeer>,
     pub doh_endpoint: Option<String>,
     pub doh_fallback_endpoints: Option<Vec<String>>,
     pub max_peers: Option<usize>,
     pub peer_connection_timeout: Option<Duration>,
     pub nwaku_url: Option<String>,
     pub network: RelayNetworkConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakuMonitorDirectPeer {
+    pub peer_id: String,
+    pub addr: String,
 }
 
 impl WakuMonitorConfig {
@@ -43,8 +51,8 @@ impl WakuMonitorConfig {
 
         config::Waku {
             nwaku_url: self.nwaku_url.clone(),
-            direct_peers: Vec::new(),
-            dns_enr_trees: None,
+            direct_peers: grouped_direct_peers(&self.direct_peers),
+            dns_enr_trees: self.dns_enr_trees.clone(),
             doh_endpoint: Some(doh),
             doh_fallback_endpoints: self.doh_fallback_endpoints.clone(),
             cluster_id: Some(self.cluster_id.unwrap_or(DEFAULT_CLUSTER_ID)),
@@ -61,6 +69,26 @@ impl WakuMonitorConfig {
             .wrap_err("construct waku relay client")?;
         Ok(Arc::new(client))
     }
+}
+
+fn grouped_direct_peers(peers: &[WakuMonitorDirectPeer]) -> Vec<config::AdditionalWakuPeer> {
+    let mut grouped: Vec<config::AdditionalWakuPeer> = Vec::new();
+    for peer in peers {
+        if let Some(existing) = grouped
+            .iter_mut()
+            .find(|existing| existing.peer_id == peer.peer_id)
+        {
+            if !existing.addrs.iter().any(|addr| addr == &peer.addr) {
+                existing.addrs.push(peer.addr.clone());
+            }
+        } else {
+            grouped.push(config::AdditionalWakuPeer {
+                peer_id: peer.peer_id.clone(),
+                addrs: vec![peer.addr.clone()],
+            });
+        }
+    }
+    grouped
 }
 
 const fn default_doh_endpoint(network_mode: RelayNetworkMode) -> &'static str {
@@ -439,10 +467,22 @@ mod tests {
 
     #[test]
     fn waku_config_overrides_apply_when_flags_present() {
+        const PEER_ID: &str = "16Uiu2HAkwNeQVY32bUrL1eM68ryMa48PXY5Bhfxfg9e2byYcc46m";
         let opts = WakuMonitorConfig {
             chain_ids: Vec::new(),
             cluster_id: Some(7),
             shard_id: Some(3),
+            dns_enr_trees: Some(vec!["enrtree://custom@example.invalid".to_string()]),
+            direct_peers: vec![
+                WakuMonitorDirectPeer {
+                    peer_id: PEER_ID.to_string(),
+                    addr: format!("/dns4/example.invalid/tcp/30304/p2p/{PEER_ID}"),
+                },
+                WakuMonitorDirectPeer {
+                    peer_id: PEER_ID.to_string(),
+                    addr: format!("/dns4/example.invalid/tcp/8000/wss/p2p/{PEER_ID}"),
+                },
+            ],
             max_peers: Some(42),
             doh_endpoint: Some("https://example.invalid/dns-query".to_string()),
             doh_fallback_endpoints: Some(vec![
@@ -456,6 +496,13 @@ mod tests {
         assert_eq!(cfg.cluster_id, Some(7));
         assert_eq!(cfg.shard_id, Some(3));
         assert_eq!(cfg.max_peers, Some(42));
+        assert_eq!(
+            cfg.dns_enr_trees.as_deref(),
+            Some(["enrtree://custom@example.invalid".to_string()].as_slice())
+        );
+        assert_eq!(cfg.direct_peers.len(), 1);
+        assert_eq!(cfg.direct_peers[0].peer_id, PEER_ID);
+        assert_eq!(cfg.direct_peers[0].addrs.len(), 2);
         assert_eq!(
             cfg.doh_endpoint.as_deref(),
             Some("https://example.invalid/dns-query")

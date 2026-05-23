@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use broadcaster_monitor::{EventRx, EventTx, Shared};
 use broadcaster_monitor_waku::{
-    RelayNetworkConfig, WakuMonitorConfig, spawn_workers_until_shutdown,
+    RelayNetworkConfig, WakuMonitorConfig, WakuMonitorDirectPeer, spawn_workers_until_shutdown,
 };
 use eyre::WrapErr;
 use gpui::{
@@ -27,8 +27,8 @@ use wallet_ops::{
     WalletNetworkProgressStage, build_wallet_network_context_with_progress,
     settings::{
         EffectiveChainConfig, EffectiveTokenRegistry, WalletSettings,
-        build_effective_chain_configs, build_effective_token_registry, load_wallet_settings,
-        save_wallet_settings,
+        build_effective_chain_configs, build_effective_token_registry, default_waku_direct_peers,
+        load_wallet_settings, save_wallet_settings,
     },
     spawn_token_anchor_refresh_worker,
     vault::DesktopVaultStore,
@@ -675,6 +675,18 @@ async fn build_wallet_startup(
         chain_ids: chain_ids.clone(),
         cluster_id: Some(settings.waku.cluster_id),
         shard_id: Some(settings.waku.shard_id),
+        dns_enr_trees: settings.waku.dns_enr_trees.clone(),
+        direct_peers: settings
+            .waku
+            .direct_peers
+            .clone()
+            .unwrap_or_else(default_waku_direct_peers)
+            .iter()
+            .map(|peer| WakuMonitorDirectPeer {
+                peer_id: peer.peer_id.clone(),
+                addr: peer.addr.clone(),
+            })
+            .collect(),
         doh_endpoint: settings.waku.doh_endpoint.clone(),
         doh_fallback_endpoints: settings.waku.doh_fallback_endpoints.clone(),
         max_peers: Some(settings.waku.max_peers),
