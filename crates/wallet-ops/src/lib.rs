@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -8,12 +9,11 @@ use alloy::eips::Encodable2718;
 use alloy::hex;
 use alloy::network::{EthereumWallet, NetworkTransactionBuilder, TransactionBuilder as _};
 use alloy::primitives::{Address, Bytes, FixedBytes, U256, address};
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::providers::Provider;
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::k256::ecdsa::SigningKey;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::uint;
-use alloy_provider::DynProvider;
 use broadcaster_core::contracts::shield::derive_shield_private_key;
 use broadcaster_core::crypto::railgun::{Address as RailgunAddress, AddressData};
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
@@ -70,6 +70,7 @@ mod public_wallet;
 mod signer;
 mod utxos;
 
+pub mod settings;
 pub mod vault;
 
 pub use amounts::{
@@ -112,21 +113,29 @@ pub struct BuildCacheRequest {
 }
 
 pub async fn build_cache(request: BuildCacheRequest) -> Result<ProverCacheBuildReport> {
-    let http = build_wallet_network_context(WalletNetworkConfig {
-        network_mode: request.network_mode,
-        proxy: request.proxy.as_ref(),
-        data_dir: &request.db_path,
-    })
-    .await?;
     let db = Arc::new(
         DbStore::open(DbConfig {
             root_dir: request.db_path.clone(),
         })
         .wrap_err("open local db")?,
     );
-    let source = artifact_source(&http);
+    let http = build_wallet_network_context(WalletNetworkConfig {
+        network_mode: request.network_mode,
+        proxy: request.proxy.as_ref(),
+        data_dir: &request.db_path,
+    })
+    .await?;
+    build_cache_with_context(db, &http).await
+}
+
+pub async fn build_cache_with_context(
+    db: Arc<DbStore>,
+    http: &HttpContext,
+) -> Result<ProverCacheBuildReport> {
+    let source = artifact_source(http);
+    let db_path = db.root_dir().to_path_buf();
     tracing::info!(
-        db_path = %request.db_path.display(),
+        db_path = %db_path.display(),
         network_mode = %http.network_mode(),
         artifact_dir = %source.out_dir.display(),
         "starting wallet cache build"
@@ -208,6 +217,7 @@ impl From<vault::WalletSource> for DesktopWalletSyncStartPolicy {
 pub struct ViewWalletChainSessionRequest {
     pub view_session: Arc<vault::DesktopViewSession>,
     pub chain_id: u64,
+    pub effective_chain: Option<settings::EffectiveChainConfig>,
     pub sync_start_policy: DesktopWalletSyncStartPolicy,
     pub init_block_number: Option<u64>,
     pub sync_to_block: Option<u64>,
@@ -220,6 +230,7 @@ pub struct ViewWalletChainSessionRequest {
 
 pub struct DesktopUnshieldCalldataRequest {
     pub chain_id: u64,
+    pub effective_chain: Option<settings::EffectiveChainConfig>,
     pub view_session: Arc<vault::DesktopViewSession>,
     pub session: Arc<WalletSession>,
     pub vault_store: Arc<vault::DesktopVaultStore>,
@@ -235,6 +246,7 @@ pub struct DesktopUnshieldCalldataRequest {
 
 pub struct DesktopSendCalldataRequest {
     pub chain_id: u64,
+    pub effective_chain: Option<settings::EffectiveChainConfig>,
     pub view_session: Arc<vault::DesktopViewSession>,
     pub session: Arc<WalletSession>,
     pub vault_store: Arc<vault::DesktopVaultStore>,
@@ -399,6 +411,7 @@ fn update_transaction_generation_stage(
 
 pub struct DesktopUnshieldPublicBroadcasterRequest {
     pub chain_id: u64,
+    pub effective_chain: Option<settings::EffectiveChainConfig>,
     pub view_session: Arc<vault::DesktopViewSession>,
     pub session: Arc<WalletSession>,
     pub vault_store: Arc<vault::DesktopVaultStore>,
@@ -412,15 +425,17 @@ pub struct DesktopUnshieldPublicBroadcasterRequest {
     pub fee_rows: Vec<FeeRow>,
     pub selection: PublicBroadcasterSelection,
     pub fee_mode: PublicBroadcasterFeeMode,
-    pub allow_suspicious_broadcasters: bool,
+    pub fee_policy: BroadcasterFeePolicy,
     pub anchor_cache: Option<Arc<TokenAnchorRateCache>>,
     pub waku: Arc<WakuClient>,
     pub response_timeout: Duration,
+    pub republish_interval: Duration,
     pub progress_tx: Option<TransactionGenerationProgressSender>,
 }
 
 pub struct DesktopSendPublicBroadcasterRequest {
     pub chain_id: u64,
+    pub effective_chain: Option<settings::EffectiveChainConfig>,
     pub view_session: Arc<vault::DesktopViewSession>,
     pub session: Arc<WalletSession>,
     pub vault_store: Arc<vault::DesktopVaultStore>,
@@ -433,15 +448,17 @@ pub struct DesktopSendPublicBroadcasterRequest {
     pub fee_rows: Vec<FeeRow>,
     pub selection: PublicBroadcasterSelection,
     pub fee_mode: PublicBroadcasterFeeMode,
-    pub allow_suspicious_broadcasters: bool,
+    pub fee_policy: BroadcasterFeePolicy,
     pub anchor_cache: Option<Arc<TokenAnchorRateCache>>,
     pub waku: Arc<WakuClient>,
     pub response_timeout: Duration,
+    pub republish_interval: Duration,
     pub progress_tx: Option<TransactionGenerationProgressSender>,
 }
 
 pub struct DesktopUnshieldPublicBroadcasterEstimateRequest {
     pub chain_id: u64,
+    pub effective_chain: Option<settings::EffectiveChainConfig>,
     pub session: Arc<WalletSession>,
     pub token: Address,
     pub fee_token: Address,
@@ -451,12 +468,13 @@ pub struct DesktopUnshieldPublicBroadcasterEstimateRequest {
     pub fee_rows: Vec<FeeRow>,
     pub selection: PublicBroadcasterSelection,
     pub fee_mode: PublicBroadcasterFeeMode,
-    pub allow_suspicious_broadcasters: bool,
+    pub fee_policy: BroadcasterFeePolicy,
     pub anchor_cache: Option<Arc<TokenAnchorRateCache>>,
 }
 
 pub struct DesktopSendPublicBroadcasterEstimateRequest {
     pub chain_id: u64,
+    pub effective_chain: Option<settings::EffectiveChainConfig>,
     pub session: Arc<WalletSession>,
     pub token: Address,
     pub fee_token: Address,
@@ -465,7 +483,7 @@ pub struct DesktopSendPublicBroadcasterEstimateRequest {
     pub fee_rows: Vec<FeeRow>,
     pub selection: PublicBroadcasterSelection,
     pub fee_mode: PublicBroadcasterFeeMode,
-    pub allow_suspicious_broadcasters: bool,
+    pub fee_policy: BroadcasterFeePolicy,
     pub anchor_cache: Option<Arc<TokenAnchorRateCache>>,
 }
 
@@ -652,18 +670,14 @@ pub fn eligible_public_broadcasters_for_asset(
     rows: &[FeeRow],
     chain_id: u64,
     token: Address,
-    unwrap: bool,
+    required_relay_adapt: Option<Address>,
 ) -> Result<Vec<PublicBroadcasterCandidate>> {
-    let chain_defaults = chain_defaults_for_chain(chain_id)?;
+    chain_defaults_for_chain(chain_id)?;
     Ok(eligible_public_broadcasters(
         rows,
         chain_id,
         token,
-        if unwrap {
-            Some(chain_defaults.relay_adapt_contract)
-        } else {
-            None
-        },
+        required_relay_adapt,
         SystemTime::now(),
     ))
 }
@@ -672,20 +686,16 @@ pub fn public_broadcaster_candidates_for_asset(
     rows: &[FeeRow],
     chain_id: u64,
     token: Address,
-    unwrap: bool,
+    required_relay_adapt: Option<Address>,
     policy: BroadcasterFeePolicy,
     anchor_rate: Option<U256>,
 ) -> Result<Vec<PublicBroadcasterCandidate>> {
-    let chain_defaults = chain_defaults_for_chain(chain_id)?;
+    chain_defaults_for_chain(chain_id)?;
     Ok(public_broadcaster_candidates(
         rows,
         chain_id,
         token,
-        if unwrap {
-            Some(chain_defaults.relay_adapt_contract)
-        } else {
-            None
-        },
+        required_relay_adapt,
         SystemTime::now(),
         policy,
         anchor_rate,
@@ -1026,13 +1036,144 @@ fn public_broadcaster_build_error(
 }
 
 struct PublicBroadcasterSetup {
-    chain_defaults: ChainConfigDefaults,
+    chain: EffectiveDesktopChainConfig,
     broadcaster: PublicBroadcasterCandidate,
-    provider: DynProvider,
+    query_rpc_pool: Arc<QueryRpcPool>,
     min_gas_price: u128,
     prover: ProverService,
     forest: MerkleForest,
     utxos: Vec<Utxo>,
+}
+
+#[derive(Clone)]
+struct EffectiveDesktopChainConfig {
+    rpc_urls: Vec<Url>,
+    railgun_contract: Address,
+    relay_adapt_contract: Address,
+    wrapped_native_token: Option<Address>,
+    gas: settings::EffectiveChainGasSettings,
+}
+
+fn effective_desktop_chain_config(
+    chain_id: u64,
+    effective_chain: Option<&settings::EffectiveChainConfig>,
+) -> Result<EffectiveDesktopChainConfig> {
+    let defaults = chain_defaults_for_chain(chain_id)?;
+    let Some(effective_chain) = effective_chain else {
+        return Ok(EffectiveDesktopChainConfig {
+            rpc_urls: defaults.rpc_urls,
+            railgun_contract: defaults.contract,
+            relay_adapt_contract: defaults.relay_adapt_contract,
+            wrapped_native_token: amounts::wrapped_native_token_for_chain(chain_id),
+            gas: settings::EffectiveChainGasSettings {
+                gas_limit_buffer: GAS_LIMIT_BUFFER,
+                gas_price_buffer_numerator: GAS_PRICE_BUFFER_NUMERATOR as u64,
+                gas_price_buffer_denominator: GAS_PRICE_BUFFER_DENOMINATOR as u64,
+            },
+        });
+    };
+    if effective_chain.chain_id != chain_id {
+        return Err(eyre!(
+            "effective chain config is for chain {}, not {chain_id}",
+            effective_chain.chain_id
+        ));
+    }
+    let rpc_urls = parse_effective_rpc_urls(chain_id, &effective_chain.rpc_endpoints)?;
+    let railgun_contract =
+        parse_effective_address("railgun contract", &effective_chain.railgun_contract)?;
+    let relay_adapt_contract = parse_effective_address(
+        "relay adapt contract",
+        &effective_chain.relay_adapt_contract,
+    )?;
+    let wrapped_native_token = effective_chain
+        .wrapped_native_token
+        .as_deref()
+        .map(|value| parse_effective_address("wrapped native token", value))
+        .transpose()?
+        .or_else(|| amounts::wrapped_native_token_for_chain(chain_id));
+    Ok(EffectiveDesktopChainConfig {
+        rpc_urls,
+        railgun_contract,
+        relay_adapt_contract,
+        wrapped_native_token,
+        gas: effective_chain.gas.clone(),
+    })
+}
+
+pub(crate) fn parse_effective_rpc_urls(
+    chain_id: u64,
+    rpc_endpoints: &[String],
+) -> Result<Vec<Url>> {
+    if rpc_endpoints.is_empty() {
+        return Err(eyre!("effective chain {chain_id} has no RPC endpoints"));
+    }
+    rpc_endpoints
+        .iter()
+        .map(|url| Url::parse(url).wrap_err_with(|| format!("parse RPC URL {url}")))
+        .collect()
+}
+
+pub(crate) fn effective_rpc_urls_for_chain(
+    defaults: &ChainConfigDefaults,
+    effective_chain: Option<&settings::EffectiveChainConfig>,
+) -> Result<Vec<Url>> {
+    effective_chain.map_or_else(
+        || Ok(defaults.rpc_urls.clone()),
+        |chain| parse_effective_rpc_urls(defaults.chain_id, &chain.rpc_endpoints),
+    )
+}
+
+pub(crate) fn query_rpc_pool_with_http_client(
+    rpc_urls: Vec<Url>,
+    http: &HttpContext,
+) -> Arc<QueryRpcPool> {
+    Arc::new(QueryRpcPool::with_http_client(
+        rpc_urls,
+        DEFAULT_QUERY_RPC_COOLDOWN,
+        http.client.clone(),
+    ))
+}
+
+pub(crate) async fn buffered_gas_price_from_rpc_pool(
+    query_rpc_pool: &QueryRpcPool,
+    gas: &settings::EffectiveChainGasSettings,
+) -> Result<u128> {
+    let mut last_error = None;
+    for _ in 0..query_rpc_pool.len() {
+        let Some(provider_handle) = query_rpc_pool.random_provider() else {
+            break;
+        };
+        match buffered_gas_price_with_policy(
+            &provider_handle.provider,
+            u128::from(gas.gas_price_buffer_numerator),
+            u128::from(gas.gas_price_buffer_denominator),
+        )
+        .await
+        {
+            Ok(gas_price) => return Ok(gas_price),
+            Err(error) => {
+                tracing::warn!(%error, rpc = %provider_handle.url, "fetch gas price failed");
+                query_rpc_pool.mark_bad_provider(&provider_handle);
+                last_error = Some(error);
+            }
+        }
+    }
+    if let Some(error) = last_error {
+        Err(error).wrap_err("all query RPC gas price attempts failed")
+    } else {
+        Err(eyre!("no healthy query RPC available"))
+    }
+}
+
+fn is_effective_wrapped_native_token(
+    chain_id: u64,
+    token: Address,
+    chain: &EffectiveDesktopChainConfig,
+) -> bool {
+    chain.wrapped_native_token.map_or_else(
+        || is_wrapped_native_token(chain_id, token),
+        |wrapped| wrapped == token,
+    )
 }
 
 fn public_broadcaster_anchor_rate_for_policy(
@@ -1048,6 +1189,7 @@ fn public_broadcaster_anchor_rate_for_policy(
 async fn public_broadcaster_setup(
     session: &WalletSession,
     chain_id: u64,
+    effective_chain: Option<&settings::EffectiveChainConfig>,
     token: Address,
     fee_rows: &[FeeRow],
     selection: &PublicBroadcasterSelection,
@@ -1056,14 +1198,14 @@ async fn public_broadcaster_setup(
     anchor_cache: Option<&Arc<TokenAnchorRateCache>>,
     http: &HttpContext,
 ) -> Result<PublicBroadcasterSetup> {
-    let chain_defaults = chain_defaults_for_chain(chain_id)?;
+    let chain = effective_desktop_chain_config(chain_id, effective_chain)?;
     let anchor_rate = public_broadcaster_anchor_rate_for_policy(anchor_cache, chain_id, token);
     let candidates = public_broadcaster_candidates(
         fee_rows,
         chain_id,
         token,
         if require_relay_adapt {
-            Some(chain_defaults.relay_adapt_contract)
+            Some(chain.relay_adapt_contract)
         } else {
             None
         },
@@ -1072,10 +1214,8 @@ async fn public_broadcaster_setup(
         anchor_rate,
     );
     let broadcaster = select_public_broadcaster_with_policy(&candidates, selection, policy)?;
-    let provider = ProviderBuilder::new()
-        .connect_reqwest(http.client.clone(), chain_defaults.rpc_url.clone())
-        .erased();
-    let min_gas_price = buffered_gas_price(&provider).await?;
+    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls.clone(), http);
+    let min_gas_price = buffered_gas_price_from_rpc_pool(&query_rpc_pool, &chain.gas).await?;
     let artifact_source = artifact_source(http);
     let prover = ProverService::new_with_db(artifact_source, Arc::clone(&session.db));
     let chain_handle = session
@@ -1088,9 +1228,9 @@ async fn public_broadcaster_setup(
     let utxos = session.unspent_utxos().await;
 
     Ok(PublicBroadcasterSetup {
-        chain_defaults,
+        chain,
         broadcaster,
-        provider,
+        query_rpc_pool,
         min_gas_price,
         prover,
         forest,
@@ -1421,6 +1561,7 @@ impl WalletSessionStore {
             request.init_block_number,
             request.sync_to_block,
             request.use_indexed_wallet_catch_up,
+            request.effective_chain.clone(),
             request.poi_read_source.clone(),
             request.local_poi_caches.clone(),
             request.rewind_wallet_cache,
@@ -1508,11 +1649,12 @@ pub async fn prepare_desktop_unshield_calldata(
             request.chain_id
         ));
     }
-    if request.unwrap && !is_wrapped_native_token(request.chain_id, request.token) {
+    let chain = effective_desktop_chain_config(request.chain_id, request.effective_chain.as_ref())?;
+    if request.unwrap && !is_effective_wrapped_native_token(request.chain_id, request.token, &chain)
+    {
         return Err(eyre!("selected token does not support unwrap-to-native"));
     }
 
-    let chain_defaults = chain_defaults_for_chain(request.chain_id)?;
     let artifact_source = artifact_source(http);
     let prover = ProverService::new_with_db(artifact_source, Arc::clone(&request.session.db));
     let chain_handle = request
@@ -1559,8 +1701,8 @@ pub async fn prepare_desktop_unshield_calldata(
     let tx_builder = TransactionBuilder {
         chain_type: 0,
         chain_id: request.chain_id,
-        railgun_contract: chain_defaults.contract,
-        relay_adapt_contract: chain_defaults.relay_adapt_contract,
+        railgun_contract: chain.railgun_contract,
+        relay_adapt_contract: chain.relay_adapt_contract,
     };
 
     update_transaction_generation_stage(
@@ -1634,7 +1776,7 @@ pub async fn prepare_desktop_send_calldata(
 
     let recipient = request.recipient.trim().to_string();
     let recipient_data = parse_railgun_recipient(&recipient)?;
-    let chain_defaults = chain_defaults_for_chain(request.chain_id)?;
+    let chain = effective_desktop_chain_config(request.chain_id, request.effective_chain.as_ref())?;
     let artifact_source = artifact_source(http);
     let prover = ProverService::new_with_db(artifact_source, Arc::clone(&request.session.db));
     let chain_handle = request
@@ -1675,8 +1817,8 @@ pub async fn prepare_desktop_send_calldata(
     let tx_builder = TransactionBuilder {
         chain_type: 0,
         chain_id: request.chain_id,
-        railgun_contract: chain_defaults.contract,
-        relay_adapt_contract: chain_defaults.relay_adapt_contract,
+        railgun_contract: chain.railgun_contract,
+        relay_adapt_contract: chain.relay_adapt_contract,
     };
 
     update_transaction_generation_stage(
@@ -1746,13 +1888,13 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
             request.chain_id
         ));
     }
-    if request.unwrap && !is_wrapped_native_token(request.chain_id, request.token) {
+    let chain = effective_desktop_chain_config(request.chain_id, request.effective_chain.as_ref())?;
+    if request.unwrap && !is_effective_wrapped_native_token(request.chain_id, request.token, &chain)
+    {
         return Err(eyre!("selected token does not support unwrap-to-native"));
     }
 
-    let chain_defaults = chain_defaults_for_chain(request.chain_id)?;
-    let policy = BroadcasterFeePolicy::default()
-        .with_allow_suspicious_broadcasters(request.allow_suspicious_broadcasters);
+    let policy = request.fee_policy;
     let anchor_rate = public_broadcaster_anchor_rate_for_policy(
         request.anchor_cache.as_ref(),
         request.chain_id,
@@ -1763,7 +1905,7 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
         request.chain_id,
         request.fee_token,
         if request.unwrap {
-            Some(chain_defaults.relay_adapt_contract)
+            Some(chain.relay_adapt_contract)
         } else {
             None
         },
@@ -1773,10 +1915,8 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
     );
     let broadcaster =
         select_public_broadcaster_with_policy(&candidates, &request.selection, policy)?;
-    let provider = ProviderBuilder::new()
-        .connect_reqwest(http.client.clone(), chain_defaults.rpc_url.clone())
-        .erased();
-    let min_gas_price = buffered_gas_price(&provider).await?;
+    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls.clone(), http);
+    let min_gas_price = buffered_gas_price_from_rpc_pool(&query_rpc_pool, &chain.gas).await?;
     let utxos = request.session.unspent_utxos().await;
     let same_token_fee = request.fee_token == request.token;
     let initial_fee_amount =
@@ -1851,9 +1991,8 @@ pub async fn estimate_desktop_send_public_broadcaster_cost(
     }
     parse_railgun_recipient(&request.recipient)?;
 
-    let chain_defaults = chain_defaults_for_chain(request.chain_id)?;
-    let policy = BroadcasterFeePolicy::default()
-        .with_allow_suspicious_broadcasters(request.allow_suspicious_broadcasters);
+    let chain = effective_desktop_chain_config(request.chain_id, request.effective_chain.as_ref())?;
+    let policy = request.fee_policy;
     let anchor_rate = public_broadcaster_anchor_rate_for_policy(
         request.anchor_cache.as_ref(),
         request.chain_id,
@@ -1870,10 +2009,8 @@ pub async fn estimate_desktop_send_public_broadcaster_cost(
     );
     let broadcaster =
         select_public_broadcaster_with_policy(&candidates, &request.selection, policy)?;
-    let provider = ProviderBuilder::new()
-        .connect_reqwest(http.client.clone(), chain_defaults.rpc_url.clone())
-        .erased();
-    let min_gas_price = buffered_gas_price(&provider).await?;
+    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls.clone(), http);
+    let min_gas_price = buffered_gas_price_from_rpc_pool(&query_rpc_pool, &chain.gas).await?;
     let utxos = request.session.unspent_utxos().await;
     let same_token_fee = request.fee_token == request.token;
     let initial_fee_amount =
@@ -1933,6 +2070,7 @@ pub async fn submit_desktop_unshield_public_broadcaster(
 ) -> Result<PublicBroadcasterSubmissionResult> {
     let waku = Arc::clone(&request.waku);
     let timeout = request.response_timeout;
+    let republish_interval = request.republish_interval;
     let progress_tx = request.progress_tx.clone();
     let session = Arc::clone(&request.session);
     let prepared = prepare_desktop_unshield_public_broadcaster(request, http).await?;
@@ -1962,6 +2100,7 @@ pub async fn submit_desktop_unshield_public_broadcaster(
         prepared.min_gas_price,
         progress_tx,
         timeout,
+        republish_interval,
     )
     .await?;
     mark_submitted_inputs_pending_spent(&session, &pending_spent_inputs, &result).await;
@@ -1974,6 +2113,7 @@ pub async fn submit_desktop_send_public_broadcaster(
 ) -> Result<PublicBroadcasterSubmissionResult> {
     let waku = Arc::clone(&request.waku);
     let timeout = request.response_timeout;
+    let republish_interval = request.republish_interval;
     let progress_tx = request.progress_tx.clone();
     let session = Arc::clone(&request.session);
     let prepared = prepare_desktop_send_public_broadcaster(request, http).await?;
@@ -2003,6 +2143,7 @@ pub async fn submit_desktop_send_public_broadcaster(
         prepared.min_gas_price,
         progress_tx,
         timeout,
+        republish_interval,
     )
     .await?;
     mark_submitted_inputs_pending_spent(&session, &pending_spent_inputs, &result).await;
@@ -2037,7 +2178,9 @@ async fn prepare_desktop_unshield_public_broadcaster(
             request.chain_id
         ));
     }
-    if request.unwrap && !is_wrapped_native_token(request.chain_id, request.token) {
+    let chain = effective_desktop_chain_config(request.chain_id, request.effective_chain.as_ref())?;
+    if request.unwrap && !is_effective_wrapped_native_token(request.chain_id, request.token, &chain)
+    {
         return Err(eyre!("selected token does not support unwrap-to-native"));
     }
 
@@ -2047,9 +2190,9 @@ async fn prepare_desktop_unshield_public_broadcaster(
         .wrap_err("authorize public broadcaster unshield spend")?;
 
     let PublicBroadcasterSetup {
-        chain_defaults,
+        chain,
         broadcaster,
-        provider,
+        query_rpc_pool,
         min_gas_price,
         prover,
         forest,
@@ -2057,12 +2200,12 @@ async fn prepare_desktop_unshield_public_broadcaster(
     } = public_broadcaster_setup(
         &request.session,
         request.chain_id,
+        request.effective_chain.as_ref(),
         request.fee_token,
         &request.fee_rows,
         &request.selection,
         request.unwrap,
-        BroadcasterFeePolicy::default()
-            .with_allow_suspicious_broadcasters(request.allow_suspicious_broadcasters),
+        request.fee_policy,
         request.anchor_cache.as_ref(),
         http,
     )
@@ -2173,8 +2316,8 @@ async fn prepare_desktop_unshield_public_broadcaster(
     let tx_builder = TransactionBuilder {
         chain_type: 0,
         chain_id: request.chain_id,
-        railgun_contract: chain_defaults.contract,
-        relay_adapt_contract: chain_defaults.relay_adapt_contract,
+        railgun_contract: chain.railgun_contract,
+        relay_adapt_contract: chain.relay_adapt_contract,
     };
 
     let mut fee_amount = initial_fee_amount;
@@ -2235,13 +2378,14 @@ async fn prepare_desktop_unshield_public_broadcaster(
             TransactionGenerationStage::EstimatingBroadcasterFee,
         );
         let gas_started = Instant::now();
-        let (gas_limit, computed_fee) = estimate_public_broadcaster_fee(
-            &provider,
+        let (gas_limit, computed_fee) = estimate_public_broadcaster_fee_from_rpc_pool(
+            &query_rpc_pool,
             request.chain_id,
             plan.call.to,
             &plan.call.data,
             broadcaster.fee,
             min_gas_price,
+            chain.gas.gas_limit_buffer,
         )
         .await?;
         let gas_elapsed_ms = gas_started.elapsed().as_millis();
@@ -2370,9 +2514,9 @@ async fn prepare_desktop_send_public_broadcaster(
 
     let recipient = parse_railgun_recipient(&request.recipient)?;
     let PublicBroadcasterSetup {
-        chain_defaults,
+        chain,
         broadcaster,
-        provider,
+        query_rpc_pool,
         min_gas_price,
         prover,
         forest,
@@ -2380,12 +2524,12 @@ async fn prepare_desktop_send_public_broadcaster(
     } = public_broadcaster_setup(
         &request.session,
         request.chain_id,
+        request.effective_chain.as_ref(),
         request.fee_token,
         &request.fee_rows,
         &request.selection,
         false,
-        BroadcasterFeePolicy::default()
-            .with_allow_suspicious_broadcasters(request.allow_suspicious_broadcasters),
+        request.fee_policy,
         request.anchor_cache.as_ref(),
         http,
     )
@@ -2483,8 +2627,8 @@ async fn prepare_desktop_send_public_broadcaster(
     let tx_builder = TransactionBuilder {
         chain_type: 0,
         chain_id: request.chain_id,
-        railgun_contract: chain_defaults.contract,
-        relay_adapt_contract: chain_defaults.relay_adapt_contract,
+        railgun_contract: chain.railgun_contract,
+        relay_adapt_contract: chain.relay_adapt_contract,
     };
 
     let mut fee_amount = initial_fee_amount;
@@ -2563,13 +2707,14 @@ async fn prepare_desktop_send_public_broadcaster(
             TransactionGenerationStage::EstimatingBroadcasterFee,
         );
         let gas_started = Instant::now();
-        let (gas_limit, computed_fee) = estimate_public_broadcaster_fee(
-            &provider,
+        let (gas_limit, computed_fee) = estimate_public_broadcaster_fee_from_rpc_pool(
+            &query_rpc_pool,
             request.chain_id,
             plan.call.to,
             &plan.call.data,
             broadcaster.fee,
             min_gas_price,
+            chain.gas.gas_limit_buffer,
         )
         .await?;
         let gas_elapsed_ms = gas_started.elapsed().as_millis();
@@ -2683,22 +2828,70 @@ async fn estimate_public_broadcaster_fee(
     data: &Bytes,
     token_fee_per_unit_gas: U256,
     min_gas_price: u128,
+    gas_limit_buffer: u64,
 ) -> Result<(u64, U256)> {
     let tx_req = TransactionRequest::default()
         .with_chain_id(chain_id)
         .with_to(to)
         .with_input(data.clone())
         .with_gas_price(min_gas_price);
-    let gas_limit = provider
+    let estimated_gas = provider
         .estimate_gas(tx_req)
         .await
-        .wrap_err("estimate public broadcaster gas")?
-        + GAS_LIMIT_BUFFER;
+        .wrap_err("estimate public broadcaster gas")?;
+    let gas_limit = public_broadcaster_gas_limit_with_buffer(estimated_gas, gas_limit_buffer);
     let service_gas_price = public_broadcaster_service_gas_price(min_gas_price);
     Ok((
         gas_limit,
         broadcaster_fee_amount(token_fee_per_unit_gas, gas_limit, service_gas_price),
     ))
+}
+
+async fn estimate_public_broadcaster_fee_from_rpc_pool(
+    query_rpc_pool: &QueryRpcPool,
+    chain_id: u64,
+    to: Address,
+    data: &Bytes,
+    token_fee_per_unit_gas: U256,
+    min_gas_price: u128,
+    gas_limit_buffer: u64,
+) -> Result<(u64, U256)> {
+    let mut last_error = None;
+    for _ in 0..query_rpc_pool.len() {
+        let Some(provider_handle) = query_rpc_pool.random_provider() else {
+            break;
+        };
+        match estimate_public_broadcaster_fee(
+            &provider_handle.provider,
+            chain_id,
+            to,
+            data,
+            token_fee_per_unit_gas,
+            min_gas_price,
+            gas_limit_buffer,
+        )
+        .await
+        {
+            Ok(result) => return Ok(result),
+            Err(error) => {
+                tracing::warn!(%error, rpc = %provider_handle.url, "estimate public broadcaster gas failed");
+                query_rpc_pool.mark_bad_provider(&provider_handle);
+                last_error = Some(error);
+            }
+        }
+    }
+    if let Some(error) = last_error {
+        Err(error).wrap_err("all query RPC public broadcaster gas estimate attempts failed")
+    } else {
+        Err(eyre!("no healthy query RPC available"))
+    }
+}
+
+const fn public_broadcaster_gas_limit_with_buffer(
+    estimated_gas: u64,
+    gas_limit_buffer: u64,
+) -> u64 {
+    estimated_gas.saturating_add(gas_limit_buffer)
 }
 
 fn public_broadcaster_transact_params(
@@ -2791,6 +2984,7 @@ async fn submit_public_broadcaster_plan(
     min_gas_price: u128,
     progress_tx: Option<TransactionGenerationProgressSender>,
     timeout: Duration,
+    republish_interval: Duration,
 ) -> Result<PublicBroadcasterSubmissionResult> {
     let transact_topic = transact_topic(broadcaster.chain_id);
     let response_topic = transact_response_topic(broadcaster.chain_id);
@@ -2865,7 +3059,7 @@ async fn submit_public_broadcaster_plan(
     let republish_payload = payload.clone();
     let republish_handle = tokio::spawn(public_broadcaster_republish_loop(
         republish_stop_rx,
-        PUBLIC_BROADCASTER_REPUBLISH_INTERVAL,
+        republish_interval,
         move |attempt| {
             let waku = Arc::clone(&republish_waku);
             let pubsub_path = republish_pubsub_path.clone();
@@ -3033,6 +3227,7 @@ async fn setup_synced_view_wallet_with_store(
     init_block_number: Option<u64>,
     sync_to_block: Option<u64>,
     use_indexed_wallet_catch_up: bool,
+    effective_chain: Option<settings::EffectiveChainConfig>,
     poi_read_source: PoiReadSource,
     shared_local_poi_caches: Option<WalletLocalPoiCaches>,
     rewind_wallet_cache: bool,
@@ -3044,13 +3239,28 @@ async fn setup_synced_view_wallet_with_store(
     sync_manager: Arc<SyncManager>,
 ) -> Result<SyncedViewWallet> {
     let chain_defaults = chain_defaults_for_chain(chain_id)?;
-    let rpc_url = rpc_url_override.unwrap_or_else(|| chain_defaults.rpc_url.clone());
+    let effective_contract = effective_chain
+        .as_ref()
+        .map(|chain| parse_effective_address("railgun contract", &chain.railgun_contract))
+        .transpose()?;
     let chain_key = ChainKey {
         chain_id: chain_defaults.chain_id,
-        contract: chain_defaults.contract,
+        contract: effective_contract.unwrap_or(chain_defaults.contract),
     };
 
-    let chain_cfg = chain_config(&chain_defaults, rpc_url, http, progress_tx.clone());
+    let effective_use_indexed_wallet_catch_up = effective_chain
+        .as_ref()
+        .map_or(use_indexed_wallet_catch_up, |chain| {
+            use_indexed_wallet_catch_up && chain.quick_sync_enabled
+        });
+    let chain_cfg = chain_config(
+        &chain_defaults,
+        rpc_url_override,
+        effective_chain.as_ref(),
+        http,
+        progress_tx.clone(),
+    )?;
+    let wallet_quick_sync_endpoint = chain_cfg.quick_sync_endpoint.clone();
     let chain_service = sync_manager
         .add_chain(chain_cfg)
         .await
@@ -3064,11 +3274,16 @@ async fn setup_synced_view_wallet_with_store(
     let chain_handle = chain_service.handle();
     let safe_head = *chain_handle.safe_head_rx.borrow();
     let safe_head = (safe_head > 0).then_some(safe_head);
+    let deployment_block = effective_chain
+        .as_ref()
+        .map_or(chain_defaults.deployment_block, |chain| {
+            chain.deployment_block
+        });
     let resolved_start = resolve_desktop_wallet_chain_start(
         sync_start_policy,
         existing_wallet_chain_metadata.as_ref(),
         init_block_number,
-        chain_defaults.deployment_block,
+        deployment_block,
         safe_head,
         rewind_wallet_cache,
     )?;
@@ -3077,7 +3292,7 @@ async fn setup_synced_view_wallet_with_store(
         start_block = resolved_start.start_block,
         last_scanned_block = resolved_start.last_scanned_block,
         sync_to_block,
-        use_indexed_wallet_catch_up,
+        effective_use_indexed_wallet_catch_up,
         poi_read_source = ?poi_read_source,
         sync_start_policy = ?sync_start_policy,
         "starting desktop view wallet sync"
@@ -3141,7 +3356,7 @@ async fn setup_synced_view_wallet_with_store(
         cache_key,
         start_block: Some(start_block),
         sync_to_block,
-        quick_sync_endpoint: chain_defaults.quick_sync_endpoint.clone(),
+        quick_sync_endpoint: wallet_quick_sync_endpoint,
         scan_keys,
         spending_public_key: Some(view_session.spending_public_key()),
         progress_tx,
@@ -3150,7 +3365,7 @@ async fn setup_synced_view_wallet_with_store(
         poi_read_source,
         local_poi_caches,
         manage_local_poi_cache,
-        use_indexed_wallet_catch_up,
+        use_indexed_wallet_catch_up: effective_use_indexed_wallet_catch_up,
     };
 
     let mut handle = sync_manager
@@ -3176,35 +3391,80 @@ fn chain_defaults_for_chain(chain_id: u64) -> Result<ChainConfigDefaults> {
 
 fn chain_config(
     defaults: &ChainConfigDefaults,
-    rpc_url: Url,
+    rpc_url_override: Option<Url>,
+    effective_chain: Option<&settings::EffectiveChainConfig>,
     http: &HttpContext,
     progress_tx: Option<SyncProgressSender>,
-) -> ChainConfig {
+) -> Result<ChainConfig> {
+    let rpc_urls = if effective_chain.is_some() {
+        effective_rpc_urls_for_chain(defaults, effective_chain)?
+    } else if let Some(rpc_url) = rpc_url_override {
+        vec![rpc_url]
+    } else {
+        defaults.rpc_urls.clone()
+    };
+    let quick_sync_endpoint = effective_chain
+        .filter(|chain| chain.quick_sync_enabled)
+        .and_then(|chain| chain.quick_sync_endpoint.as_ref())
+        .map(|url| Url::parse(url).wrap_err_with(|| format!("parse quick-sync URL {url}")))
+        .transpose()?
+        .or_else(|| {
+            effective_chain
+                .is_none()
+                .then(|| defaults.quick_sync_endpoint.clone())
+                .flatten()
+        });
+    let contract = effective_chain
+        .map(|chain| parse_effective_address("railgun contract", &chain.railgun_contract))
+        .transpose()?
+        .unwrap_or(defaults.contract);
+    let archive_rpc_url = effective_chain
+        .and_then(|chain| chain.archive_rpc_url.as_ref())
+        .map(|url| Url::parse(url).wrap_err_with(|| format!("parse archive RPC URL {url}")))
+        .transpose()?;
     let query_rpc_pool = Arc::new(QueryRpcPool::with_http_client(
-        vec![rpc_url],
+        rpc_urls,
         DEFAULT_QUERY_RPC_COOLDOWN,
         http.client.clone(),
     ));
 
-    ChainConfig {
+    Ok(ChainConfig {
         chain_id: defaults.chain_id,
-        contract: defaults.contract,
+        contract,
         rpcs: query_rpc_pool,
-        archive_rpc_url: None,
-        archive_until_block: defaults.archive_until_block,
-        deployment_block: defaults.deployment_block,
-        v2_start_block: defaults.v2_start_block,
-        legacy_shield_block: defaults.legacy_shield_block,
-        block_range: DEFAULT_BLOCK_RANGE,
-        indexed_wallet_block_range: defaults.indexed_wallet_block_range,
-        poll_interval: DEFAULT_POLL_INTERVAL,
-        finality_depth: defaults.finality_depth,
-        quick_sync_endpoint: defaults.quick_sync_endpoint.clone(),
+        archive_rpc_url,
+        archive_until_block: effective_chain.map_or(defaults.archive_until_block, |chain| {
+            chain.archive_until_block
+        }),
+        deployment_block: effective_chain
+            .map_or(defaults.deployment_block, |chain| chain.deployment_block),
+        v2_start_block: effective_chain
+            .map_or(defaults.v2_start_block, |chain| chain.v2_start_block),
+        legacy_shield_block: effective_chain.map_or(defaults.legacy_shield_block, |chain| {
+            chain.legacy_shield_block
+        }),
+        block_range: effective_chain
+            .and_then(|chain| chain.block_range)
+            .unwrap_or(DEFAULT_BLOCK_RANGE),
+        indexed_wallet_block_range: effective_chain
+            .map_or(defaults.indexed_wallet_block_range, |chain| {
+                chain.indexed_wallet_block_range
+            }),
+        poll_interval: effective_chain
+            .and_then(|chain| chain.poll_interval_secs)
+            .map_or(DEFAULT_POLL_INTERVAL, Duration::from_secs),
+        finality_depth: effective_chain
+            .map_or(defaults.finality_depth, |chain| chain.finality_depth),
+        quick_sync_endpoint,
         anchor_interval: defaults.anchor_interval,
         anchor_retention: defaults.anchor_retention,
         http_client: Some(http.client.clone()),
         progress_tx,
-    }
+    })
+}
+
+fn parse_effective_address(label: &str, value: &str) -> Result<Address> {
+    Address::from_str(value).wrap_err_with(|| format!("parse effective {label} address"))
 }
 
 fn wallet_local_poi_caches(
@@ -3248,23 +3508,33 @@ fn artifact_source(http: &HttpContext) -> ArtifactSource {
     }
 }
 
-async fn buffered_gas_price(provider: &(impl Provider + Clone)) -> Result<u128> {
+async fn buffered_gas_price_with_policy(
+    provider: &(impl Provider + Clone),
+    numerator: u128,
+    denominator: u128,
+) -> Result<u128> {
+    if denominator == 0 {
+        return Err(eyre!(
+            "gas price buffer denominator must be greater than zero"
+        ));
+    }
     let gas_price = provider.get_gas_price().await.wrap_err("fetch gas price")?;
-    Ok(gas_price * GAS_PRICE_BUFFER_NUMERATOR / GAS_PRICE_BUFFER_DENOMINATOR)
+    Ok(gas_price * numerator / denominator)
 }
 
-pub(crate) async fn sign_send_wait_with_sent(
+pub(crate) async fn sign_send_wait_with_sent_with_gas_buffer(
     provider: &(impl Provider + Clone),
     wallet: &EthereumWallet,
     tx_req: TransactionRequest,
     label: &str,
+    gas_limit_buffer: u64,
     on_sent: impl FnOnce(String) + Send,
 ) -> Result<TxReceiptOutput> {
     let gas = provider
         .estimate_gas(tx_req.clone())
         .await
         .wrap_err_with(|| format!("{label}: estimate gas"))?
-        + GAS_LIMIT_BUFFER;
+        + gas_limit_buffer;
     let tx_req = tx_req.with_gas_limit(gas);
 
     tracing::info!(
@@ -3350,6 +3620,7 @@ mod tests {
     };
     use railgun_wallet::{PoiStatus, Utxo, UtxoCommitmentKind, UtxoSource, WalletKeys, WalletUtxo};
     use serde_json::json;
+    use sync_service::ChainConfigDefaults;
 
     use super::signer::{EvmMessageSigner, EvmTransactionSigner, SoftwareEvmSigner};
     use super::{
@@ -3368,10 +3639,11 @@ mod tests {
         parse_send_amount, parse_unshield_amount, public_broadcaster_amount_split,
         public_broadcaster_amount_split_for_tokens, public_broadcaster_anchor_rate_for_policy,
         public_broadcaster_build_error, public_broadcaster_candidates,
-        public_broadcaster_fee_breakdown, public_broadcaster_max_entered_amount,
-        public_broadcaster_max_entered_amount_for_tokens, public_broadcaster_republish_loop,
-        public_broadcaster_transact_params, resolve_desktop_wallet_chain_start,
-        select_public_broadcaster, select_public_broadcaster_with_policy, send_approximate_shape,
+        public_broadcaster_fee_breakdown, public_broadcaster_gas_limit_with_buffer,
+        public_broadcaster_max_entered_amount, public_broadcaster_max_entered_amount_for_tokens,
+        public_broadcaster_republish_loop, public_broadcaster_transact_params,
+        resolve_desktop_wallet_chain_start, select_public_broadcaster,
+        select_public_broadcaster_with_policy, send_approximate_shape,
         sort_specific_public_broadcasters, transact_topic, unshield_approximate_shape,
         utxo_outputs_from_utxos, wrapped_native_token_for_chain,
     };
@@ -3520,6 +3792,86 @@ mod tests {
                 last_scanned_block: 99,
             }
         );
+    }
+
+    #[test]
+    fn chain_config_uses_effective_rpc_pool_and_sync_tuning() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let root_dir = temp_db_root();
+        let http = runtime
+            .block_on(super::build_wallet_network_context(
+                super::WalletNetworkConfig {
+                    network_mode: Some(super::WalletNetworkMode::Direct),
+                    proxy: None,
+                    data_dir: &root_dir,
+                },
+            ))
+            .expect("direct HTTP context");
+        let defaults = ChainConfigDefaults::for_chain(1).expect("ethereum defaults");
+        let effective = super::settings::EffectiveChainConfig {
+            chain_id: 1,
+            enabled: true,
+            rpc_endpoints: vec![
+                "https://rpc-a.example".to_string(),
+                "https://rpc-b.example".to_string(),
+            ],
+            archive_rpc_url: Some("https://archive.example".to_string()),
+            quick_sync_enabled: false,
+            quick_sync_endpoint: Some("https://quick.example/graphql".to_string()),
+            indexed_wallet_block_range: 12_345,
+            deployment_block: 12_000,
+            v2_start_block: 13_000,
+            legacy_shield_block: 14_000,
+            archive_until_block: 12_500,
+            railgun_contract: defaults.contract.to_string(),
+            relay_adapt_contract: defaults.relay_adapt_contract.to_string(),
+            relay_adapt_7702_contract: defaults.relay_adapt_7702_contract.to_string(),
+            wrapped_native_token: super::amounts::wrapped_native_token_for_chain(1)
+                .map(|token| token.to_string()),
+            multicall_contract: defaults.multicall_contract.to_string(),
+            finality_depth: 99,
+            block_range: Some(2_000),
+            poll_interval_secs: Some(30),
+            gas: super::settings::EffectiveChainGasSettings {
+                gas_limit_buffer: 250_000,
+                gas_price_buffer_numerator: 110,
+                gas_price_buffer_denominator: 100,
+            },
+        };
+
+        let cfg = super::chain_config(
+            &defaults,
+            Some(reqwest::Url::parse("https://ignored.example").expect("url")),
+            Some(&effective),
+            &http,
+            None,
+        )
+        .expect("chain config");
+
+        assert_eq!(cfg.quick_sync_endpoint, None);
+        assert_eq!(cfg.indexed_wallet_block_range, 12_345);
+        assert_eq!(cfg.finality_depth, 99);
+        assert_eq!(cfg.block_range, 2_000);
+        assert_eq!(cfg.poll_interval, Duration::from_secs(30));
+        assert_eq!(
+            cfg.archive_rpc_url.as_ref().map(reqwest::Url::as_str),
+            Some("https://archive.example/")
+        );
+        assert_eq!(cfg.deployment_block, 12_000);
+        assert_eq!(cfg.v2_start_block, 13_000);
+        assert_eq!(cfg.legacy_shield_block, 14_000);
+        assert_eq!(cfg.archive_until_block, 12_500);
+
+        let first = cfg.rpcs.random_provider().expect("first provider");
+        cfg.rpcs.mark_bad_provider(&first);
+        let second = cfg.rpcs.random_provider().expect("fallback provider");
+        assert_ne!(first.url, second.url);
+
+        drop(http);
+        let _ = fs::remove_dir_all(root_dir);
     }
 
     #[test]
@@ -5304,6 +5656,14 @@ mod tests {
         });
 
         assert_eq!(gas, 1_803_200);
+    }
+
+    #[test]
+    fn public_broadcaster_gas_limit_uses_configured_buffer() {
+        assert_eq!(
+            public_broadcaster_gas_limit_with_buffer(210_000, 250_000),
+            460_000
+        );
     }
 
     #[test]

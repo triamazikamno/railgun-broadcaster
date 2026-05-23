@@ -27,6 +27,7 @@ const OUTPUT_POI_RECOVERY_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("output_poi_recovery");
 const POI_ARTIFACT_CACHE_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("poi_artifact_cache");
+const APP_SETTINGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("app_settings_v1");
 const DESKTOP_WALLET_VAULT_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("desktop_wallet_vault_v1");
 
@@ -43,6 +44,7 @@ pub enum LocalDbTable {
     PendingOutputPoiContext,
     OutputPoiRecovery,
     PoiArtifactCache,
+    AppSettings,
     DesktopWalletVault,
 }
 
@@ -59,6 +61,7 @@ pub enum LocalDbTableDecodeKind {
     PendingOutputPoiContext,
     OutputPoiRecovery,
     PoiArtifactCache,
+    AppSettings,
     DesktopWalletVault,
 }
 
@@ -126,6 +129,11 @@ pub const LOCAL_DB_TABLES: &[LocalDbTableInfo] = &[
         decode_kind: LocalDbTableDecodeKind::PoiArtifactCache,
     },
     LocalDbTableInfo {
+        table: LocalDbTable::AppSettings,
+        name: "app_settings_v1",
+        decode_kind: LocalDbTableDecodeKind::AppSettings,
+    },
+    LocalDbTableInfo {
         table: LocalDbTable::DesktopWalletVault,
         name: "desktop_wallet_vault_v1",
         decode_kind: LocalDbTableDecodeKind::DesktopWalletVault,
@@ -147,6 +155,7 @@ impl LocalDbTable {
             Self::PendingOutputPoiContext => PENDING_OUTPUT_POI_CONTEXT_TABLE,
             Self::OutputPoiRecovery => OUTPUT_POI_RECOVERY_TABLE,
             Self::PoiArtifactCache => POI_ARTIFACT_CACHE_TABLE,
+            Self::AppSettings => APP_SETTINGS_TABLE,
             Self::DesktopWalletVault => DESKTOP_WALLET_VAULT_TABLE,
         }
     }
@@ -634,6 +643,12 @@ impl OutputPoiRecoveryRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DesktopWalletVaultRecord {
+    pub key: String,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppSettingsRecord {
     pub key: String,
     pub payload: Vec<u8>,
 }
@@ -1161,6 +1176,53 @@ impl DbStore {
         self.list_decoded_by_prefix(OUTPUT_POI_RECOVERY_TABLE, &prefix)
     }
 
+    pub fn get_app_settings_record(&self, key: &str) -> Result<Option<Vec<u8>>, DbError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(APP_SETTINGS_TABLE)?;
+        match table.get(key)? {
+            Some(value) => Ok(Some(value.value().to_vec())),
+            None => Ok(None),
+        }
+    }
+
+    pub fn put_app_settings_record(&self, key: &str, payload: &[u8]) -> Result<(), DbError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(APP_SETTINGS_TABLE)?;
+            table.insert(key, payload)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_app_settings_record(&self, key: &str) -> Result<(), DbError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(APP_SETTINGS_TABLE)?;
+            table.remove(key)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn list_app_settings_records(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<AppSettingsRecord>, DbError> {
+        let range_end = prefix_range_end(prefix);
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(APP_SETTINGS_TABLE)?;
+        let mut out = Vec::new();
+        for entry in table.range(prefix..range_end.as_str())? {
+            let (key, value) = entry?;
+            out.push(AppSettingsRecord {
+                key: key.value().to_string(),
+                payload: value.value().to_vec(),
+            });
+        }
+        Ok(out)
+    }
+
     pub fn get_desktop_wallet_vault_record(&self, key: &str) -> Result<Option<Vec<u8>>, DbError> {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(DESKTOP_WALLET_VAULT_TABLE)?;
@@ -1276,6 +1338,7 @@ impl DbStore {
         txn.open_table(PENDING_OUTPUT_POI_CONTEXT_TABLE)?;
         txn.open_table(OUTPUT_POI_RECOVERY_TABLE)?;
         txn.open_table(POI_ARTIFACT_CACHE_TABLE)?;
+        txn.open_table(APP_SETTINGS_TABLE)?;
         txn.open_table(DESKTOP_WALLET_VAULT_TABLE)?;
         txn.commit()?;
         Ok(())
@@ -1713,6 +1776,57 @@ mod tests {
             .expect("list wallet recovery records");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].output_commitment, record.output_commitment);
+
+        drop(store);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn app_settings_records_are_transactional_plaintext_records() {
+        let root_dir = temp_db_root();
+        let store = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open db");
+
+        assert!(
+            store
+                .get_app_settings_record("wallet-settings")
+                .expect("load missing settings")
+                .is_none()
+        );
+
+        store
+            .put_app_settings_record("wallet-settings", b"settings-v1")
+            .expect("store settings");
+        store
+            .put_app_settings_record("other-settings", b"other")
+            .expect("store other settings");
+
+        assert_eq!(
+            store
+                .get_app_settings_record("wallet-settings")
+                .expect("load settings")
+                .expect("settings present"),
+            b"settings-v1"
+        );
+
+        let records = store
+            .list_app_settings_records("wallet")
+            .expect("list settings records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].key, "wallet-settings");
+        assert_eq!(records[0].payload, b"settings-v1");
+
+        store
+            .delete_app_settings_record("wallet-settings")
+            .expect("delete settings");
+        assert!(
+            store
+                .get_app_settings_record("wallet-settings")
+                .expect("load deleted settings")
+                .is_none()
+        );
 
         drop(store);
         fs::remove_dir_all(root_dir).expect("remove temp db dir");

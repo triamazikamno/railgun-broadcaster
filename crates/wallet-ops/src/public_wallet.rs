@@ -1,25 +1,31 @@
 use std::collections::BTreeMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 use alloy::network::{EthereumWallet, TransactionBuilder as _};
 use alloy::primitives::{Address, U256};
-use alloy::providers::{CallItem, Provider, ProviderBuilder};
+use alloy::providers::{CallItem, Provider};
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol;
 use alloy::sol_types::SolCall;
+use broadcaster_core::query_rpc_pool::{ProviderHandle, QueryRpcPool};
 use eyre::{Result, WrapErr, eyre};
 use railgun_ui::{chain_name, known_tokens_for_chain};
+use reqwest::Url;
 use sync_service::ChainConfigDefaults;
 use zeroize::Zeroizing;
 
 use crate::amounts::wrapped_native_token_for_chain;
+use crate::settings::{EffectiveChainConfig, EffectiveChainGasSettings, EffectiveTokenRegistry};
 use crate::signer::{EvmMessageSigner, EvmTransactionSigner, SoftwareEvmSigner};
 use crate::vault::{DesktopVaultStore, DesktopViewSession, PublicAccountMetadata};
 use crate::{
     GAS_LIMIT_BUFFER, HttpContext, ShieldSendOutput, TxReceiptOutput, WETH_DEPOSIT_SELECTOR,
-    buffered_gas_price, chain_defaults_for_chain, sign_send_wait_with_sent,
+    buffered_gas_price_from_rpc_pool, buffered_gas_price_with_policy, chain_defaults_for_chain,
+    effective_rpc_urls_for_chain, query_rpc_pool_with_http_client,
+    sign_send_wait_with_sent_with_gas_buffer,
 };
 
 sol! {
@@ -58,7 +64,7 @@ impl PublicAssetId {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicBalanceAsset {
     pub id: PublicAssetId,
-    pub symbol: &'static str,
+    pub symbol: String,
     pub decimals: u8,
 }
 
@@ -150,6 +156,7 @@ impl Drop for PublicBalanceRefreshGuard {
 
 pub struct PublicSendRequest {
     pub chain_id: u64,
+    pub effective_chain: Option<EffectiveChainConfig>,
     pub view_session: Arc<DesktopViewSession>,
     pub vault_store: Arc<DesktopVaultStore>,
     pub vault_password: Zeroizing<String>,
@@ -166,6 +173,7 @@ pub struct PublicSendResult {
 
 pub struct PublicShieldRequest {
     pub chain_id: u64,
+    pub effective_chain: Option<EffectiveChainConfig>,
     pub view_session: Arc<DesktopViewSession>,
     pub vault_store: Arc<DesktopVaultStore>,
     pub vault_password: Zeroizing<String>,
@@ -204,24 +212,58 @@ pub const fn public_balance_refresh_interval_secs() -> u64 {
 
 #[must_use]
 pub fn public_balance_assets_for_chain(chain_id: u64) -> Vec<PublicBalanceAsset> {
+    public_balance_assets_for_chain_with_registry(chain_id, None)
+}
+
+#[must_use]
+pub(crate) fn public_balance_assets_for_chain_with_registry(
+    chain_id: u64,
+    token_registry: Option<&EffectiveTokenRegistry>,
+) -> Vec<PublicBalanceAsset> {
     let mut assets = Vec::new();
     if let Some(native) = native_asset_for_chain(chain_id) {
         assets.push(native);
     }
-    assets.extend(
-        known_tokens_for_chain(chain_id).map(|token| PublicBalanceAsset {
-            id: PublicAssetId::Erc20(token.token),
-            symbol: token.symbol,
-            decimals: token.decimals,
-        }),
-    );
+    if let Some(token_registry) = token_registry {
+        assets.extend(
+            token_registry
+                .tokens
+                .values()
+                .filter(|token| token.chain_id == chain_id)
+                .filter_map(|token| {
+                    Address::from_str(&token.token_address)
+                        .ok()
+                        .map(|address| PublicBalanceAsset {
+                            id: PublicAssetId::Erc20(address),
+                            symbol: token.symbol.clone(),
+                            decimals: token.decimals,
+                        })
+                }),
+        );
+    } else {
+        assets.extend(
+            known_tokens_for_chain(chain_id).map(|token| PublicBalanceAsset {
+                id: PublicAssetId::Erc20(token.token),
+                symbol: token.symbol.to_string(),
+                decimals: token.decimals,
+            }),
+        );
+    }
     assets
 }
 
 #[must_use]
 pub fn public_native_action_gas_units(steps: &[PublicActionProgressStep]) -> u64 {
+    public_native_action_gas_units_with_buffer(steps, GAS_LIMIT_BUFFER)
+}
+
+#[must_use]
+fn public_native_action_gas_units_with_buffer(
+    steps: &[PublicActionProgressStep],
+    gas_limit_buffer: u64,
+) -> u64 {
     steps.iter().fold(0_u64, |total, step| {
-        total.saturating_add(public_native_step_gas_units(*step) + GAS_LIMIT_BUFFER)
+        total.saturating_add(public_native_step_gas_units(*step) + gas_limit_buffer)
     })
 }
 
@@ -230,20 +272,35 @@ pub fn public_native_action_gas_reserve(
     gas_price: u128,
     steps: &[PublicActionProgressStep],
 ) -> U256 {
-    U256::from(public_native_action_gas_units(steps)) * U256::from(gas_price)
+    public_native_action_gas_reserve_with_buffer(gas_price, steps, GAS_LIMIT_BUFFER)
+}
+
+#[must_use]
+fn public_native_action_gas_reserve_with_buffer(
+    gas_price: u128,
+    steps: &[PublicActionProgressStep],
+    gas_limit_buffer: u64,
+) -> U256 {
+    U256::from(public_native_action_gas_units_with_buffer(
+        steps,
+        gas_limit_buffer,
+    )) * U256::from(gas_price)
 }
 
 pub async fn estimate_public_native_action_gas_reserve(
     chain_id: u64,
     steps: &[PublicActionProgressStep],
+    effective_chain: Option<&EffectiveChainConfig>,
     http: &HttpContext,
 ) -> Result<U256> {
-    let defaults = chain_defaults_for_public_chain(chain_id)?;
-    let provider = ProviderBuilder::new()
-        .connect_reqwest(http.client.clone(), defaults.rpc_url)
-        .erased();
-    let gas_price = buffered_gas_price(&provider).await?;
-    Ok(public_native_action_gas_reserve(gas_price, steps))
+    let chain = public_chain_runtime_config(chain_id, effective_chain)?;
+    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
+    let gas_price = buffered_gas_price_from_rpc_pool(&query_rpc_pool, &chain.gas).await?;
+    Ok(public_native_action_gas_reserve_with_buffer(
+        gas_price,
+        steps,
+        chain.gas.gas_limit_buffer,
+    ))
 }
 
 const fn public_native_step_gas_units(step: PublicActionProgressStep) -> u64 {
@@ -259,8 +316,9 @@ pub(crate) fn plan_public_balance_calls(
     chain_id: u64,
     multicall_addr: Address,
     accounts: &[PublicAccountMetadata],
+    token_registry: Option<&EffectiveTokenRegistry>,
 ) -> Vec<PlannedPublicBalanceCall> {
-    let assets = public_balance_assets_for_chain(chain_id);
+    let assets = public_balance_assets_for_chain_with_registry(chain_id, token_registry);
     let mut calls = Vec::with_capacity(accounts.len().saturating_mul(assets.len()));
     for account in accounts {
         for asset in &assets {
@@ -295,45 +353,62 @@ pub(crate) fn plan_public_balance_calls(
 pub async fn refresh_public_balances(
     chain_id: u64,
     accounts: &[PublicAccountMetadata],
+    effective_chain: Option<&EffectiveChainConfig>,
+    token_registry: Option<&EffectiveTokenRegistry>,
     http: &HttpContext,
 ) -> Result<PublicBalanceSnapshot> {
-    let defaults = chain_defaults_for_public_chain(chain_id)?;
+    let chain = public_chain_runtime_config(chain_id, effective_chain)?;
     let chain_label =
         chain_name(chain_id).map_or_else(|| format!("chain {chain_id}"), str::to_string);
-    let multicall_contract = defaults.multicall_contract;
-    let rpc_url = defaults.rpc_url.clone();
-    let rpc_host = rpc_url
-        .host_str()
-        .map_or_else(|| "configured RPC".to_string(), str::to_string);
-    let planned_calls = plan_public_balance_calls(chain_id, multicall_contract, accounts);
+    let multicall_contract = chain.multicall_contract;
+    let planned_calls =
+        plan_public_balance_calls(chain_id, multicall_contract, accounts, token_registry);
     if planned_calls.is_empty() {
         return Ok(empty_public_balance_snapshot(chain_id, accounts));
     }
 
-    let provider = ProviderBuilder::new()
-        .connect_reqwest(http.client.clone(), rpc_url)
-        .erased();
-    let mut multicall = provider
-        .multicall()
-        .dynamic::<PublicErc20::balanceOfCall>()
-        .address(multicall_contract);
-    for call in &planned_calls {
-        multicall =
-            multicall.add_call_dynamic(CallItem::new(call.target, call.data.clone().into()));
-    }
+    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
+    let mut last_error = None;
+    let mut results = None;
+    for _ in 0..query_rpc_pool.len() {
+        let Some(provider_handle) = query_rpc_pool.random_provider() else {
+            break;
+        };
+        let mut multicall = provider_handle
+            .provider
+            .multicall()
+            .dynamic::<PublicErc20::balanceOfCall>()
+            .address(multicall_contract);
+        for call in &planned_calls {
+            multicall =
+                multicall.add_call_dynamic(CallItem::new(call.target, call.data.clone().into()));
+        }
 
-    let results = multicall
-        .try_aggregate(false)
-        .await
-        .wrap_err_with(|| {
-            let account_suffix = if accounts.len() == 1 { "" } else { "s" };
-            let call_suffix = if planned_calls.len() == 1 { "" } else { "s" };
-            format!(
-                "could not refresh public balances on {chain_label}: Multicall3 request to {rpc_host} ({multicall_contract:#x}) failed for {} account{account_suffix} and {} balance call{call_suffix}",
-                accounts.len(),
-                planned_calls.len(),
-            )
-        })?;
+        match multicall.try_aggregate(false).await {
+            Ok(values) => {
+                results = Some(values);
+                break;
+            }
+            Err(error) => {
+                tracing::warn!(%error, rpc = %provider_handle.url, "refresh public balances multicall failed");
+                query_rpc_pool.mark_bad_provider(&provider_handle);
+                last_error = Some(eyre!("{error}"));
+            }
+        }
+    }
+    let results = results.ok_or_else(|| {
+        let account_suffix = if accounts.len() == 1 { "" } else { "s" };
+        let call_suffix = if planned_calls.len() == 1 { "" } else { "s" };
+        let detail = last_error.map_or_else(
+            || "no healthy query RPC available".to_string(),
+            |error| error.to_string(),
+        );
+        eyre!(
+            "could not refresh public balances on {chain_label}: Multicall3 request to configured RPCs ({multicall_contract:#x}) failed for {} account{account_suffix} and {} balance call{call_suffix}: {detail}",
+            accounts.len(),
+            planned_calls.len(),
+        )
+    })?;
     Ok(public_balance_snapshot_from_results(
         chain_id,
         accounts,
@@ -357,7 +432,7 @@ pub async fn submit_public_send_with_progress(
     if request.amount.is_zero() {
         return Err(eyre!("amount is required"));
     }
-    let defaults = chain_defaults_for_public_chain(request.chain_id)?;
+    let chain = public_chain_runtime_config(request.chain_id, request.effective_chain.as_ref())?;
     let signer = vaulted_public_signer(
         &request.vault_store,
         &request.view_session,
@@ -366,14 +441,10 @@ pub async fn submit_public_send_with_progress(
     )?;
     let from_address = signer.address();
     let wallet = signer.ethereum_wallet();
-    let provider = ProviderBuilder::new()
-        .connect_reqwest(http.client.clone(), defaults.rpc_url)
-        .erased();
-    let gas_price = buffered_gas_price(&provider).await?;
-    let nonce = provider
-        .get_transaction_count(from_address)
-        .await
-        .wrap_err("fetch public send nonce")?;
+    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
+    let (provider_handle, gas_price, nonce) =
+        public_action_provider_with_nonce(&query_rpc_pool, from_address, &chain.gas).await?;
+    let provider = provider_handle.provider;
     let tx_req = public_send_transaction_request(
         request.chain_id,
         from_address,
@@ -389,6 +460,7 @@ pub async fn submit_public_send_with_progress(
         &wallet,
         tx_req,
         "public-send",
+        chain.gas.gas_limit_buffer,
         &mut progress,
     )
     .await?;
@@ -413,8 +485,8 @@ pub async fn submit_public_shield_with_progress(
     if request.amount.is_zero() {
         return Err(eyre!("amount is required"));
     }
-    let defaults = chain_defaults_for_public_chain(request.chain_id)?;
-    let token = public_shield_token(request.chain_id, request.asset)?;
+    let chain = public_chain_runtime_config(request.chain_id, request.effective_chain.as_ref())?;
+    let token = public_shield_token(request.asset, &chain)?;
     let recipient = request
         .view_session
         .receive_address()
@@ -430,7 +502,7 @@ pub async fn submit_public_shield_with_progress(
     )?;
     let shield_private_key = signer.derive_shield_private_key()?;
     let approve_data = broadcaster_core::contracts::shield::build_approve_calldata(
-        defaults.contract,
+        chain.railgun_contract,
         request.amount,
     );
     let shield_data = broadcaster_core::contracts::shield::build_shield_calldata(
@@ -444,14 +516,10 @@ pub async fn submit_public_shield_with_progress(
 
     let from_address = signer.address();
     let wallet = signer.ethereum_wallet();
-    let provider = ProviderBuilder::new()
-        .connect_reqwest(http.client.clone(), defaults.rpc_url)
-        .erased();
-    let gas_price = buffered_gas_price(&provider).await?;
-    let mut nonce = provider
-        .get_transaction_count(from_address)
-        .await
-        .wrap_err("fetch public shield nonce")?;
+    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
+    let (provider_handle, gas_price, mut nonce) =
+        public_action_provider_with_nonce(&query_rpc_pool, from_address, &chain.gas).await?;
+    let provider = provider_handle.provider;
 
     let wrap_receipt = if request.asset == PublicAssetId::Native {
         let tx_req = TransactionRequest::default()
@@ -468,6 +536,7 @@ pub async fn submit_public_shield_with_progress(
             &wallet,
             tx_req,
             "public-shield-wrap",
+            chain.gas.gas_limit_buffer,
             &mut progress,
         )
         .await?;
@@ -496,6 +565,7 @@ pub async fn submit_public_shield_with_progress(
         &wallet,
         approve_tx,
         "public-shield-approve",
+        chain.gas.gas_limit_buffer,
         &mut progress,
     )
     .await?;
@@ -510,7 +580,7 @@ pub async fn submit_public_shield_with_progress(
     let shield_tx = TransactionRequest::default()
         .with_chain_id(request.chain_id)
         .with_from(from_address)
-        .with_to(defaults.contract)
+        .with_to(chain.railgun_contract)
         .with_input(shield_data)
         .with_gas_price(gas_price)
         .with_nonce(nonce);
@@ -520,6 +590,7 @@ pub async fn submit_public_shield_with_progress(
         &wallet,
         shield_tx,
         "public-shield",
+        chain.gas.gas_limit_buffer,
         &mut progress,
     )
     .await?;
@@ -543,6 +614,7 @@ async fn sign_public_action_step(
     wallet: &EthereumWallet,
     tx_req: TransactionRequest,
     label: &str,
+    gas_limit_buffer: u64,
     progress: &mut (impl FnMut(PublicActionProgressUpdate) + Send),
 ) -> Result<TxReceiptOutput> {
     progress(public_action_progress_update(
@@ -552,15 +624,22 @@ async fn sign_public_action_step(
         None,
     ));
     let mut sent_hash = None;
-    let receipt = match sign_send_wait_with_sent(provider, wallet, tx_req, label, |tx_hash| {
-        sent_hash = Some(tx_hash.clone());
-        progress(public_action_progress_update(
-            step,
-            PublicActionProgressStatus::Pending,
-            Some(tx_hash),
-            None,
-        ));
-    })
+    let receipt = match sign_send_wait_with_sent_with_gas_buffer(
+        provider,
+        wallet,
+        tx_req,
+        label,
+        gas_limit_buffer,
+        |tx_hash| {
+            sent_hash = Some(tx_hash.clone());
+            progress(public_action_progress_update(
+                step,
+                PublicActionProgressStatus::Pending,
+                Some(tx_hash),
+                None,
+            ));
+        },
+    )
     .await
     {
         Ok(receipt) => receipt,
@@ -676,7 +755,7 @@ fn empty_public_balance_snapshot(
     }
 }
 
-const fn native_asset_for_chain(chain_id: u64) -> Option<PublicBalanceAsset> {
+fn native_asset_for_chain(chain_id: u64) -> Option<PublicBalanceAsset> {
     let symbol = match chain_id {
         1 | 42161 => "ETH",
         56 => "BNB",
@@ -685,17 +764,121 @@ const fn native_asset_for_chain(chain_id: u64) -> Option<PublicBalanceAsset> {
     };
     Some(PublicBalanceAsset {
         id: PublicAssetId::Native,
-        symbol,
+        symbol: symbol.to_string(),
         decimals: 18,
     })
 }
 
-fn public_shield_token(chain_id: u64, asset: PublicAssetId) -> Result<Address> {
+fn public_shield_token(asset: PublicAssetId, chain: &PublicChainRuntimeConfig) -> Result<Address> {
     match asset {
-        PublicAssetId::Native => wrapped_native_token_for_chain(chain_id)
+        PublicAssetId::Native => chain
+            .wrapped_native_token
             .ok_or_else(|| eyre!("selected chain does not support native shielding")),
         PublicAssetId::Erc20(token) => Ok(token),
     }
+}
+
+struct PublicChainRuntimeConfig {
+    rpc_urls: Vec<Url>,
+    railgun_contract: Address,
+    wrapped_native_token: Option<Address>,
+    multicall_contract: Address,
+    gas: EffectiveChainGasSettings,
+}
+
+fn public_chain_runtime_config(
+    chain_id: u64,
+    effective_chain: Option<&EffectiveChainConfig>,
+) -> Result<PublicChainRuntimeConfig> {
+    let defaults = chain_defaults_for_public_chain(chain_id)?;
+    let Some(effective_chain) = effective_chain else {
+        return Ok(PublicChainRuntimeConfig {
+            rpc_urls: defaults.rpc_urls,
+            railgun_contract: defaults.contract,
+            wrapped_native_token: wrapped_native_token_for_chain(chain_id),
+            multicall_contract: defaults.multicall_contract,
+            gas: EffectiveChainGasSettings {
+                gas_limit_buffer: GAS_LIMIT_BUFFER,
+                gas_price_buffer_numerator: crate::GAS_PRICE_BUFFER_NUMERATOR as u64,
+                gas_price_buffer_denominator: crate::GAS_PRICE_BUFFER_DENOMINATOR as u64,
+            },
+        });
+    };
+    if effective_chain.chain_id != chain_id {
+        return Err(eyre!(
+            "effective chain config is for chain {}, not {chain_id}",
+            effective_chain.chain_id
+        ));
+    }
+    let rpc_urls = effective_rpc_urls_for_chain(&defaults, Some(effective_chain))?;
+    let railgun_contract =
+        parse_effective_address("railgun contract", &effective_chain.railgun_contract)?;
+    let wrapped_native_token = effective_chain
+        .wrapped_native_token
+        .as_deref()
+        .map(|value| parse_effective_address("wrapped native token", value))
+        .transpose()?
+        .or_else(|| wrapped_native_token_for_chain(chain_id));
+    let multicall_contract =
+        parse_effective_address("multicall contract", &effective_chain.multicall_contract)?;
+    Ok(PublicChainRuntimeConfig {
+        rpc_urls,
+        railgun_contract,
+        wrapped_native_token,
+        multicall_contract,
+        gas: effective_chain.gas.clone(),
+    })
+}
+
+async fn public_action_provider_with_nonce(
+    query_rpc_pool: &QueryRpcPool,
+    from_address: Address,
+    gas: &EffectiveChainGasSettings,
+) -> Result<(ProviderHandle, u128, u64)> {
+    let mut last_error = None;
+    for _ in 0..query_rpc_pool.len() {
+        let Some(provider_handle) = query_rpc_pool.random_provider() else {
+            break;
+        };
+        let gas_price = match buffered_gas_price_with_policy(
+            &provider_handle.provider,
+            u128::from(gas.gas_price_buffer_numerator),
+            u128::from(gas.gas_price_buffer_denominator),
+        )
+        .await
+        {
+            Ok(gas_price) => gas_price,
+            Err(error) => {
+                tracing::warn!(%error, rpc = %provider_handle.url, "fetch public action gas price failed");
+                query_rpc_pool.mark_bad_provider(&provider_handle);
+                last_error = Some(error);
+                continue;
+            }
+        };
+        let nonce = match provider_handle
+            .provider
+            .get_transaction_count(from_address)
+            .await
+        {
+            Ok(nonce) => nonce,
+            Err(error) => {
+                tracing::warn!(%error, rpc = %provider_handle.url, "fetch public action nonce failed");
+                query_rpc_pool.mark_bad_provider(&provider_handle);
+                last_error = Some(eyre!("fetch public action nonce: {error}"));
+                continue;
+            }
+        };
+        return Ok((provider_handle, gas_price, nonce));
+    }
+    if let Some(error) = last_error {
+        Err(error).wrap_err("all public action query RPC attempts failed")
+    } else {
+        Err(eyre!("no healthy query RPC available"))
+    }
+}
+
+fn parse_effective_address(label: &str, value: &str) -> Result<Address> {
+    Address::from_str(value).wrap_err_with(|| format!("parse effective {label} address"))
 }
 
 fn vaulted_public_signer(
@@ -839,7 +1022,7 @@ mod tests {
             display_order: 0,
         };
         let multicall = address!("0xcA11bde05977b3631167028862bE2a173976CA11");
-        let calls = plan_public_balance_calls(1, multicall, &[account]);
+        let calls = plan_public_balance_calls(1, multicall, &[account], None);
 
         assert_eq!(calls.first().expect("native call").target, multicall);
         assert_eq!(
@@ -851,6 +1034,47 @@ mod tests {
                 .iter()
                 .any(|call| matches!(call.asset.id, PublicAssetId::Erc20(_)))
         );
+    }
+
+    #[test]
+    fn balance_assets_use_effective_token_registry_overlays() {
+        let mut settings = crate::settings::WalletSettings::default();
+        settings
+            .tokens
+            .built_in_tombstones
+            .push(crate::settings::TokenKey {
+                chain_id: 1,
+                token_address: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2".to_string(),
+            });
+        settings
+            .tokens
+            .custom_tokens
+            .push(crate::settings::CustomTokenSettings {
+                chain_id: 1,
+                token_address: "0x0000000000000000000000000000000000000002".to_string(),
+                symbol: "CSTM".to_string(),
+                decimals: 9,
+                icon_path: None,
+                price_anchor: None,
+            });
+        let registry = crate::settings::build_effective_token_registry(&settings)
+            .expect("effective token registry");
+
+        let assets = public_balance_assets_for_chain_with_registry(1, Some(&registry));
+
+        assert!(assets.iter().any(|asset| asset.id == PublicAssetId::Native));
+        assert!(!assets.iter().any(|asset| {
+            asset.id == PublicAssetId::Erc20(address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"))
+        }));
+        let custom = assets
+            .iter()
+            .find(|asset| {
+                asset.id
+                    == PublicAssetId::Erc20(address!("0x0000000000000000000000000000000000000002"))
+            })
+            .expect("custom token asset");
+        assert_eq!(custom.symbol, "CSTM");
+        assert_eq!(custom.decimals, 9);
     }
 
     #[test]
@@ -873,7 +1097,7 @@ mod tests {
                 account: account.address,
                 asset: PublicBalanceAsset {
                     id: PublicAssetId::Native,
-                    symbol: "ETH",
+                    symbol: "ETH".to_string(),
                     decimals: 18,
                 },
                 target: address!("0xcA11bde05977b3631167028862bE2a173976CA11"),
@@ -886,7 +1110,7 @@ mod tests {
                     id: PublicAssetId::Erc20(address!(
                         "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
                     )),
-                    symbol: "WETH",
+                    symbol: "WETH".to_string(),
                     decimals: 18,
                 },
                 target: address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
@@ -945,6 +1169,68 @@ mod tests {
                 + PUBLIC_NATIVE_SHIELD_GAS_UNITS
                 + (3 * GAS_LIMIT_BUFFER),
         );
+        assert_eq!(
+            public_native_action_gas_units_with_buffer(&send_steps, 7),
+            PUBLIC_NATIVE_SEND_GAS_UNITS + 7,
+        );
+    }
+
+    #[test]
+    fn effective_public_chain_config_uses_settings_overrides() {
+        let defaults = chain_defaults_for_public_chain(1).expect("ethereum defaults");
+        let effective = EffectiveChainConfig {
+            chain_id: 1,
+            enabled: true,
+            rpc_endpoints: vec!["https://rpc.example".to_string()],
+            archive_rpc_url: None,
+            quick_sync_enabled: true,
+            quick_sync_endpoint: defaults.quick_sync_endpoint.map(|url| url.to_string()),
+            indexed_wallet_block_range: defaults.indexed_wallet_block_range,
+            deployment_block: defaults.deployment_block,
+            v2_start_block: defaults.v2_start_block,
+            legacy_shield_block: defaults.legacy_shield_block,
+            archive_until_block: defaults.archive_until_block,
+            railgun_contract: "0x0000000000000000000000000000000000000001".to_string(),
+            relay_adapt_contract: defaults.relay_adapt_contract.to_string(),
+            relay_adapt_7702_contract: defaults.relay_adapt_7702_contract.to_string(),
+            wrapped_native_token: Some("0x0000000000000000000000000000000000000002".to_string()),
+            multicall_contract: "0x0000000000000000000000000000000000000003".to_string(),
+            finality_depth: defaults.finality_depth,
+            block_range: None,
+            poll_interval_secs: None,
+            gas: EffectiveChainGasSettings {
+                gas_limit_buffer: 42,
+                gas_price_buffer_numerator: 111,
+                gas_price_buffer_denominator: 100,
+            },
+        };
+
+        let config = public_chain_runtime_config(1, Some(&effective)).expect("effective config");
+
+        assert_eq!(config.rpc_urls.len(), 1);
+        assert_eq!(config.rpc_urls[0].as_str(), "https://rpc.example/");
+        assert_eq!(
+            config.railgun_contract,
+            address!("0x0000000000000000000000000000000000000001")
+        );
+        assert_eq!(
+            config.wrapped_native_token,
+            Some(address!("0x0000000000000000000000000000000000000002"))
+        );
+        assert_eq!(
+            config.multicall_contract,
+            address!("0x0000000000000000000000000000000000000003")
+        );
+        assert_eq!(config.gas.gas_limit_buffer, 42);
+    }
+
+    #[test]
+    fn effective_public_chain_config_uses_default_rpc_fallbacks() {
+        let defaults = chain_defaults_for_public_chain(1).expect("ethereum defaults");
+        let config = public_chain_runtime_config(1, None).expect("default config");
+
+        assert_eq!(config.rpc_urls, defaults.rpc_urls);
+        assert!(config.rpc_urls.len() > 1);
     }
 
     #[test]
@@ -996,6 +1282,7 @@ mod tests {
         let send_result = runtime.block_on(submit_public_send(
             PublicSendRequest {
                 chain_id: 1,
+                effective_chain: None,
                 view_session: Arc::clone(&view_session),
                 vault_store: Arc::clone(&store),
                 vault_password: Zeroizing::new(TEST_PASSWORD.to_string()),
@@ -1014,6 +1301,7 @@ mod tests {
         let shield_result = runtime.block_on(submit_public_shield(
             PublicShieldRequest {
                 chain_id: 1,
+                effective_chain: None,
                 view_session,
                 vault_store: store,
                 vault_password: Zeroizing::new(TEST_PASSWORD.to_string()),

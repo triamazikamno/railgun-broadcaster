@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::{Mutex, Notify, broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, broadcast, mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tracing::{debug, error, trace, warn};
 
@@ -354,6 +354,20 @@ const fn tor_discovery_retry_delay(failures: u32) -> Duration {
     }
 }
 
+async fn shutdown_changed_or_requested(shutdown: &mut watch::Receiver<bool>) -> bool {
+    if *shutdown.borrow() {
+        return true;
+    }
+    shutdown.changed().await.is_err() || *shutdown.borrow()
+}
+
+async fn sleep_or_shutdown(duration: Duration, shutdown: &mut watch::Receiver<bool>) -> bool {
+    tokio::select! {
+        () = tokio::time::sleep(duration) => false,
+        should_shutdown = shutdown_changed_or_requested(shutdown) => should_shutdown,
+    }
+}
+
 struct NodeInner {
     config: NodeConfig,
     discovery_config: DiscoveryConfig,
@@ -368,9 +382,19 @@ struct NodeInner {
     peer_exchange_cooldown: Duration,
     op_counter: AtomicU64,
     store_peer_tx: broadcast::Sender<PeerId>,
+    shutdown_tx: watch::Sender<bool>,
 }
 
 impl NodeInner {
+    fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+        self.discovery_wake.notify_waiters();
+    }
+
+    fn is_shutdown(&self) -> bool {
+        *self.shutdown_tx.borrow()
+    }
+
     const fn uses_tor_profile(&self) -> bool {
         matches!(self.network_profile, WakuTransportProfile::Tor)
     }
@@ -479,8 +503,20 @@ impl NodeInner {
 
     async fn run_discovery_loop(self: Arc<Self>) {
         let mut tor_zero_peer_failures = 0_u32;
+        let mut shutdown = self.shutdown_tx.subscribe();
         loop {
-            match self.discover().await {
+            let discover = self.discover();
+            let result = tokio::select! {
+                result = discover => result,
+                should_shutdown = shutdown_changed_or_requested(&mut shutdown) => {
+                    if should_shutdown {
+                        debug!("discovery loop shutting down");
+                        break;
+                    }
+                    continue;
+                }
+            };
+            match result {
                 Ok(usable) if usable > 0 => tor_zero_peer_failures = 0,
                 Ok(_) => {
                     if self.uses_tor_profile() {
@@ -504,6 +540,12 @@ impl NodeInner {
             tokio::select! {
                 () = tokio::time::sleep(sleep_for) => {}
                 () = self.discovery_wake.notified() => {}
+                should_shutdown = shutdown_changed_or_requested(&mut shutdown) => {
+                    if should_shutdown {
+                        debug!("discovery loop shutting down");
+                        break;
+                    }
+                }
             }
         }
     }
@@ -541,6 +583,7 @@ impl NodeInner {
     }
 
     async fn run_peer_exchange_loop(self: Arc<Self>) {
+        let mut shutdown = self.shutdown_tx.subscribe();
         loop {
             let connected = self.peer_book.read().connected.len();
             let interval = if connected < self.discovery_config.peer_exchange_bootstrap_peers {
@@ -551,21 +594,34 @@ impl NodeInner {
 
             if connected == 0 {
                 debug!("skipping peer exchange: no connected peers");
-                tokio::time::sleep(interval).await;
+                if sleep_or_shutdown(interval, &mut shutdown).await {
+                    debug!("peer exchange loop shutting down");
+                    break;
+                }
                 continue;
             }
 
             if connected >= self.config.connection_cap {
                 debug!("skipping peer exchange: connection cap reached");
-                tokio::time::sleep(interval).await;
+                if sleep_or_shutdown(interval, &mut shutdown).await {
+                    debug!("peer exchange loop shutting down");
+                    break;
+                }
                 continue;
             }
 
             debug!(connected, "performing peer exchange");
-            match self
-                .peer_exchange_rounds(self.discovery_config.peer_exchange_rounds)
-                .await
-            {
+            let result = tokio::select! {
+                result = self.peer_exchange_rounds(self.discovery_config.peer_exchange_rounds) => result,
+                should_shutdown = shutdown_changed_or_requested(&mut shutdown) => {
+                    if should_shutdown {
+                        debug!("peer exchange loop shutting down");
+                        break;
+                    }
+                    continue;
+                }
+            };
+            match result {
                 Ok(()) => {}
                 Err(WakuError::Cancelled) => warn!("peer exchange cancelled"),
                 Err(error) => {
@@ -574,12 +630,27 @@ impl NodeInner {
                 }
             }
 
-            tokio::time::sleep(interval).await;
+            if sleep_or_shutdown(interval, &mut shutdown).await {
+                debug!("peer exchange loop shutting down");
+                break;
+            }
         }
     }
 
     async fn run_dialer(self: Arc<Self>, mut dial_rx: mpsc::Receiver<PeerId>) {
-        while let Some(peer_id) = dial_rx.recv().await {
+        let mut shutdown = self.shutdown_tx.subscribe();
+        loop {
+            let peer_id = tokio::select! {
+                peer_id = dial_rx.recv() => peer_id,
+                should_shutdown = shutdown_changed_or_requested(&mut shutdown) => {
+                    if should_shutdown {
+                        debug!("dialer loop shutting down");
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let Some(peer_id) = peer_id else { break };
             let addrs = {
                 let mut book = self.peer_book.write();
 
@@ -626,9 +697,16 @@ impl NodeInner {
 
     async fn run_event_loop(self: Arc<Self>, mut transport_rx: mpsc::Receiver<TransportEvent>) {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
+        let mut shutdown = self.shutdown_tx.subscribe();
 
         loop {
             tokio::select! {
+                should_shutdown = shutdown_changed_or_requested(&mut shutdown) => {
+                    if should_shutdown {
+                        debug!("event loop shutting down");
+                        break;
+                    }
+                }
                 _ = tick.tick() => {
                     self.handle_tick(Instant::now()).await;
                 }
@@ -1343,8 +1421,9 @@ impl WakuNode {
         let (transport_tx, transport_cmd_rx) = mpsc::channel(64);
         let (transport_event_tx, transport_event_rx) = mpsc::channel(64);
         let (dial_tx, dial_rx) = mpsc::channel(64);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        tokio::spawn(transport.run(transport_cmd_rx, transport_event_tx));
+        tokio::spawn(transport.run(transport_cmd_rx, transport_event_tx, shutdown_rx));
 
         let metadata_response = proto::metadata::WakuMetadataResponse {
             cluster_id: Some(config.cluster_id),
@@ -1375,6 +1454,7 @@ impl WakuNode {
             peer_exchange_cooldown: config.peer_exchange_cooldown,
             op_counter: AtomicU64::new(1),
             store_peer_tx,
+            shutdown_tx,
         });
 
         {
@@ -1406,6 +1486,15 @@ impl WakuNode {
         }
 
         Ok(Self { inner })
+    }
+
+    pub fn shutdown(&self) {
+        self.inner.shutdown();
+    }
+
+    #[must_use]
+    pub fn is_shutdown(&self) -> bool {
+        self.inner.is_shutdown()
     }
 
     pub fn add_additional_peers(&self, peers: Vec<discovery::DiscoveredPeer>) {
@@ -1894,5 +1983,19 @@ mod tests {
             tor_discovery_retry_delay(u32::MAX),
             Duration::from_secs(300)
         );
+    }
+
+    #[tokio::test]
+    async fn node_shutdown_marks_node_and_wakes_workers() {
+        let mut config = WakuConfig::default();
+        config.discovery.enr_trees.clear();
+
+        let node = WakuNode::spawn(config).expect("spawn Waku node");
+        assert!(!node.is_shutdown());
+
+        node.shutdown();
+
+        assert!(node.is_shutdown());
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }

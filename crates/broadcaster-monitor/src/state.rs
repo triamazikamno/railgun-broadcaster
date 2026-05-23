@@ -112,6 +112,13 @@ impl MonitorState {
         Some(self.bump_rev())
     }
 
+    pub fn clear(&mut self) -> u64 {
+        self.fees.clear();
+        self.peer_summary = PeerSummary::default();
+        self.peer_rows.clear();
+        self.bump_rev()
+    }
+
     #[must_use]
     pub fn fee_rows(&self) -> Vec<FeeRow> {
         self.fees.values().cloned().collect()

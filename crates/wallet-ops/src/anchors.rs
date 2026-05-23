@@ -1,21 +1,24 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use alloy::primitives::{Address, U256};
-use alloy::providers::{CallItem, Provider, ProviderBuilder};
+use alloy::providers::{CallItem, Provider};
 use alloy::sol;
 use alloy::sol_types::SolCall;
-use alloy_provider::DynProvider;
+use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use eyre::{Result, WrapErr};
 use railgun_ui::{TokenAnchorInfo, TokenAnchorSource, lookup_token, token_anchor_entries};
 use sync_service::ChainConfigDefaults;
 use tokio::runtime::Handle;
 use tokio::sync::watch;
+use tokio::task::AbortHandle;
 use tokio::time::{Instant, MissedTickBehavior, interval};
 
-use crate::HttpContext;
+use crate::settings::{EffectiveChainConfig, EffectiveTokenRegistry, PriceAnchorSettings};
+use crate::{HttpContext, effective_rpc_urls_for_chain, query_rpc_pool_with_http_client};
 
 const ANCHOR_OUTLIER_THRESHOLD_BPS: U256 = alloy::uint!(5_000_U256);
 const BPS_DENOMINATOR: U256 = alloy::uint!(10_000_U256);
@@ -125,6 +128,31 @@ struct TokenAnchorKey {
     token: Address,
 }
 
+#[derive(Debug, Clone)]
+struct RuntimeTokenAnchorInfo {
+    chain_id: u64,
+    token: Address,
+    anchor_sources: Vec<RuntimeTokenAnchorSource>,
+}
+
+#[derive(Debug, Clone)]
+enum RuntimeTokenAnchorSource {
+    Fixed {
+        token_fee_per_unit_gas: U256,
+    },
+    ChainlinkOracle {
+        chain_id: u64,
+        addr: Address,
+        token_decimals: u8,
+        oracle_decimals: u8,
+        is_inversed: bool,
+    },
+    Product {
+        sources: Vec<Self>,
+        scale_decimals: u8,
+    },
+}
+
 impl TokenAnchorKey {
     const fn new(chain_id: u64, token: Address) -> Self {
         Self { chain_id, token }
@@ -160,9 +188,10 @@ impl TokenAnchorRateCache {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct TokenAnchorRefreshHandle {
     wake_tx: watch::Sender<u64>,
+    abort_handle: AbortHandle,
 }
 
 impl TokenAnchorRefreshHandle {
@@ -172,27 +201,52 @@ impl TokenAnchorRefreshHandle {
     }
 }
 
+impl Drop for TokenAnchorRefreshHandle {
+    fn drop(&mut self) {
+        self.abort_handle.abort();
+    }
+}
+
 #[must_use]
 pub fn spawn_token_anchor_refresh_worker(
     runtime: &Handle,
     cache: Arc<TokenAnchorRateCache>,
     chain_ids: Vec<u64>,
+    effective_chains: BTreeMap<u64, EffectiveChainConfig>,
+    token_registry: EffectiveTokenRegistry,
     http: HttpContext,
 ) -> TokenAnchorRefreshHandle {
     let (wake_tx, wake_rx) = watch::channel(0_u64);
-    runtime.spawn(run_token_anchor_refresh_worker(
-        cache, chain_ids, http, wake_rx,
+    let task = runtime.spawn(run_token_anchor_refresh_worker(
+        cache,
+        chain_ids,
+        effective_chains,
+        token_registry,
+        http,
+        wake_rx,
     ));
-    TokenAnchorRefreshHandle { wake_tx }
+    TokenAnchorRefreshHandle {
+        wake_tx,
+        abort_handle: task.abort_handle(),
+    }
 }
 
 async fn run_token_anchor_refresh_worker(
     cache: Arc<TokenAnchorRateCache>,
     chain_ids: Vec<u64>,
+    effective_chains: BTreeMap<u64, EffectiveChainConfig>,
+    token_registry: EffectiveTokenRegistry,
     http: HttpContext,
     mut wake_rx: watch::Receiver<u64>,
 ) {
-    refresh_token_anchor_rates(&cache, &chain_ids, &http).await;
+    refresh_token_anchor_rates(
+        &cache,
+        &chain_ids,
+        &effective_chains,
+        &token_registry,
+        &http,
+    )
+    .await;
     let mut last_refresh = Instant::now();
 
     let mut refresh_interval = interval(TOKEN_ANCHOR_REFRESH_INTERVAL);
@@ -201,7 +255,7 @@ async fn run_token_anchor_refresh_worker(
     loop {
         tokio::select! {
             _ = refresh_interval.tick() => {
-                refresh_token_anchor_rates(&cache, &chain_ids, &http).await;
+                refresh_token_anchor_rates(&cache, &chain_ids, &effective_chains, &token_registry, &http).await;
                 last_refresh = Instant::now();
             }
             changed = wake_rx.changed() => {
@@ -209,7 +263,7 @@ async fn run_token_anchor_refresh_worker(
                     break;
                 }
                 if last_refresh.elapsed() >= TOKEN_ANCHOR_WAKE_REFRESH_MIN_INTERVAL {
-                    refresh_token_anchor_rates(&cache, &chain_ids, &http).await;
+                    refresh_token_anchor_rates(&cache, &chain_ids, &effective_chains, &token_registry, &http).await;
                     last_refresh = Instant::now();
                 }
             }
@@ -220,10 +274,12 @@ async fn run_token_anchor_refresh_worker(
 pub async fn refresh_token_anchor_rates(
     cache: &TokenAnchorRateCache,
     chain_ids: &[u64],
+    effective_chains: &BTreeMap<u64, EffectiveChainConfig>,
+    token_registry: &EffectiveTokenRegistry,
     http: &HttpContext,
 ) {
-    let mut entries_by_chain: BTreeMap<u64, Vec<TokenAnchorInfo>> = BTreeMap::new();
-    for entry in token_anchor_entries_for_chains(chain_ids) {
+    let mut entries_by_chain: BTreeMap<u64, Vec<RuntimeTokenAnchorInfo>> = BTreeMap::new();
+    for entry in token_anchor_entries_for_chains(chain_ids, token_registry) {
         entries_by_chain
             .entry(entry.chain_id)
             .or_default()
@@ -231,52 +287,85 @@ pub async fn refresh_token_anchor_rates(
     }
 
     for (chain_id, entries) in entries_by_chain {
-        refresh_token_anchor_rates_for_chain(cache, chain_id, &entries, http).await;
+        refresh_token_anchor_rates_for_chain(cache, chain_id, &entries, effective_chains, http)
+            .await;
     }
 }
 
 async fn refresh_token_anchor_rates_for_chain(
     cache: &TokenAnchorRateCache,
     chain_id: u64,
-    entries: &[TokenAnchorInfo],
+    entries: &[RuntimeTokenAnchorInfo],
+    effective_chains: &BTreeMap<u64, EffectiveChainConfig>,
     http: &HttpContext,
 ) {
-    let oracle_addresses = oracle_addresses_for_entries(entries);
-    let oracle_answers = if oracle_addresses.is_empty() {
-        BTreeMap::new()
-    } else {
-        match fetch_oracle_answers_for_chain(chain_id, &oracle_addresses, http).await {
-            Ok(answers) => answers,
+    let oracle_addresses_by_chain = oracle_addresses_for_entries(entries);
+    let mut oracle_answers = BTreeMap::new();
+    for (oracle_chain_id, oracle_addresses) in oracle_addresses_by_chain {
+        match fetch_oracle_answers_for_chain(
+            oracle_chain_id,
+            &oracle_addresses,
+            effective_chains,
+            http,
+        )
+        .await
+        {
+            Ok(answers) => {
+                for (oracle_address, answer) in answers {
+                    oracle_answers.insert((oracle_chain_id, oracle_address), answer);
+                }
+            }
             Err(error) => {
-                tracing::warn!(chain_id, %error, "failed to refresh token anchor oracles");
-                BTreeMap::new()
+                tracing::warn!(chain_id, oracle_chain_id, %error, "failed to refresh token anchor oracles");
             }
         }
-    };
+    }
     store_anchor_rates_from_entries(cache, entries, &oracle_answers);
 }
 
 async fn fetch_oracle_answers_for_chain(
     chain_id: u64,
     oracle_addresses: &[Address],
+    effective_chains: &BTreeMap<u64, EffectiveChainConfig>,
     http: &HttpContext,
 ) -> Result<BTreeMap<Address, U256>> {
-    let (provider, multicall_addr) = provider_for_chain(chain_id, http)?;
-    let mut multicall = provider
-        .multicall()
-        .dynamic::<AggregatorInterface::latestAnswerCall>()
-        .address(multicall_addr);
-    for oracle_address in oracle_addresses {
-        multicall = multicall.add_call_dynamic(CallItem::new(
-            *oracle_address,
-            AggregatorInterface::latestAnswerCall {}.abi_encode().into(),
-        ));
-    }
+    let (query_rpc_pool, multicall_addr) = provider_for_chain(chain_id, effective_chains, http)?;
+    let mut last_error = None;
+    let mut results = None;
+    for _ in 0..query_rpc_pool.len() {
+        let Some(provider_handle) = query_rpc_pool.random_provider() else {
+            break;
+        };
+        let mut multicall = provider_handle
+            .provider
+            .multicall()
+            .dynamic::<AggregatorInterface::latestAnswerCall>()
+            .address(multicall_addr);
+        for oracle_address in oracle_addresses {
+            multicall = multicall.add_call_dynamic(CallItem::new(
+                *oracle_address,
+                AggregatorInterface::latestAnswerCall {}.abi_encode().into(),
+            ));
+        }
 
-    let results = multicall
-        .try_aggregate(false)
-        .await
-        .wrap_err("multicall anchor oracle answers")?;
+        match multicall.try_aggregate(false).await {
+            Ok(values) => {
+                results = Some(values);
+                break;
+            }
+            Err(error) => {
+                tracing::warn!(chain_id, %error, rpc = %provider_handle.url, "multicall anchor oracle answers failed");
+                query_rpc_pool.mark_bad_provider(&provider_handle);
+                last_error = Some(eyre::eyre!("{error}"));
+            }
+        }
+    }
+    let results = results.ok_or_else(|| {
+        last_error.map_or_else(
+            || eyre::eyre!("no healthy query RPC available for chain {chain_id}"),
+            |error| error.wrap_err("multicall anchor oracle answers"),
+        )
+    })?;
     let mut answers = BTreeMap::new();
     for (oracle_address, result) in oracle_addresses.iter().copied().zip(results) {
         match result {
@@ -297,43 +386,177 @@ async fn fetch_oracle_answers_for_chain(
     Ok(answers)
 }
 
-fn provider_for_chain(chain_id: u64, http: &HttpContext) -> Result<(DynProvider, Address)> {
+fn provider_for_chain(
+    chain_id: u64,
+    effective_chains: &BTreeMap<u64, EffectiveChainConfig>,
+    http: &HttpContext,
+) -> Result<(Arc<QueryRpcPool>, Address)> {
     let defaults = ChainConfigDefaults::for_chain(chain_id)
         .ok_or_else(|| eyre::eyre!("unsupported chain id {chain_id}"))?;
-    let provider = ProviderBuilder::new()
-        .connect_reqwest(http.client.clone(), defaults.rpc_url)
-        .erased();
-    Ok((provider, defaults.multicall_contract))
+    let effective_chain = effective_chains.get(&chain_id);
+    let rpc_urls = effective_rpc_urls_for_chain(&defaults, effective_chain)?;
+    let multicall_contract = if let Some(effective_chain) = effective_chain {
+        Address::from_str(&effective_chain.multicall_contract)
+            .wrap_err("parse effective multicall contract")?
+    } else {
+        defaults.multicall_contract
+    };
+    Ok((
+        query_rpc_pool_with_http_client(rpc_urls, http),
+        multicall_contract,
+    ))
 }
 
-fn token_anchor_entries_for_chains(chain_ids: &[u64]) -> Vec<TokenAnchorInfo> {
+fn token_anchor_entries_for_chains(
+    chain_ids: &[u64],
+    token_registry: &EffectiveTokenRegistry,
+) -> Vec<RuntimeTokenAnchorInfo> {
     let chain_ids = chain_ids.iter().copied().collect::<BTreeSet<_>>();
-    token_anchor_entries()
+    let registry_tokens = token_registry
+        .tokens
+        .values()
+        .filter(|token| chain_ids.contains(&token.chain_id))
+        .filter_map(|token| {
+            Address::from_str(&token.token_address)
+                .ok()
+                .map(|address| ((token.chain_id, address), token.price_anchor.as_ref()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut entries = token_anchor_entries()
         .filter(|entry| chain_ids.contains(&entry.chain_id))
-        .collect()
+        .filter(|entry| registry_tokens.contains_key(&(entry.chain_id, entry.token)))
+        .map(static_anchor_entry_to_runtime)
+        .collect::<BTreeMap<_, _>>();
+    for ((chain_id, token), anchor) in registry_tokens {
+        if let Some(anchor) = anchor.and_then(price_anchor_to_runtime_sources) {
+            entries.insert(
+                (chain_id, token),
+                RuntimeTokenAnchorInfo {
+                    chain_id,
+                    token,
+                    anchor_sources: anchor,
+                },
+            );
+        }
+    }
+    entries.into_values().collect()
 }
 
-fn oracle_addresses_for_entries(entries: &[TokenAnchorInfo]) -> Vec<Address> {
-    let mut addresses = BTreeSet::new();
+fn static_anchor_entry_to_runtime(
+    entry: TokenAnchorInfo,
+) -> ((u64, Address), RuntimeTokenAnchorInfo) {
+    (
+        (entry.chain_id, entry.token),
+        RuntimeTokenAnchorInfo {
+            chain_id: entry.chain_id,
+            token: entry.token,
+            anchor_sources: entry
+                .anchor_sources
+                .iter()
+                .map(|source| static_anchor_source_to_runtime(entry.chain_id, source))
+                .collect(),
+        },
+    )
+}
+
+fn static_anchor_source_to_runtime(
+    chain_id: u64,
+    source: &TokenAnchorSource,
+) -> RuntimeTokenAnchorSource {
+    match source {
+        TokenAnchorSource::Fixed {
+            token_fee_per_unit_gas,
+        } => RuntimeTokenAnchorSource::Fixed {
+            token_fee_per_unit_gas: *token_fee_per_unit_gas,
+        },
+        TokenAnchorSource::ChainlinkOracle {
+            addr,
+            token_decimals,
+            oracle_decimals,
+            is_inversed,
+        } => RuntimeTokenAnchorSource::ChainlinkOracle {
+            chain_id,
+            addr: *addr,
+            token_decimals: *token_decimals,
+            oracle_decimals: *oracle_decimals,
+            is_inversed: *is_inversed,
+        },
+        TokenAnchorSource::Product {
+            sources,
+            scale_decimals,
+        } => RuntimeTokenAnchorSource::Product {
+            sources: sources
+                .iter()
+                .map(|source| static_anchor_source_to_runtime(chain_id, source))
+                .collect(),
+            scale_decimals: *scale_decimals,
+        },
+    }
+}
+
+fn price_anchor_to_runtime_sources(
+    anchor: &PriceAnchorSettings,
+) -> Option<Vec<RuntimeTokenAnchorSource>> {
+    Some(vec![price_anchor_to_runtime_source(anchor)?])
+}
+
+fn price_anchor_to_runtime_source(
+    anchor: &PriceAnchorSettings,
+) -> Option<RuntimeTokenAnchorSource> {
+    match anchor {
+        PriceAnchorSettings::Fixed { rate } => Some(RuntimeTokenAnchorSource::Fixed {
+            token_fee_per_unit_gas: U256::from_str_radix(rate, 10).ok()?,
+        }),
+        PriceAnchorSettings::Oracle {
+            chain_id,
+            oracle_address,
+            token_decimals,
+            oracle_decimals,
+            is_inversed,
+        } => Some(RuntimeTokenAnchorSource::ChainlinkOracle {
+            chain_id: *chain_id,
+            addr: Address::from_str(oracle_address).ok()?,
+            token_decimals: *token_decimals,
+            oracle_decimals: *oracle_decimals,
+            is_inversed: *is_inversed,
+        }),
+        PriceAnchorSettings::Product {
+            components,
+            scale_decimals,
+        } => Some(RuntimeTokenAnchorSource::Product {
+            sources: components
+                .iter()
+                .map(price_anchor_to_runtime_source)
+                .collect::<Option<Vec<_>>>()?,
+            scale_decimals: *scale_decimals,
+        }),
+    }
+}
+
+fn oracle_addresses_for_entries(entries: &[RuntimeTokenAnchorInfo]) -> BTreeMap<u64, Vec<Address>> {
+    let mut addresses: BTreeMap<u64, BTreeSet<Address>> = BTreeMap::new();
     for entry in entries {
-        for source in entry.anchor_sources {
+        for source in &entry.anchor_sources {
             collect_oracle_addresses_from_source(source, &mut addresses);
         }
     }
-    addresses.into_iter().collect()
+    addresses
+        .into_iter()
+        .map(|(chain_id, addresses)| (chain_id, addresses.into_iter().collect()))
+        .collect()
 }
 
 fn collect_oracle_addresses_from_source(
-    source: &TokenAnchorSource,
-    addresses: &mut BTreeSet<Address>,
+    source: &RuntimeTokenAnchorSource,
+    addresses: &mut BTreeMap<u64, BTreeSet<Address>>,
 ) {
     match source {
-        TokenAnchorSource::Fixed { .. } => {}
-        TokenAnchorSource::ChainlinkOracle { addr, .. } => {
-            addresses.insert(*addr);
+        RuntimeTokenAnchorSource::Fixed { .. } => {}
+        RuntimeTokenAnchorSource::ChainlinkOracle { chain_id, addr, .. } => {
+            addresses.entry(*chain_id).or_default().insert(*addr);
         }
-        TokenAnchorSource::Product { sources, .. } => {
-            for source in *sources {
+        RuntimeTokenAnchorSource::Product { sources, .. } => {
+            for source in sources {
                 collect_oracle_addresses_from_source(source, addresses);
             }
         }
@@ -342,11 +565,11 @@ fn collect_oracle_addresses_from_source(
 
 fn store_anchor_rates_from_entries(
     cache: &TokenAnchorRateCache,
-    entries: &[TokenAnchorInfo],
-    oracle_answers: &BTreeMap<Address, U256>,
+    entries: &[RuntimeTokenAnchorInfo],
+    oracle_answers: &BTreeMap<(u64, Address), U256>,
 ) {
     for entry in entries {
-        let rates = anchor_rates_from_sources(entry.anchor_sources, oracle_answers);
+        let rates = anchor_rates_from_sources(&entry.anchor_sources, oracle_answers);
         if let Some(rate) = average_non_outlier_anchor_rates(&rates) {
             cache.store_rate(entry.chain_id, entry.token, rate);
         }
@@ -354,8 +577,8 @@ fn store_anchor_rates_from_entries(
 }
 
 fn anchor_rates_from_sources(
-    sources: &[TokenAnchorSource],
-    oracle_answers: &BTreeMap<Address, U256>,
+    sources: &[RuntimeTokenAnchorSource],
+    oracle_answers: &BTreeMap<(u64, Address), U256>,
 ) -> Vec<U256> {
     sources
         .iter()
@@ -364,32 +587,33 @@ fn anchor_rates_from_sources(
 }
 
 fn anchor_rate_from_source(
-    source: &TokenAnchorSource,
-    oracle_answers: &BTreeMap<Address, U256>,
+    source: &RuntimeTokenAnchorSource,
+    oracle_answers: &BTreeMap<(u64, Address), U256>,
 ) -> Option<U256> {
-    match *source {
-        TokenAnchorSource::Fixed {
+    match source {
+        RuntimeTokenAnchorSource::Fixed {
             token_fee_per_unit_gas,
-        } => non_zero_rate(token_fee_per_unit_gas),
-        TokenAnchorSource::ChainlinkOracle {
+        } => non_zero_rate(*token_fee_per_unit_gas),
+        RuntimeTokenAnchorSource::ChainlinkOracle {
+            chain_id,
             addr,
             token_decimals,
             oracle_decimals,
             is_inversed,
-        } => oracle_answers.get(&addr).and_then(|price| {
-            oracle_answer_to_anchor_rate(*price, token_decimals, oracle_decimals, is_inversed)
+        } => oracle_answers.get(&(*chain_id, *addr)).and_then(|price| {
+            oracle_answer_to_anchor_rate(*price, *token_decimals, *oracle_decimals, *is_inversed)
         }),
-        TokenAnchorSource::Product {
+        RuntimeTokenAnchorSource::Product {
             sources,
             scale_decimals,
-        } => product_anchor_rate(sources, scale_decimals, oracle_answers),
+        } => product_anchor_rate(sources, *scale_decimals, oracle_answers),
     }
 }
 
 fn product_anchor_rate(
-    sources: &[TokenAnchorSource],
+    sources: &[RuntimeTokenAnchorSource],
     scale_decimals: u8,
-    oracle_answers: &BTreeMap<Address, U256>,
+    oracle_answers: &BTreeMap<(u64, Address), U256>,
 ) -> Option<U256> {
     let scale = checked_pow10(scale_decimals)?;
     let mut rates = sources
@@ -552,6 +776,13 @@ mod tests {
         scale_decimals: 18,
     }];
 
+    fn runtime_sources(sources: &[TokenAnchorSource]) -> Vec<RuntimeTokenAnchorSource> {
+        sources
+            .iter()
+            .map(|source| static_anchor_source_to_runtime(1, source))
+            .collect()
+    }
+
     #[test]
     fn fixed_anchor_source_uses_wrapped_native_rate() {
         assert_eq!(
@@ -615,10 +846,10 @@ mod tests {
     fn cache_keeps_stale_rate_when_refresh_has_no_usable_value() {
         let cache = TokenAnchorRateCache::new();
         let token = address!("0x0000000000000000000000000000000000000001");
-        let entry = TokenAnchorInfo {
+        let entry = RuntimeTokenAnchorInfo {
             chain_id: 1,
             token,
-            anchor_sources: SHARED_ORACLE_SOURCE_6,
+            anchor_sources: runtime_sources(SHARED_ORACLE_SOURCE_6),
         };
         cache.store_rate(1, token, uint!(123_U256));
 
@@ -634,30 +865,82 @@ mod tests {
     #[test]
     fn oracle_addresses_for_entries_deduplicates_shared_sources() {
         let entries = [
-            TokenAnchorInfo {
+            RuntimeTokenAnchorInfo {
                 chain_id: 1,
                 token: address!("0x0000000000000000000000000000000000000001"),
-                anchor_sources: SHARED_ORACLE_SOURCE_6,
+                anchor_sources: runtime_sources(SHARED_ORACLE_SOURCE_6),
             },
-            TokenAnchorInfo {
+            RuntimeTokenAnchorInfo {
                 chain_id: 1,
                 token: address!("0x0000000000000000000000000000000000000002"),
-                anchor_sources: SHARED_ORACLE_SOURCE_18,
+                anchor_sources: runtime_sources(SHARED_ORACLE_SOURCE_18),
             },
-            TokenAnchorInfo {
+            RuntimeTokenAnchorInfo {
                 chain_id: 1,
                 token: address!("0x0000000000000000000000000000000000000003"),
-                anchor_sources: ARB_PER_ETH_ANCHOR_SOURCE,
+                anchor_sources: runtime_sources(ARB_PER_ETH_ANCHOR_SOURCE),
             },
         ];
 
         assert_eq!(
             oracle_addresses_for_entries(&entries),
-            vec![
-                address!("0x0000000000000000000000000000000000000100"),
-                address!("0x0000000000000000000000000000000000000200"),
-                address!("0x0000000000000000000000000000000000000300"),
-            ]
+            BTreeMap::from([(
+                1,
+                vec![
+                    address!("0x0000000000000000000000000000000000000100"),
+                    address!("0x0000000000000000000000000000000000000200"),
+                    address!("0x0000000000000000000000000000000000000300"),
+                ],
+            )])
+        );
+    }
+
+    #[test]
+    fn token_anchor_entries_apply_effective_registry_overrides() {
+        let mut settings = crate::settings::WalletSettings::default();
+        let weth = address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let custom = address!("0x0000000000000000000000000000000000000002");
+        settings
+            .tokens
+            .built_in_tombstones
+            .push(crate::settings::TokenKey {
+                chain_id: 1,
+                token_address: weth.to_string(),
+            });
+        settings
+            .tokens
+            .custom_tokens
+            .push(crate::settings::CustomTokenSettings {
+                chain_id: 1,
+                token_address: custom.to_string(),
+                symbol: "CSTM".to_string(),
+                decimals: 18,
+                icon_path: None,
+                price_anchor: Some(crate::settings::PriceAnchorSettings::Oracle {
+                    chain_id: 42161,
+                    oracle_address: "0x0000000000000000000000000000000000000100".to_string(),
+                    token_decimals: 18,
+                    oracle_decimals: 8,
+                    is_inversed: false,
+                }),
+            });
+        let registry = crate::settings::build_effective_token_registry(&settings)
+            .expect("effective token registry");
+
+        let entries = token_anchor_entries_for_chains(&[1], &registry);
+
+        assert!(!entries.iter().any(|entry| entry.token == weth));
+        let custom_entry = entries
+            .iter()
+            .find(|entry| entry.token == custom)
+            .expect("custom anchor entry");
+        let oracle_addresses = oracle_addresses_for_entries(std::slice::from_ref(custom_entry));
+        assert_eq!(
+            oracle_addresses,
+            BTreeMap::from([(
+                42161,
+                vec![address!("0x0000000000000000000000000000000000000100")],
+            )])
         );
     }
 
@@ -665,16 +948,16 @@ mod tests {
     fn anchor_rates_from_sources_reuses_oracle_answer() {
         let mut answers = BTreeMap::new();
         answers.insert(
-            address!("0x0000000000000000000000000000000000000100"),
+            (1, address!("0x0000000000000000000000000000000000000100")),
             uint!(3_000_00000000_U256),
         );
 
         assert_eq!(
-            anchor_rates_from_sources(SHARED_ORACLE_SOURCE_6, &answers),
+            anchor_rates_from_sources(&runtime_sources(SHARED_ORACLE_SOURCE_6), &answers),
             vec![uint!(3_000_000_000_U256)]
         );
         assert_eq!(
-            anchor_rates_from_sources(SHARED_ORACLE_SOURCE_18, &answers),
+            anchor_rates_from_sources(&runtime_sources(SHARED_ORACLE_SOURCE_18), &answers),
             vec![uint!(3_000_000_000_000_000_000_000_U256)]
         );
     }
@@ -683,16 +966,16 @@ mod tests {
     fn anchor_rates_from_sources_composes_arb_per_eth_anchor() {
         let mut answers = BTreeMap::new();
         answers.insert(
-            address!("0x0000000000000000000000000000000000000200"),
+            (1, address!("0x0000000000000000000000000000000000000200")),
             uint!(3_000_00000000_U256),
         );
         answers.insert(
-            address!("0x0000000000000000000000000000000000000300"),
+            (1, address!("0x0000000000000000000000000000000000000300")),
             uint!(70_000000_U256),
         );
 
         assert_eq!(
-            anchor_rates_from_sources(ARB_PER_ETH_ANCHOR_SOURCE, &answers),
+            anchor_rates_from_sources(&runtime_sources(ARB_PER_ETH_ANCHOR_SOURCE), &answers),
             vec![uint!(4_285_714_285_714_285_713_000_U256)]
         );
     }
@@ -701,11 +984,14 @@ mod tests {
     fn anchor_rates_from_sources_discards_composite_with_missing_component() {
         let mut answers = BTreeMap::new();
         answers.insert(
-            address!("0x0000000000000000000000000000000000000200"),
+            (1, address!("0x0000000000000000000000000000000000000200")),
             uint!(3_000_00000000_U256),
         );
 
-        assert!(anchor_rates_from_sources(ARB_PER_ETH_ANCHOR_SOURCE, &answers).is_empty());
+        assert!(
+            anchor_rates_from_sources(&runtime_sources(ARB_PER_ETH_ANCHOR_SOURCE), &answers)
+                .is_empty()
+        );
     }
 
     #[test]

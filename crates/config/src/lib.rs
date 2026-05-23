@@ -33,6 +33,8 @@ pub struct Waku {
     pub direct_peers: Vec<AdditionalWakuPeer>,
     pub dns_enr_trees: Option<Vec<String>>,
     pub doh_endpoint: Option<String>,
+    #[serde(default)]
+    pub doh_fallback_endpoints: Option<Vec<String>>,
     pub cluster_id: Option<u32>,
     pub max_peers: Option<usize>,
     pub peer_connection_timeout: Option<humantime_serde::Serde<Duration>>,

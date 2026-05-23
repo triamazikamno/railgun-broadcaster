@@ -28,7 +28,7 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, error};
 
 /// Internal request ID used by the coordinator to correlate responses.
@@ -205,6 +205,7 @@ impl Transport {
         mut self,
         mut cmd_rx: mpsc::Receiver<TransportCmd>,
         event_tx: mpsc::Sender<TransportEvent>,
+        mut shutdown: watch::Receiver<bool>,
     ) {
         let mut filter_push_control = self.swarm.behaviour().filter_push.new_control();
         let Ok(mut filter_push_streams) =
@@ -216,6 +217,12 @@ impl Transport {
 
         loop {
             tokio::select! {
+                should_shutdown = Self::shutdown_changed_or_requested(&mut shutdown) => {
+                    if should_shutdown {
+                        debug!("transport loop shutting down");
+                        break;
+                    }
+                }
                 stream = filter_push_streams.next() => {
                     let Some((peer_id, stream)) = stream else {
                         error!("filter push stream acceptor closed, stopping transport loop");
@@ -240,6 +247,13 @@ impl Transport {
                 }
             }
         }
+    }
+
+    async fn shutdown_changed_or_requested(shutdown: &mut watch::Receiver<bool>) -> bool {
+        if *shutdown.borrow() {
+            return true;
+        }
+        shutdown.changed().await.is_err() || *shutdown.borrow()
     }
 
     async fn handle_cmd(&mut self, cmd: TransportCmd, event_tx: &mpsc::Sender<TransportEvent>) {

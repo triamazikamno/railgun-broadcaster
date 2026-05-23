@@ -16,6 +16,7 @@ pub const APP_TEXT_COLOR: u32 = TEXT;
 
 pub const BACKGROUND: u32 = 0x3f3f3f;
 pub const SURFACE: u32 = 0x383838;
+pub const SETTINGS_INPUT_SURFACE: u32 = 0x3c3c3c;
 pub const SURFACE_ELEVATED: u32 = 0x444444;
 pub const SURFACE_ELEVATED_ALT: u32 = 0x4a4a4a;
 pub const SURFACE_HOVER: u32 = 0x4f4f4f;
@@ -135,7 +136,7 @@ pub fn apply_zenburn_component_theme(cx: &mut App) {
     colors.bullish = rgb(SUCCESS);
     colors.bearish = rgb(DANGER);
     colors.switch = rgb(SURFACE_HOVER);
-    colors.switch_thumb = rgb(TEXT_MUTED);
+    colors.switch_thumb = rgb(SURFACE);
     colors.tab = rgb(SURFACE);
     colors.tab_active = rgb(SURFACE_ELEVATED);
     colors.tab_active_foreground = rgb(TEXT);

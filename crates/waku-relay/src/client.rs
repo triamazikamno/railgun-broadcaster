@@ -85,10 +85,50 @@ impl std::fmt::Debug for RelayNetworkConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RelayMessageOutcome {
     Delivered,
     Duplicate,
     Dropped,
+    SinkClosed,
+}
+
+fn handle_relay_message(
+    cache: &mut LruCache<u64, ()>,
+    sink_tx: &mpsc::Sender<WakuMessage>,
+    message: WakuMessage,
+) -> RelayMessageOutcome {
+    let hash = message.hash_key();
+
+    if cache.contains(&hash) {
+        tracing::debug!(hash, "duplicate message, ignoring");
+        return RelayMessageOutcome::Duplicate;
+    }
+    cache.put(hash, ());
+    match sink_tx.try_send(message) {
+        Ok(()) => RelayMessageOutcome::Delivered,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            tracing::warn!("failed to send message to sink: channel full");
+            RelayMessageOutcome::Dropped
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            tracing::debug!("message sink closed; stopping relay subscription task");
+            RelayMessageOutcome::SinkClosed
+        }
+    }
+}
+
+fn relay_sink_is_closed(sink_tx: &mpsc::Sender<WakuMessage>) -> bool {
+    if sink_tx.is_closed() {
+        tracing::debug!("message sink closed; stopping relay subscription task");
+        return true;
+    }
+    false
+}
+
+async fn wait_for_relay_sink_closed(sink_tx: &mpsc::Sender<WakuMessage>) {
+    sink_tx.closed().await;
+    tracing::debug!("message sink closed; stopping relay subscription task");
 }
 
 pub struct Client {
@@ -98,6 +138,14 @@ pub struct Client {
     waku_fleet: Option<Arc<WakuNode>>,
     network_mode: RelayNetworkMode,
     disabled_reason: Option<Arc<str>>,
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        if let Some(waku_fleet) = self.waku_fleet.as_ref() {
+            waku_fleet.shutdown();
+        }
+    }
 }
 
 impl Client {
@@ -128,7 +176,7 @@ impl Client {
                 let tor_client = tor_client.ok_or_else(|| {
                     ClientError::Disabled("Tor Waku profile requires an Arti client".to_string())
                 })?;
-                add_tor_doh_fallback(&mut config);
+                add_tor_doh_fallback(&mut config, cfg.doh_fallback_endpoints.is_some());
                 config.network =
                     WakuNetworkConfig::tor_with_client_provider(tor_client, http_client.clone());
             }
@@ -170,6 +218,12 @@ impl Client {
         }
         if let Some(doh_endpoint) = &cfg.doh_endpoint {
             config.discovery.doh_endpoint.clone_from(doh_endpoint);
+        }
+        if let Some(doh_fallback_endpoints) = &cfg.doh_fallback_endpoints {
+            config
+                .discovery
+                .doh_fallback_endpoints
+                .clone_from(doh_fallback_endpoints);
         }
         config.cluster_id = configured_cluster_id(cfg);
         config.shard_id = configured_shard_id(cfg);
@@ -319,22 +373,11 @@ impl Client {
                         VecDeque::new()
                     };
                     let mut queried_store_peers = HashSet::new();
-                    let mut handle_message = |message: WakuMessage| {
-                        let hash = message.hash_key();
-
-                        if cache.contains(&hash) {
-                            tracing::debug!(hash, "duplicate message, ignoring");
-                            return RelayMessageOutcome::Duplicate;
-                        }
-                        cache.put(hash, ());
-                        if let Err(error) = sink_tx.try_send(message) {
-                            tracing::warn!(%error, "failed to send message to sink");
-                            return RelayMessageOutcome::Dropped;
-                        }
-                        RelayMessageOutcome::Delivered
-                    };
-
                     loop {
+                        if relay_sink_is_closed(&sink_tx) {
+                            return;
+                        }
+
                         if let Some(lookback) = history_lookback
                             && let Some(peer_id) = pending_store_peers.pop_front()
                         {
@@ -352,7 +395,12 @@ impl Client {
                                 pagination_limit: Some(FEE_HISTORY_PAGE_LIMIT),
                             };
 
-                            match waku_fleet.store_query_peer(peer_id, query).await {
+                            let query_result = tokio::select! {
+                                () = wait_for_relay_sink_closed(&sink_tx) => return,
+                                result = waku_fleet.store_query_peer(peer_id, query) => result,
+                            };
+
+                            match query_result {
                                 Ok(messages) => {
                                     let returned = messages.len();
                                     let mut matching_topics = 0usize;
@@ -370,10 +418,11 @@ impl Client {
                                             hash = msg.hash_key(),
                                             "received historical message from store peer"
                                         );
-                                        match handle_message(msg) {
+                                        match handle_relay_message(&mut cache, &sink_tx, msg) {
                                             RelayMessageOutcome::Delivered => delivered += 1,
                                             RelayMessageOutcome::Duplicate => deduped += 1,
                                             RelayMessageOutcome::Dropped => dropped += 1,
+                                            RelayMessageOutcome::SinkClosed => return,
                                         }
                                     }
                                     tracing::debug!(
@@ -395,11 +444,20 @@ impl Client {
                         }
 
                         tokio::select! {
+                            () = wait_for_relay_sink_closed(&sink_tx) => return,
                             _ = tick.tick(), if nwaku_messages_url.is_some() => {
                                 let Some(url) = &nwaku_messages_url else { continue };
-                                match http.get(url).send().await.and_then(reqwest::Response::error_for_status) {
+                                let response = tokio::select! {
+                                    () = wait_for_relay_sink_closed(&sink_tx) => return,
+                                    response = http.get(url).send() => response.and_then(reqwest::Response::error_for_status),
+                                };
+                                match response {
                                     Ok(resp) => {
-                                        match resp.json::<Vec<Message>>().await {
+                                        let messages = tokio::select! {
+                                            () = wait_for_relay_sink_closed(&sink_tx) => return,
+                                            messages = resp.json::<Vec<Message>>() => messages,
+                                        };
+                                        match messages {
                                             Ok(messages) => {
                                                 for msg in messages {
                                                     if !content_topics.contains(&msg.content_topic) {
@@ -413,7 +471,9 @@ impl Client {
                                                                 ..Default::default()
                                                             };
                                                             tracing::debug!(msg.content_topic, hash=msg.hash_key(), "received message from nwaku");
-                                                            let _ = handle_message(msg);
+                                                            if matches!(handle_relay_message(&mut cache, &sink_tx, msg), RelayMessageOutcome::SinkClosed) {
+                                                                return;
+                                                            }
                                                         }
                                                         Err(error) => {
                                                             tracing::warn!(%error, "failed to decode message payload");
@@ -434,7 +494,9 @@ impl Client {
                             msg = fleet_rx.recv() => {
                                 if let Some(msg) = msg {
                                     tracing::debug!(msg.content_topic, hash=msg.hash_key(), "received message from fleet");
-                                    let _ = handle_message(msg);
+                                    if matches!(handle_relay_message(&mut cache, &sink_tx, msg), RelayMessageOutcome::SinkClosed) {
+                                        return;
+                                    }
                                 } else {
                                     tracing::warn!("fleet subscription channel closed");
                                     break;
@@ -602,8 +664,9 @@ fn configured_shard_id(cfg: &config::Waku) -> u32 {
     cfg.shard_id.unwrap_or(DEFAULT_SHARD_ID)
 }
 
-fn add_tor_doh_fallback(config: &mut WakuConfig) {
-    if config.discovery.doh_endpoint != DEFAULT_CLEARNET_DOH_ENDPOINT
+fn add_tor_doh_fallback(config: &mut WakuConfig, fallback_endpoints_configured: bool) {
+    if !fallback_endpoints_configured
+        && config.discovery.doh_endpoint != DEFAULT_CLEARNET_DOH_ENDPOINT
         && !config
             .discovery
             .doh_fallback_endpoints
@@ -620,9 +683,15 @@ fn add_tor_doh_fallback(config: &mut WakuConfig) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_CLUSTER_ID, DEFAULT_SHARD_ID, add_tor_doh_fallback, is_fee_content_topic,
-        relay_shard_pubsub_path,
+        CACHE_SIZE, Client, DEFAULT_CLUSTER_ID, DEFAULT_SHARD_ID, RelayMessageOutcome,
+        add_tor_doh_fallback, handle_relay_message, is_fee_content_topic, relay_shard_pubsub_path,
+        relay_sink_is_closed, wait_for_relay_sink_closed,
     };
+    use lru::LruCache;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use waku::proto::WakuMessage;
     use waku::{DEFAULT_CLEARNET_DOH_ENDPOINT, DEFAULT_TOR_DOH_ENDPOINT};
 
     #[test]
@@ -643,6 +712,39 @@ mod tests {
     }
 
     #[test]
+    fn relay_message_delivery_reports_closed_sink() {
+        let (sink_tx, sink_rx) = mpsc::channel(1);
+        drop(sink_rx);
+        let mut cache = LruCache::new(CACHE_SIZE);
+        let msg = WakuMessage {
+            content_topic: "/railgun/v2/0-1-fees/json".to_string(),
+            payload: vec![1, 2, 3],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            handle_relay_message(&mut cache, &sink_tx, msg),
+            RelayMessageOutcome::SinkClosed
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_sink_closed_wait_completes_without_messages() {
+        let (sink_tx, sink_rx) = mpsc::channel::<WakuMessage>(1);
+        assert!(!relay_sink_is_closed(&sink_tx));
+
+        drop(sink_rx);
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            wait_for_relay_sink_closed(&sink_tx),
+        )
+        .await
+        .expect("closed sink should wake relay task promptly");
+        assert!(relay_sink_is_closed(&sink_tx));
+    }
+
+    #[test]
     fn waku_config_from_config_applies_schema_fields() {
         let cfg = config::Waku {
             nwaku_url: None,
@@ -650,6 +752,9 @@ mod tests {
             direct_peers: Vec::new(),
             dns_enr_trees: Some(vec!["enrtree://example".to_string()]),
             doh_endpoint: Some("https://example.invalid/dns-query".to_string()),
+            doh_fallback_endpoints: Some(vec![
+                "https://fallback.example.invalid/dns-query".to_string(),
+            ]),
             cluster_id: Some(7),
             max_peers: Some(42),
             peer_connection_timeout: None,
@@ -664,6 +769,10 @@ mod tests {
             waku.discovery.doh_endpoint,
             "https://example.invalid/dns-query"
         );
+        assert_eq!(
+            waku.discovery.doh_fallback_endpoints,
+            vec!["https://fallback.example.invalid/dns-query".to_string()]
+        );
         assert_eq!(waku.node.connection_cap, 42);
     }
 
@@ -675,6 +784,7 @@ mod tests {
             direct_peers: Vec::new(),
             dns_enr_trees: None,
             doh_endpoint: None,
+            doh_fallback_endpoints: None,
             cluster_id: None,
             max_peers: None,
             peer_connection_timeout: None,
@@ -691,12 +801,45 @@ mod tests {
         let mut waku = waku::WakuConfig::default();
         waku.discovery.doh_endpoint = DEFAULT_TOR_DOH_ENDPOINT.to_string();
 
-        add_tor_doh_fallback(&mut waku);
+        add_tor_doh_fallback(&mut waku, false);
 
         assert_eq!(waku.discovery.doh_endpoint, DEFAULT_TOR_DOH_ENDPOINT);
         assert_eq!(
             waku.discovery.doh_fallback_endpoints,
             vec![DEFAULT_CLEARNET_DOH_ENDPOINT.to_string()]
         );
+    }
+
+    #[test]
+    fn tor_doh_fallback_respects_explicit_empty_list() {
+        let mut waku = waku::WakuConfig::default();
+        waku.discovery.doh_endpoint = DEFAULT_TOR_DOH_ENDPOINT.to_string();
+
+        add_tor_doh_fallback(&mut waku, true);
+
+        assert!(waku.discovery.doh_fallback_endpoints.is_empty());
+    }
+
+    #[tokio::test]
+    async fn client_drop_shuts_down_embedded_waku_node() {
+        let cfg = config::Waku {
+            nwaku_url: None,
+            shard_id: None,
+            direct_peers: Vec::new(),
+            dns_enr_trees: Some(Vec::new()),
+            doh_endpoint: None,
+            doh_fallback_endpoints: None,
+            cluster_id: None,
+            max_peers: None,
+            peer_connection_timeout: None,
+        };
+        let client = Client::new(&cfg).expect("client starts");
+        let node = Arc::clone(client.waku_fleet.as_ref().expect("Waku node enabled"));
+        assert!(!node.is_shutdown());
+
+        drop(client);
+
+        assert!(node.is_shutdown());
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }

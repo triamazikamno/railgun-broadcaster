@@ -3,7 +3,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{
-    Arc, RwLock,
+    Arc, RwLock, Weak,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::Duration;
@@ -310,9 +310,12 @@ impl HttpContext {
     #[must_use]
     pub fn arti_client_provider(&self) -> Option<WalletTorClientProvider> {
         if let Some(socks_bridge) = self.socks_bridge.as_ref() {
-            let active_client = Arc::clone(&socks_bridge.active_client);
+            let active_client: Weak<RwLock<WalletTorClient>> =
+                Arc::downgrade(&socks_bridge.active_client);
             return Some(Arc::new(move || {
-                active_client.read().ok().map(|client| client.clone())
+                active_client.upgrade().and_then(|active_client| {
+                    active_client.read().ok().map(|client| client.clone())
+                })
             }));
         }
 

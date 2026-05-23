@@ -1,0 +1,353 @@
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use alloy::primitives::{Address, U256};
+use gpui::Context;
+use wallet_ops::{
+    BroadcasterFeePolicy, BroadcasterFeePolicyStatus, ListUtxosOutput, PublicBroadcasterCandidate,
+    PublicBroadcasterCostEstimate, PublicBroadcasterFeeMode,
+    fee_policy_eligible_public_broadcasters,
+    max_broadcaster_fee_token_amount_from_outputs as planner_max_broadcaster_fee_token_amount_from_outputs,
+    public_broadcaster_candidates_for_asset,
+    settings::{EffectiveChainConfig, EffectiveTokenRegistry},
+};
+
+use super::private_assets::format_private_asset_rows;
+use super::{
+    DeliveryFormKind, DeliveryMode, SendFormState, UnshieldAssetKey, UnshieldFormState, WalletRoot,
+    parse_address,
+};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PublicBroadcasterFeeTokenOption {
+    pub(super) token: Address,
+    pub(super) label: String,
+    pub(super) decimals: Option<u8>,
+    pub(super) max_spendable: U256,
+    pub(super) eligible_broadcaster_count: usize,
+    pub(super) icon_path: Option<PathBuf>,
+}
+
+impl WalletRoot {
+    pub(super) fn monitor_fee_rows(&self) -> Vec<broadcaster_monitor::FeeRow> {
+        self.monitor_state.read().fee_rows()
+    }
+
+    pub(super) const fn public_broadcaster_fee_policy(
+        &self,
+        allow_suspicious_broadcasters: bool,
+    ) -> BroadcasterFeePolicy {
+        self.public_broadcaster_policy
+            .with_allow_suspicious_broadcasters(allow_suspicious_broadcasters)
+    }
+
+    pub(super) fn current_public_broadcaster_candidates(
+        &self,
+        chain_id: u64,
+        token: Address,
+        unwrap: bool,
+        policy: BroadcasterFeePolicy,
+    ) -> Vec<PublicBroadcasterCandidate> {
+        let required_relay_adapt =
+            required_relay_adapt_for_unwrap(&self.effective_chain_configs, chain_id, unwrap);
+        public_broadcaster_candidates_for_asset(
+            &self.monitor_fee_rows(),
+            chain_id,
+            token,
+            required_relay_adapt,
+            policy,
+            self.public_broadcaster_anchor_cache
+                .cached_rate(chain_id, token),
+        )
+        .unwrap_or_default()
+    }
+
+    pub(super) fn current_public_broadcaster_fee_token_options(
+        &self,
+        chain_id: u64,
+        unwrap: bool,
+        policy: BroadcasterFeePolicy,
+    ) -> Vec<PublicBroadcasterFeeTokenOption> {
+        let Some(snapshot) = self
+            .chain_states
+            .get(&chain_id)
+            .and_then(|state| state.snapshot())
+        else {
+            return Vec::new();
+        };
+        let fee_rows = self.monitor_fee_rows();
+        let required_relay_adapt =
+            required_relay_adapt_for_unwrap(&self.effective_chain_configs, chain_id, unwrap);
+        public_broadcaster_fee_token_options_from_snapshot(
+            snapshot,
+            &fee_rows,
+            required_relay_adapt,
+            policy,
+            Some(&self.effective_token_registry),
+            |token| {
+                self.public_broadcaster_anchor_cache
+                    .cached_rate(chain_id, token)
+            },
+        )
+    }
+
+    pub(super) fn default_public_broadcaster_fee_token(
+        &self,
+        chain_id: u64,
+        action_token: Address,
+        unwrap: bool,
+        allow_suspicious_broadcasters: bool,
+    ) -> Address {
+        let policy = self.public_broadcaster_fee_policy(allow_suspicious_broadcasters);
+        let options = self.current_public_broadcaster_fee_token_options(chain_id, unwrap, policy);
+        resolve_selected_public_broadcaster_fee_token(action_token, action_token, &options)
+    }
+
+    pub(super) fn refresh_public_broadcaster_anchor(
+        &self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        cx: &Context<'_, Self>,
+    ) {
+        let Some((_chain_id, _token)) = (match kind {
+            DeliveryFormKind::Send => self
+                .send_forms
+                .get(&key)
+                .map(|form| (form.asset.chain_id, form.selected_fee_token)),
+            DeliveryFormKind::Unshield => self
+                .unshield_forms
+                .get(&key)
+                .map(|form| (form.asset.chain_id, form.selected_fee_token)),
+        }) else {
+            return;
+        };
+        self.public_broadcaster_anchor_refresh.wake();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(2)).await;
+            let _ = this.update(cx, |_root, cx| cx.notify());
+        })
+        .detach();
+    }
+}
+
+pub(super) const fn broadcaster_candidate_anchor_rate(
+    candidate: &PublicBroadcasterCandidate,
+) -> Option<U256> {
+    match candidate.fee_policy_status {
+        BroadcasterFeePolicyStatus::Normal { anchor_rate, .. }
+        | BroadcasterFeePolicyStatus::Suspicious { anchor_rate, .. } => Some(anchor_rate),
+        BroadcasterFeePolicyStatus::UnknownAnchor => None,
+    }
+}
+
+pub(super) fn should_show_distinct_amount(entered_amount: U256, amount: U256) -> bool {
+    amount != entered_amount
+}
+
+fn public_broadcaster_max_entered_amount_for_mode(
+    max_receiver_amount: U256,
+    fee_amount: U256,
+    fee_mode: PublicBroadcasterFeeMode,
+) -> U256 {
+    match fee_mode {
+        PublicBroadcasterFeeMode::DeductFromAmount => max_receiver_amount + fee_amount,
+        PublicBroadcasterFeeMode::AddToAmount => max_receiver_amount,
+    }
+}
+
+fn cost_estimate_max_entered_amount_for_mode(
+    estimate: &PublicBroadcasterCostEstimate,
+    fee_mode: PublicBroadcasterFeeMode,
+) -> U256 {
+    let fee_mode =
+        effective_public_broadcaster_fee_mode(estimate.action_token, estimate.fee_token, fee_mode);
+    public_broadcaster_max_entered_amount_for_mode(
+        estimate.max_receiver_amount,
+        estimate.fee_amount,
+        fee_mode,
+    )
+}
+
+pub(super) fn send_form_max_entered_amount(
+    form: &SendFormState,
+    delivery_mode: DeliveryMode,
+    fee_mode: PublicBroadcasterFeeMode,
+) -> Option<U256> {
+    match delivery_mode {
+        DeliveryMode::ManualCalldata => Some(form.asset.max_batched),
+        DeliveryMode::PublicBroadcaster => form
+            .cost_estimate
+            .as_ref()
+            .map(|estimate| cost_estimate_max_entered_amount_for_mode(estimate, fee_mode)),
+        DeliveryMode::SelfBroadcast => None,
+    }
+}
+
+pub(super) fn unshield_form_max_entered_amount(
+    form: &UnshieldFormState,
+    delivery_mode: DeliveryMode,
+    fee_mode: PublicBroadcasterFeeMode,
+) -> Option<U256> {
+    match delivery_mode {
+        DeliveryMode::ManualCalldata => Some(form.asset.max_batched),
+        DeliveryMode::PublicBroadcaster => form
+            .cost_estimate
+            .as_ref()
+            .map(|estimate| cost_estimate_max_entered_amount_for_mode(estimate, fee_mode)),
+        DeliveryMode::SelfBroadcast => None,
+    }
+}
+
+fn max_broadcaster_fee_token_amount_from_snapshot(
+    snapshot: &ListUtxosOutput,
+    token: Address,
+) -> U256 {
+    planner_max_broadcaster_fee_token_amount_from_outputs(&snapshot.utxos, token)
+}
+
+pub(super) fn public_broadcaster_fee_token_options_from_snapshot(
+    snapshot: &ListUtxosOutput,
+    fee_rows: &[broadcaster_monitor::FeeRow],
+    required_relay_adapt: Option<Address>,
+    policy: BroadcasterFeePolicy,
+    registry: Option<&EffectiveTokenRegistry>,
+    mut anchor_rate_for_token: impl FnMut(Address) -> Option<U256>,
+) -> Vec<PublicBroadcasterFeeTokenOption> {
+    format_private_asset_rows(snapshot.chain_id, &snapshot.totals, registry)
+        .into_iter()
+        .filter_map(|asset| {
+            let token = asset.token?;
+            let poi_verified_total = asset.poi_verified_total?;
+            if poi_verified_total.is_zero() {
+                return None;
+            }
+            let max_spendable = max_broadcaster_fee_token_amount_from_snapshot(snapshot, token);
+            if max_spendable.is_zero() {
+                return None;
+            }
+            let candidates = public_broadcaster_candidates_for_asset(
+                fee_rows,
+                snapshot.chain_id,
+                token,
+                required_relay_adapt,
+                policy,
+                anchor_rate_for_token(token),
+            )
+            .unwrap_or_default();
+            let eligible_broadcaster_count =
+                fee_policy_eligible_public_broadcasters(&candidates, policy).len();
+            Some(PublicBroadcasterFeeTokenOption {
+                token,
+                label: asset.label,
+                decimals: asset.decimals,
+                max_spendable,
+                eligible_broadcaster_count,
+                icon_path: asset.icon_path,
+            })
+        })
+        .collect()
+}
+
+pub(super) fn fee_token_option_has_eligible_broadcaster(
+    options: &[PublicBroadcasterFeeTokenOption],
+    token: Address,
+) -> bool {
+    options
+        .iter()
+        .any(|option| option.token == token && option.eligible_broadcaster_count > 0)
+}
+
+fn selected_fee_token_eligible_broadcaster_count(
+    options: &[PublicBroadcasterFeeTokenOption],
+    token: Address,
+) -> Option<usize> {
+    options
+        .iter()
+        .find(|option| option.token == token)
+        .map(|option| option.eligible_broadcaster_count)
+}
+
+pub(super) fn public_broadcaster_submit_disabled_for_fee_token_options(
+    options: &[PublicBroadcasterFeeTokenOption],
+    selected_fee_token: Address,
+) -> bool {
+    selected_fee_token_eligible_broadcaster_count(options, selected_fee_token).unwrap_or_default()
+        == 0
+}
+
+pub(super) fn public_broadcaster_fee_token_warning(
+    fee_rows: &[broadcaster_monitor::FeeRow],
+    chain_id: u64,
+    options: &[PublicBroadcasterFeeTokenOption],
+    selected_fee_token: Address,
+) -> Option<&'static str> {
+    if selected_fee_token_eligible_broadcaster_count(options, selected_fee_token)
+        .unwrap_or_default()
+        > 0
+    {
+        return None;
+    }
+    if !fee_rows.iter().any(|row| row.chain_id == chain_id) {
+        return Some("Searching for public broadcasters");
+    }
+    if options
+        .iter()
+        .any(|option| option.eligible_broadcaster_count > 0)
+    {
+        return Some(
+            "Choose a fee token with at least one eligible public broadcaster before submitting.",
+        );
+    }
+    Some("No detected public broadcaster supports your spendable fee tokens")
+}
+
+pub(super) fn resolve_selected_public_broadcaster_fee_token(
+    current_fee_token: Address,
+    action_token: Address,
+    options: &[PublicBroadcasterFeeTokenOption],
+) -> Address {
+    if fee_token_option_has_eligible_broadcaster(options, current_fee_token) {
+        return current_fee_token;
+    }
+    if fee_token_option_has_eligible_broadcaster(options, action_token) {
+        return action_token;
+    }
+    options
+        .iter()
+        .find(|option| option.eligible_broadcaster_count > 0)
+        .map_or(current_fee_token, |option| option.token)
+}
+
+pub(super) fn effective_public_broadcaster_fee_mode(
+    action_token: Address,
+    fee_token: Address,
+    fee_mode: PublicBroadcasterFeeMode,
+) -> PublicBroadcasterFeeMode {
+    if action_token == fee_token {
+        fee_mode
+    } else {
+        PublicBroadcasterFeeMode::AddToAmount
+    }
+}
+
+pub(super) fn should_show_broadcaster_fee_mode_toggle(
+    action_token: Address,
+    fee_token: Address,
+) -> bool {
+    action_token == fee_token
+}
+
+pub(super) fn required_relay_adapt_for_unwrap(
+    effective_chain_configs: &BTreeMap<u64, EffectiveChainConfig>,
+    chain_id: u64,
+    unwrap: bool,
+) -> Option<Address> {
+    unwrap
+        .then(|| {
+            effective_chain_configs
+                .get(&chain_id)
+                .and_then(|chain| parse_address(&chain.relay_adapt_contract))
+        })
+        .flatten()
+}

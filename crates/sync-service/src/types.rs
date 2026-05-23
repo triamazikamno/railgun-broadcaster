@@ -134,7 +134,7 @@ pub struct ChainConfigDefaults {
     pub relay_adapt_contract: Address,
     pub relay_adapt_7702_contract: Address,
     pub multicall_contract: Address,
-    pub rpc_url: Url,
+    pub rpc_urls: Vec<Url>,
     pub quick_sync_endpoint: Option<Url>,
     pub indexed_wallet_block_range: u64,
     pub deployment_block: u64,
@@ -155,8 +155,15 @@ impl ChainConfigDefaults {
                 relay_adapt_contract: address!("0xAc9f360Ae85469B27aEDdEaFC579Ef2d052aD405"),
                 relay_adapt_7702_contract: address!("0x2df3d82c06339387a4532c685daaf39a218cf56e"),
                 multicall_contract: address!("0xcA11bde05977b3631167028862bE2a173976CA11"),
-                rpc_url: Url::parse("https://ethereum-public.nodies.app")
-                    .expect("valid ethereum rpc url"),
+                rpc_urls: default_rpc_urls(&[
+                    "https://ethereum-public.nodies.app",
+                    "https://ethereum-rpc.publicnode.com",
+                    "https://rpc.eth.gateway.fm",
+                    "https://public-eth.nownodes.io",
+                    "https://eth.api.pocket.network",
+                    "https://mainnet.rpc.sentio.xyz",
+                    "https://eth.drpc.org",
+                ]),
                 quick_sync_endpoint: Some(
                     Url::parse("https://rail-squid.squids.live/squid-railgun-ethereum-v2/graphql")
                         .expect("valid ethereum quick sync endpoint"),
@@ -176,7 +183,13 @@ impl ChainConfigDefaults {
                 relay_adapt_contract: address!("0xf82d00fc51f730f42a00f85e74895a2849fff2dd"),
                 relay_adapt_7702_contract: address!("0x6fa84bc1587cc90978dc9535d4d38dc74fa4b522"),
                 multicall_contract: address!("0xcA11bde05977b3631167028862bE2a173976CA11"),
-                rpc_url: Url::parse("https://bsc.publicnode.com").expect("valid bsc rpc url"),
+                rpc_urls: default_rpc_urls(&[
+                    "https://bsc.publicnode.com",
+                    "https://binance-smart-chain-public.nodies.app",
+                    "https://bsc-mainnet.nodereal.io/v1/64a9df0874fb4a93b9d0a3849de012d3",
+                    "https://bsc.rpc.blxrbdn.com",
+                    "https://bsc.drpc.org",
+                ]),
                 quick_sync_endpoint: Some(
                     Url::parse("https://rail-squid.squids.live/squid-railgun-bsc-v2/graphql")
                         .expect("valid bsc quick sync endpoint"),
@@ -196,8 +209,13 @@ impl ChainConfigDefaults {
                 relay_adapt_contract: address!("0xF82d00fC51F730F42A00F85E74895a2849ffF2Dd"),
                 relay_adapt_7702_contract: address!("0x6fa84bc1587cc90978dc9535d4d38dc74fa4b522"),
                 multicall_contract: address!("0xcA11bde05977b3631167028862bE2a173976CA11"),
-                rpc_url: Url::parse("https://rpc-mainnet.matic.quiknode.pro")
-                    .expect("valid polygon rpc url"),
+                rpc_urls: default_rpc_urls(&[
+                    "https://rpc-mainnet.matic.quiknode.pro",
+                    "https://polygon-public.nodies.app",
+                    "https://polygon-bor-rpc.publicnode.com",
+                    "https://poly.api.pocket.network",
+                    "https://polygon.drpc.org",
+                ]),
                 quick_sync_endpoint: Some(
                     Url::parse("https://rail-squid.squids.live/squid-railgun-polygon-v2/graphql")
                         .expect("valid polygon quick sync endpoint"),
@@ -217,8 +235,16 @@ impl ChainConfigDefaults {
                 relay_adapt_contract: address!("0xB4F2d77bD12c6b548Ae398244d7FAD4ABCE4D89b"),
                 relay_adapt_7702_contract: address!("0x6fa84bc1587cc90978dc9535d4d38dc74fa4b522"),
                 multicall_contract: address!("0xcA11bde05977b3631167028862bE2a173976CA11"),
-                rpc_url: Url::parse("https://arbitrum-one-public.nodies.app")
-                    .expect("valid arbitrum rpc url"),
+                rpc_urls: default_rpc_urls(&[
+                    "https://arbitrum-one-public.nodies.app",
+                    "https://arb1.arbitrum.io/rpc",
+                    "https://arbitrum-one.public.blastapi.io",
+                    "https://arbitrum-one-rpc.publicnode.com",
+                    "https://api.zan.top/arb-one",
+                    "https://arbitrum.rpc.subquery.network/public",
+                    "https://arb1.lava.build",
+                    "https://arbitrum.gateway.tenderly.co",
+                ]),
                 quick_sync_endpoint: Some(
                     Url::parse("https://rail-squid.squids.live/squid-railgun-arbitrum-v2/graphql")
                         .expect("valid arbitrum quick sync endpoint"),
@@ -235,6 +261,12 @@ impl ChainConfigDefaults {
             _ => None,
         }
     }
+}
+
+fn default_rpc_urls(urls: &[&str]) -> Vec<Url> {
+    urls.iter()
+        .map(|url| Url::parse(url).expect("valid default rpc url"))
+        .collect()
 }
 
 pub trait WalletCacheStore: Send + Sync {
@@ -386,6 +418,24 @@ mod tests {
                 .unwrap()
                 .indexed_wallet_block_range,
             5_000_000
+        );
+    }
+
+    #[test]
+    fn default_rpc_urls_include_fallbacks() {
+        assert_eq!(
+            ChainConfigDefaults::for_chain(1).unwrap().rpc_urls[0].as_str(),
+            "https://ethereum-public.nodies.app/"
+        );
+        assert!(ChainConfigDefaults::for_chain(1).unwrap().rpc_urls.len() > 1);
+        assert!(ChainConfigDefaults::for_chain(56).unwrap().rpc_urls.len() > 1);
+        assert!(ChainConfigDefaults::for_chain(137).unwrap().rpc_urls.len() > 1);
+        assert!(
+            ChainConfigDefaults::for_chain(42161)
+                .unwrap()
+                .rpc_urls
+                .len()
+                > 1
         );
     }
 

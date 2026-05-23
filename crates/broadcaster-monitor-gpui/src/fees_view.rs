@@ -88,7 +88,7 @@ impl FeesChainFilterItem {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FeesTokenFilterItem {
     value: FeesFilter<(u64, Address)>,
     show_chain: bool,
@@ -181,6 +181,7 @@ pub(crate) struct FeesDelegate {
     broadcaster_input: Entity<InputState>,
     token_filter: FeesFilter<(u64, Address)>,
     token_select: Entity<SelectState<SearchableVec<FeesTokenFilterItem>>>,
+    synced_token_filter_items: Vec<FeesTokenFilterItem>,
     /// Active sort state for the fee column. `Default` preserves the natural
     /// (chain, broadcaster, token) order set by `set_rows`.
     fee_sort: ColumnSort,
@@ -233,6 +234,7 @@ impl FeesDelegate {
             broadcaster_input,
             token_filter: FeesFilter::All,
             token_select,
+            synced_token_filter_items: Vec::new(),
             fee_sort: ColumnSort::Default,
             bonus_sort: ColumnSort::Default,
         }
@@ -362,7 +364,7 @@ impl FeesDelegate {
     }
 
     pub(crate) fn sync_filter_selects(
-        &self,
+        &mut self,
         window: &mut Window,
         cx: &mut Context<'_, TableState<Self>>,
     ) {
@@ -373,9 +375,15 @@ impl FeesDelegate {
         });
 
         let token_items = self.token_filter_items();
+        let token_items_changed = self.synced_token_filter_items != token_items;
+        if token_items_changed {
+            self.synced_token_filter_items.clone_from(&token_items);
+        }
         self.token_select.update(cx, |select, cx| {
             let selected_value = select.selected_value().copied();
-            select.set_items(SearchableVec::new(token_items), window, cx);
+            if token_items_changed {
+                select.set_items(SearchableVec::new(token_items), window, cx);
+            }
             if selected_value != Some(self.token_filter) {
                 select.set_selected_value(&self.token_filter, window, cx);
             }
@@ -985,6 +993,20 @@ mod tests {
         let r_no_id = row(1, "0zkABCdef", t, None);
         assert!(matches_broadcaster(&r_no_id, "abcdef"));
         assert!(!matches_broadcaster(&r_no_id, "ali"));
+    }
+
+    #[test]
+    fn token_filter_items_compare_value_and_chain_display_scope() {
+        let token = address!("0x0000000000000000000000000000000000000001");
+
+        assert_eq!(
+            FeesTokenFilterItem::token(1, token, false),
+            FeesTokenFilterItem::token(1, token, false)
+        );
+        assert_ne!(
+            FeesTokenFilterItem::token(1, token, false),
+            FeesTokenFilterItem::token(1, token, true)
+        );
     }
 
     #[test]

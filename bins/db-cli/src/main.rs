@@ -54,6 +54,11 @@ struct DesktopWalletVaultValue {
     payload_len: usize,
 }
 
+#[derive(Serialize)]
+struct AppSettingsValue {
+    payload_len: usize,
+}
+
 fn main() -> Result<()> {
     let opt = Options::from_args();
 
@@ -197,6 +202,7 @@ fn print_value(table: Option<LocalDbTableInfo>, key: &str, value: &[u8], raw: bo
         LocalDbTableDecodeKind::PoiArtifactCache => {
             print_decoded::<PoiArtifactCacheRecord>(key, value)
         }
+        LocalDbTableDecodeKind::AppSettings => print_app_settings(key, value),
         LocalDbTableDecodeKind::WalletUtxo => print_wallet_utxo(key, value),
         LocalDbTableDecodeKind::DesktopWalletVault => print_desktop_wallet_vault(key, value),
     }
@@ -237,6 +243,16 @@ fn print_desktop_wallet_vault(key: &str, value: &[u8]) -> Result<()> {
     print_json(&entry)
 }
 
+fn print_app_settings(key: &str, value: &[u8]) -> Result<()> {
+    let entry = Entry {
+        key: key.to_string(),
+        value: AppSettingsValue {
+            payload_len: value.len(),
+        },
+    };
+    print_json(&entry)
+}
+
 fn split_wallet_key(key: &str) -> (String, String) {
     let mut parts = key.splitn(2, '|');
     let wallet_id = parts.next().unwrap_or_default().to_string();
@@ -248,4 +264,18 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
     let data = serde_json::to_string(value).wrap_err("serialize json")?;
     println!("{data}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppSettingsValue;
+
+    #[test]
+    fn app_settings_value_redacts_payload_bytes() {
+        let value = serde_json::to_value(AppSettingsValue { payload_len: 3 })
+            .expect("serialize app settings value");
+
+        assert_eq!(value["payload_len"], 3);
+        assert!(value.get("payload_hex").is_none());
+    }
 }

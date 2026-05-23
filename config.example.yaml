@@ -282,6 +282,10 @@ waku:
   # DNS-over-HTTPS endpoint to use for DNS resolution.
   doh_endpoint: "https://cloudflare-dns.com/dns-query"
 
+  # DNS-over-HTTPS fallback endpoints. In Tor network mode, the clearnet DoH
+  # endpoint is used as a fallback unless explicitly disabled.
+  #doh_fallback_endpoints: []
+
   # Maximum number of peers to maintain persistent connections with
   max_peers: 10
 

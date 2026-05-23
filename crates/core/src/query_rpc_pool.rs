@@ -83,6 +83,16 @@ impl QueryRpcPool {
         Some(self.handle(index))
     }
 
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.providers.len()
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.providers.is_empty()
+    }
+
     pub fn mark_bad_provider(&self, handle: &ProviderHandle) {
         let until = Instant::now() + self.cooldown;
         let mut cooldowns = self

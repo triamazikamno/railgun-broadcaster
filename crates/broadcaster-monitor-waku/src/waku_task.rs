@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use eyre::{Result, WrapErr};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use waku::PeerSnapshot;
 use waku::proto::WakuMessage;
 pub use waku::{DEFAULT_CLEARNET_DOH_ENDPOINT as DEFAULT_DOH_ENDPOINT, DEFAULT_TOR_DOH_ENDPOINT};
@@ -21,6 +21,7 @@ pub struct WakuMonitorConfig {
     pub cluster_id: Option<u32>,
     pub shard_id: Option<u32>,
     pub doh_endpoint: Option<String>,
+    pub doh_fallback_endpoints: Option<Vec<String>>,
     pub max_peers: Option<usize>,
     pub peer_connection_timeout: Option<Duration>,
     pub nwaku_url: Option<String>,
@@ -45,6 +46,7 @@ impl WakuMonitorConfig {
             direct_peers: Vec::new(),
             dns_enr_trees: None,
             doh_endpoint: Some(doh),
+            doh_fallback_endpoints: self.doh_fallback_endpoints.clone(),
             cluster_id: Some(self.cluster_id.unwrap_or(DEFAULT_CLUSTER_ID)),
             shard_id: Some(self.shard_id.unwrap_or(DEFAULT_SHARD_ID)),
             max_peers: Some(self.max_peers.unwrap_or(DEFAULT_MAX_PEERS)),
@@ -78,6 +80,26 @@ pub async fn spawn_workers(
     shared: Shared,
     events: EventTx,
 ) -> Result<()> {
+    spawn_workers_inner(opts, waku, shared, events, None).await
+}
+
+pub async fn spawn_workers_until_shutdown(
+    opts: WakuMonitorConfig,
+    waku: Arc<Client>,
+    shared: Shared,
+    events: EventTx,
+    shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    spawn_workers_inner(opts, waku, shared, events, Some(shutdown)).await
+}
+
+async fn spawn_workers_inner(
+    opts: WakuMonitorConfig,
+    waku: Arc<Client>,
+    shared: Shared,
+    events: EventTx,
+    mut shutdown: Option<watch::Receiver<bool>>,
+) -> Result<()> {
     let chain_ids = opts.chain_ids;
     let content_topics: Vec<String> = chain_ids
         .iter()
@@ -90,38 +112,83 @@ pub async fn spawn_workers(
         "subscribing to broadcaster fees content topics"
     );
 
-    spawn_peer_poll_worker(Arc::clone(&waku), shared.clone(), events.clone());
+    spawn_peer_poll_worker(
+        Arc::clone(&waku),
+        shared.clone(),
+        events.clone(),
+        shutdown.clone(),
+    );
 
     if let Some(reason) = waku.disabled_reason() {
         tracing::warn!(%reason, "Waku fee subscription disabled by network policy");
         return Ok(());
     }
 
-    let msg_rx = waku
-        .subscribe_with_fee_history(content_topics)
-        .await
-        .wrap_err("subscribe to fees content topics")?;
+    let subscribe = waku.subscribe_with_fee_history(content_topics);
+    let msg_rx = if let Some(shutdown) = shutdown.as_mut() {
+        tokio::select! {
+            result = subscribe => result.wrap_err("subscribe to fees content topics")?,
+            should_shutdown = shutdown_changed_or_requested(shutdown) => {
+                if should_shutdown {
+                    tracing::debug!("fees subscription startup shutting down");
+                    return Ok(());
+                }
+                return Ok(());
+            }
+        }
+    } else {
+        subscribe
+            .await
+            .wrap_err("subscribe to fees content topics")?
+    };
 
     // Fees message pipeline.
     {
         let shared = shared.clone();
         let events = events.clone();
         tokio::spawn(async move {
-            run_fees_loop(msg_rx, shared, events).await;
+            run_fees_loop(msg_rx, shared, events, shutdown).await;
         });
     }
 
     Ok(())
 }
 
-fn spawn_peer_poll_worker(waku: Arc<Client>, shared: Shared, events: EventTx) {
+fn spawn_peer_poll_worker(
+    waku: Arc<Client>,
+    shared: Shared,
+    events: EventTx,
+    shutdown: Option<watch::Receiver<bool>>,
+) {
     tokio::spawn(async move {
-        run_peer_poll_loop(waku, shared, events).await;
+        run_peer_poll_loop(waku, shared, events, shutdown).await;
     });
 }
 
-async fn run_fees_loop(mut msg_rx: mpsc::Receiver<WakuMessage>, shared: Shared, events: EventTx) {
-    while let Some(msg) = msg_rx.recv().await {
+async fn run_fees_loop(
+    mut msg_rx: mpsc::Receiver<WakuMessage>,
+    shared: Shared,
+    events: EventTx,
+    mut shutdown: Option<watch::Receiver<bool>>,
+) {
+    loop {
+        let msg = if let Some(shutdown) = shutdown.as_mut() {
+            tokio::select! {
+                msg = msg_rx.recv() => msg,
+                should_shutdown = shutdown_changed_or_requested(shutdown) => {
+                    if should_shutdown {
+                        tracing::debug!("fees subscription worker shutting down");
+                        return;
+                    }
+                    continue;
+                }
+            }
+        } else {
+            msg_rx.recv().await
+        };
+        let Some(msg) = msg else {
+            break;
+        };
         let Some(chain_id) = extract_fees_chain_id(&msg.content_topic) else {
             tracing::trace!(topic = %msg.content_topic, "ignoring non-fees content topic");
             continue;
@@ -203,12 +270,37 @@ pub fn extract_fees_chain_id(topic: &str) -> Option<u64> {
     }
 }
 
-async fn run_peer_poll_loop(waku: Arc<Client>, shared: Shared, events: EventTx) {
+async fn run_peer_poll_loop(
+    waku: Arc<Client>,
+    shared: Shared,
+    events: EventTx,
+    mut shutdown: Option<watch::Receiver<bool>>,
+) {
     let mut ticker = tokio::time::interval(PEER_POLL_INTERVAL);
     loop {
-        ticker.tick().await;
+        if let Some(shutdown) = shutdown.as_mut() {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                should_shutdown = shutdown_changed_or_requested(shutdown) => {
+                    if should_shutdown {
+                        tracing::debug!("peer polling worker shutting down");
+                        break;
+                    }
+                    continue;
+                }
+            }
+        } else {
+            ticker.tick().await;
+        }
         publish_peer_summary(&waku, &shared, &events);
     }
+}
+
+async fn shutdown_changed_or_requested(shutdown: &mut watch::Receiver<bool>) -> bool {
+    if *shutdown.borrow() {
+        return true;
+    }
+    shutdown.changed().await.is_err() || *shutdown.borrow()
 }
 
 fn publish_peer_summary(waku: &Client, shared: &Shared, events: &EventTx) {
@@ -321,6 +413,7 @@ mod tests {
         assert_eq!(cfg.shard_id, Some(DEFAULT_SHARD_ID));
         assert_eq!(cfg.max_peers, Some(DEFAULT_MAX_PEERS));
         assert_eq!(cfg.doh_endpoint.as_deref(), Some(DEFAULT_DOH_ENDPOINT));
+        assert!(cfg.doh_fallback_endpoints.is_none());
         assert_eq!(
             cfg.peer_connection_timeout
                 .map(humantime_serde::Serde::into_inner),
@@ -352,6 +445,9 @@ mod tests {
             shard_id: Some(3),
             max_peers: Some(42),
             doh_endpoint: Some("https://example.invalid/dns-query".to_string()),
+            doh_fallback_endpoints: Some(vec![
+                "https://fallback.example.invalid/dns-query".to_string(),
+            ]),
             peer_connection_timeout: Some(Duration::from_secs(3)),
             nwaku_url: Some("http://127.0.0.1:8645".to_string()),
             network: RelayNetworkConfig::direct(),
@@ -363,6 +459,10 @@ mod tests {
         assert_eq!(
             cfg.doh_endpoint.as_deref(),
             Some("https://example.invalid/dns-query")
+        );
+        assert_eq!(
+            cfg.doh_fallback_endpoints.as_deref(),
+            Some(["https://fallback.example.invalid/dns-query".to_string()].as_slice())
         );
         assert_eq!(
             cfg.peer_connection_timeout

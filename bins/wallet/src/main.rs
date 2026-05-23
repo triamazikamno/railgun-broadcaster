@@ -14,7 +14,6 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 use ui::logs::{DEFAULT_LOG_CAPACITY, LogStore, UiLogLayer};
-use wallet_ops::BuildCacheRequest;
 
 use crate::assets::WalletAssets;
 use crate::cli::Options;
@@ -33,20 +32,6 @@ fn main() -> Result<()> {
         .wrap_err("build tokio runtime")?;
     let logs = LogStore::new(DEFAULT_LOG_CAPACITY);
     install_tracing(logs.clone())?;
-
-    if opts.build_cache {
-        let request = BuildCacheRequest {
-            db_path: opts
-                .db_path
-                .clone()
-                .unwrap_or_else(crate::cli::default_db_path),
-            network_mode: opts.network_mode,
-            proxy: opts.proxy,
-        };
-        runtime.block_on(wallet_ops::build_cache(request))?;
-        drop(runtime);
-        return Ok(());
-    }
 
     let runtime_handle = runtime.handle().clone();
     let monitor = shared();
