@@ -5,12 +5,13 @@ use std::str::FromStr;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+use alloy::eips::BlockNumberOrTag;
 use alloy::eips::Encodable2718;
 use alloy::hex;
 use alloy::network::{EthereumWallet, NetworkTransactionBuilder, TransactionBuilder as _};
-use alloy::primitives::{Address, Bytes, FixedBytes, U256, address};
+use alloy::primitives::{Address, Bytes, FixedBytes, U256, address, keccak256};
 use alloy::providers::Provider;
-use alloy::rpc::types::TransactionRequest;
+use alloy::rpc::types::{FeeHistory, TransactionReceipt, TransactionRequest};
 use alloy::signers::k256::ecdsa::SigningKey;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::uint;
@@ -58,7 +59,8 @@ pub use sync_service::{
     PoiArtifactManifestSource, PoiArtifactSourceConfig, PoiCacheService, PoiReadSource,
     SyncProgressStage, SyncProgressUpdate,
 };
-use tokio::sync::{RwLock, oneshot, watch};
+use tokio::sync::{RwLock, mpsc, oneshot, watch};
+use tokio::task::JoinSet;
 use waku_relay::client::Client as WakuClient;
 use waku_relay::msg::ContentTopic;
 use zeroize::{Zeroize, Zeroizing};
@@ -256,7 +258,6 @@ pub(crate) use poi_contexts::{
 };
 pub(crate) use utxos::utxo_outputs_from_utxos;
 
-#[cfg(test)]
 pub(crate) use amounts::wrapped_native_token_for_chain;
 #[cfg(test)]
 pub(crate) use poi_contexts::{
@@ -355,6 +356,15 @@ pub struct DesktopSendCalldataRequest {
 
 pub const SELF_BROADCAST_AUTO_MAX_FEE_NUMERATOR: u128 = 120;
 pub const SELF_BROADCAST_AUTO_MAX_FEE_DENOMINATOR: u128 = 100;
+pub const SELF_BROADCAST_MIN_PRIORITY_FEE_PER_GAS: u128 = 1;
+pub const SELF_BROADCAST_REPLACEMENT_BUMP_NUMERATOR: u128 = 9;
+pub const SELF_BROADCAST_REPLACEMENT_BUMP_DENOMINATOR: u128 = 8;
+const SELF_BROADCAST_FEE_HISTORY_BLOCKS: u64 = 5;
+const SELF_BROADCAST_FEE_HISTORY_REWARD_PERCENTILES: [f64; 3] = [25.0, 50.0, 75.0];
+const SELF_BROADCAST_DIRECT_FEE_QUOTE_GRACE: Duration = Duration::from_millis(750);
+const SELF_BROADCAST_DIRECT_FEE_QUOTE_DEADLINE: Duration = Duration::from_secs(8);
+const SELF_BROADCAST_TOR_FEE_QUOTE_GRACE: Duration = Duration::from_secs(2);
+const SELF_BROADCAST_TOR_FEE_QUOTE_DEADLINE: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelfBroadcastGasFeeQuote {
@@ -373,13 +383,57 @@ pub enum SelfBroadcastGasFeeSelection {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelfBroadcastCommandKind {
+    Retry,
+    Replacement,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelfBroadcastCommand {
+    pub kind: SelfBroadcastCommandKind,
+    pub gas_fee: SelfBroadcastGasFeeSelection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfBroadcastAttemptInfo {
+    pub tx_hash: String,
+    pub nonce: u64,
+    pub gas_limit: u64,
+    pub max_fee_per_gas: u128,
+    pub max_priority_fee_per_gas: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelfBroadcastSessionEvent {
+    StepFailed {
+        stage: TransactionGenerationStage,
+        message: String,
+    },
+    AttemptSubmitted(SelfBroadcastAttemptInfo),
+    AttemptRejected {
+        stage: TransactionGenerationStage,
+        message: String,
+    },
+}
+
+pub type SelfBroadcastCommandSender = mpsc::UnboundedSender<SelfBroadcastCommand>;
+pub type SelfBroadcastCommandReceiver = mpsc::UnboundedReceiver<SelfBroadcastCommand>;
+pub type SelfBroadcastSessionEventSender = mpsc::UnboundedSender<SelfBroadcastSessionEvent>;
+
 impl SelfBroadcastGasFeeQuote {
     #[must_use]
     pub const fn from_rpc_gas_price(rpc_gas_price: u128) -> Self {
+        let suggested_max_fee_per_gas = self_broadcast_auto_max_fee_per_gas(rpc_gas_price);
+        let suggested_max_fee_per_gas = if suggested_max_fee_per_gas > 0 {
+            suggested_max_fee_per_gas
+        } else {
+            SELF_BROADCAST_MIN_PRIORITY_FEE_PER_GAS
+        };
         Self {
             rpc_gas_price,
-            suggested_max_fee_per_gas: self_broadcast_auto_max_fee_per_gas(rpc_gas_price),
-            suggested_max_priority_fee_per_gas: 0,
+            suggested_max_fee_per_gas,
+            suggested_max_priority_fee_per_gas: SELF_BROADCAST_MIN_PRIORITY_FEE_PER_GAS,
         }
     }
 }
@@ -390,6 +444,14 @@ pub const fn self_broadcast_auto_max_fee_per_gas(rpc_gas_price: u128) -> u128 {
         / SELF_BROADCAST_AUTO_MAX_FEE_DENOMINATOR
 }
 
+#[must_use]
+pub const fn self_broadcast_replacement_bumped_fee(value: u128) -> u128 {
+    value
+        .saturating_mul(SELF_BROADCAST_REPLACEMENT_BUMP_NUMERATOR)
+        .saturating_add(SELF_BROADCAST_REPLACEMENT_BUMP_DENOMINATOR - 1)
+        / SELF_BROADCAST_REPLACEMENT_BUMP_DENOMINATOR
+}
+
 pub async fn quote_desktop_self_broadcast_gas_fee(
     chain_id: u64,
     effective_chain: Option<&settings::EffectiveChainConfig>,
@@ -397,7 +459,7 @@ pub async fn quote_desktop_self_broadcast_gas_fee(
 ) -> Result<SelfBroadcastGasFeeQuote> {
     let chain = effective_desktop_chain_config(chain_id, effective_chain)?;
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
-    self_broadcast_gas_fee_quote_from_rpc_pool(&query_rpc_pool).await
+    self_broadcast_gas_fee_quote_from_rpc_pool(&query_rpc_pool, http.network_mode()).await
 }
 
 pub struct DesktopUnshieldSelfBroadcastRequest {
@@ -416,6 +478,8 @@ pub struct DesktopUnshieldSelfBroadcastRequest {
     pub verify_proof: bool,
     pub gas_fee: SelfBroadcastGasFeeSelection,
     pub progress_tx: Option<TransactionGenerationProgressSender>,
+    pub command_rx: Option<SelfBroadcastCommandReceiver>,
+    pub event_tx: Option<SelfBroadcastSessionEventSender>,
 }
 
 pub struct DesktopSendSelfBroadcastRequest {
@@ -433,6 +497,8 @@ pub struct DesktopSendSelfBroadcastRequest {
     pub verify_proof: bool,
     pub gas_fee: SelfBroadcastGasFeeSelection,
     pub progress_tx: Option<TransactionGenerationProgressSender>,
+    pub command_rx: Option<SelfBroadcastCommandReceiver>,
+    pub event_tx: Option<SelfBroadcastSessionEventSender>,
 }
 
 #[derive(Debug, Clone)]
@@ -787,6 +853,7 @@ pub struct DesktopSelfBroadcastResult {
     pub estimated_native_gas_cost: U256,
     pub live_native_balance: U256,
     pub tx: TxReceiptOutput,
+    pub attempts: Vec<SelfBroadcastAttemptInfo>,
 }
 
 struct PreparedPrivatePlan<P> {
@@ -825,14 +892,29 @@ struct DesktopSendPlanRequest<'a> {
 }
 
 struct SelfBroadcastPreflight {
-    provider_handle: ProviderHandle,
     tx_req: TransactionRequest,
+    nonce: u64,
     gas_limit: u64,
     rpc_gas_price: u128,
     max_fee_per_gas: u128,
     max_priority_fee_per_gas: u128,
     estimated_native_gas_cost: U256,
     live_native_balance: U256,
+}
+
+struct SubmittedSelfBroadcastAttempt {
+    provider_handles: Vec<ProviderHandle>,
+    tx_hash: FixedBytes<32>,
+    info: SelfBroadcastAttemptInfo,
+    rpc_gas_price: u128,
+    estimated_native_gas_cost: U256,
+    live_native_balance: U256,
+}
+
+struct SelfBroadcastSentTx {
+    tx_hash: FixedBytes<32>,
+    tx_hash_string: String,
+    provider_handles: Vec<ProviderHandle>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1313,7 +1395,7 @@ fn effective_desktop_chain_config(
             rpc_urls: defaults.rpc_urls,
             railgun_contract: defaults.contract,
             relay_adapt_contract: defaults.relay_adapt_contract,
-            wrapped_native_token: amounts::wrapped_native_token_for_chain(chain_id),
+            wrapped_native_token: wrapped_native_token_for_chain(chain_id),
             gas: settings::EffectiveChainGasSettings {
                 gas_limit_buffer: GAS_LIMIT_BUFFER,
                 gas_price_buffer_numerator: GAS_PRICE_BUFFER_NUMERATOR as u64,
@@ -1339,7 +1421,7 @@ fn effective_desktop_chain_config(
         .as_deref()
         .map(|value| parse_effective_address("wrapped native token", value))
         .transpose()?
-        .or_else(|| amounts::wrapped_native_token_for_chain(chain_id));
+        .or_else(|| wrapped_native_token_for_chain(chain_id));
     Ok(EffectiveDesktopChainConfig {
         rpc_urls,
         railgun_contract,
@@ -2601,6 +2683,8 @@ pub async fn submit_desktop_unshield_self_broadcast(
         pending_spent_inputs,
         request.gas_fee,
         request.progress_tx,
+        request.command_rx,
+        request.event_tx,
         http,
     )
     .await
@@ -2662,6 +2746,8 @@ pub async fn submit_desktop_send_self_broadcast(
         pending_spent_inputs,
         request.gas_fee,
         request.progress_tx,
+        request.command_rx,
+        request.event_tx,
         http,
     )
     .await
@@ -2680,30 +2766,13 @@ async fn submit_self_broadcast_plan(
     pending_spent_inputs: Vec<Utxo>,
     gas_fee: SelfBroadcastGasFeeSelection,
     progress_tx: Option<TransactionGenerationProgressSender>,
+    mut command_rx: Option<SelfBroadcastCommandReceiver>,
+    event_tx: Option<SelfBroadcastSessionEventSender>,
     http: &HttpContext,
 ) -> Result<DesktopSelfBroadcastResult> {
     let chain = effective_desktop_chain_config(chain_id, effective_chain)?;
     let gas_payer = self_broadcast_gas_payer(vault_store, view_session, &public_account_uuid)?;
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
-    update_transaction_generation_stage(
-        progress_tx.as_ref(),
-        TransactionGenerationStage::EstimatingSelfBroadcastGas,
-    );
-    let preflight = self_broadcast_preflight_from_rpc_pool(
-        &query_rpc_pool,
-        chain_id,
-        gas_payer,
-        to,
-        data,
-        gas_fee,
-        &chain.gas,
-    )
-    .await?;
-
-    update_transaction_generation_stage(
-        progress_tx.as_ref(),
-        TransactionGenerationStage::SigningSelfBroadcast,
-    );
     let signer = vaulted_public_signer(
         vault_store,
         view_session,
@@ -2716,33 +2785,365 @@ async fn submit_self_broadcast_plan(
         ));
     }
     let wallet = signer.ethereum_wallet();
-    let gas_limit = preflight.gas_limit;
-    let rpc_gas_price = preflight.rpc_gas_price;
-    let max_fee_per_gas = preflight.max_fee_per_gas;
-    let max_priority_fee_per_gas = preflight.max_priority_fee_per_gas;
-    let estimated_native_gas_cost = preflight.estimated_native_gas_cost;
-    let live_native_balance = preflight.live_native_balance;
-    let provider = preflight.provider_handle.provider;
-    let tx = sign_send_wait_self_broadcast_transaction(
-        &provider,
-        &wallet,
+    let mut next_gas_fee = gas_fee;
+    let mut submitted_attempts = Vec::new();
+    let mut nonce = None;
+
+    loop {
+        update_transaction_generation_stage(
+            progress_tx.as_ref(),
+            TransactionGenerationStage::EstimatingSelfBroadcastGas,
+        );
+        let preflight = match self_broadcast_preflight_from_rpc_pool(
+            &query_rpc_pool,
+            chain_id,
+            gas_payer,
+            to,
+            data.clone(),
+            next_gas_fee,
+            &chain.gas,
+            nonce,
+            http.network_mode(),
+        )
+        .await
+        {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                let message = report_chain_string(&error);
+                emit_self_broadcast_event(
+                    event_tx.as_ref(),
+                    SelfBroadcastSessionEvent::StepFailed {
+                        stage: TransactionGenerationStage::EstimatingSelfBroadcastGas,
+                        message,
+                    },
+                );
+                let Some(command) = recv_self_broadcast_command(&mut command_rx).await else {
+                    return Err(error);
+                };
+                next_gas_fee = command.gas_fee;
+                continue;
+            }
+        };
+        nonce = Some(preflight.nonce);
+
+        update_transaction_generation_stage(
+            progress_tx.as_ref(),
+            TransactionGenerationStage::SigningSelfBroadcast,
+        );
+        let attempt = match submit_self_broadcast_attempt(
+            preflight,
+            &query_rpc_pool,
+            http.network_mode(),
+            &wallet,
+            &session,
+            &pending_spent_inputs,
+            event_tx.as_ref(),
+        )
+        .await
+        {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                let message = report_chain_string(&error);
+                emit_self_broadcast_event(
+                    event_tx.as_ref(),
+                    SelfBroadcastSessionEvent::StepFailed {
+                        stage: TransactionGenerationStage::SigningSelfBroadcast,
+                        message,
+                    },
+                );
+                let Some(command) = recv_self_broadcast_command(&mut command_rx).await else {
+                    return Err(error);
+                };
+                next_gas_fee = command.gas_fee;
+                continue;
+            }
+        };
+        submitted_attempts.push(attempt);
+        update_transaction_generation_stage(
+            progress_tx.as_ref(),
+            TransactionGenerationStage::WaitingForSelfBroadcastReceipt,
+        );
+
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(3)) => {
+                    if let Some((winner_index, receipt)) = poll_self_broadcast_attempt_receipts(&submitted_attempts).await? {
+                        let winner = &submitted_attempts[winner_index];
+                        session
+                            .mark_pending_spent_utxos(
+                                &pending_spent_inputs,
+                                parse_submitted_tx_hash(&receipt.tx_hash),
+                            )
+                            .await;
+                        return Ok(DesktopSelfBroadcastResult {
+                            chain_id,
+                            public_account_uuid,
+                            gas_payer,
+                            gas_limit: winner.info.gas_limit,
+                            rpc_gas_price: winner.rpc_gas_price,
+                            max_fee_per_gas: winner.info.max_fee_per_gas,
+                            max_priority_fee_per_gas: winner.info.max_priority_fee_per_gas,
+                            estimated_native_gas_cost: winner.estimated_native_gas_cost,
+                            live_native_balance: winner.live_native_balance,
+                            tx: receipt,
+                            attempts: submitted_attempts
+                                .iter()
+                                .map(|attempt| attempt.info.clone())
+                                .collect(),
+                        });
+                    }
+                }
+                command = recv_self_broadcast_command(&mut command_rx) => {
+                    let Some(command) = command else {
+                        continue;
+                    };
+                    let Some(nonce) = nonce else {
+                        next_gas_fee = command.gas_fee;
+                        break;
+                    };
+                    let gas_limit = submitted_attempts
+                        .last()
+                        .map_or(0, |attempt| attempt.info.gas_limit);
+                    let replacement = match self_broadcast_replacement_preflight_from_rpc_pool(
+                        &query_rpc_pool,
+                        chain_id,
+                        gas_payer,
+                        to,
+                        data.clone(),
+                        command.gas_fee,
+                        gas_limit,
+                        nonce,
+                    )
+                    .await
+                    {
+                        Ok(preflight) => preflight,
+                        Err(error) => {
+                            emit_self_broadcast_event(
+                                event_tx.as_ref(),
+                                SelfBroadcastSessionEvent::AttemptRejected {
+                                    stage: TransactionGenerationStage::WaitingForSelfBroadcastReceipt,
+                                    message: report_chain_string(&error),
+                                },
+                            );
+                            continue;
+                        }
+                    };
+                    update_transaction_generation_stage(
+                        progress_tx.as_ref(),
+                        TransactionGenerationStage::SigningSelfBroadcast,
+                    );
+                    match submit_self_broadcast_attempt(
+                        replacement,
+                        &query_rpc_pool,
+                        http.network_mode(),
+                        &wallet,
+                        &session,
+                        &pending_spent_inputs,
+                        event_tx.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(attempt) => submitted_attempts.push(attempt),
+                        Err(error) => emit_self_broadcast_event(
+                            event_tx.as_ref(),
+                            SelfBroadcastSessionEvent::AttemptRejected {
+                                stage: TransactionGenerationStage::SigningSelfBroadcast,
+                                message: report_chain_string(&error),
+                            },
+                        ),
+                    }
+                    update_transaction_generation_stage(
+                        progress_tx.as_ref(),
+                        TransactionGenerationStage::WaitingForSelfBroadcastReceipt,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn emit_self_broadcast_event(
+    event_tx: Option<&SelfBroadcastSessionEventSender>,
+    event: SelfBroadcastSessionEvent,
+) {
+    if let Some(event_tx) = event_tx {
+        let _ = event_tx.send(event);
+    }
+}
+
+fn report_chain_string(error: &Report) -> String {
+    error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
+}
+
+async fn recv_self_broadcast_command(
+    command_rx: &mut Option<SelfBroadcastCommandReceiver>,
+) -> Option<SelfBroadcastCommand> {
+    let command_rx = command_rx.as_mut()?;
+    command_rx.recv().await
+}
+
+async fn submit_self_broadcast_attempt(
+    preflight: SelfBroadcastPreflight,
+    query_rpc_pool: &QueryRpcPool,
+    network_mode: WalletNetworkMode,
+    wallet: &EthereumWallet,
+    session: &WalletSession,
+    pending_spent_inputs: &[Utxo],
+    event_tx: Option<&SelfBroadcastSessionEventSender>,
+) -> Result<SubmittedSelfBroadcastAttempt> {
+    let sent = sign_send_self_broadcast_transaction(
+        query_rpc_pool,
+        network_mode,
+        wallet,
         preflight.tx_req,
-        &session,
-        &pending_spent_inputs,
-        progress_tx.as_ref(),
+        session,
+        pending_spent_inputs,
     )
     .await?;
-    Ok(DesktopSelfBroadcastResult {
-        chain_id,
-        public_account_uuid,
-        gas_payer,
+    let info = SelfBroadcastAttemptInfo {
+        tx_hash: sent.tx_hash_string,
+        nonce: preflight.nonce,
+        gas_limit: preflight.gas_limit,
+        max_fee_per_gas: preflight.max_fee_per_gas,
+        max_priority_fee_per_gas: preflight.max_priority_fee_per_gas,
+    };
+    emit_self_broadcast_event(
+        event_tx,
+        SelfBroadcastSessionEvent::AttemptSubmitted(info.clone()),
+    );
+    Ok(SubmittedSelfBroadcastAttempt {
+        provider_handles: sent.provider_handles,
+        tx_hash: sent.tx_hash,
+        info,
+        rpc_gas_price: preflight.rpc_gas_price,
+        estimated_native_gas_cost: preflight.estimated_native_gas_cost,
+        live_native_balance: preflight.live_native_balance,
+    })
+}
+
+async fn poll_self_broadcast_attempt_receipts(
+    attempts: &[SubmittedSelfBroadcastAttempt],
+) -> Result<Option<(usize, TxReceiptOutput)>> {
+    for (index, attempt) in attempts.iter().enumerate() {
+        for provider_handle in &attempt.provider_handles {
+            match provider_handle
+                .provider
+                .get_transaction_receipt(attempt.tx_hash)
+                .await
+            {
+                Ok(Some(receipt)) => {
+                    return Ok(Some((index, tx_receipt_output(attempt.tx_hash, &receipt))));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        url = %provider_handle.url,
+                        %error,
+                        "self-broadcast receipt fetch failed"
+                    );
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+async fn self_broadcast_replacement_preflight_from_rpc_pool(
+    query_rpc_pool: &QueryRpcPool,
+    chain_id: u64,
+    from: Address,
+    to: Address,
+    data: Bytes,
+    gas_fee: SelfBroadcastGasFeeSelection,
+    gas_limit: u64,
+    nonce: u64,
+) -> Result<SelfBroadcastPreflight> {
+    let mut last_error = None;
+    for _ in 0..query_rpc_pool.len() {
+        let Some(provider_handle) = query_rpc_pool.random_provider() else {
+            break;
+        };
+        match self_broadcast_replacement_preflight(
+            provider_handle,
+            chain_id,
+            from,
+            to,
+            data.clone(),
+            gas_fee,
+            gas_limit,
+            nonce,
+        )
+        .await
+        {
+            Ok(preflight) => return Ok(preflight),
+            Err(error) if is_self_broadcast_insufficient_native_gas_error(&error) => {
+                return Err(error);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "self-broadcast replacement preflight failed");
+                last_error = Some(error);
+            }
+        }
+    }
+    if let Some(error) = last_error {
+        Err(error).wrap_err("all self-broadcast replacement RPC attempts failed")
+    } else {
+        Err(eyre!("no healthy query RPC available"))
+    }
+}
+
+async fn self_broadcast_replacement_preflight(
+    provider_handle: ProviderHandle,
+    chain_id: u64,
+    from: Address,
+    to: Address,
+    data: Bytes,
+    gas_fee: SelfBroadcastGasFeeSelection,
+    gas_limit: u64,
+    nonce: u64,
+) -> Result<SelfBroadcastPreflight> {
+    let provider = &provider_handle.provider;
+    let quote = self_broadcast_gas_fee_quote(provider)
+        .await
+        .wrap_err("fetch self-broadcast gas price")?;
+    let SelfBroadcastResolvedGasFee {
+        rpc_gas_price,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+    } = resolve_self_broadcast_gas_fee(gas_fee, quote)?;
+    let estimated_native_gas_cost = self_broadcast_native_gas_cost(gas_limit, max_fee_per_gas);
+    let live_native_balance = provider
+        .get_balance(from)
+        .await
+        .wrap_err("fetch self-broadcast native balance")?;
+    if live_native_balance < estimated_native_gas_cost {
+        return Err(self_broadcast_insufficient_native_gas_error(
+            live_native_balance,
+            estimated_native_gas_cost,
+        ));
+    }
+    Ok(SelfBroadcastPreflight {
+        tx_req: self_broadcast_transaction_request(
+            chain_id,
+            from,
+            to,
+            data,
+            max_fee_per_gas,
+            max_priority_fee_per_gas,
+            nonce,
+        )
+        .with_gas_limit(gas_limit),
+        nonce,
         gas_limit,
         rpc_gas_price,
         max_fee_per_gas,
         max_priority_fee_per_gas,
         estimated_native_gas_cost,
         live_native_balance,
-        tx,
     })
 }
 
@@ -2767,34 +3168,274 @@ struct SelfBroadcastResolvedGasFee {
     max_priority_fee_per_gas: u128,
 }
 
-async fn self_broadcast_gas_fee_quote_from_rpc_pool(
-    query_rpc_pool: &QueryRpcPool,
-) -> Result<SelfBroadcastGasFeeQuote> {
-    let mut last_error = None;
-    for _ in 0..query_rpc_pool.len() {
-        let Some(provider_handle) = query_rpc_pool.random_provider() else {
-            break;
-        };
-        match self_broadcast_gas_fee_quote(&provider_handle.provider).await {
-            Ok(quote) => return Ok(quote),
-            Err(error) => {
-                tracing::warn!(%error, "self-broadcast gas fee quote failed");
-                last_error = Some(error);
-            }
+#[derive(Debug, Clone, Copy)]
+struct SelfBroadcastFeeQuoteTimeoutPolicy {
+    grace_after_first_usable: Duration,
+    hard_deadline: Duration,
+}
+
+impl SelfBroadcastFeeQuoteTimeoutPolicy {
+    const fn for_network_mode(network_mode: WalletNetworkMode) -> Self {
+        match network_mode {
+            WalletNetworkMode::Tor => Self {
+                grace_after_first_usable: SELF_BROADCAST_TOR_FEE_QUOTE_GRACE,
+                hard_deadline: SELF_BROADCAST_TOR_FEE_QUOTE_DEADLINE,
+            },
+            WalletNetworkMode::Proxy | WalletNetworkMode::Direct => Self {
+                grace_after_first_usable: SELF_BROADCAST_DIRECT_FEE_QUOTE_GRACE,
+                hard_deadline: SELF_BROADCAST_DIRECT_FEE_QUOTE_DEADLINE,
+            },
         }
     }
-    if let Some(error) = last_error {
-        Err(error).wrap_err("all self-broadcast gas quote RPC attempts failed")
-    } else {
-        Err(eyre!("no healthy query RPC available"))
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SelfBroadcastFeeSample {
+    rpc_gas_price: Option<u128>,
+    max_priority_fee_per_gas: Option<u128>,
+    next_base_fee_per_gas: Option<u128>,
+    priority_fee_rewards: Vec<u128>,
+}
+
+impl SelfBroadcastFeeSample {
+    fn from_parts(
+        rpc_gas_price: Option<u128>,
+        max_priority_fee_per_gas: Option<u128>,
+        fee_history: Option<FeeHistory>,
+    ) -> Self {
+        let Some(fee_history) = fee_history else {
+            return Self {
+                rpc_gas_price,
+                max_priority_fee_per_gas,
+                next_base_fee_per_gas: None,
+                priority_fee_rewards: Vec::new(),
+            };
+        };
+        let next_base_fee_per_gas = fee_history.base_fee_per_gas.last().copied();
+        let priority_fee_rewards = fee_history
+            .reward
+            .unwrap_or_default()
+            .into_iter()
+            .flatten()
+            .collect();
+        Self {
+            rpc_gas_price,
+            max_priority_fee_per_gas,
+            next_base_fee_per_gas,
+            priority_fee_rewards,
+        }
     }
+
+    fn has_non_zero_fee_history_tip(&self) -> bool {
+        self.priority_fee_rewards.iter().any(|value| *value > 0)
+    }
+
+    const fn has_non_zero_priority_tip(&self) -> bool {
+        matches!(self.max_priority_fee_per_gas, Some(value) if value > 0)
+    }
+
+    fn has_usable_tip(&self) -> bool {
+        self.has_non_zero_fee_history_tip() || self.has_non_zero_priority_tip()
+    }
+}
+
+async fn self_broadcast_parallel_fee_samples(
+    providers: Vec<ProviderHandle>,
+    policy: SelfBroadcastFeeQuoteTimeoutPolicy,
+) -> Vec<SelfBroadcastFeeSample> {
+    let started_at = Instant::now();
+    let mut join_set = JoinSet::new();
+    for provider_handle in providers {
+        join_set.spawn(self_broadcast_provider_fee_sample(
+            provider_handle,
+            policy.hard_deadline,
+        ));
+    }
+
+    let mut samples = Vec::new();
+    let mut grace_deadline = None;
+    while !join_set.is_empty() {
+        let now = Instant::now();
+        let Some(hard_remaining) = policy
+            .hard_deadline
+            .checked_sub(now.saturating_duration_since(started_at))
+        else {
+            break;
+        };
+        let wait_for = grace_deadline.map_or(hard_remaining, |deadline: Instant| {
+            deadline.saturating_duration_since(now).min(hard_remaining)
+        });
+        if wait_for.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(wait_for, join_set.join_next()).await {
+            Ok(Some(Ok(sample))) => {
+                let usable_tip = sample.has_usable_tip();
+                samples.push(sample);
+                if usable_tip && grace_deadline.is_none() {
+                    grace_deadline = Some(Instant::now() + policy.grace_after_first_usable);
+                }
+                let non_zero_fee_history_sources = samples
+                    .iter()
+                    .filter(|sample| sample.has_non_zero_fee_history_tip())
+                    .count();
+                if non_zero_fee_history_sources >= 2 {
+                    break;
+                }
+            }
+            Ok(Some(Err(error))) => {
+                tracing::warn!(%error, "self-broadcast gas fee quote task failed");
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    join_set.abort_all();
+    samples
+}
+
+async fn self_broadcast_provider_fee_sample(
+    provider_handle: ProviderHandle,
+    timeout: Duration,
+) -> SelfBroadcastFeeSample {
+    let provider = provider_handle.provider;
+    let gas_price = tokio::time::timeout(timeout, provider.get_gas_price());
+    let max_priority_fee = tokio::time::timeout(timeout, provider.get_max_priority_fee_per_gas());
+    let fee_history = tokio::time::timeout(
+        timeout,
+        provider.get_fee_history(
+            SELF_BROADCAST_FEE_HISTORY_BLOCKS,
+            BlockNumberOrTag::Latest,
+            &SELF_BROADCAST_FEE_HISTORY_REWARD_PERCENTILES,
+        ),
+    );
+    let (gas_price, max_priority_fee, fee_history) =
+        tokio::join!(gas_price, max_priority_fee, fee_history);
+    let rpc_gas_price = match gas_price {
+        Ok(Ok(value)) => Some(value),
+        Ok(Err(error)) => {
+            tracing::warn!(url = %provider_handle.url, %error, "self-broadcast eth_gasPrice failed");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(url = %provider_handle.url, "self-broadcast eth_gasPrice timed out");
+            None
+        }
+    };
+    let max_priority_fee_per_gas = match max_priority_fee {
+        Ok(Ok(value)) => Some(value),
+        Ok(Err(error)) => {
+            tracing::debug!(url = %provider_handle.url, %error, "self-broadcast eth_maxPriorityFeePerGas failed");
+            None
+        }
+        Err(_) => {
+            tracing::debug!(url = %provider_handle.url, "self-broadcast eth_maxPriorityFeePerGas timed out");
+            None
+        }
+    };
+    let fee_history = match fee_history {
+        Ok(Ok(value)) => Some(value),
+        Ok(Err(error)) => {
+            tracing::debug!(url = %provider_handle.url, %error, "self-broadcast eth_feeHistory failed");
+            None
+        }
+        Err(_) => {
+            tracing::debug!(url = %provider_handle.url, "self-broadcast eth_feeHistory timed out");
+            None
+        }
+    };
+    SelfBroadcastFeeSample::from_parts(rpc_gas_price, max_priority_fee_per_gas, fee_history)
+}
+
+fn self_broadcast_quote_from_fee_samples(
+    samples: &[SelfBroadcastFeeSample],
+) -> Option<SelfBroadcastGasFeeQuote> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut gas_prices = non_zero_values(samples.iter().filter_map(|sample| sample.rpc_gas_price));
+    let mut fee_history_rewards = non_zero_values(
+        samples
+            .iter()
+            .flat_map(|sample| sample.priority_fee_rewards.iter().copied()),
+    );
+    let mut priority_fee_suggestions = non_zero_values(
+        samples
+            .iter()
+            .filter_map(|sample| sample.max_priority_fee_per_gas),
+    );
+    let mut next_base_fees = non_zero_values(
+        samples
+            .iter()
+            .filter_map(|sample| sample.next_base_fee_per_gas),
+    );
+
+    let selected_tip = upper_quartile(&mut fee_history_rewards)
+        .or_else(|| upper_quartile(&mut priority_fee_suggestions))
+        .unwrap_or(SELF_BROADCAST_MIN_PRIORITY_FEE_PER_GAS)
+        .max(SELF_BROADCAST_MIN_PRIORITY_FEE_PER_GAS);
+    let rpc_gas_price = upper_quartile(&mut gas_prices);
+    let gas_price_max_fee = rpc_gas_price.map_or(0, self_broadcast_auto_max_fee_per_gas);
+    let fee_history_max_fee = upper_quartile(&mut next_base_fees).map_or(0, |base_fee| {
+        self_broadcast_auto_max_fee_per_gas(base_fee).saturating_add(selected_tip)
+    });
+    let suggested_max_fee_per_gas = gas_price_max_fee.max(fee_history_max_fee).max(selected_tip);
+    Some(SelfBroadcastGasFeeQuote {
+        rpc_gas_price: rpc_gas_price.unwrap_or(suggested_max_fee_per_gas),
+        suggested_max_fee_per_gas,
+        suggested_max_priority_fee_per_gas: selected_tip.min(suggested_max_fee_per_gas),
+    })
+}
+
+fn non_zero_values(values: impl IntoIterator<Item = u128>) -> Vec<u128> {
+    values.into_iter().filter(|value| *value > 0).collect()
+}
+
+fn upper_quartile(values: &mut [u128]) -> Option<u128> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    let index = values.len().saturating_mul(3).saturating_sub(1) / 4;
+    values.get(index).copied()
+}
+
+async fn self_broadcast_gas_fee_quote_from_rpc_pool(
+    query_rpc_pool: &QueryRpcPool,
+    network_mode: WalletNetworkMode,
+) -> Result<SelfBroadcastGasFeeQuote> {
+    let providers = query_rpc_pool.available_providers();
+    if providers.is_empty() {
+        return Err(eyre!("no healthy query RPC available"));
+    }
+    let policy = SelfBroadcastFeeQuoteTimeoutPolicy::for_network_mode(network_mode);
+    let samples = self_broadcast_parallel_fee_samples(providers, policy).await;
+    if let Some(quote) = self_broadcast_quote_from_fee_samples(&samples) {
+        return Ok(quote);
+    }
+
+    Err(eyre!("all self-broadcast gas quote RPC attempts failed"))
 }
 
 async fn self_broadcast_gas_fee_quote(
     provider: &impl Provider,
 ) -> Result<SelfBroadcastGasFeeQuote> {
     let rpc_gas_price = provider.get_gas_price().await.wrap_err("fetch gas price")?;
-    Ok(SelfBroadcastGasFeeQuote::from_rpc_gas_price(rpc_gas_price))
+    let max_priority_fee_per_gas = provider.get_max_priority_fee_per_gas().await.ok();
+    let fee_history = provider
+        .get_fee_history(
+            SELF_BROADCAST_FEE_HISTORY_BLOCKS,
+            BlockNumberOrTag::Latest,
+            &SELF_BROADCAST_FEE_HISTORY_REWARD_PERCENTILES,
+        )
+        .await
+        .ok();
+    let sample = SelfBroadcastFeeSample::from_parts(
+        Some(rpc_gas_price),
+        max_priority_fee_per_gas,
+        fee_history,
+    );
+    self_broadcast_quote_from_fee_samples(&[sample])
+        .ok_or_else(|| eyre!("self-broadcast gas fee quote returned no usable values"))
 }
 
 fn resolve_self_broadcast_gas_fee(
@@ -2844,7 +3485,12 @@ async fn self_broadcast_preflight_from_rpc_pool(
     data: Bytes,
     gas_fee: SelfBroadcastGasFeeSelection,
     gas: &settings::EffectiveChainGasSettings,
+    nonce: Option<u64>,
+    network_mode: WalletNetworkMode,
 ) -> Result<SelfBroadcastPreflight> {
+    let quote = self_broadcast_gas_fee_quote_from_rpc_pool(query_rpc_pool, network_mode)
+        .await
+        .wrap_err("fetch self-broadcast gas price")?;
     let mut last_error = None;
     for _ in 0..query_rpc_pool.len() {
         let Some(provider_handle) = query_rpc_pool.random_provider() else {
@@ -2857,7 +3503,9 @@ async fn self_broadcast_preflight_from_rpc_pool(
             to,
             data.clone(),
             gas_fee,
+            quote,
             gas,
+            nonce,
         )
         .await
         {
@@ -2866,7 +3514,7 @@ async fn self_broadcast_preflight_from_rpc_pool(
                 return Err(error);
             }
             Err(error) => {
-                tracing::warn!(%error, "self-broadcast preflight failed");
+                tracing::warn!(?error, "self-broadcast preflight failed");
                 last_error = Some(error);
             }
         }
@@ -2885,21 +3533,24 @@ async fn self_broadcast_preflight(
     to: Address,
     data: Bytes,
     gas_fee: SelfBroadcastGasFeeSelection,
+    quote: SelfBroadcastGasFeeQuote,
     gas: &settings::EffectiveChainGasSettings,
+    nonce: Option<u64>,
 ) -> Result<SelfBroadcastPreflight> {
     let provider = &provider_handle.provider;
-    let quote = self_broadcast_gas_fee_quote(provider)
-        .await
-        .wrap_err("fetch self-broadcast gas price")?;
     let SelfBroadcastResolvedGasFee {
         rpc_gas_price,
         max_fee_per_gas,
         max_priority_fee_per_gas,
     } = resolve_self_broadcast_gas_fee(gas_fee, quote)?;
-    let nonce = provider
-        .get_transaction_count(from)
-        .await
-        .wrap_err("fetch self-broadcast nonce")?;
+    let nonce = if let Some(nonce) = nonce {
+        nonce
+    } else {
+        provider
+            .get_transaction_count(from)
+            .await
+            .wrap_err("fetch self-broadcast nonce")?
+    };
     let tx_req = self_broadcast_transaction_request(
         chain_id,
         from,
@@ -2926,8 +3577,8 @@ async fn self_broadcast_preflight(
         ));
     }
     Ok(SelfBroadcastPreflight {
-        provider_handle,
         tx_req: tx_req.with_gas_limit(gas_limit),
+        nonce,
         gas_limit,
         rpc_gas_price,
         max_fee_per_gas,
@@ -2976,14 +3627,25 @@ fn is_self_broadcast_insufficient_native_gas_error(error: &Report) -> bool {
         .starts_with("insufficient native gas for self-broadcast:")
 }
 
-async fn sign_send_wait_self_broadcast_transaction(
-    provider: &(impl Provider + Clone),
+enum SelfBroadcastRawTxBroadcastOutcome {
+    Accepted,
+    AlreadyKnown,
+    Rejected(String),
+}
+
+struct SelfBroadcastRawTxBroadcastResult {
+    provider_handle: ProviderHandle,
+    outcome: SelfBroadcastRawTxBroadcastOutcome,
+}
+
+async fn sign_send_self_broadcast_transaction(
+    query_rpc_pool: &QueryRpcPool,
+    network_mode: WalletNetworkMode,
     wallet: &EthereumWallet,
     tx_req: TransactionRequest,
     session: &WalletSession,
     pending_spent_inputs: &[Utxo],
-    progress_tx: Option<&TransactionGenerationProgressSender>,
-) -> Result<TxReceiptOutput> {
+) -> Result<SelfBroadcastSentTx> {
     tracing::info!(
         from = %tx_req.from.unwrap_or_default(),
         to = ?tx_req.to,
@@ -2995,12 +3657,15 @@ async fn sign_send_wait_self_broadcast_transaction(
         .await
         .wrap_err("self-broadcast: sign")?
         .encoded_2718();
-    let tx_hash = provider
-        .send_raw_transaction(&signed_tx)
-        .await
-        .wrap_err("self-broadcast: send")?
-        .tx_hash()
-        .to_owned();
+    let tx_hash = keccak256(&signed_tx);
+    let provider_handles = self_broadcast_send_raw_transaction_to_rpc_pool(
+        query_rpc_pool,
+        network_mode,
+        signed_tx,
+        tx_hash,
+    )
+    .await
+    .wrap_err("self-broadcast: send")?;
     let tx_hash_string = hex::encode_prefixed(tx_hash);
     session
         .mark_pending_spent_utxos(
@@ -3008,23 +3673,159 @@ async fn sign_send_wait_self_broadcast_transaction(
             parse_submitted_tx_hash(&tx_hash_string),
         )
         .await;
-    tracing::info!(%tx_hash, "sent self-broadcast transaction, waiting for confirmation...");
-    update_transaction_generation_stage(
-        progress_tx,
-        TransactionGenerationStage::WaitingForSelfBroadcastReceipt,
-    );
+    tracing::info!(%tx_hash, providers = provider_handles.len(), "sent self-broadcast transaction");
+    Ok(SelfBroadcastSentTx {
+        tx_hash,
+        tx_hash_string,
+        provider_handles,
+    })
+}
 
-    let receipt = loop {
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        if let Some(receipt) = provider
-            .get_transaction_receipt(tx_hash)
-            .await
-            .wrap_err("self-broadcast: fetch receipt")?
-        {
-            break receipt;
+async fn self_broadcast_send_raw_transaction_to_rpc_pool(
+    query_rpc_pool: &QueryRpcPool,
+    network_mode: WalletNetworkMode,
+    signed_tx: Vec<u8>,
+    tx_hash: FixedBytes<32>,
+) -> Result<Vec<ProviderHandle>> {
+    let providers = query_rpc_pool.available_providers();
+    if providers.is_empty() {
+        return Err(eyre!("no healthy query RPC available"));
+    }
+
+    let policy = SelfBroadcastFeeQuoteTimeoutPolicy::for_network_mode(network_mode);
+    let started_at = Instant::now();
+    let mut join_set = JoinSet::new();
+    for provider_handle in providers {
+        join_set.spawn(self_broadcast_send_raw_transaction_to_provider(
+            provider_handle,
+            signed_tx.clone(),
+            tx_hash,
+            policy.hard_deadline,
+        ));
+    }
+
+    let mut accepted_provider_handles = Vec::new();
+    let mut last_error = None;
+    let mut grace_deadline = None;
+    while !join_set.is_empty() {
+        let now = Instant::now();
+        let Some(hard_remaining) = policy
+            .hard_deadline
+            .checked_sub(now.saturating_duration_since(started_at))
+        else {
+            break;
+        };
+        let wait_for = grace_deadline.map_or(hard_remaining, |deadline: Instant| {
+            deadline.saturating_duration_since(now).min(hard_remaining)
+        });
+        if wait_for.is_zero() {
+            break;
         }
-    };
 
+        match tokio::time::timeout(wait_for, join_set.join_next()).await {
+            Ok(Some(Ok(result))) => match result.outcome {
+                SelfBroadcastRawTxBroadcastOutcome::Accepted => {
+                    tracing::info!(
+                        url = %result.provider_handle.url,
+                        %tx_hash,
+                        "self-broadcast tx accepted by RPC"
+                    );
+                    accepted_provider_handles.push(result.provider_handle);
+                    if grace_deadline.is_none() {
+                        grace_deadline = Some(Instant::now() + policy.grace_after_first_usable);
+                    }
+                }
+                SelfBroadcastRawTxBroadcastOutcome::AlreadyKnown => {
+                    tracing::info!(
+                        url = %result.provider_handle.url,
+                        %tx_hash,
+                        "self-broadcast tx already known by RPC"
+                    );
+                    accepted_provider_handles.push(result.provider_handle);
+                    if grace_deadline.is_none() {
+                        grace_deadline = Some(Instant::now() + policy.grace_after_first_usable);
+                    }
+                }
+                SelfBroadcastRawTxBroadcastOutcome::Rejected(message) => {
+                    tracing::warn!(
+                        url = %result.provider_handle.url,
+                        %tx_hash,
+                        message,
+                        "self-broadcast tx rejected by RPC"
+                    );
+                    last_error = Some(message);
+                }
+            },
+            Ok(Some(Err(error))) => {
+                last_error = Some(error.to_string());
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    join_set.abort_all();
+
+    if accepted_provider_handles.is_empty() {
+        return Err(eyre!(last_error.unwrap_or_else(|| {
+            "self-broadcast transaction was not accepted by any RPC before the deadline".to_string()
+        })));
+    }
+    Ok(accepted_provider_handles)
+}
+
+async fn self_broadcast_send_raw_transaction_to_provider(
+    provider_handle: ProviderHandle,
+    signed_tx: Vec<u8>,
+    tx_hash: FixedBytes<32>,
+    timeout: Duration,
+) -> SelfBroadcastRawTxBroadcastResult {
+    let send_result = tokio::time::timeout(
+        timeout,
+        provider_handle.provider.send_raw_transaction(&signed_tx),
+    )
+    .await;
+    let outcome = match send_result {
+        Ok(Ok(pending)) => {
+            let returned_hash = pending.tx_hash().to_owned();
+            if returned_hash == tx_hash {
+                SelfBroadcastRawTxBroadcastOutcome::Accepted
+            } else {
+                SelfBroadcastRawTxBroadcastOutcome::Rejected(format!(
+                    "RPC returned unexpected transaction hash {returned_hash}; expected {tx_hash}"
+                ))
+            }
+        }
+        Ok(Err(error)) if is_self_broadcast_tx_already_known_error(&error) => {
+            SelfBroadcastRawTxBroadcastOutcome::AlreadyKnown
+        }
+        Ok(Err(error)) => SelfBroadcastRawTxBroadcastOutcome::Rejected(error.to_string()),
+        Err(_) => SelfBroadcastRawTxBroadcastOutcome::Rejected(
+            "self-broadcast send timed out".to_string(),
+        ),
+    };
+    SelfBroadcastRawTxBroadcastResult {
+        provider_handle,
+        outcome,
+    }
+}
+
+fn is_self_broadcast_tx_already_known_error(error: &alloy::transports::TransportError) -> bool {
+    error
+        .as_error_resp()
+        .is_some_and(|response| is_self_broadcast_tx_already_known_message(&response.message))
+}
+
+fn is_self_broadcast_tx_already_known_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("already known")
+        || message.contains("already in mempool")
+        || message.contains("known transaction")
+        || message.contains("already imported")
+        || message.contains("already have")
+        || message.contains("already exists")
+        || message.contains("transaction already")
+}
+
+fn tx_receipt_output(tx_hash: FixedBytes<32>, receipt: &TransactionReceipt) -> TxReceiptOutput {
     let status = receipt.status();
     let block_number = receipt.block_number.unwrap_or(0);
     let gas_used = receipt.gas_used;
@@ -3033,12 +3834,12 @@ async fn sign_send_wait_self_broadcast_transaction(
     } else {
         tracing::warn!(%tx_hash, block_number, gas_used, "self-broadcast transaction reverted");
     }
-    Ok(TxReceiptOutput {
-        tx_hash: tx_hash_string,
+    TxReceiptOutput {
+        tx_hash: hex::encode_prefixed(tx_hash),
         status,
         block_number,
         gas_used,
-    })
+    }
 }
 
 async fn mark_submitted_inputs_pending_spent(
@@ -4519,14 +5320,15 @@ mod tests {
         DesktopWalletChainStart, DesktopWalletSyncStartPolicy, ListUtxosOutput,
         PublicBroadcasterCandidate, PublicBroadcasterFeeMargin, PublicBroadcasterFeeMode,
         PublicBroadcasterResultKind, PublicBroadcasterSelection, RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
-        SelfBroadcastGasFeeQuote, SelfBroadcastGasFeeSelection, TokenTotal, UtxoOutput,
-        WalletPendingOverlay, WalletPendingSpent, apply_pending_overlay_to_outputs,
+        SelfBroadcastFeeSample, SelfBroadcastGasFeeQuote, SelfBroadcastGasFeeSelection, TokenTotal,
+        UtxoOutput, WalletPendingOverlay, WalletPendingSpent, apply_pending_overlay_to_outputs,
         approximate_public_broadcaster_cost, approximate_public_broadcaster_gas,
         broadcaster_fee_amount, broadcaster_fee_covers, buffered_public_broadcaster_fee,
         decode_public_broadcaster_response, eligible_public_broadcasters,
         fee_policy_eligible_public_broadcasters, fixed_token_anchor_rate,
         initial_separate_token_public_broadcaster_fee,
-        is_self_broadcast_insufficient_native_gas_error, is_wrapped_native_token,
+        is_self_broadcast_insufficient_native_gas_error,
+        is_self_broadcast_tx_already_known_message, is_wrapped_native_token,
         max_broadcaster_fee_token_amount_from_outputs, max_send_amount_from_outputs,
         max_unshield_amount_from_outputs, parse_railgun_recipient, parse_send_amount,
         parse_submitted_tx_hash, parse_unshield_amount, public_broadcaster_amount_split,
@@ -4538,7 +5340,8 @@ mod tests {
         resolve_desktop_wallet_chain_start, resolve_self_broadcast_gas_fee,
         select_public_broadcaster, select_public_broadcaster_with_policy,
         self_broadcast_gas_limit_with_buffer, self_broadcast_insufficient_native_gas_error,
-        self_broadcast_native_gas_cost, self_broadcast_transaction_request, send_approximate_shape,
+        self_broadcast_native_gas_cost, self_broadcast_quote_from_fee_samples,
+        self_broadcast_transaction_request, send_approximate_shape,
         sort_specific_public_broadcasters, transact_topic, unshield_approximate_shape,
         utxo_outputs_from_utxos, validate_self_broadcast_gas_fee, wrapped_native_token_for_chain,
     };
@@ -4724,8 +5527,7 @@ mod tests {
             railgun_contract: defaults.contract.to_string(),
             relay_adapt_contract: defaults.relay_adapt_contract.to_string(),
             relay_adapt_7702_contract: defaults.relay_adapt_7702_contract.to_string(),
-            wrapped_native_token: super::amounts::wrapped_native_token_for_chain(1)
-                .map(|token| token.to_string()),
+            wrapped_native_token: wrapped_native_token_for_chain(1).map(|token| token.to_string()),
             multicall_contract: defaults.multicall_contract.to_string(),
             finality_depth: 99,
             block_range: Some(2_000),
@@ -5103,16 +5905,82 @@ mod tests {
     }
 
     #[test]
-    fn self_broadcast_auto_gas_fee_uses_rpc_gas_price_with_zero_tip() {
+    fn self_broadcast_auto_gas_fee_uses_rpc_gas_price_with_min_tip() {
         let quote = SelfBroadcastGasFeeQuote::from_rpc_gas_price(100);
         let resolved = resolve_self_broadcast_gas_fee(SelfBroadcastGasFeeSelection::Auto, quote)
             .expect("resolve auto gas fee");
 
         assert_eq!(quote.suggested_max_fee_per_gas, 120);
-        assert_eq!(quote.suggested_max_priority_fee_per_gas, 0);
+        assert_eq!(quote.suggested_max_priority_fee_per_gas, 1);
         assert_eq!(resolved.rpc_gas_price, 100);
         assert_eq!(resolved.max_fee_per_gas, 120);
-        assert_eq!(resolved.max_priority_fee_per_gas, 0);
+        assert_eq!(resolved.max_priority_fee_per_gas, 1);
+    }
+
+    #[test]
+    fn self_broadcast_fee_samples_ignore_zero_tips_when_non_zero_exists() {
+        let samples = [
+            SelfBroadcastFeeSample {
+                rpc_gas_price: Some(100),
+                max_priority_fee_per_gas: Some(0),
+                next_base_fee_per_gas: Some(80),
+                priority_fee_rewards: vec![0, 0, 0],
+            },
+            SelfBroadcastFeeSample {
+                rpc_gas_price: Some(110),
+                max_priority_fee_per_gas: Some(0),
+                next_base_fee_per_gas: Some(90),
+                priority_fee_rewards: vec![0, 5, 7],
+            },
+        ];
+
+        let quote = self_broadcast_quote_from_fee_samples(&samples).expect("fee quote");
+
+        assert_eq!(quote.suggested_max_priority_fee_per_gas, 7);
+        assert_eq!(quote.rpc_gas_price, 110);
+        assert_eq!(quote.suggested_max_fee_per_gas, 132);
+    }
+
+    #[test]
+    fn self_broadcast_fee_samples_include_fee_history_base_fee_cap() {
+        let samples = [SelfBroadcastFeeSample {
+            rpc_gas_price: Some(100),
+            max_priority_fee_per_gas: Some(1),
+            next_base_fee_per_gas: Some(200),
+            priority_fee_rewards: vec![10],
+        }];
+
+        let quote = self_broadcast_quote_from_fee_samples(&samples).expect("fee quote");
+
+        assert_eq!(quote.suggested_max_priority_fee_per_gas, 10);
+        assert_eq!(quote.suggested_max_fee_per_gas, 250);
+    }
+
+    #[test]
+    fn self_broadcast_already_known_classifier_excludes_nonce_errors() {
+        for message in [
+            "already known",
+            "already in mempool",
+            "known transaction: 0xabc",
+            "transaction already imported",
+            "Transaction already exists",
+        ] {
+            assert!(
+                is_self_broadcast_tx_already_known_message(message),
+                "expected {message:?} to be classified as already known"
+            );
+        }
+
+        for message in [
+            "nonce too low",
+            "replacement transaction underpriced",
+            "transaction gas price below minimum",
+        ] {
+            assert!(
+                !is_self_broadcast_tx_already_known_message(message),
+                "expected {message:?} to remain retryable"
+            );
+        }
     }
 
     #[test]
@@ -5121,6 +5989,14 @@ mod tests {
         assert!(validate_self_broadcast_gas_fee(1, 1).is_ok());
         assert!(validate_self_broadcast_gas_fee(0, 0).is_err());
         assert!(validate_self_broadcast_gas_fee(1, 2).is_err());
+    }
+
+    #[test]
+    fn self_broadcast_replacement_bump_uses_ceil_twelve_point_five_percent() {
+        assert_eq!(super::self_broadcast_replacement_bumped_fee(0), 0);
+        assert_eq!(super::self_broadcast_replacement_bumped_fee(1), 2);
+        assert_eq!(super::self_broadcast_replacement_bumped_fee(8), 9);
+        assert_eq!(super::self_broadcast_replacement_bumped_fee(100), 113);
     }
 
     #[test]

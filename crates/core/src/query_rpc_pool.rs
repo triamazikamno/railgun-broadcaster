@@ -93,6 +93,25 @@ impl QueryRpcPool {
         self.providers.is_empty()
     }
 
+    #[must_use]
+    pub fn available_providers(&self) -> Vec<ProviderHandle> {
+        if self.providers.is_empty() {
+            return Vec::new();
+        }
+
+        let now = Instant::now();
+        let mut cooldowns = self
+            .cooldowns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cooldowns.retain(|_, until| *until > now);
+
+        (0..self.providers.len())
+            .filter(|index| !cooldowns.contains_key(index))
+            .map(|index| self.handle(index))
+            .collect()
+    }
+
     pub fn mark_bad_provider(&self, handle: &ProviderHandle) {
         let until = Instant::now() + self.cooldown;
         let mut cooldowns = self

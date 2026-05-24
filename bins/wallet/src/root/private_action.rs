@@ -19,7 +19,7 @@ use gpui_component::{
 };
 use railgun_ui::short_address;
 use rand::seq::IndexedRandom;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use ui::clipboard::clipboard_with_toast;
 use ui::controls::{
     app_button, app_button_base, app_button_label, app_muted_text, app_strong_text,
@@ -32,10 +32,11 @@ use wallet_ops::{
     PreparedSendCall, PreparedUnshieldCall, PublicAssetId, PublicBalanceAmount, PublicBalanceEntry,
     PublicBalanceSnapshot, PublicBroadcasterCandidate, PublicBroadcasterCostEstimate,
     PublicBroadcasterFeeMode, PublicBroadcasterResultKind, PublicBroadcasterSubmissionResult,
-    SelfBroadcastGasFeeSelection, TransactionGenerationStage,
-    fee_policy_eligible_public_broadcasters, parse_railgun_recipient, parse_send_amount,
-    parse_unshield_amount, prepare_desktop_send_calldata, prepare_desktop_unshield_calldata,
-    quote_desktop_self_broadcast_gas_fee, select_public_broadcaster_with_policy,
+    SelfBroadcastGasFeeQuote, SelfBroadcastGasFeeSelection, SelfBroadcastSessionEvent,
+    TransactionGenerationStage, fee_policy_eligible_public_broadcasters, parse_railgun_recipient,
+    parse_send_amount, parse_unshield_amount, prepare_desktop_send_calldata,
+    prepare_desktop_unshield_calldata, quote_desktop_self_broadcast_gas_fee,
+    select_public_broadcaster_with_policy,
     settings::EffectiveTokenRegistry,
     sort_specific_public_broadcasters, submit_desktop_send_public_broadcaster,
     submit_desktop_send_self_broadcast, submit_desktop_unshield_public_broadcaster,
@@ -968,6 +969,24 @@ pub(super) fn random_self_broadcast_gas_payer_uuid(
     candidates
         .choose(&mut rand::rng())
         .map(|account| Arc::from(account.public_account_uuid.as_str()))
+}
+
+fn self_broadcast_initial_gas_values(
+    selection: &SelfBroadcastGasFeeSelection,
+    quote: Option<SelfBroadcastGasFeeQuote>,
+) -> Option<(u128, u128)> {
+    match *selection {
+        SelfBroadcastGasFeeSelection::Auto => quote.map(|quote| {
+            (
+                quote.suggested_max_fee_per_gas,
+                quote.suggested_max_priority_fee_per_gas,
+            )
+        }),
+        SelfBroadcastGasFeeSelection::Custom {
+            max_fee_per_gas,
+            max_priority_fee_per_gas,
+        } => Some((max_fee_per_gas, max_priority_fee_per_gas)),
+    }
 }
 
 fn self_broadcast_gas_payer_random_candidate(
@@ -2945,6 +2964,14 @@ impl WalletRoot {
         } else {
             SelfBroadcastGasFeeSelection::Auto
         };
+        let self_broadcast_initial_gas_fee = if delivery_mode == DeliveryMode::SelfBroadcast {
+            self_broadcast_initial_gas_values(
+                &self_broadcast_gas_fee,
+                form.self_broadcast_gas_fee.quote,
+            )
+        } else {
+            None
+        };
         let broadcaster_fee_mode = effective_public_broadcaster_fee_mode(
             asset.token,
             fee_token,
@@ -3063,6 +3090,20 @@ impl WalletRoot {
         self.send_generation_seq = self.send_generation_seq.wrapping_add(1);
         let generation_id = self.send_generation_seq;
         let (progress_tx, progress_rx) = watch::channel(TransactionGenerationStage::default());
+        let (self_broadcast_command_tx, self_broadcast_command_rx) =
+            if delivery_mode == DeliveryMode::SelfBroadcast {
+                let (tx, rx) = mpsc::unbounded_channel();
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
+        let (self_broadcast_event_tx, self_broadcast_event_rx) =
+            if delivery_mode == DeliveryMode::SelfBroadcast {
+                let (tx, rx) = mpsc::unbounded_channel();
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
         if let Some(form) = self.send_forms.get_mut(&key) {
             form.generation_id = generation_id;
             form.generating = true;
@@ -3098,6 +3139,8 @@ impl WalletRoot {
                     recipient.clone(),
                     self_broadcast_gas_payer_display
                         .expect("self-broadcast gas payer was validated"),
+                    self_broadcast_command_tx,
+                    self_broadcast_initial_gas_fee,
                 );
             }
             DeliveryMode::ManualCalldata => {}
@@ -3178,6 +3221,8 @@ impl WalletRoot {
                     verify_proof: true,
                     gas_fee: self_broadcast_gas_fee,
                     progress_tx: Some(progress_tx),
+                    command_rx: self_broadcast_command_rx,
+                    event_tx: self_broadcast_event_tx,
                 };
                 self.runtime.spawn(async move {
                     submit_desktop_send_self_broadcast(request, &http)
@@ -3188,6 +3233,16 @@ impl WalletRoot {
         };
         let terminal_progress_rx = progress_rx.clone();
         Self::watch_send_generation_stage(key, generation_id, progress_rx, window, cx);
+        if let Some(event_rx) = self_broadcast_event_rx {
+            Self::watch_self_broadcast_session_events(
+                DeliveryFormKind::Send,
+                key,
+                generation_id,
+                event_rx,
+                window,
+                cx,
+            );
+        }
         cx.spawn(async move |this, cx| {
             let result = join
                 .await
@@ -3361,6 +3416,14 @@ impl WalletRoot {
         } else {
             SelfBroadcastGasFeeSelection::Auto
         };
+        let self_broadcast_initial_gas_fee = if delivery_mode == DeliveryMode::SelfBroadcast {
+            self_broadcast_initial_gas_values(
+                &self_broadcast_gas_fee,
+                form.self_broadcast_gas_fee.quote,
+            )
+        } else {
+            None
+        };
         let broadcaster_fee_mode = effective_public_broadcaster_fee_mode(
             asset.token,
             fee_token,
@@ -3486,6 +3549,20 @@ impl WalletRoot {
         self.unshield_generation_seq = self.unshield_generation_seq.wrapping_add(1);
         let generation_id = self.unshield_generation_seq;
         let (progress_tx, progress_rx) = watch::channel(TransactionGenerationStage::default());
+        let (self_broadcast_command_tx, self_broadcast_command_rx) =
+            if delivery_mode == DeliveryMode::SelfBroadcast {
+                let (tx, rx) = mpsc::unbounded_channel();
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
+        let (self_broadcast_event_tx, self_broadcast_event_rx) =
+            if delivery_mode == DeliveryMode::SelfBroadcast {
+                let (tx, rx) = mpsc::unbounded_channel();
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
         if let Some(form) = self.unshield_forms.get_mut(&key) {
             form.generation_id = generation_id;
             form.generating = true;
@@ -3521,6 +3598,8 @@ impl WalletRoot {
                     recipient.to_checksum(None),
                     self_broadcast_gas_payer_display
                         .expect("self-broadcast gas payer was validated"),
+                    self_broadcast_command_tx,
+                    self_broadcast_initial_gas_fee,
                 );
             }
             DeliveryMode::ManualCalldata => {}
@@ -3604,6 +3683,8 @@ impl WalletRoot {
                     verify_proof: true,
                     gas_fee: self_broadcast_gas_fee,
                     progress_tx: Some(progress_tx),
+                    command_rx: self_broadcast_command_rx,
+                    event_tx: self_broadcast_event_tx,
                 };
                 self.runtime.spawn(async move {
                     submit_desktop_unshield_self_broadcast(request, &http)
@@ -3614,6 +3695,16 @@ impl WalletRoot {
         };
         let terminal_progress_rx = progress_rx.clone();
         Self::watch_unshield_generation_stage(key, generation_id, progress_rx, window, cx);
+        if let Some(event_rx) = self_broadcast_event_rx {
+            Self::watch_self_broadcast_session_events(
+                DeliveryFormKind::Unshield,
+                key,
+                generation_id,
+                event_rx,
+                window,
+                cx,
+            );
+        }
         cx.spawn(async move |this, cx| {
             let result = join.await.unwrap_or_else(|error| {
                 Err(eyre::eyre!("unshield generation task failed: {error}"))
@@ -3749,6 +3840,53 @@ impl WalletRoot {
                 {
                     break;
                 }
+            }
+        })
+        .detach();
+    }
+
+    fn watch_self_broadcast_session_events(
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        generation_id: u64,
+        mut event_rx: mpsc::UnboundedReceiver<SelfBroadcastSessionEvent>,
+        window: &Window,
+        cx: &Context<'_, Self>,
+    ) {
+        cx.spawn_in(window, async move |this, cx| {
+            while let Some(event) = event_rx.recv().await {
+                let _ = this.update_in(cx, |root, window, cx| match event {
+                    SelfBroadcastSessionEvent::StepFailed { stage, message } => {
+                        if root.record_private_broadcaster_progress_step_error(
+                            kind,
+                            key,
+                            generation_id,
+                            stage,
+                            &message,
+                            cx,
+                        ) {
+                            root.show_private_broadcaster_progress_dialog(window, cx);
+                        }
+                    }
+                    SelfBroadcastSessionEvent::AttemptSubmitted(attempt) => {
+                        root.record_private_self_broadcast_attempt(
+                            kind,
+                            key,
+                            generation_id,
+                            attempt,
+                            cx,
+                        );
+                    }
+                    SelfBroadcastSessionEvent::AttemptRejected { message, .. } => {
+                        root.record_private_self_broadcast_attempt_rejected(
+                            kind,
+                            key,
+                            generation_id,
+                            message,
+                            cx,
+                        );
+                    }
+                });
             }
         })
         .detach();

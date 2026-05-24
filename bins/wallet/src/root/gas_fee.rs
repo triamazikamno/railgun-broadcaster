@@ -98,10 +98,12 @@ impl Eip1559GasFeeEditorState {
         }
 
         let max_fee = format_gwei(quote.suggested_max_fee_per_gas);
+        let max_priority_fee = format_gwei(quote.suggested_max_priority_fee_per_gas);
         self.max_fee_input
             .update(cx, |input, cx| input.set_value(max_fee, window, cx));
-        self.max_priority_fee_input
-            .update(cx, |input, cx| input.set_value("0", window, cx));
+        self.max_priority_fee_input.update(cx, |input, cx| {
+            input.set_value(max_priority_fee, window, cx);
+        });
     }
 
     pub(super) fn overwrite_custom_from_auto(
@@ -113,10 +115,12 @@ impl Eip1559GasFeeEditorState {
             return false;
         };
         let max_fee = format_gwei(quote.suggested_max_fee_per_gas);
+        let max_priority_fee = format_gwei(quote.suggested_max_priority_fee_per_gas);
         self.max_fee_input
             .update(cx, |input, cx| input.set_value(max_fee, window, cx));
-        self.max_priority_fee_input
-            .update(cx, |input, cx| input.set_value("0", window, cx));
+        self.max_priority_fee_input.update(cx, |input, cx| {
+            input.set_value(max_priority_fee, window, cx);
+        });
         true
     }
 }
@@ -283,6 +287,10 @@ fn render_gas_fee_inputs(
         || SharedString::from("unavailable"),
         |quote| SharedString::from(format_gwei(quote.suggested_max_fee_per_gas)),
     );
+    let auto_max_tip = state.quote.map_or_else(
+        || SharedString::from("unavailable"),
+        |quote| SharedString::from(format_gwei(quote.suggested_max_priority_fee_per_gas)),
+    );
     div()
         .flex()
         .items_end()
@@ -317,7 +325,7 @@ fn render_gas_fee_inputs(
             "Max tip (gwei)",
             if auto_selected {
                 render_auto_gas_fee_value(
-                    "0",
+                    auto_max_tip,
                     Some(render_auto_gas_fee_edit_button(
                         root,
                         SharedString::from(format!(

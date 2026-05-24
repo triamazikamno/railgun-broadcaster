@@ -229,24 +229,42 @@ impl WalletHandle {
         let now = now_epoch_secs();
         let changed = {
             let mut overlay = self.pending_overlay.write().await;
-            let mut existing: HashSet<_> = overlay
+            let chain_pending: HashSet<_> = overlay
                 .pending_spent
                 .iter()
-                .chain(overlay.local_pending_spent.iter())
+                .map(WalletPendingSpent::key)
+                .collect();
+            let mut existing: HashSet<_> = overlay
+                .local_pending_spent
+                .iter()
                 .map(WalletPendingSpent::key)
                 .collect();
             let before = overlay.local_pending_spent.len();
+            let mut updated_existing = false;
             for utxo in utxos {
-                if existing.insert((utxo.tree, utxo.position)) {
+                let key = (utxo.tree, utxo.position);
+                if chain_pending.contains(&key) {
+                    continue;
+                }
+                if existing.insert(key) {
                     overlay
                         .local_pending_spent
                         .push(WalletPendingSpent::submitted(utxo, tx_hash, now));
+                } else if let Some(spent) = overlay
+                    .local_pending_spent
+                    .iter_mut()
+                    .find(|spent| spent.key() == key)
+                    && spent.tx_hash != tx_hash
+                {
+                    spent.tx_hash = tx_hash;
+                    spent.block_timestamp = Some(now);
+                    updated_existing = true;
                 }
             }
             overlay
                 .local_pending_spent
                 .sort_by_key(WalletPendingSpent::key);
-            overlay.local_pending_spent.len() != before
+            overlay.local_pending_spent.len() != before || updated_existing
         };
         self.notify_if_changed(changed);
     }
@@ -9207,6 +9225,31 @@ mod tests {
             .await;
 
         assert_eq!(handle.pending_overlay().await.local_pending_spent.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn local_pending_spent_updates_existing_submitted_tx_hash() {
+        let wallet_utxo = test_wallet_utxo(7);
+        let handle = test_wallet_handle(vec![wallet_utxo.clone()]);
+        let first_hash = FixedBytes::from([0x11; 32]);
+        let replacement_hash = FixedBytes::from([0x22; 32]);
+
+        handle
+            .mark_pending_spent_utxos(std::slice::from_ref(&wallet_utxo.utxo), Some(first_hash))
+            .await;
+        handle
+            .mark_pending_spent_utxos(
+                std::slice::from_ref(&wallet_utxo.utxo),
+                Some(replacement_hash),
+            )
+            .await;
+
+        let overlay = handle.pending_overlay().await;
+        assert_eq!(overlay.local_pending_spent.len(), 1);
+        assert_eq!(
+            overlay.local_pending_spent[0].tx_hash,
+            Some(replacement_hash)
+        );
     }
 
     #[tokio::test]

@@ -2,19 +2,26 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::{
-    AppContext, Context, Entity, ParentElement, Pixels, SharedString, Styled, Window, div, px, rgb,
+    AppContext, Context, Entity, IntoElement, ParentElement, Pixels, SharedString, Styled, Window,
+    div, prelude::FluentBuilder as _, px, rgb,
 };
-use gpui_component::{Sizable, WindowExt};
+use gpui_component::{
+    Sizable, WindowExt,
+    button::ButtonVariants,
+    input::{InputEvent, InputState},
+};
 use ui::clipboard::clipboard_with_toast;
-use ui::controls::{app_button, app_muted_text, app_strong_text};
+use ui::controls::{app_button, app_input, app_muted_text, app_strong_text};
 use ui::theme;
 use wallet_ops::{
     DesktopSelfBroadcastResult, PublicBroadcasterCostEstimate, PublicBroadcasterResultKind,
-    PublicBroadcasterSubmissionResult, TransactionGenerationStage,
+    PublicBroadcasterSubmissionResult, SelfBroadcastAttemptInfo, SelfBroadcastCommand,
+    SelfBroadcastCommandKind, SelfBroadcastCommandSender, SelfBroadcastGasFeeSelection,
+    TransactionGenerationStage, self_broadcast_replacement_bumped_fee,
 };
 
 use super::dialogs::PrivateBroadcasterProgressDialogContent;
-use super::gas_fee::format_gwei;
+use super::gas_fee::{format_gwei, parse_gwei_to_wei, validate_custom_gas_fee};
 use super::private_action::{delivery_element_id, private_action_title_row};
 use super::public_action::{
     PublicActionStepStatus, public_action_step_color, render_public_action_step_marker,
@@ -46,6 +53,7 @@ const SELF_BROADCAST_PROGRESS_STAGES: [TransactionGenerationStage; 6] = [
     TransactionGenerationStage::SigningSelfBroadcast,
     TransactionGenerationStage::WaitingForSelfBroadcastReceipt,
 ];
+const SELF_BROADCAST_GAS_RETRY_DIALOG_WIDTH: Pixels = px(460.0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PrivateSubmissionProgressFlow {
@@ -73,9 +81,30 @@ pub(super) struct PrivateBroadcasterProgressState {
     pub(super) estimate: Option<PublicBroadcasterCostEstimate>,
     pub(super) result: Option<PublicBroadcasterSubmissionResult>,
     pub(super) self_broadcast_result: Option<DesktopSelfBroadcastResult>,
+    pub(super) self_broadcast_command_tx: Option<SelfBroadcastCommandSender>,
+    pub(super) self_broadcast_attempts: Vec<SelfBroadcastAttemptInfo>,
+    pub(super) self_broadcast_current_gas_fee: Option<(u128, u128)>,
+    pub(super) self_broadcast_action_error: Option<Arc<str>>,
     pub(super) error: Option<Arc<str>>,
     pub(super) dialog_open: bool,
     pub(super) stage_seen: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SelfBroadcastGasRetryKind {
+    RetryEstimate,
+    SpeedUp,
+}
+
+pub(super) struct SelfBroadcastGasRetryDialogContent {
+    root: Entity<WalletRoot>,
+    kind: DeliveryFormKind,
+    key: UnshieldAssetKey,
+    generation_id: u64,
+    retry_kind: SelfBroadcastGasRetryKind,
+    max_fee_input: Entity<InputState>,
+    max_tip_input: Entity<InputState>,
+    error: Option<Arc<str>>,
 }
 
 pub(super) const fn private_broadcaster_dialog_title_action(
@@ -99,6 +128,183 @@ pub(super) const fn private_submission_dialog_title_action(
             DeliveryFormKind::Send => "Self-broadcast send",
             DeliveryFormKind::Unshield => "Self-broadcast unshield",
         },
+    }
+}
+
+impl SelfBroadcastGasRetryDialogContent {
+    fn new(
+        root: Entity<WalletRoot>,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        generation_id: u64,
+        retry_kind: SelfBroadcastGasRetryKind,
+        initial_max_fee_per_gas: u128,
+        initial_max_priority_fee_per_gas: u128,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Self {
+        let max_fee_input = cx.new(|cx| {
+            let mut input = InputState::new(window, cx).placeholder("max fee gwei");
+            input.set_value(format_gwei(initial_max_fee_per_gas), window, cx);
+            input
+        });
+        let max_tip_input = cx.new(|cx| {
+            let mut input = InputState::new(window, cx).placeholder("max tip gwei");
+            input.set_value(format_gwei(initial_max_priority_fee_per_gas), window, cx);
+            input
+        });
+        cx.observe(&root, |_this, _root, cx| cx.notify()).detach();
+        cx.subscribe(&max_fee_input, |this, _input, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.error = None;
+                cx.notify();
+            }
+        })
+        .detach();
+        cx.subscribe(&max_tip_input, |this, _input, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.error = None;
+                cx.notify();
+            }
+        })
+        .detach();
+        Self {
+            root,
+            kind,
+            key,
+            generation_id,
+            retry_kind,
+            max_fee_input,
+            max_tip_input,
+            error: None,
+        }
+    }
+}
+
+impl gpui::Render for SelfBroadcastGasRetryDialogContent {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        let title = match self.retry_kind {
+            SelfBroadcastGasRetryKind::RetryEstimate => "Retry with custom gas",
+            SelfBroadcastGasRetryKind::SpeedUp => "Speed up transaction",
+        };
+        let detail = match self.retry_kind {
+            SelfBroadcastGasRetryKind::RetryEstimate => {
+                "Retry gas estimation and signing using these EIP-1559 fee values."
+            }
+            SelfBroadcastGasRetryKind::SpeedUp => {
+                "Uses the same nonce to replace the pending transaction. Values are prefilled +12.5%."
+            }
+        };
+        let submit_root = self.root.clone();
+        let cancel_root = self.root.clone();
+        let dialog = cx.entity();
+        let max_fee_input = self.max_fee_input.clone();
+        let max_tip_input = self.max_tip_input.clone();
+        let kind = self.kind;
+        let key = self.key;
+        let generation_id = self.generation_id;
+        let retry_kind = self.retry_kind;
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(app_strong_text(title))
+            .child(app_muted_text(detail).whitespace_normal())
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_wrap()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(150.0))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(app_muted_text("Max fee (gwei)"))
+                            .child(app_input(&self.max_fee_input).w_full()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(150.0))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(app_muted_text("Max tip (gwei)"))
+                            .child(app_input(&self.max_tip_input).w_full()),
+                    ),
+            )
+            .when_some(self.error.as_ref(), |this, error| {
+                this.child(app_muted_text(error.to_string()).text_color(rgb(theme::DANGER)))
+            })
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_wrap()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        app_button("self-broadcast-gas-retry-cancel", "Cancel")
+                            .flex_none()
+                            .on_click(move |_event, window, cx| {
+                                let _ = &cancel_root;
+                                window.close_dialog(cx);
+                            }),
+                    )
+                    .child(
+                        app_button("self-broadcast-gas-retry-confirm", "Submit")
+                            .primary()
+                            .flex_none()
+                            .on_click(move |_event, window, cx| {
+                                let max_fee_raw = max_fee_input.read(cx).value().to_string();
+                                let max_tip_raw = max_tip_input.read(cx).value().to_string();
+                                let max_fee = match parse_gwei_to_wei(&max_fee_raw) {
+                                    Ok(value) => value,
+                                    Err(error) => {
+                                        dialog.update(cx, |this, cx| {
+                                            this.error = Some(Arc::from(error));
+                                            cx.notify();
+                                        });
+                                        return;
+                                    }
+                                };
+                                let max_tip = match parse_gwei_to_wei(&max_tip_raw) {
+                                    Ok(value) => value,
+                                    Err(error) => {
+                                        dialog.update(cx, |this, cx| {
+                                            this.error = Some(Arc::from(error));
+                                            cx.notify();
+                                        });
+                                        return;
+                                    }
+                                };
+                                if let Err(error) = validate_custom_gas_fee(max_fee, max_tip) {
+                                    dialog.update(cx, |this, cx| {
+                                        this.error = Some(Arc::from(error));
+                                        cx.notify();
+                                    });
+                                    return;
+                                }
+                                submit_root.update(cx, |root, cx| {
+                                    root.submit_self_broadcast_gas_retry(
+                                        kind,
+                                        key,
+                                        generation_id,
+                                        retry_kind,
+                                        max_fee,
+                                        max_tip,
+                                        cx,
+                                    );
+                                });
+                                window.close_dialog(cx);
+                            }),
+                    ),
+            )
     }
 }
 
@@ -193,6 +399,10 @@ impl WalletRoot {
             estimate,
             result: None,
             self_broadcast_result: None,
+            self_broadcast_command_tx: None,
+            self_broadcast_attempts: Vec::new(),
+            self_broadcast_current_gas_fee: None,
+            self_broadcast_action_error: None,
             error: None,
             dialog_open,
             stage_seen: false,
@@ -208,6 +418,8 @@ impl WalletRoot {
         icon_path: Option<PathBuf>,
         recipient: String,
         gas_payer: String,
+        command_tx: Option<SelfBroadcastCommandSender>,
+        current_gas_fee: Option<(u128, u128)>,
     ) {
         let asset_label = Arc::<str>::from(asset_label);
         let dialog_open = self
@@ -227,6 +439,10 @@ impl WalletRoot {
             estimate: None,
             result: None,
             self_broadcast_result: None,
+            self_broadcast_command_tx: command_tx,
+            self_broadcast_attempts: Vec::new(),
+            self_broadcast_current_gas_fee: current_gas_fee,
+            self_broadcast_action_error: None,
             error: None,
             dialog_open,
             stage_seen: false,
@@ -368,7 +584,14 @@ impl WalletRoot {
             final_stage,
             result.tx.status,
         );
+        progress
+            .self_broadcast_attempts
+            .clone_from(&result.attempts);
+        progress.self_broadcast_current_gas_fee =
+            Some((result.max_fee_per_gas, result.max_priority_fee_per_gas));
+        progress.self_broadcast_action_error = None;
         progress.self_broadcast_result = Some(result);
+        progress.self_broadcast_command_tx = None;
         progress.error = None;
         cx.notify();
     }
@@ -399,12 +622,184 @@ impl WalletRoot {
             final_stage,
             message.as_str(),
         );
+        progress.self_broadcast_action_error = None;
         progress.error = Some(Arc::from(message));
+        progress.self_broadcast_command_tx = None;
+        cx.notify();
+    }
+
+    pub(super) fn record_private_broadcaster_progress_step_error(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        generation_id: u64,
+        stage: TransactionGenerationStage,
+        message: &str,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        let Some(progress) = self.private_broadcaster_progress.as_mut() else {
+            return false;
+        };
+        if progress.kind != kind
+            || progress.key != key
+            || progress.generation_id != generation_id
+            || progress.result.is_some()
+            || progress.self_broadcast_result.is_some()
+            || progress.error.is_some()
+        {
+            return false;
+        }
+        progress.stage_seen = true;
+        fail_private_broadcaster_progress_steps_at_stage(&mut progress.steps, stage, message);
+        progress.self_broadcast_action_error = None;
+        cx.notify();
+        !progress.dialog_open
+    }
+
+    pub(super) fn record_private_self_broadcast_attempt(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        generation_id: u64,
+        attempt: SelfBroadcastAttemptInfo,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(progress) = self.private_broadcaster_progress.as_mut() else {
+            return;
+        };
+        if progress.kind != kind
+            || progress.key != key
+            || progress.generation_id != generation_id
+            || progress.result.is_some()
+            || progress.self_broadcast_result.is_some()
+            || progress.error.is_some()
+        {
+            return;
+        }
+        progress.self_broadcast_current_gas_fee =
+            Some((attempt.max_fee_per_gas, attempt.max_priority_fee_per_gas));
+        progress.self_broadcast_action_error = None;
+        progress.self_broadcast_attempts.push(attempt);
+        cx.notify();
+    }
+
+    pub(super) fn record_private_self_broadcast_attempt_rejected(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        generation_id: u64,
+        message: String,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(progress) = self.private_broadcaster_progress.as_mut() else {
+            return;
+        };
+        if progress.kind != kind
+            || progress.key != key
+            || progress.generation_id != generation_id
+            || progress.result.is_some()
+            || progress.self_broadcast_result.is_some()
+            || progress.error.is_some()
+        {
+            return;
+        }
+        progress.self_broadcast_action_error = Some(Arc::from(message));
+        cx.notify();
+    }
+
+    pub(super) fn open_self_broadcast_gas_retry_dialog(
+        &self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        generation_id: u64,
+        retry_kind: SelfBroadcastGasRetryKind,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(progress) = self.private_broadcaster_progress.as_ref() else {
+            return;
+        };
+        if progress.kind != kind
+            || progress.key != key
+            || progress.generation_id != generation_id
+            || progress.self_broadcast_command_tx.is_none()
+        {
+            return;
+        }
+        let Some((mut max_fee, mut max_tip)) = progress.self_broadcast_current_gas_fee else {
+            return;
+        };
+        if retry_kind == SelfBroadcastGasRetryKind::SpeedUp {
+            max_fee = self_broadcast_replacement_bumped_fee(max_fee);
+            max_tip = self_broadcast_replacement_bumped_fee(max_tip);
+        }
+        let root = cx.entity();
+        let content = cx.new(|cx| {
+            SelfBroadcastGasRetryDialogContent::new(
+                root,
+                kind,
+                key,
+                generation_id,
+                retry_kind,
+                max_fee,
+                max_tip,
+                window,
+                cx,
+            )
+        });
+        let dialog_width =
+            (window.viewport_size().width * 0.92).min(SELF_BROADCAST_GAS_RETRY_DIALOG_WIDTH);
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            dialog.w(dialog_width).child(content.clone())
+        });
+    }
+
+    fn submit_self_broadcast_gas_retry(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        generation_id: u64,
+        retry_kind: SelfBroadcastGasRetryKind,
+        max_fee_per_gas: u128,
+        max_priority_fee_per_gas: u128,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(progress) = self.private_broadcaster_progress.as_ref() else {
+            return;
+        };
+        if progress.kind != kind
+            || progress.key != key
+            || progress.generation_id != generation_id
+            || progress.self_broadcast_result.is_some()
+            || progress.error.is_some()
+        {
+            return;
+        }
+        let Some(command_tx) = progress.self_broadcast_command_tx.as_ref() else {
+            return;
+        };
+        let command_kind = match retry_kind {
+            SelfBroadcastGasRetryKind::RetryEstimate => SelfBroadcastCommandKind::Retry,
+            SelfBroadcastGasRetryKind::SpeedUp => SelfBroadcastCommandKind::Replacement,
+        };
+        let send_result = command_tx.send(SelfBroadcastCommand {
+            kind: command_kind,
+            gas_fee: SelfBroadcastGasFeeSelection::Custom {
+                max_fee_per_gas,
+                max_priority_fee_per_gas,
+            },
+        });
+        if let Some(progress) = self.private_broadcaster_progress.as_mut() {
+            progress.self_broadcast_action_error = send_result.err().map(|_| {
+                Arc::from("Self-broadcast session is no longer accepting retry commands.")
+            });
+        }
         cx.notify();
     }
 
     pub(super) fn render_private_broadcaster_progress_dialog_content(
         &self,
+        root: &Entity<Self>,
         content_width: Pixels,
     ) -> gpui::Div {
         let Some(progress) = self.private_broadcaster_progress.as_ref() else {
@@ -417,7 +812,7 @@ impl WalletRoot {
             .flex()
             .flex_col()
             .gap_3()
-            .child(render_private_broadcaster_progress_stepper(&progress.steps));
+            .child(render_private_broadcaster_progress_stepper(root, progress));
 
         match progress.flow {
             PrivateSubmissionProgressFlow::PublicBroadcaster => {
@@ -690,8 +1085,10 @@ fn private_progress_stage_index(
 }
 
 pub(super) fn render_private_broadcaster_progress_stepper(
-    steps: &[PrivateBroadcasterProgressStepState],
+    root: &Entity<WalletRoot>,
+    progress: &PrivateBroadcasterProgressState,
 ) -> gpui::Div {
+    let steps = &progress.steps;
     let mut stepper = div()
         .flex()
         .flex_col()
@@ -704,6 +1101,8 @@ pub(super) fn render_private_broadcaster_progress_stepper(
     let last_index = steps.len().saturating_sub(1);
     for (index, step) in steps.iter().enumerate() {
         stepper = stepper.child(render_private_broadcaster_progress_step(
+            root.clone(),
+            progress,
             step,
             index == last_index,
         ));
@@ -712,6 +1111,8 @@ pub(super) fn render_private_broadcaster_progress_stepper(
 }
 
 fn render_private_broadcaster_progress_step(
+    root: Entity<WalletRoot>,
+    progress: &PrivateBroadcasterProgressState,
     step: &PrivateBroadcasterProgressStepState,
     is_last: bool,
 ) -> gpui::Div {
@@ -759,6 +1160,9 @@ fn render_private_broadcaster_progress_step(
                 .line_height(gpui::relative(1.0)),
         );
     }
+    if let Some(action) = render_self_broadcast_step_action(root, progress, step) {
+        body = body.child(action);
+    }
 
     div()
         .flex()
@@ -781,6 +1185,80 @@ fn render_private_broadcaster_progress_step(
                 })),
         )
         .child(body)
+}
+
+fn render_self_broadcast_step_action(
+    root: Entity<WalletRoot>,
+    progress: &PrivateBroadcasterProgressState,
+    step: &PrivateBroadcasterProgressStepState,
+) -> Option<gpui::AnyElement> {
+    if progress.flow != PrivateSubmissionProgressFlow::SelfBroadcast
+        || progress.self_broadcast_command_tx.is_none()
+        || progress.error.is_some()
+        || progress.self_broadcast_result.is_some()
+    {
+        return None;
+    }
+    let retry_kind = match (step.stage, step.status) {
+        (
+            TransactionGenerationStage::EstimatingSelfBroadcastGas
+            | TransactionGenerationStage::SigningSelfBroadcast,
+            PublicActionStepStatus::Error,
+        ) => SelfBroadcastGasRetryKind::RetryEstimate,
+        (
+            TransactionGenerationStage::WaitingForSelfBroadcastReceipt,
+            PublicActionStepStatus::Pending,
+        ) if !progress.self_broadcast_attempts.is_empty() => SelfBroadcastGasRetryKind::SpeedUp,
+        _ => return None,
+    };
+    let label = match retry_kind {
+        SelfBroadcastGasRetryKind::RetryEstimate => "Retry with custom gas",
+        SelfBroadcastGasRetryKind::SpeedUp => "Speed up transaction",
+    };
+    let key = progress.key;
+    let kind = progress.kind;
+    let generation_id = progress.generation_id;
+    let mut action = div()
+        .pt(px(4.0))
+        .flex()
+        .flex_col()
+        .items_start()
+        .gap_1()
+        .child(
+            app_button(
+                delivery_element_id(key, kind, private_broadcaster_retry_button_id(retry_kind)),
+                label,
+            )
+            .small()
+            .outline()
+            .on_click(move |_event, window, cx| {
+                root.update(cx, |root, cx| {
+                    root.open_self_broadcast_gas_retry_dialog(
+                        kind,
+                        key,
+                        generation_id,
+                        retry_kind,
+                        window,
+                        cx,
+                    );
+                });
+            }),
+        );
+    if let Some(error) = progress.self_broadcast_action_error.as_deref() {
+        action = action.child(
+            app_muted_text(format!("Last retry failed: {error}"))
+                .text_color(rgb(theme::DANGER))
+                .whitespace_normal(),
+        );
+    }
+    Some(action.into_any_element())
+}
+
+const fn private_broadcaster_retry_button_id(kind: SelfBroadcastGasRetryKind) -> &'static str {
+    match kind {
+        SelfBroadcastGasRetryKind::RetryEstimate => "retry-self-gas",
+        SelfBroadcastGasRetryKind::SpeedUp => "speed-up-self-tx",
+    }
 }
 
 const fn private_broadcaster_stage_detail(

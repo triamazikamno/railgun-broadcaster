@@ -141,7 +141,7 @@ impl Render for PrivateBroadcasterProgressDialogContent {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         self.root
             .read(cx)
-            .render_private_broadcaster_progress_dialog_content(self.content_width)
+            .render_private_broadcaster_progress_dialog_content(&self.root, self.content_width)
     }
 }
 
