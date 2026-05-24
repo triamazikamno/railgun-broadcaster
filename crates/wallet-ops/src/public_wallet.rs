@@ -881,7 +881,7 @@ fn parse_effective_address(label: &str, value: &str) -> Result<Address> {
     Address::from_str(value).wrap_err_with(|| format!("parse effective {label} address"))
 }
 
-fn vaulted_public_signer(
+pub(crate) fn vaulted_public_signer(
     vault_store: &DesktopVaultStore,
     view_session: &DesktopViewSession,
     vault_password: &str,
@@ -945,6 +945,8 @@ mod tests {
 
     const TEST_PASSWORD: &str = "correct horse battery staple";
     const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    const TEST_IMPORTED_PRIVATE_KEY: &str =
+        "0x59c6995e998f97a5a0044966f0945387e7d5e4a4dbd4b3f1b530b87d9b4a5c2f";
     static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn test_kdf() -> KdfParams {
@@ -1316,6 +1318,54 @@ mod tests {
             Err(error) => assert!(error.to_string().contains("amount is required")),
         }
 
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn vaulted_public_signer_resolves_private_self_broadcast_gas_payers() {
+        let (root_dir, db, store, view_session) = public_action_request_parts();
+        let derived = store
+            .list_active_public_accounts_for_session(&view_session)
+            .expect("active accounts")
+            .into_iter()
+            .find(|account| account.source == PublicAccountSource::Derived)
+            .expect("derived account");
+        let derived_secret_key = format!("public-account-secret|{}", derived.public_account_uuid);
+        assert!(
+            db.get_desktop_wallet_vault_record(&derived_secret_key)
+                .expect("load derived secret record")
+                .is_none()
+        );
+
+        let derived_signer = vaulted_public_signer(
+            &store,
+            &view_session,
+            TEST_PASSWORD,
+            &derived.public_account_uuid,
+        )
+        .expect("derived signer");
+        assert_eq!(derived_signer.address(), derived.address);
+
+        let imported = store
+            .import_public_account(
+                TEST_PASSWORD,
+                &view_session,
+                TEST_IMPORTED_PRIVATE_KEY,
+                Some("Imported"),
+                false,
+            )
+            .expect("import public account");
+        let imported_signer = vaulted_public_signer(
+            &store,
+            &view_session,
+            TEST_PASSWORD,
+            &imported.public_account_uuid,
+        )
+        .expect("imported signer");
+        assert_eq!(imported_signer.address(), imported.address);
+
+        drop(store);
         drop(db);
         fs::remove_dir_all(root_dir).expect("remove temp db dir");
     }

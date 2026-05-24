@@ -33,6 +33,7 @@ mod actions;
 mod broadcaster_picker;
 mod chain_load;
 mod dialogs;
+mod gas_fee;
 mod network;
 mod private_action;
 mod private_assets;
@@ -63,8 +64,8 @@ use broadcaster_picker::BroadcasterPickerState;
 use chain_load::{ChainUtxoState, chain_load_overrides, start_shared_poi_cache_service};
 use network::TorExitIpQueryState;
 use private_action::{
-    DeliveryFormKind, DeliveryMode, PrivateActionFormState, SendFormState, SendResult,
-    UnshieldAsset, UnshieldAssetKey, UnshieldFormState, UnshieldResult,
+    DeliveryFormKind, DeliveryMode, PrivateActionFormState, SendFormState, UnshieldAsset,
+    UnshieldAssetKey, UnshieldFormState,
 };
 use private_broadcaster::PrivateBroadcasterProgressState;
 use public_account::PublicAccountFormState;
@@ -105,12 +106,17 @@ use broadcaster_picker::{
 #[cfg(test)]
 use chain_load::{loading_summary, progress_detail, wallet_generation_matches};
 #[cfg(test)]
+use gas_fee::{format_gwei, parse_gwei_to_wei, validate_custom_gas_fee};
+#[cfg(test)]
 use private_action::{
     PrivateActionMetric, SEND_AUTHORIZATION_FAILED_ERROR, SEND_MISSING_PASSWORD_ERROR,
-    UNSHIELD_AUTHORIZATION_FAILED_ERROR, UNSHIELD_MISSING_PASSWORD_ERROR,
-    adjusted_amount_for_max_change, form_error_clears_public_broadcaster_cost_estimate,
+    SelfBroadcastNativeBalanceState, UNSHIELD_AUTHORIZATION_FAILED_ERROR,
+    UNSHIELD_MISSING_PASSWORD_ERROR, adjusted_amount_for_max_change,
+    default_self_broadcast_gas_payer_uuid, form_error_clears_public_broadcaster_cost_estimate,
     format_exact_asset_amount_for_display, format_form_error_for_asset, private_action_metrics,
-    send_element_id, send_public_broadcaster_estimate_input_error,
+    random_self_broadcast_gas_payer_uuid, self_broadcast_gas_payer_matches_search,
+    self_broadcast_native_balance_label, self_broadcast_native_balance_state, send_element_id,
+    send_public_broadcaster_estimate_input_error,
     should_clear_private_action_error_on_password_change, unshield_element_id,
     unshield_public_broadcaster_estimate_input_error,
 };
@@ -125,7 +131,8 @@ use private_assets::{
 use private_broadcaster::{
     apply_private_broadcaster_progress_stage, fail_private_broadcaster_progress_steps_at_stage,
     finish_private_broadcaster_progress_steps, finish_private_broadcaster_progress_steps_at_stage,
-    private_broadcaster_progress_steps,
+    finish_private_self_broadcast_progress_steps_at_stage, private_broadcaster_progress_steps,
+    self_broadcast_progress_steps,
 };
 #[cfg(test)]
 use public_account::{

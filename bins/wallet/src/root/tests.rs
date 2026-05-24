@@ -34,7 +34,9 @@ use super::private_assets::{
     build_send_asset, build_unshield_asset, format_private_asset_rows_from_snapshot,
     should_show_pending_amount, should_show_pending_poi_amount,
 };
-use super::private_broadcaster::private_broadcaster_closed_active_stage;
+use super::private_broadcaster::{
+    PrivateSubmissionProgressFlow, private_broadcaster_closed_active_stage,
+};
 use super::public_action::{public_action_asset_label, public_action_max_label};
 use super::public_broadcaster_cost::public_broadcaster_cost_status;
 use super::{
@@ -44,42 +46,48 @@ use super::{
     PriceAnchorDialogValues, PrivateActionMetric, PrivateBroadcasterProgressState,
     PublicActionMode, PublicActionStepStatus, PublicBroadcasterFeeTokenOption, SECONDS_PER_DAY,
     SECONDS_PER_HOUR, SECONDS_PER_MINUTE, SECONDS_PER_MONTH, SECONDS_PER_YEAR,
-    SEND_AUTHORIZATION_FAILED_ERROR, SEND_MISSING_PASSWORD_ERROR, SettingsApplyMode,
-    UNSHIELD_AUTHORIZATION_FAILED_ERROR, UNSHIELD_MISSING_PASSWORD_ERROR, UnshieldAsset,
-    UnshieldAssetKey, VaultState, WalletAppOptions, WalletRoot, WalletSelectItem, WalletTab,
-    add_chain_rpc_endpoint, add_poi_gateway_url, add_waku_direct_peer, add_waku_dns_enr_tree,
-    add_waku_doh_fallback_endpoint, adjusted_amount_for_max_change,
+    SEND_AUTHORIZATION_FAILED_ERROR, SEND_MISSING_PASSWORD_ERROR, SelfBroadcastNativeBalanceState,
+    SettingsApplyMode, UNSHIELD_AUTHORIZATION_FAILED_ERROR, UNSHIELD_MISSING_PASSWORD_ERROR,
+    UnshieldAsset, UnshieldAssetKey, VaultState, WalletAppOptions, WalletRoot, WalletSelectItem,
+    WalletTab, add_chain_rpc_endpoint, add_poi_gateway_url, add_waku_direct_peer,
+    add_waku_dns_enr_tree, add_waku_doh_fallback_endpoint, adjusted_amount_for_max_change,
     apply_private_broadcaster_progress_stage, broadcaster_choice_supported_by_candidates,
-    classify_settings_apply_mode, display_chain_contract_settings,
-    display_chain_quick_sync_endpoint, display_chain_rpc_endpoints, display_price_anchor_entries,
-    display_rows_from_output, display_token_entries, display_waku_direct_peers,
-    display_waku_dns_enr_trees, display_waku_doh_endpoint, display_waku_doh_fallback_endpoints,
+    classify_settings_apply_mode, default_self_broadcast_gas_payer_uuid,
+    display_chain_contract_settings, display_chain_quick_sync_endpoint,
+    display_chain_rpc_endpoints, display_price_anchor_entries, display_rows_from_output,
+    display_token_entries, display_waku_direct_peers, display_waku_dns_enr_trees,
+    display_waku_doh_endpoint, display_waku_doh_fallback_endpoints,
     effective_public_broadcaster_fee_mode, ethereum_weth_public_broadcaster_count,
     fail_private_broadcaster_progress_steps_at_stage, fee_token_option_has_eligible_broadcaster,
     finish_private_broadcaster_progress_steps, finish_private_broadcaster_progress_steps_at_stage,
+    finish_private_self_broadcast_progress_steps_at_stage,
     form_error_clears_public_broadcaster_cost_estimate, format_anchor_bps_exact_range,
     format_anchor_bps_percent, format_anchor_bps_percent_range, format_anchor_premium_range,
     format_compact_age, format_exact_asset_amount_for_display, format_form_error_for_asset,
-    format_native_token_amount_for_display, format_private_asset_rows,
+    format_gwei, format_native_token_amount_for_display, format_private_asset_rows,
     format_public_broadcaster_fee_margin, format_report_chain, format_send_amount_input,
     format_total, format_unshield_amount_input, is_effective_wrapped_native_token,
     load_validated_startup_settings, loading_summary, max_send_amount_from_snapshot,
     max_unshield_amount_from_snapshot, merge_public_balance_snapshot, native_token_display_label,
-    native_wrapped_output_labels, next_public_account_label_number, parse_repair_cache_block,
-    price_anchor_dialog_values_from_entry, price_anchor_override_from_dialog_values,
-    price_anchor_token_primary_label, private_action_metrics, private_broadcaster_progress_steps,
-    progress_detail, public_account_identicon_color, public_account_identicon_pattern,
+    native_wrapped_output_labels, next_public_account_label_number, parse_gwei_to_wei,
+    parse_repair_cache_block, price_anchor_dialog_values_from_entry,
+    price_anchor_override_from_dialog_values, price_anchor_token_primary_label,
+    private_action_metrics, private_broadcaster_progress_steps, progress_detail,
+    public_account_identicon_color, public_account_identicon_pattern,
     public_account_matches_search, public_account_visible_balances_for_chain,
     public_action_error_copy_value, public_action_error_details, public_action_error_summary,
     public_action_max_amount_after_reserve, public_action_progress_steps,
     public_address_qr_module_range, public_address_qr_payload, public_asset_decimals,
-    public_asset_icon_path, public_asset_label, public_balance_entry_for_chain,
-    public_broadcaster_candidates_for_asset, public_broadcaster_cost_status_text,
-    public_broadcaster_fee_token_options_from_snapshot, public_broadcaster_fee_token_warning,
-    public_broadcaster_submit_disabled_for_fee_token_options, refresh_form_asset_from_snapshot,
+    public_asset_icon_path, public_asset_label, public_balance_amount_label,
+    public_balance_entry_for_chain, public_broadcaster_candidates_for_asset,
+    public_broadcaster_cost_status_text, public_broadcaster_fee_token_options_from_snapshot,
+    public_broadcaster_fee_token_warning, public_broadcaster_submit_disabled_for_fee_token_options,
+    random_self_broadcast_gas_payer_uuid, refresh_form_asset_from_snapshot,
     remove_chain_rpc_endpoint, remove_poi_gateway_url, remove_waku_direct_peer,
     remove_waku_dns_enr_tree, remove_waku_doh_fallback_endpoint, repair_cache_help_text,
     required_relay_adapt_for_unwrap, resolve_selected_public_broadcaster_fee_token,
+    self_broadcast_gas_payer_matches_search, self_broadcast_native_balance_label,
+    self_broadcast_native_balance_state, self_broadcast_progress_steps,
     send_asset_key_from_formatted, send_element_id, send_key_matches_asset,
     send_public_broadcaster_estimate_input_error, set_chain_rpc_endpoint, set_poi_gateway_url,
     set_price_anchor_override, set_waku_direct_peer, set_waku_dns_enr_tree,
@@ -92,8 +100,8 @@ use super::{
     should_show_proxy_url_setting, should_show_proxy_waku_disclaimer,
     sidebar_primary_activity_order, startup_settings_action_state,
     unshield_asset_key_from_formatted, unshield_element_id, unshield_key_matches_asset,
-    unshield_public_broadcaster_estimate_input_error, wallet_generation_matches,
-    wallet_options_from_metadata,
+    unshield_public_broadcaster_estimate_input_error, validate_custom_gas_fee,
+    wallet_generation_matches, wallet_options_from_metadata,
 };
 
 fn utxo_output(token: &str, value: &str, is_spent: bool) -> UtxoOutput {
@@ -2516,18 +2524,80 @@ fn private_broadcaster_terminal_result_applies_latest_stage_before_timeout() {
 }
 
 #[test]
+fn self_broadcast_progress_stage_sequence_tracks_direct_submission() {
+    let mut steps = self_broadcast_progress_steps();
+
+    assert_eq!(
+        steps.iter().map(|step| step.stage).collect::<Vec<_>>(),
+        vec![
+            TransactionGenerationStage::SelectingPrivateNotes,
+            TransactionGenerationStage::ProvingTransaction,
+            TransactionGenerationStage::GeneratingPoiProofs,
+            TransactionGenerationStage::EstimatingSelfBroadcastGas,
+            TransactionGenerationStage::SigningSelfBroadcast,
+            TransactionGenerationStage::WaitingForSelfBroadcastReceipt,
+        ]
+    );
+
+    apply_private_broadcaster_progress_stage(
+        &mut steps,
+        TransactionGenerationStage::SigningSelfBroadcast,
+    );
+    let statuses = steps.iter().map(|step| step.status).collect::<Vec<_>>();
+    assert_eq!(
+        statuses,
+        vec![
+            PublicActionStepStatus::Done,
+            PublicActionStepStatus::Done,
+            PublicActionStepStatus::Done,
+            PublicActionStepStatus::Done,
+            PublicActionStepStatus::Pending,
+            PublicActionStepStatus::NotStarted,
+        ]
+    );
+}
+
+#[test]
+fn self_broadcast_reverted_receipt_marks_receipt_step_error() {
+    let mut steps = self_broadcast_progress_steps();
+
+    finish_private_self_broadcast_progress_steps_at_stage(
+        &mut steps,
+        TransactionGenerationStage::WaitingForSelfBroadcastReceipt,
+        false,
+    );
+
+    assert_eq!(
+        steps.last().map(|step| step.status),
+        Some(PublicActionStepStatus::Error)
+    );
+    assert!(
+        steps[..steps.len() - 1]
+            .iter()
+            .all(|step| step.status == PublicActionStepStatus::Done)
+    );
+    assert_eq!(
+        steps.last().and_then(|step| step.message.as_deref()),
+        Some("Transaction receipt indicates the self-broadcast transaction reverted.")
+    );
+}
+
+#[test]
 fn closed_private_broadcaster_progress_exposes_active_stage() {
     let key = UnshieldAssetKey::new(1, Address::from([0x11; 20]));
     let mut progress = PrivateBroadcasterProgressState {
+        flow: PrivateSubmissionProgressFlow::PublicBroadcaster,
         kind: DeliveryFormKind::Send,
         key,
         generation_id: 7,
         asset_label: Arc::from("ETH"),
         icon_path: None,
         recipient: Arc::from("0zk"),
+        gas_payer: None,
         steps: private_broadcaster_progress_steps(),
         estimate: None,
         result: None,
+        self_broadcast_result: None,
         error: None,
         dialog_open: false,
         stage_seen: false,
@@ -2949,8 +3019,16 @@ fn unshield_element_ids_are_asset_scoped() {
 }
 
 fn public_account_for_search(label: Option<&str>, address: Address) -> PublicAccountMetadata {
+    public_account_for_search_with_uuid("public-account", label, address)
+}
+
+fn public_account_for_search_with_uuid(
+    uuid: &str,
+    label: Option<&str>,
+    address: Address,
+) -> PublicAccountMetadata {
     PublicAccountMetadata {
-        public_account_uuid: "public-account".to_string(),
+        public_account_uuid: uuid.to_string(),
         address,
         label: label.map(str::to_string),
         source: PublicAccountSource::Imported,
@@ -2990,6 +3068,212 @@ fn public_account_search_rejects_non_matches() {
     let account = public_account_for_search(Some("Primary"), Address::from([0xcd; 20]));
 
     assert!(!public_account_matches_search(&account, "savings"));
+}
+
+#[test]
+fn self_broadcast_gas_payer_defaulting_requires_explicit_multiple_choice() {
+    let first =
+        public_account_for_search_with_uuid("public-1", Some("Main"), Address::from([0x11; 20]));
+    let second =
+        public_account_for_search_with_uuid("public-2", Some("Backup"), Address::from([0x22; 20]));
+
+    assert_eq!(default_self_broadcast_gas_payer_uuid(&[]), None);
+    assert_eq!(
+        default_self_broadcast_gas_payer_uuid(std::slice::from_ref(&first)).as_deref(),
+        Some("public-1")
+    );
+    assert_eq!(
+        default_self_broadcast_gas_payer_uuid(&[first, second]),
+        None
+    );
+}
+
+#[test]
+fn self_broadcast_gas_payer_search_matches_label_and_addresses() {
+    let account = public_account_for_search_with_uuid(
+        "public-1",
+        Some("Private gas payer"),
+        Address::from([0xab; 20]),
+    );
+
+    assert!(self_broadcast_gas_payer_matches_search(&account, "gas"));
+    assert!(self_broadcast_gas_payer_matches_search(&account, "0xabab"));
+    assert!(self_broadcast_gas_payer_matches_search(&account, "ABAB"));
+    assert!(self_broadcast_gas_payer_matches_search(
+        &account,
+        &railgun_ui::short_address(&account.address),
+    ));
+    assert!(!self_broadcast_gas_payer_matches_search(
+        &account, "savings"
+    ));
+}
+
+#[test]
+fn random_self_broadcast_gas_payer_returns_eligible_account_uuid() {
+    let first =
+        public_account_for_search_with_uuid("public-1", Some("Main"), Address::from([0x11; 20]));
+    let second =
+        public_account_for_search_with_uuid("public-2", Some("Backup"), Address::from([0x22; 20]));
+
+    assert_eq!(
+        random_self_broadcast_gas_payer_uuid(&[], None, 1, None),
+        None
+    );
+    assert_eq!(
+        random_self_broadcast_gas_payer_uuid(
+            std::slice::from_ref(&first),
+            Some("public-1"),
+            1,
+            None
+        ),
+        None
+    );
+    assert_eq!(
+        random_self_broadcast_gas_payer_uuid(std::slice::from_ref(&first), None, 1, None)
+            .as_deref(),
+        Some("public-1")
+    );
+    assert_eq!(
+        random_self_broadcast_gas_payer_uuid(
+            &[first.clone(), second.clone()],
+            Some("public-1"),
+            1,
+            None
+        )
+        .as_deref(),
+        Some("public-2")
+    );
+    let selected = random_self_broadcast_gas_payer_uuid(&[first, second], None, 1, None)
+        .expect("random account selected");
+    assert!(matches!(selected.as_ref(), "public-1" | "public-2"));
+}
+
+#[test]
+fn random_self_broadcast_gas_payer_skips_known_zero_native_balance() {
+    let first =
+        public_account_for_search_with_uuid("public-1", Some("Empty"), Address::from([0x11; 20]));
+    let second =
+        public_account_for_search_with_uuid("public-2", Some("Funded"), Address::from([0x22; 20]));
+    let snapshot = public_native_balance_snapshot_for_test(
+        1,
+        vec![
+            (first.clone(), PublicBalanceAmount::Available(U256::ZERO)),
+            (
+                second.clone(),
+                PublicBalanceAmount::Available(U256::from(5_u64)),
+            ),
+        ],
+    );
+
+    assert_eq!(
+        random_self_broadcast_gas_payer_uuid(
+            &[first.clone(), second.clone()],
+            None,
+            1,
+            Some(&snapshot)
+        )
+        .as_deref(),
+        Some("public-2")
+    );
+    assert_eq!(
+        random_self_broadcast_gas_payer_uuid(
+            &[first.clone(), second],
+            Some("public-2"),
+            1,
+            Some(&snapshot)
+        ),
+        None
+    );
+    assert_eq!(
+        random_self_broadcast_gas_payer_uuid(
+            std::slice::from_ref(&first),
+            None,
+            56,
+            Some(&snapshot)
+        )
+        .as_deref(),
+        Some("public-1")
+    );
+}
+
+#[test]
+fn self_broadcast_native_balance_label_uses_snapshot_or_unavailable() {
+    let snapshot = public_balance_snapshot_for_test(1);
+    let expected =
+        public_balance_amount_label(&PublicBalanceAmount::Available(U256::from(5_u64)), 18);
+
+    assert_eq!(
+        self_broadcast_native_balance_label(Some(&snapshot), 1, "public-account"),
+        expected
+    );
+    assert_eq!(
+        self_broadcast_native_balance_label(Some(&snapshot), 56, "public-account"),
+        "unavailable"
+    );
+    assert_eq!(
+        self_broadcast_native_balance_label(Some(&snapshot), 1, "missing"),
+        "unavailable"
+    );
+}
+
+#[test]
+fn self_broadcast_native_balance_state_distinguishes_zero_positive_and_unknown() {
+    let empty =
+        public_account_for_search_with_uuid("public-1", Some("Empty"), Address::from([0x11; 20]));
+    let funded =
+        public_account_for_search_with_uuid("public-2", Some("Funded"), Address::from([0x22; 20]));
+    let unavailable = public_account_for_search_with_uuid(
+        "public-3",
+        Some("Unavailable"),
+        Address::from([0x33; 20]),
+    );
+    let snapshot = public_native_balance_snapshot_for_test(
+        1,
+        vec![
+            (empty, PublicBalanceAmount::Available(U256::ZERO)),
+            (funded, PublicBalanceAmount::Available(U256::from(5_u64))),
+            (unavailable, PublicBalanceAmount::Unavailable),
+        ],
+    );
+
+    assert_eq!(
+        self_broadcast_native_balance_state(Some(&snapshot), 1, "public-1"),
+        SelfBroadcastNativeBalanceState::Zero
+    );
+    assert_eq!(
+        self_broadcast_native_balance_state(Some(&snapshot), 1, "public-2"),
+        SelfBroadcastNativeBalanceState::Positive
+    );
+    assert_eq!(
+        self_broadcast_native_balance_state(Some(&snapshot), 1, "public-3"),
+        SelfBroadcastNativeBalanceState::Unknown
+    );
+    assert_eq!(
+        self_broadcast_native_balance_state(Some(&snapshot), 56, "public-1"),
+        SelfBroadcastNativeBalanceState::Unknown
+    );
+    assert_eq!(
+        self_broadcast_native_balance_state(Some(&snapshot), 1, "missing"),
+        SelfBroadcastNativeBalanceState::Unknown
+    );
+}
+
+#[test]
+fn eip1559_gas_fee_helpers_parse_and_format_gwei() {
+    assert_eq!(parse_gwei_to_wei("1"), Ok(1_000_000_000));
+    assert_eq!(parse_gwei_to_wei("1.25"), Ok(1_250_000_000));
+    assert_eq!(parse_gwei_to_wei("0.000000001"), Ok(1));
+    assert!(parse_gwei_to_wei("0.0000000001").is_err());
+    assert_eq!(format_gwei(1_250_000_000), "1.25");
+    assert_eq!(format_gwei(1), "0.000000001");
+}
+
+#[test]
+fn eip1559_custom_gas_fee_validation_rejects_invalid_caps() {
+    assert!(validate_custom_gas_fee(1, 0).is_ok());
+    assert!(validate_custom_gas_fee(1, 1).is_ok());
+    assert!(validate_custom_gas_fee(0, 0).is_err());
+    assert!(validate_custom_gas_fee(1, 2).is_err());
 }
 
 #[test]
@@ -3072,6 +3356,30 @@ fn public_balance_snapshot_for_test(chain_id: u64) -> PublicBalanceSnapshot {
                 amount: PublicBalanceAmount::Available(U256::from(5_u64)),
             }],
         }],
+    }
+}
+
+fn public_native_balance_snapshot_for_test(
+    chain_id: u64,
+    accounts: Vec<(PublicAccountMetadata, PublicBalanceAmount)>,
+) -> PublicBalanceSnapshot {
+    PublicBalanceSnapshot {
+        chain_id,
+        refreshed_at: SystemTime::UNIX_EPOCH,
+        accounts: accounts
+            .into_iter()
+            .map(|(account, amount)| PublicAccountBalance {
+                account,
+                balances: vec![PublicBalanceEntry {
+                    asset: PublicBalanceAsset {
+                        id: PublicAssetId::Native,
+                        symbol: "ETH".to_string(),
+                        decimals: 18,
+                    },
+                    amount,
+                }],
+            })
+            .collect(),
     }
 }
 

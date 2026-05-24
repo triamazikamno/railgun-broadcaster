@@ -16,7 +16,7 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::uint;
 use broadcaster_core::contracts::shield::derive_shield_private_key;
 use broadcaster_core::crypto::railgun::{Address as RailgunAddress, AddressData};
-use broadcaster_core::query_rpc_pool::QueryRpcPool;
+use broadcaster_core::query_rpc_pool::{ProviderHandle, QueryRpcPool};
 use broadcaster_core::transact::{
     BroadcasterRawParamsTransact, DEFAULT_TXID_VERSION, EncryptedTransactRequest,
     railgun_txid_leaf_hash,
@@ -97,6 +97,7 @@ pub use http::{
     build_wallet_network_context_with_progress, request_tor_state_reset,
     resolve_wallet_network_mode,
 };
+use public_wallet::vaulted_public_signer;
 pub use public_wallet::{
     PublicAccountBalance, PublicActionProgressStatus, PublicActionProgressStep,
     PublicActionProgressUpdate, PublicAssetId, PublicBalanceAmount, PublicBalanceAsset,
@@ -107,6 +108,7 @@ pub use public_wallet::{
     submit_public_send, submit_public_send_with_progress, submit_public_shield,
     submit_public_shield_with_progress,
 };
+use signer::EvmTransactionSigner;
 use utxos::apply_pending_overlay_to_outputs;
 pub use utxos::{
     ListUtxosOutput, TokenTotal, UtxoOutput, max_broadcaster_fee_token_amount_from_outputs,
@@ -351,6 +353,88 @@ pub struct DesktopSendCalldataRequest {
     pub progress_tx: Option<TransactionGenerationProgressSender>,
 }
 
+pub const SELF_BROADCAST_AUTO_MAX_FEE_NUMERATOR: u128 = 120;
+pub const SELF_BROADCAST_AUTO_MAX_FEE_DENOMINATOR: u128 = 100;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelfBroadcastGasFeeQuote {
+    pub rpc_gas_price: u128,
+    pub suggested_max_fee_per_gas: u128,
+    pub suggested_max_priority_fee_per_gas: u128,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SelfBroadcastGasFeeSelection {
+    #[default]
+    Auto,
+    Custom {
+        max_fee_per_gas: u128,
+        max_priority_fee_per_gas: u128,
+    },
+}
+
+impl SelfBroadcastGasFeeQuote {
+    #[must_use]
+    pub const fn from_rpc_gas_price(rpc_gas_price: u128) -> Self {
+        Self {
+            rpc_gas_price,
+            suggested_max_fee_per_gas: self_broadcast_auto_max_fee_per_gas(rpc_gas_price),
+            suggested_max_priority_fee_per_gas: 0,
+        }
+    }
+}
+
+#[must_use]
+pub const fn self_broadcast_auto_max_fee_per_gas(rpc_gas_price: u128) -> u128 {
+    rpc_gas_price.saturating_mul(SELF_BROADCAST_AUTO_MAX_FEE_NUMERATOR)
+        / SELF_BROADCAST_AUTO_MAX_FEE_DENOMINATOR
+}
+
+pub async fn quote_desktop_self_broadcast_gas_fee(
+    chain_id: u64,
+    effective_chain: Option<&settings::EffectiveChainConfig>,
+    http: &HttpContext,
+) -> Result<SelfBroadcastGasFeeQuote> {
+    let chain = effective_desktop_chain_config(chain_id, effective_chain)?;
+    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
+    self_broadcast_gas_fee_quote_from_rpc_pool(&query_rpc_pool).await
+}
+
+pub struct DesktopUnshieldSelfBroadcastRequest {
+    pub chain_id: u64,
+    pub effective_chain: Option<settings::EffectiveChainConfig>,
+    pub view_session: Arc<vault::DesktopViewSession>,
+    pub session: Arc<WalletSession>,
+    pub vault_store: Arc<vault::DesktopVaultStore>,
+    pub vault_password: Zeroizing<String>,
+    pub public_account_uuid: String,
+    pub token: Address,
+    pub fee_token: Address,
+    pub amount: U256,
+    pub recipient: Address,
+    pub unwrap: bool,
+    pub verify_proof: bool,
+    pub gas_fee: SelfBroadcastGasFeeSelection,
+    pub progress_tx: Option<TransactionGenerationProgressSender>,
+}
+
+pub struct DesktopSendSelfBroadcastRequest {
+    pub chain_id: u64,
+    pub effective_chain: Option<settings::EffectiveChainConfig>,
+    pub view_session: Arc<vault::DesktopViewSession>,
+    pub session: Arc<WalletSession>,
+    pub vault_store: Arc<vault::DesktopVaultStore>,
+    pub vault_password: Zeroizing<String>,
+    pub public_account_uuid: String,
+    pub token: Address,
+    pub fee_token: Address,
+    pub amount: U256,
+    pub recipient: String,
+    pub verify_proof: bool,
+    pub gas_fee: SelfBroadcastGasFeeSelection,
+    pub progress_tx: Option<TransactionGenerationProgressSender>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PublicBroadcasterCandidate {
     pub chain_id: u64,
@@ -456,6 +540,9 @@ pub enum TransactionGenerationStage {
     GeneratingPoiProofs,
     PublishingToBroadcaster,
     WaitingForBroadcasterResponse,
+    EstimatingSelfBroadcastGas,
+    SigningSelfBroadcast,
+    WaitingForSelfBroadcastReceipt,
 }
 
 impl TransactionGenerationStage {
@@ -468,6 +555,9 @@ impl TransactionGenerationStage {
             Self::GeneratingPoiProofs => "Generating POI proofs",
             Self::PublishingToBroadcaster => "Publishing to broadcaster",
             Self::WaitingForBroadcasterResponse => "Waiting for broadcaster response",
+            Self::EstimatingSelfBroadcastGas => "Estimating self-broadcast gas",
+            Self::SigningSelfBroadcast => "Signing self-broadcast transaction",
+            Self::WaitingForSelfBroadcastReceipt => "Waiting for self-broadcast receipt",
         }
     }
 
@@ -485,6 +575,13 @@ impl TransactionGenerationStage {
             Self::PublishingToBroadcaster => "Encrypting and publishing the request over Waku.",
             Self::WaitingForBroadcasterResponse => {
                 "Waiting for the selected broadcaster to respond."
+            }
+            Self::EstimatingSelfBroadcastGas => {
+                "Estimating direct transaction gas and checking the gas payer balance."
+            }
+            Self::SigningSelfBroadcast => "Unlocking the selected Public account and signing.",
+            Self::WaitingForSelfBroadcastReceipt => {
+                "Waiting for the submitted transaction receipt."
             }
         }
     }
@@ -676,6 +773,66 @@ pub struct PreparedSendCall {
     pub public_output_count: usize,
     pub to: Address,
     pub data: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopSelfBroadcastResult {
+    pub chain_id: u64,
+    pub public_account_uuid: String,
+    pub gas_payer: Address,
+    pub gas_limit: u64,
+    pub rpc_gas_price: u128,
+    pub max_fee_per_gas: u128,
+    pub max_priority_fee_per_gas: u128,
+    pub estimated_native_gas_cost: U256,
+    pub live_native_balance: U256,
+    pub tx: TxReceiptOutput,
+}
+
+struct PreparedPrivatePlan<P> {
+    plan: P,
+    max_spendable: U256,
+    prover: ProverService,
+}
+
+struct DesktopUnshieldPlanRequest<'a> {
+    chain_id: u64,
+    effective_chain: Option<&'a settings::EffectiveChainConfig>,
+    view_session: &'a vault::DesktopViewSession,
+    session: &'a WalletSession,
+    vault_store: &'a vault::DesktopVaultStore,
+    vault_password: &'a str,
+    token: Address,
+    amount: U256,
+    recipient: Address,
+    unwrap: bool,
+    verify_proof: bool,
+    progress_tx: Option<&'a TransactionGenerationProgressSender>,
+}
+
+struct DesktopSendPlanRequest<'a> {
+    chain_id: u64,
+    effective_chain: Option<&'a settings::EffectiveChainConfig>,
+    view_session: &'a vault::DesktopViewSession,
+    session: &'a WalletSession,
+    vault_store: &'a vault::DesktopVaultStore,
+    vault_password: &'a str,
+    token: Address,
+    amount: U256,
+    recipient: &'a str,
+    verify_proof: bool,
+    progress_tx: Option<&'a TransactionGenerationProgressSender>,
+}
+
+struct SelfBroadcastPreflight {
+    provider_handle: ProviderHandle,
+    tx_req: TransactionRequest,
+    gas_limit: u64,
+    rpc_gas_price: u128,
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+    estimated_native_gas_cost: U256,
+    live_native_balance: U256,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1730,10 +1887,10 @@ async fn wallet_session_from_parts(
     })
 }
 
-pub async fn prepare_desktop_unshield_calldata(
-    request: DesktopUnshieldCalldataRequest,
+async fn prepare_desktop_unshield_plan_without_broadcaster_fee(
+    request: DesktopUnshieldPlanRequest<'_>,
     http: &HttpContext,
-) -> Result<PreparedUnshieldCall> {
+) -> Result<PreparedPrivatePlan<UnshieldPlan>> {
     if request.session.chain_id != request.chain_id {
         return Err(eyre!(
             "selected wallet session is for chain {}, not {}",
@@ -1741,7 +1898,7 @@ pub async fn prepare_desktop_unshield_calldata(
             request.chain_id
         ));
     }
-    let chain = effective_desktop_chain_config(request.chain_id, request.effective_chain.as_ref())?;
+    let chain = effective_desktop_chain_config(request.chain_id, request.effective_chain)?;
     if request.unwrap && !is_effective_wrapped_native_token(request.chain_id, request.token, &chain)
     {
         return Err(eyre!("selected token does not support unwrap-to-native"));
@@ -1775,7 +1932,7 @@ pub async fn prepare_desktop_unshield_calldata(
         min_gas_price: 0,
     };
     update_transaction_generation_stage(
-        request.progress_tx.as_ref(),
+        request.progress_tx,
         TransactionGenerationStage::SelectingPrivateNotes,
     );
     let selection_info = unshield_selection_info(&utxos, request.token, request.amount, false)
@@ -1783,7 +1940,7 @@ pub async fn prepare_desktop_unshield_calldata(
 
     let mut grant = request
         .vault_store
-        .create_spend_grant(request.vault_password.as_str())
+        .create_spend_grant(request.vault_password)
         .wrap_err("authorize unshield spend")?;
     let signer = request
         .vault_store
@@ -1798,7 +1955,7 @@ pub async fn prepare_desktop_unshield_calldata(
     };
 
     update_transaction_generation_stage(
-        request.progress_tx.as_ref(),
+        request.progress_tx,
         TransactionGenerationStage::ProvingTransaction,
     );
     let plan = tx_builder
@@ -1813,51 +1970,17 @@ pub async fn prepare_desktop_unshield_calldata(
         .await
         .wrap_err("build desktop unshield calldata")?;
 
-    update_transaction_generation_stage(
-        request.progress_tx.as_ref(),
-        TransactionGenerationStage::GeneratingPoiProofs,
-    );
-    let (pending_poi_list_keys, pending_pois) = active_list_pre_transaction_pois(
-        &plan.chunks,
-        request.session.as_ref(),
-        request.chain_id,
-        &prover,
-        request.verify_proof,
-        http,
-        "generate manual unshield pending output pre-transaction POI",
-    )
-    .await?;
-    persist_pending_unshield_output_poi_contexts(
-        request.session.db.as_ref(),
-        request.chain_id,
-        request.view_session.wallet_id(),
-        &plan.chunks,
-        &pending_pois,
-        &pending_poi_list_keys,
-        false,
-        false,
-    )?;
-
-    Ok(PreparedUnshieldCall {
-        chain_id: request.chain_id,
-        token: request.token,
-        amount: request.amount,
-        recipient: request.recipient,
-        unwrap: request.unwrap,
+    Ok(PreparedPrivatePlan {
+        plan,
         max_spendable: selection_info.max_spendable,
-        transaction_count: plan.transaction_count(),
-        input_count: plan.input_count(),
-        private_output_count: plan.private_output_count(),
-        public_output_count: plan.public_output_count(),
-        to: plan.call.to,
-        data: hex::encode_prefixed(&plan.call.data),
+        prover,
     })
 }
 
-pub async fn prepare_desktop_send_calldata(
-    request: DesktopSendCalldataRequest,
+async fn prepare_desktop_send_plan_without_broadcaster_fee(
+    request: DesktopSendPlanRequest<'_>,
     http: &HttpContext,
-) -> Result<PreparedSendCall> {
+) -> Result<PreparedPrivatePlan<SendPlan>> {
     if request.session.chain_id != request.chain_id {
         return Err(eyre!(
             "selected wallet session is for chain {}, not {}",
@@ -1866,9 +1989,9 @@ pub async fn prepare_desktop_send_calldata(
         ));
     }
 
-    let recipient = request.recipient.trim().to_string();
-    let recipient_data = parse_railgun_recipient(&recipient)?;
-    let chain = effective_desktop_chain_config(request.chain_id, request.effective_chain.as_ref())?;
+    let recipient = request.recipient.trim();
+    let recipient_data = parse_railgun_recipient(recipient)?;
+    let chain = effective_desktop_chain_config(request.chain_id, request.effective_chain)?;
     let artifact_source = artifact_source(http);
     let prover = ProverService::new_with_db(artifact_source, Arc::clone(&request.session.db));
     let chain_handle = request
@@ -1891,7 +2014,7 @@ pub async fn prepare_desktop_send_calldata(
         min_gas_price: 0,
     };
     update_transaction_generation_stage(
-        request.progress_tx.as_ref(),
+        request.progress_tx,
         TransactionGenerationStage::SelectingPrivateNotes,
     );
     let selection_info = send_selection_info(&utxos, request.token, request.amount, false)
@@ -1899,7 +2022,7 @@ pub async fn prepare_desktop_send_calldata(
 
     let mut grant = request
         .vault_store
-        .create_spend_grant(request.vault_password.as_str())
+        .create_spend_grant(request.vault_password)
         .wrap_err("authorize send spend")?;
     let signer = request
         .vault_store
@@ -1914,7 +2037,7 @@ pub async fn prepare_desktop_send_calldata(
     };
 
     update_transaction_generation_stage(
-        request.progress_tx.as_ref(),
+        request.progress_tx,
         TransactionGenerationStage::ProvingTransaction,
     );
     let plan = tx_builder
@@ -1929,44 +2052,224 @@ pub async fn prepare_desktop_send_calldata(
         .await
         .wrap_err("build desktop send calldata")?;
 
-    update_transaction_generation_stage(
-        request.progress_tx.as_ref(),
-        TransactionGenerationStage::GeneratingPoiProofs,
-    );
+    Ok(PreparedPrivatePlan {
+        plan,
+        max_spendable: selection_info.max_spendable,
+        prover,
+    })
+}
+
+async fn persist_manual_unshield_pending_pois(
+    plan: &UnshieldPlan,
+    session: &WalletSession,
+    chain_id: u64,
+    wallet_id: &str,
+    prover: &ProverService,
+    verify_proof: bool,
+    http: &HttpContext,
+    operation_label: &'static str,
+) -> Result<()> {
     let (pending_poi_list_keys, pending_pois) = active_list_pre_transaction_pois(
         &plan.chunks,
-        request.session.as_ref(),
-        request.chain_id,
-        &prover,
-        request.verify_proof,
+        session,
+        chain_id,
+        prover,
+        verify_proof,
         http,
-        "generate manual send pending output pre-transaction POI",
+        operation_label,
     )
     .await?;
-    persist_pending_send_output_poi_contexts(
-        request.session.db.as_ref(),
-        request.chain_id,
-        request.view_session.wallet_id(),
+    persist_pending_unshield_output_poi_contexts(
+        session.db.as_ref(),
+        chain_id,
+        wallet_id,
         &plan.chunks,
         &pending_pois,
         &pending_poi_list_keys,
         false,
         false,
     )?;
+    Ok(())
+}
 
-    Ok(PreparedSendCall {
-        chain_id: request.chain_id,
-        token: request.token,
-        amount: request.amount,
+async fn persist_manual_send_pending_pois(
+    plan: &SendPlan,
+    session: &WalletSession,
+    chain_id: u64,
+    wallet_id: &str,
+    prover: &ProverService,
+    verify_proof: bool,
+    http: &HttpContext,
+    operation_label: &'static str,
+) -> Result<()> {
+    let (pending_poi_list_keys, pending_pois) = active_list_pre_transaction_pois(
+        &plan.chunks,
+        session,
+        chain_id,
+        prover,
+        verify_proof,
+        http,
+        operation_label,
+    )
+    .await?;
+    persist_pending_send_output_poi_contexts(
+        session.db.as_ref(),
+        chain_id,
+        wallet_id,
+        &plan.chunks,
+        &pending_pois,
+        &pending_poi_list_keys,
+        false,
+        false,
+    )?;
+    Ok(())
+}
+
+fn prepared_unshield_call_from_plan(
+    chain_id: u64,
+    token: Address,
+    amount: U256,
+    recipient: Address,
+    unwrap: bool,
+    max_spendable: U256,
+    plan: &UnshieldPlan,
+) -> PreparedUnshieldCall {
+    PreparedUnshieldCall {
+        chain_id,
+        token,
+        amount,
         recipient,
-        max_spendable: selection_info.max_spendable,
+        unwrap,
+        max_spendable,
         transaction_count: plan.transaction_count(),
         input_count: plan.input_count(),
         private_output_count: plan.private_output_count(),
         public_output_count: plan.public_output_count(),
         to: plan.call.to,
         data: hex::encode_prefixed(&plan.call.data),
-    })
+    }
+}
+
+fn prepared_send_call_from_plan(
+    chain_id: u64,
+    token: Address,
+    amount: U256,
+    recipient: String,
+    max_spendable: U256,
+    plan: &SendPlan,
+) -> PreparedSendCall {
+    PreparedSendCall {
+        chain_id,
+        token,
+        amount,
+        recipient,
+        max_spendable,
+        transaction_count: plan.transaction_count(),
+        input_count: plan.input_count(),
+        private_output_count: plan.private_output_count(),
+        public_output_count: plan.public_output_count(),
+        to: plan.call.to,
+        data: hex::encode_prefixed(&plan.call.data),
+    }
+}
+
+pub async fn prepare_desktop_unshield_calldata(
+    request: DesktopUnshieldCalldataRequest,
+    http: &HttpContext,
+) -> Result<PreparedUnshieldCall> {
+    let prepared = prepare_desktop_unshield_plan_without_broadcaster_fee(
+        DesktopUnshieldPlanRequest {
+            chain_id: request.chain_id,
+            effective_chain: request.effective_chain.as_ref(),
+            view_session: request.view_session.as_ref(),
+            session: request.session.as_ref(),
+            vault_store: request.vault_store.as_ref(),
+            vault_password: request.vault_password.as_str(),
+            token: request.token,
+            amount: request.amount,
+            recipient: request.recipient,
+            unwrap: request.unwrap,
+            verify_proof: request.verify_proof,
+            progress_tx: request.progress_tx.as_ref(),
+        },
+        http,
+    )
+    .await?;
+
+    update_transaction_generation_stage(
+        request.progress_tx.as_ref(),
+        TransactionGenerationStage::GeneratingPoiProofs,
+    );
+    persist_manual_unshield_pending_pois(
+        &prepared.plan,
+        request.session.as_ref(),
+        request.chain_id,
+        request.view_session.wallet_id(),
+        &prepared.prover,
+        request.verify_proof,
+        http,
+        "generate manual unshield pending output pre-transaction POI",
+    )
+    .await?;
+
+    Ok(prepared_unshield_call_from_plan(
+        request.chain_id,
+        request.token,
+        request.amount,
+        request.recipient,
+        request.unwrap,
+        prepared.max_spendable,
+        &prepared.plan,
+    ))
+}
+
+pub async fn prepare_desktop_send_calldata(
+    request: DesktopSendCalldataRequest,
+    http: &HttpContext,
+) -> Result<PreparedSendCall> {
+    let recipient = request.recipient.trim().to_string();
+    let prepared = prepare_desktop_send_plan_without_broadcaster_fee(
+        DesktopSendPlanRequest {
+            chain_id: request.chain_id,
+            effective_chain: request.effective_chain.as_ref(),
+            view_session: request.view_session.as_ref(),
+            session: request.session.as_ref(),
+            vault_store: request.vault_store.as_ref(),
+            vault_password: request.vault_password.as_str(),
+            token: request.token,
+            amount: request.amount,
+            recipient: &recipient,
+            verify_proof: request.verify_proof,
+            progress_tx: request.progress_tx.as_ref(),
+        },
+        http,
+    )
+    .await?;
+
+    update_transaction_generation_stage(
+        request.progress_tx.as_ref(),
+        TransactionGenerationStage::GeneratingPoiProofs,
+    );
+    persist_manual_send_pending_pois(
+        &prepared.plan,
+        request.session.as_ref(),
+        request.chain_id,
+        request.view_session.wallet_id(),
+        &prepared.prover,
+        request.verify_proof,
+        http,
+        "generate manual send pending output pre-transaction POI",
+    )
+    .await?;
+
+    Ok(prepared_send_call_from_plan(
+        request.chain_id,
+        request.token,
+        request.amount,
+        recipient,
+        prepared.max_spendable,
+        &prepared.plan,
+    ))
 }
 
 pub async fn estimate_desktop_unshield_public_broadcaster_cost(
@@ -2240,6 +2543,502 @@ pub async fn submit_desktop_send_public_broadcaster(
     .await?;
     mark_submitted_inputs_pending_spent(&session, &pending_spent_inputs, &result).await;
     Ok(result)
+}
+
+pub async fn submit_desktop_unshield_self_broadcast(
+    request: DesktopUnshieldSelfBroadcastRequest,
+    http: &HttpContext,
+) -> Result<DesktopSelfBroadcastResult> {
+    let prepared = prepare_desktop_unshield_plan_without_broadcaster_fee(
+        DesktopUnshieldPlanRequest {
+            chain_id: request.chain_id,
+            effective_chain: request.effective_chain.as_ref(),
+            view_session: request.view_session.as_ref(),
+            session: request.session.as_ref(),
+            vault_store: request.vault_store.as_ref(),
+            vault_password: request.vault_password.as_str(),
+            token: request.token,
+            amount: request.amount,
+            recipient: request.recipient,
+            unwrap: request.unwrap,
+            verify_proof: request.verify_proof,
+            progress_tx: request.progress_tx.as_ref(),
+        },
+        http,
+    )
+    .await?;
+    update_transaction_generation_stage(
+        request.progress_tx.as_ref(),
+        TransactionGenerationStage::GeneratingPoiProofs,
+    );
+    persist_manual_unshield_pending_pois(
+        &prepared.plan,
+        request.session.as_ref(),
+        request.chain_id,
+        request.view_session.wallet_id(),
+        &prepared.prover,
+        request.verify_proof,
+        http,
+        "generate self-broadcast unshield pending output pre-transaction POI",
+    )
+    .await?;
+    let pending_spent_inputs = prepared
+        .plan
+        .inputs
+        .iter()
+        .map(|input| input.utxo.clone())
+        .collect::<Vec<_>>();
+    submit_self_broadcast_plan(
+        request.chain_id,
+        request.effective_chain.as_ref(),
+        request.view_session.as_ref(),
+        request.vault_store.as_ref(),
+        request.vault_password.as_str(),
+        request.public_account_uuid,
+        Arc::clone(&request.session),
+        prepared.plan.call.to,
+        prepared.plan.call.data,
+        pending_spent_inputs,
+        request.gas_fee,
+        request.progress_tx,
+        http,
+    )
+    .await
+}
+
+pub async fn submit_desktop_send_self_broadcast(
+    request: DesktopSendSelfBroadcastRequest,
+    http: &HttpContext,
+) -> Result<DesktopSelfBroadcastResult> {
+    let recipient = request.recipient.trim().to_string();
+    let prepared = prepare_desktop_send_plan_without_broadcaster_fee(
+        DesktopSendPlanRequest {
+            chain_id: request.chain_id,
+            effective_chain: request.effective_chain.as_ref(),
+            view_session: request.view_session.as_ref(),
+            session: request.session.as_ref(),
+            vault_store: request.vault_store.as_ref(),
+            vault_password: request.vault_password.as_str(),
+            token: request.token,
+            amount: request.amount,
+            recipient: &recipient,
+            verify_proof: request.verify_proof,
+            progress_tx: request.progress_tx.as_ref(),
+        },
+        http,
+    )
+    .await?;
+    update_transaction_generation_stage(
+        request.progress_tx.as_ref(),
+        TransactionGenerationStage::GeneratingPoiProofs,
+    );
+    persist_manual_send_pending_pois(
+        &prepared.plan,
+        request.session.as_ref(),
+        request.chain_id,
+        request.view_session.wallet_id(),
+        &prepared.prover,
+        request.verify_proof,
+        http,
+        "generate self-broadcast send pending output pre-transaction POI",
+    )
+    .await?;
+    let pending_spent_inputs = prepared
+        .plan
+        .inputs
+        .iter()
+        .map(|input| input.utxo.clone())
+        .collect::<Vec<_>>();
+    submit_self_broadcast_plan(
+        request.chain_id,
+        request.effective_chain.as_ref(),
+        request.view_session.as_ref(),
+        request.vault_store.as_ref(),
+        request.vault_password.as_str(),
+        request.public_account_uuid,
+        Arc::clone(&request.session),
+        prepared.plan.call.to,
+        prepared.plan.call.data,
+        pending_spent_inputs,
+        request.gas_fee,
+        request.progress_tx,
+        http,
+    )
+    .await
+}
+
+async fn submit_self_broadcast_plan(
+    chain_id: u64,
+    effective_chain: Option<&settings::EffectiveChainConfig>,
+    view_session: &vault::DesktopViewSession,
+    vault_store: &vault::DesktopVaultStore,
+    vault_password: &str,
+    public_account_uuid: String,
+    session: Arc<WalletSession>,
+    to: Address,
+    data: Bytes,
+    pending_spent_inputs: Vec<Utxo>,
+    gas_fee: SelfBroadcastGasFeeSelection,
+    progress_tx: Option<TransactionGenerationProgressSender>,
+    http: &HttpContext,
+) -> Result<DesktopSelfBroadcastResult> {
+    let chain = effective_desktop_chain_config(chain_id, effective_chain)?;
+    let gas_payer = self_broadcast_gas_payer(vault_store, view_session, &public_account_uuid)?;
+    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
+    update_transaction_generation_stage(
+        progress_tx.as_ref(),
+        TransactionGenerationStage::EstimatingSelfBroadcastGas,
+    );
+    let preflight = self_broadcast_preflight_from_rpc_pool(
+        &query_rpc_pool,
+        chain_id,
+        gas_payer,
+        to,
+        data,
+        gas_fee,
+        &chain.gas,
+    )
+    .await?;
+
+    update_transaction_generation_stage(
+        progress_tx.as_ref(),
+        TransactionGenerationStage::SigningSelfBroadcast,
+    );
+    let signer = vaulted_public_signer(
+        vault_store,
+        view_session,
+        vault_password,
+        &public_account_uuid,
+    )?;
+    if signer.address() != gas_payer {
+        return Err(eyre!(
+            "selected public account signer address does not match account metadata"
+        ));
+    }
+    let wallet = signer.ethereum_wallet();
+    let gas_limit = preflight.gas_limit;
+    let rpc_gas_price = preflight.rpc_gas_price;
+    let max_fee_per_gas = preflight.max_fee_per_gas;
+    let max_priority_fee_per_gas = preflight.max_priority_fee_per_gas;
+    let estimated_native_gas_cost = preflight.estimated_native_gas_cost;
+    let live_native_balance = preflight.live_native_balance;
+    let provider = preflight.provider_handle.provider;
+    let tx = sign_send_wait_self_broadcast_transaction(
+        &provider,
+        &wallet,
+        preflight.tx_req,
+        &session,
+        &pending_spent_inputs,
+        progress_tx.as_ref(),
+    )
+    .await?;
+    Ok(DesktopSelfBroadcastResult {
+        chain_id,
+        public_account_uuid,
+        gas_payer,
+        gas_limit,
+        rpc_gas_price,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+        estimated_native_gas_cost,
+        live_native_balance,
+        tx,
+    })
+}
+
+fn self_broadcast_gas_payer(
+    vault_store: &vault::DesktopVaultStore,
+    view_session: &vault::DesktopViewSession,
+    public_account_uuid: &str,
+) -> Result<Address> {
+    vault_store
+        .list_active_public_accounts_for_session(view_session)
+        .wrap_err("load active public accounts")?
+        .into_iter()
+        .find(|account| account.public_account_uuid == public_account_uuid)
+        .map(|account| account.address)
+        .ok_or_else(|| eyre!("selected gas payer is not an active Public account"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelfBroadcastResolvedGasFee {
+    rpc_gas_price: u128,
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+}
+
+async fn self_broadcast_gas_fee_quote_from_rpc_pool(
+    query_rpc_pool: &QueryRpcPool,
+) -> Result<SelfBroadcastGasFeeQuote> {
+    let mut last_error = None;
+    for _ in 0..query_rpc_pool.len() {
+        let Some(provider_handle) = query_rpc_pool.random_provider() else {
+            break;
+        };
+        match self_broadcast_gas_fee_quote(&provider_handle.provider).await {
+            Ok(quote) => return Ok(quote),
+            Err(error) => {
+                tracing::warn!(%error, "self-broadcast gas fee quote failed");
+                last_error = Some(error);
+            }
+        }
+    }
+    if let Some(error) = last_error {
+        Err(error).wrap_err("all self-broadcast gas quote RPC attempts failed")
+    } else {
+        Err(eyre!("no healthy query RPC available"))
+    }
+}
+
+async fn self_broadcast_gas_fee_quote(
+    provider: &impl Provider,
+) -> Result<SelfBroadcastGasFeeQuote> {
+    let rpc_gas_price = provider.get_gas_price().await.wrap_err("fetch gas price")?;
+    Ok(SelfBroadcastGasFeeQuote::from_rpc_gas_price(rpc_gas_price))
+}
+
+fn resolve_self_broadcast_gas_fee(
+    selection: SelfBroadcastGasFeeSelection,
+    quote: SelfBroadcastGasFeeQuote,
+) -> Result<SelfBroadcastResolvedGasFee> {
+    let (max_fee_per_gas, max_priority_fee_per_gas) = match selection {
+        SelfBroadcastGasFeeSelection::Auto => (
+            quote.suggested_max_fee_per_gas,
+            quote.suggested_max_priority_fee_per_gas,
+        ),
+        SelfBroadcastGasFeeSelection::Custom {
+            max_fee_per_gas,
+            max_priority_fee_per_gas,
+        } => (max_fee_per_gas, max_priority_fee_per_gas),
+    };
+    validate_self_broadcast_gas_fee(max_fee_per_gas, max_priority_fee_per_gas)?;
+    Ok(SelfBroadcastResolvedGasFee {
+        rpc_gas_price: quote.rpc_gas_price,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+    })
+}
+
+fn validate_self_broadcast_gas_fee(
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+) -> Result<()> {
+    if max_fee_per_gas == 0 {
+        return Err(eyre!(
+            "self-broadcast max fee per gas must be greater than zero"
+        ));
+    }
+    if max_priority_fee_per_gas > max_fee_per_gas {
+        return Err(eyre!(
+            "self-broadcast max priority fee per gas cannot exceed max fee per gas"
+        ));
+    }
+    Ok(())
+}
+
+async fn self_broadcast_preflight_from_rpc_pool(
+    query_rpc_pool: &QueryRpcPool,
+    chain_id: u64,
+    from: Address,
+    to: Address,
+    data: Bytes,
+    gas_fee: SelfBroadcastGasFeeSelection,
+    gas: &settings::EffectiveChainGasSettings,
+) -> Result<SelfBroadcastPreflight> {
+    let mut last_error = None;
+    for _ in 0..query_rpc_pool.len() {
+        let Some(provider_handle) = query_rpc_pool.random_provider() else {
+            break;
+        };
+        match self_broadcast_preflight(
+            provider_handle,
+            chain_id,
+            from,
+            to,
+            data.clone(),
+            gas_fee,
+            gas,
+        )
+        .await
+        {
+            Ok(preflight) => return Ok(preflight),
+            Err(error) if is_self_broadcast_insufficient_native_gas_error(&error) => {
+                return Err(error);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "self-broadcast preflight failed");
+                last_error = Some(error);
+            }
+        }
+    }
+    if let Some(error) = last_error {
+        Err(error).wrap_err("all self-broadcast query RPC attempts failed")
+    } else {
+        Err(eyre!("no healthy query RPC available"))
+    }
+}
+
+async fn self_broadcast_preflight(
+    provider_handle: ProviderHandle,
+    chain_id: u64,
+    from: Address,
+    to: Address,
+    data: Bytes,
+    gas_fee: SelfBroadcastGasFeeSelection,
+    gas: &settings::EffectiveChainGasSettings,
+) -> Result<SelfBroadcastPreflight> {
+    let provider = &provider_handle.provider;
+    let quote = self_broadcast_gas_fee_quote(provider)
+        .await
+        .wrap_err("fetch self-broadcast gas price")?;
+    let SelfBroadcastResolvedGasFee {
+        rpc_gas_price,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+    } = resolve_self_broadcast_gas_fee(gas_fee, quote)?;
+    let nonce = provider
+        .get_transaction_count(from)
+        .await
+        .wrap_err("fetch self-broadcast nonce")?;
+    let tx_req = self_broadcast_transaction_request(
+        chain_id,
+        from,
+        to,
+        data,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+        nonce,
+    );
+    let estimated_gas = provider
+        .estimate_gas(tx_req.clone())
+        .await
+        .wrap_err("estimate self-broadcast gas")?;
+    let gas_limit = self_broadcast_gas_limit_with_buffer(estimated_gas, gas.gas_limit_buffer);
+    let estimated_native_gas_cost = self_broadcast_native_gas_cost(gas_limit, max_fee_per_gas);
+    let live_native_balance = provider
+        .get_balance(from)
+        .await
+        .wrap_err("fetch self-broadcast native balance")?;
+    if live_native_balance < estimated_native_gas_cost {
+        return Err(self_broadcast_insufficient_native_gas_error(
+            live_native_balance,
+            estimated_native_gas_cost,
+        ));
+    }
+    Ok(SelfBroadcastPreflight {
+        provider_handle,
+        tx_req: tx_req.with_gas_limit(gas_limit),
+        gas_limit,
+        rpc_gas_price,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+        estimated_native_gas_cost,
+        live_native_balance,
+    })
+}
+
+fn self_broadcast_transaction_request(
+    chain_id: u64,
+    from: Address,
+    to: Address,
+    data: Bytes,
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+    nonce: u64,
+) -> TransactionRequest {
+    TransactionRequest::default()
+        .with_chain_id(chain_id)
+        .with_from(from)
+        .with_to(to)
+        .with_input(data)
+        .with_max_fee_per_gas(max_fee_per_gas)
+        .with_max_priority_fee_per_gas(max_priority_fee_per_gas)
+        .with_nonce(nonce)
+}
+
+const fn self_broadcast_gas_limit_with_buffer(estimated_gas: u64, gas_limit_buffer: u64) -> u64 {
+    estimated_gas.saturating_add(gas_limit_buffer)
+}
+
+fn self_broadcast_native_gas_cost(gas_limit: u64, max_fee_per_gas: u128) -> U256 {
+    U256::from(gas_limit) * U256::from(max_fee_per_gas)
+}
+
+fn self_broadcast_insufficient_native_gas_error(balance: U256, estimated_cost: U256) -> Report {
+    eyre!(
+        "insufficient native gas for self-broadcast: live balance {balance}, estimated cost {estimated_cost}"
+    )
+}
+
+fn is_self_broadcast_insufficient_native_gas_error(error: &Report) -> bool {
+    error
+        .to_string()
+        .starts_with("insufficient native gas for self-broadcast:")
+}
+
+async fn sign_send_wait_self_broadcast_transaction(
+    provider: &(impl Provider + Clone),
+    wallet: &EthereumWallet,
+    tx_req: TransactionRequest,
+    session: &WalletSession,
+    pending_spent_inputs: &[Utxo],
+    progress_tx: Option<&TransactionGenerationProgressSender>,
+) -> Result<TxReceiptOutput> {
+    tracing::info!(
+        from = %tx_req.from.unwrap_or_default(),
+        to = ?tx_req.to,
+        gas = ?tx_req.gas,
+        "signing and sending self-broadcast transaction",
+    );
+    let signed_tx = tx_req
+        .build(wallet)
+        .await
+        .wrap_err("self-broadcast: sign")?
+        .encoded_2718();
+    let tx_hash = provider
+        .send_raw_transaction(&signed_tx)
+        .await
+        .wrap_err("self-broadcast: send")?
+        .tx_hash()
+        .to_owned();
+    let tx_hash_string = hex::encode_prefixed(tx_hash);
+    session
+        .mark_pending_spent_utxos(
+            pending_spent_inputs,
+            parse_submitted_tx_hash(&tx_hash_string),
+        )
+        .await;
+    tracing::info!(%tx_hash, "sent self-broadcast transaction, waiting for confirmation...");
+    update_transaction_generation_stage(
+        progress_tx,
+        TransactionGenerationStage::WaitingForSelfBroadcastReceipt,
+    );
+
+    let receipt = loop {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        if let Some(receipt) = provider
+            .get_transaction_receipt(tx_hash)
+            .await
+            .wrap_err("self-broadcast: fetch receipt")?
+        {
+            break receipt;
+        }
+    };
+
+    let status = receipt.status();
+    let block_number = receipt.block_number.unwrap_or(0);
+    let gas_used = receipt.gas_used;
+    if status {
+        tracing::info!(%tx_hash, block_number, gas_used, "self-broadcast transaction confirmed");
+    } else {
+        tracing::warn!(%tx_hash, block_number, gas_used, "self-broadcast transaction reverted");
+    }
+    Ok(TxReceiptOutput {
+        tx_hash: tx_hash_string,
+        status,
+        block_number,
+        gas_used,
+    })
 }
 
 async fn mark_submitted_inputs_pending_spent(
@@ -3720,24 +4519,28 @@ mod tests {
         DesktopWalletChainStart, DesktopWalletSyncStartPolicy, ListUtxosOutput,
         PublicBroadcasterCandidate, PublicBroadcasterFeeMargin, PublicBroadcasterFeeMode,
         PublicBroadcasterResultKind, PublicBroadcasterSelection, RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
-        TokenTotal, UtxoOutput, WalletPendingOverlay, WalletPendingSpent,
-        apply_pending_overlay_to_outputs, approximate_public_broadcaster_cost,
-        approximate_public_broadcaster_gas, broadcaster_fee_amount, broadcaster_fee_covers,
-        buffered_public_broadcaster_fee, decode_public_broadcaster_response,
-        eligible_public_broadcasters, fee_policy_eligible_public_broadcasters,
-        fixed_token_anchor_rate, initial_separate_token_public_broadcaster_fee,
-        is_wrapped_native_token, max_broadcaster_fee_token_amount_from_outputs,
-        max_send_amount_from_outputs, max_unshield_amount_from_outputs, parse_railgun_recipient,
-        parse_send_amount, parse_unshield_amount, public_broadcaster_amount_split,
+        SelfBroadcastGasFeeQuote, SelfBroadcastGasFeeSelection, TokenTotal, UtxoOutput,
+        WalletPendingOverlay, WalletPendingSpent, apply_pending_overlay_to_outputs,
+        approximate_public_broadcaster_cost, approximate_public_broadcaster_gas,
+        broadcaster_fee_amount, broadcaster_fee_covers, buffered_public_broadcaster_fee,
+        decode_public_broadcaster_response, eligible_public_broadcasters,
+        fee_policy_eligible_public_broadcasters, fixed_token_anchor_rate,
+        initial_separate_token_public_broadcaster_fee,
+        is_self_broadcast_insufficient_native_gas_error, is_wrapped_native_token,
+        max_broadcaster_fee_token_amount_from_outputs, max_send_amount_from_outputs,
+        max_unshield_amount_from_outputs, parse_railgun_recipient, parse_send_amount,
+        parse_submitted_tx_hash, parse_unshield_amount, public_broadcaster_amount_split,
         public_broadcaster_amount_split_for_tokens, public_broadcaster_anchor_rate_for_policy,
         public_broadcaster_build_error, public_broadcaster_candidates,
         public_broadcaster_fee_breakdown, public_broadcaster_gas_limit_with_buffer,
         public_broadcaster_max_entered_amount, public_broadcaster_max_entered_amount_for_tokens,
         public_broadcaster_republish_loop, public_broadcaster_transact_params,
-        resolve_desktop_wallet_chain_start, select_public_broadcaster,
-        select_public_broadcaster_with_policy, send_approximate_shape,
+        resolve_desktop_wallet_chain_start, resolve_self_broadcast_gas_fee,
+        select_public_broadcaster, select_public_broadcaster_with_policy,
+        self_broadcast_gas_limit_with_buffer, self_broadcast_insufficient_native_gas_error,
+        self_broadcast_native_gas_cost, self_broadcast_transaction_request, send_approximate_shape,
         sort_specific_public_broadcasters, transact_topic, unshield_approximate_shape,
-        utxo_outputs_from_utxos, wrapped_native_token_for_chain,
+        utxo_outputs_from_utxos, validate_self_broadcast_gas_fee, wrapped_native_token_for_chain,
     };
 
     static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -4277,6 +5080,80 @@ mod tests {
             max_unshield_amount_from_outputs(&outputs, token),
             U256::ZERO
         );
+    }
+
+    #[test]
+    fn self_broadcast_transaction_request_sets_outer_evm_fields() {
+        let from = address(0x11);
+        let to = address(0x22);
+        let calldata = Bytes::from_static(&[0xaa, 0xbb, 0xcc]);
+
+        let tx_req = self_broadcast_transaction_request(5, from, to, calldata.clone(), 42, 0, 7);
+
+        assert_eq!(tx_req.chain_id, Some(5));
+        assert_eq!(tx_req.from, Some(from));
+        assert_eq!(tx_req.to, Some(to.into()));
+        assert_eq!(tx_req.max_fee_per_gas, Some(42));
+        assert_eq!(tx_req.max_priority_fee_per_gas, Some(0));
+        assert_eq!(tx_req.nonce, Some(7));
+        assert_eq!(
+            tx_req.input.input().expect("self-broadcast input"),
+            calldata.as_ref()
+        );
+    }
+
+    #[test]
+    fn self_broadcast_auto_gas_fee_uses_rpc_gas_price_with_zero_tip() {
+        let quote = SelfBroadcastGasFeeQuote::from_rpc_gas_price(100);
+        let resolved = resolve_self_broadcast_gas_fee(SelfBroadcastGasFeeSelection::Auto, quote)
+            .expect("resolve auto gas fee");
+
+        assert_eq!(quote.suggested_max_fee_per_gas, 120);
+        assert_eq!(quote.suggested_max_priority_fee_per_gas, 0);
+        assert_eq!(resolved.rpc_gas_price, 100);
+        assert_eq!(resolved.max_fee_per_gas, 120);
+        assert_eq!(resolved.max_priority_fee_per_gas, 0);
+    }
+
+    #[test]
+    fn self_broadcast_custom_gas_fee_validates_caps() {
+        assert!(validate_self_broadcast_gas_fee(1, 0).is_ok());
+        assert!(validate_self_broadcast_gas_fee(1, 1).is_ok());
+        assert!(validate_self_broadcast_gas_fee(0, 0).is_err());
+        assert!(validate_self_broadcast_gas_fee(1, 2).is_err());
+    }
+
+    #[test]
+    fn self_broadcast_gas_cost_uses_max_fee_cap() {
+        assert_eq!(self_broadcast_gas_limit_with_buffer(21_000, 5_000), 26_000);
+        assert_eq!(self_broadcast_gas_limit_with_buffer(u64::MAX, 1), u64::MAX);
+        assert_eq!(
+            self_broadcast_native_gas_cost(26_000, 2_000_000_000),
+            U256::from(52_000_000_000_000_u128)
+        );
+    }
+
+    #[test]
+    fn self_broadcast_insufficient_gas_error_is_terminal_and_formatted() {
+        let error =
+            self_broadcast_insufficient_native_gas_error(U256::from(7_u64), U256::from(9_u64));
+
+        assert!(is_self_broadcast_insufficient_native_gas_error(&error));
+        assert_eq!(
+            error.to_string(),
+            "insufficient native gas for self-broadcast: live balance 7, estimated cost 9"
+        );
+    }
+
+    #[test]
+    fn self_broadcast_pending_spent_hash_parsing_accepts_submitted_tx_hash() {
+        let hash = "0x1111111111111111111111111111111111111111111111111111111111111111";
+
+        assert_eq!(
+            parse_submitted_tx_hash(hash),
+            Some(FixedBytes::from([0x11; 32]))
+        );
+        assert_eq!(parse_submitted_tx_hash("not-a-hash"), None);
     }
 
     #[test]

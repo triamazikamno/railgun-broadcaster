@@ -9,30 +9,41 @@ use gpui::{
     StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
-    Disableable, IconName, Selectable, Sizable, WindowExt,
+    Disableable, Icon, IconName, IndexPath, Selectable, Sizable, WindowExt,
     alert::Alert,
     button::{Button, ButtonGroup, ButtonVariants},
     input::{Input, InputEvent, InputState},
     popover::Popover,
+    select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState},
     spinner::Spinner,
 };
 use railgun_ui::short_address;
+use rand::seq::IndexedRandom;
 use tokio::sync::watch;
 use ui::clipboard::clipboard_with_toast;
-use ui::controls::{app_button, app_muted_text, app_strong_text};
+use ui::controls::{
+    app_button, app_button_base, app_button_label, app_muted_text, app_strong_text,
+};
 use ui::theme::{self, APP_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
-    DesktopSendCalldataRequest, DesktopSendPublicBroadcasterRequest,
-    DesktopUnshieldCalldataRequest, DesktopUnshieldPublicBroadcasterRequest, ListUtxosOutput,
-    PreparedSendCall, PreparedUnshieldCall, PublicBroadcasterCandidate,
-    PublicBroadcasterCostEstimate, PublicBroadcasterFeeMode, PublicBroadcasterResultKind,
-    PublicBroadcasterSubmissionResult, TransactionGenerationStage,
+    DesktopSelfBroadcastResult, DesktopSendCalldataRequest, DesktopSendPublicBroadcasterRequest,
+    DesktopSendSelfBroadcastRequest, DesktopUnshieldCalldataRequest,
+    DesktopUnshieldPublicBroadcasterRequest, DesktopUnshieldSelfBroadcastRequest, ListUtxosOutput,
+    PreparedSendCall, PreparedUnshieldCall, PublicAssetId, PublicBalanceAmount, PublicBalanceEntry,
+    PublicBalanceSnapshot, PublicBroadcasterCandidate, PublicBroadcasterCostEstimate,
+    PublicBroadcasterFeeMode, PublicBroadcasterResultKind, PublicBroadcasterSubmissionResult,
+    SelfBroadcastGasFeeSelection, TransactionGenerationStage,
     fee_policy_eligible_public_broadcasters, parse_railgun_recipient, parse_send_amount,
     parse_unshield_amount, prepare_desktop_send_calldata, prepare_desktop_unshield_calldata,
-    select_public_broadcaster_with_policy, settings::EffectiveTokenRegistry,
+    quote_desktop_self_broadcast_gas_fee, select_public_broadcaster_with_policy,
+    settings::EffectiveTokenRegistry,
     sort_specific_public_broadcasters, submit_desktop_send_public_broadcaster,
-    submit_desktop_unshield_public_broadcaster,
+    submit_desktop_send_self_broadcast, submit_desktop_unshield_public_broadcaster,
+    submit_desktop_unshield_self_broadcast,
+    vault::{PublicAccountMetadata, PublicAccountStatus},
 };
+
+use crate::assets::RailgunActionIcon;
 
 use super::broadcaster_picker::{
     BroadcasterChoice, broadcaster_choice_supported_by_candidates,
@@ -40,11 +51,17 @@ use super::broadcaster_picker::{
     should_preserve_estimate_after_broadcaster_policy_change,
 };
 use super::dialogs::PrivateActionDialogContent;
+use super::gas_fee::{
+    Eip1559GasFeeEditTarget, Eip1559GasFeeEditorState, Eip1559GasFeeMode,
+    render_eip1559_gas_fee_editor,
+};
 use super::private_assets::refresh_form_asset_from_snapshot;
 use super::private_broadcaster::{
-    private_broadcaster_closed_active_stage, render_private_broadcaster_active_status_notice,
-    render_private_broadcaster_status_notice,
+    private_broadcaster_closed_active_progress, render_private_broadcaster_status_notice,
+    render_private_self_broadcast_status_notice, render_private_submission_active_status_notice,
 };
+use super::public_account::public_account_display_label;
+use super::public_balances::public_balance_entry_for_chain;
 use super::public_broadcaster_cost::{
     cost_estimate_detail_text, public_broadcaster_cost_status,
     render_public_broadcaster_cost_estimate, render_public_broadcaster_cost_status,
@@ -54,10 +71,11 @@ use super::{
     ChainUtxoState, PRIVATE_ACTION_FORM_MAX_HEIGHT, PRIVATE_ASSET_LIST_WIDTH,
     PublicBroadcasterFeeTokenOption, WalletRoot, effective_public_broadcaster_fee_mode,
     format_exact_token_amount_for_display, format_report_chain, format_send_amount_input,
-    format_unshield_amount_input, is_effective_wrapped_native_token, native_wrapped_output_labels,
-    parse_address, public_broadcaster_fee_token_warning,
-    public_broadcaster_submit_disabled_for_fee_token_options, send_form_max_entered_amount,
-    should_show_broadcaster_fee_mode_toggle, token_label_row, unshield_form_max_entered_amount,
+    format_unshield_amount_input, is_effective_wrapped_native_token, native_token_display_label,
+    native_wrapped_output_labels, parse_address, public_balance_amount_label,
+    public_broadcaster_fee_token_warning, public_broadcaster_submit_disabled_for_fee_token_options,
+    send_form_max_entered_amount, should_show_broadcaster_fee_mode_toggle, token_label_row,
+    unshield_form_max_entered_amount,
 };
 
 pub(super) const SEND_MISSING_PASSWORD_ERROR: &str =
@@ -68,6 +86,8 @@ pub(super) const SEND_AUTHORIZATION_FAILED_ERROR: &str =
     "authorize public broadcaster send spend: unlock failed";
 pub(super) const UNSHIELD_AUTHORIZATION_FAILED_ERROR: &str =
     "authorize public broadcaster unshield spend: unlock failed";
+const SELF_BROADCAST_PRIVACY_WARNING: &str = "Self-broadcast links the selected Public account, RPC metadata, and transaction timing to this private action.";
+const SELF_BROADCAST_ZERO_GAS_PAYER_WARNING: &str = "Selected gas payer has 0 native balance on this chain. Choose another Public account or fund this account before self-broadcasting.";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) enum DeliveryMode {
@@ -88,14 +108,57 @@ pub(super) struct PrivateActionFormState {
     pub(super) key: UnshieldAssetKey,
 }
 
+#[derive(Clone)]
+pub(super) struct SelfBroadcastGasPayerSelectItem {
+    public_account_uuid: Arc<str>,
+    label: Arc<str>,
+    address: Address,
+    chain_id: u64,
+    balance_label: Arc<str>,
+}
+
+impl SelectItem for SelfBroadcastGasPayerSelectItem {
+    type Value = Arc<str>;
+
+    fn title(&self) -> SharedString {
+        SharedString::from(format!("{} · {}", self.label, short_address(&self.address)))
+    }
+
+    fn display_title(&self) -> Option<gpui::AnyElement> {
+        Some(
+            self_broadcast_gas_payer_select_trigger_row(&self.label, &self.address)
+                .into_any_element(),
+        )
+    }
+
+    fn render(&self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        self_broadcast_gas_payer_select_menu_row(
+            &self.label,
+            &self.address,
+            self.chain_id,
+            &self.balance_label,
+        )
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.public_account_uuid
+    }
+
+    fn matches(&self, query: &str) -> bool {
+        self_broadcast_gas_payer_fields_match(Some(&self.label), &self.address, query)
+    }
+}
+
 pub(super) enum SendResult {
     Manual(PreparedSendCall),
     PublicBroadcaster(Box<PublicBroadcasterSubmissionResult>),
+    SelfBroadcast(Box<DesktopSelfBroadcastResult>),
 }
 
 pub(super) enum UnshieldResult {
     Manual(PreparedUnshieldCall),
     PublicBroadcaster(Box<PublicBroadcasterSubmissionResult>),
+    SelfBroadcast(Box<DesktopSelfBroadcastResult>),
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -133,6 +196,11 @@ pub(super) struct UnshieldFormState {
     pub(super) password_input: Entity<InputState>,
     pub(super) unwrap: bool,
     pub(super) delivery_mode: DeliveryMode,
+    pub(super) self_broadcast_gas_payer_uuid: Option<Arc<str>>,
+    pub(super) self_broadcast_gas_payer_select:
+        Entity<SelectState<SearchableVec<SelfBroadcastGasPayerSelectItem>>>,
+    pub(super) self_broadcast_gas_fee: Eip1559GasFeeEditorState,
+    pub(super) self_broadcast_estimated_native_gas_cost: Option<U256>,
     pub(super) selected_fee_token: Address,
     pub(super) broadcaster_choice: BroadcasterChoice,
     pub(super) broadcaster_fee_mode: PublicBroadcasterFeeMode,
@@ -156,6 +224,11 @@ pub(super) struct SendFormState {
     pub(super) amount_input: Entity<InputState>,
     pub(super) password_input: Entity<InputState>,
     pub(super) delivery_mode: DeliveryMode,
+    pub(super) self_broadcast_gas_payer_uuid: Option<Arc<str>>,
+    pub(super) self_broadcast_gas_payer_select:
+        Entity<SelectState<SearchableVec<SelfBroadcastGasPayerSelectItem>>>,
+    pub(super) self_broadcast_gas_fee: Eip1559GasFeeEditorState,
+    pub(super) self_broadcast_estimated_native_gas_cost: Option<U256>,
     pub(super) selected_fee_token: Address,
     pub(super) broadcaster_choice: BroadcasterChoice,
     pub(super) broadcaster_fee_mode: PublicBroadcasterFeeMode,
@@ -666,12 +739,321 @@ pub(super) fn render_unshield_generating_status(
         )
 }
 
+impl WalletRoot {
+    fn active_self_broadcast_gas_payer_accounts(&self) -> Vec<PublicAccountMetadata> {
+        self.public_accounts
+            .iter()
+            .filter(|account| account.status == PublicAccountStatus::Active)
+            .cloned()
+            .collect()
+    }
+
+    fn default_self_broadcast_gas_payer_uuid(&self) -> Option<Arc<str>> {
+        default_self_broadcast_gas_payer_uuid(&self.active_self_broadcast_gas_payer_accounts())
+    }
+
+    fn new_self_broadcast_gas_payer_select(
+        &self,
+        chain_id: u64,
+        selected_uuid: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Entity<SelectState<SearchableVec<SelfBroadcastGasPayerSelectItem>>> {
+        let accounts = self.active_self_broadcast_gas_payer_accounts();
+        let items = self_broadcast_gas_payer_select_items(
+            &accounts,
+            chain_id,
+            self.public_balance_snapshot.as_deref(),
+        );
+        let selected_index = self_broadcast_gas_payer_select_index(&items, selected_uuid);
+        cx.new(|cx| {
+            SelectState::new(SearchableVec::new(items), selected_index, window, cx).searchable(true)
+        })
+    }
+
+    pub(super) fn sync_self_broadcast_gas_payer_selects(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let accounts = self.active_self_broadcast_gas_payer_accounts();
+        let snapshot = self.public_balance_snapshot.clone();
+        for form in self.send_forms.values_mut() {
+            let selected = normalized_self_broadcast_gas_payer_uuid(
+                form.self_broadcast_gas_payer_uuid.as_ref(),
+                &accounts,
+            );
+            form.self_broadcast_gas_payer_uuid.clone_from(&selected);
+            sync_self_broadcast_gas_payer_select_entity(
+                &form.self_broadcast_gas_payer_select,
+                &accounts,
+                form.asset.chain_id,
+                snapshot.as_deref(),
+                selected.as_ref(),
+                window,
+                cx,
+            );
+        }
+        for form in self.unshield_forms.values_mut() {
+            let selected = normalized_self_broadcast_gas_payer_uuid(
+                form.self_broadcast_gas_payer_uuid.as_ref(),
+                &accounts,
+            );
+            form.self_broadcast_gas_payer_uuid.clone_from(&selected);
+            sync_self_broadcast_gas_payer_select_entity(
+                &form.self_broadcast_gas_payer_select,
+                &accounts,
+                form.asset.chain_id,
+                snapshot.as_deref(),
+                selected.as_ref(),
+                window,
+                cx,
+            );
+        }
+    }
+
+    fn sync_self_broadcast_gas_payer_select(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let accounts = self.active_self_broadcast_gas_payer_accounts();
+        let snapshot = self.public_balance_snapshot.clone();
+        match kind {
+            DeliveryFormKind::Send => {
+                let Some(form) = self.send_forms.get_mut(&key) else {
+                    return;
+                };
+                sync_self_broadcast_gas_payer_select_entity(
+                    &form.self_broadcast_gas_payer_select,
+                    &accounts,
+                    form.asset.chain_id,
+                    snapshot.as_deref(),
+                    form.self_broadcast_gas_payer_uuid.as_ref(),
+                    window,
+                    cx,
+                );
+            }
+            DeliveryFormKind::Unshield => {
+                let Some(form) = self.unshield_forms.get_mut(&key) else {
+                    return;
+                };
+                sync_self_broadcast_gas_payer_select_entity(
+                    &form.self_broadcast_gas_payer_select,
+                    &accounts,
+                    form.asset.chain_id,
+                    snapshot.as_deref(),
+                    form.self_broadcast_gas_payer_uuid.as_ref(),
+                    window,
+                    cx,
+                );
+            }
+        }
+    }
+
+    fn selected_self_broadcast_gas_payer_account(
+        &self,
+        selected_uuid: Option<&str>,
+    ) -> Option<&PublicAccountMetadata> {
+        let selected_uuid = selected_uuid?;
+        self.public_accounts.iter().find(|account| {
+            account.status == PublicAccountStatus::Active
+                && account.public_account_uuid == selected_uuid
+        })
+    }
+}
+
+pub(super) fn default_self_broadcast_gas_payer_uuid(
+    accounts: &[PublicAccountMetadata],
+) -> Option<Arc<str>> {
+    (accounts.len() == 1).then(|| Arc::from(accounts[0].public_account_uuid.as_str()))
+}
+
+#[cfg(test)]
+pub(super) fn self_broadcast_gas_payer_matches_search(
+    account: &PublicAccountMetadata,
+    query: &str,
+) -> bool {
+    self_broadcast_gas_payer_fields_match(
+        public_account_display_label(account).as_deref(),
+        &account.address,
+        query,
+    )
+}
+
+fn self_broadcast_gas_payer_fields_match(
+    label: Option<&str>,
+    address: &Address,
+    query: &str,
+) -> bool {
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    let full_address = address.to_checksum(None).to_ascii_lowercase();
+    let lower_hex_address = format!("{address:#x}");
+    let short = short_address(address).to_ascii_lowercase();
+    label.is_some_and(|label| label.to_ascii_lowercase().contains(&query))
+        || full_address.contains(&query)
+        || lower_hex_address.contains(&query)
+        || short.contains(&query)
+}
+
+fn self_broadcast_gas_payer_label(account: &PublicAccountMetadata) -> String {
+    public_account_display_label(account).unwrap_or_else(|| short_address(&account.address))
+}
+
+fn self_broadcast_native_balance_entry(
+    snapshot: Option<&PublicBalanceSnapshot>,
+    chain_id: u64,
+    public_account_uuid: &str,
+) -> Option<PublicBalanceEntry> {
+    public_balance_entry_for_chain(
+        snapshot,
+        chain_id,
+        public_account_uuid,
+        PublicAssetId::Native,
+        PublicAccountStatus::Active,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SelfBroadcastNativeBalanceState {
+    Unknown,
+    Zero,
+    Positive,
+}
+
+pub(super) fn self_broadcast_native_balance_state(
+    snapshot: Option<&PublicBalanceSnapshot>,
+    chain_id: u64,
+    public_account_uuid: &str,
+) -> SelfBroadcastNativeBalanceState {
+    match self_broadcast_native_balance_entry(snapshot, chain_id, public_account_uuid)
+        .map(|entry| entry.amount)
+    {
+        Some(PublicBalanceAmount::Available(amount)) if amount.is_zero() => {
+            SelfBroadcastNativeBalanceState::Zero
+        }
+        Some(PublicBalanceAmount::Available(_)) => SelfBroadcastNativeBalanceState::Positive,
+        Some(PublicBalanceAmount::Unavailable) | None => SelfBroadcastNativeBalanceState::Unknown,
+    }
+}
+
+pub(super) fn self_broadcast_native_balance_label(
+    snapshot: Option<&PublicBalanceSnapshot>,
+    chain_id: u64,
+    public_account_uuid: &str,
+) -> String {
+    self_broadcast_native_balance_entry(snapshot, chain_id, public_account_uuid).map_or_else(
+        || "unavailable".to_string(),
+        |entry| public_balance_amount_label(&entry.amount, entry.asset.decimals),
+    )
+}
+
+pub(super) fn random_self_broadcast_gas_payer_uuid(
+    accounts: &[PublicAccountMetadata],
+    selected_uuid: Option<&str>,
+    chain_id: u64,
+    snapshot: Option<&PublicBalanceSnapshot>,
+) -> Option<Arc<str>> {
+    let candidates = accounts
+        .iter()
+        .filter(|account| {
+            self_broadcast_gas_payer_random_candidate(account, selected_uuid, chain_id, snapshot)
+        })
+        .collect::<Vec<_>>();
+    candidates
+        .choose(&mut rand::rng())
+        .map(|account| Arc::from(account.public_account_uuid.as_str()))
+}
+
+fn self_broadcast_gas_payer_random_candidate(
+    account: &PublicAccountMetadata,
+    selected_uuid: Option<&str>,
+    chain_id: u64,
+    snapshot: Option<&PublicBalanceSnapshot>,
+) -> bool {
+    Some(account.public_account_uuid.as_str()) != selected_uuid
+        && self_broadcast_native_balance_state(snapshot, chain_id, &account.public_account_uuid)
+            != SelfBroadcastNativeBalanceState::Zero
+}
+
+fn normalized_self_broadcast_gas_payer_uuid(
+    selected_uuid: Option<&Arc<str>>,
+    accounts: &[PublicAccountMetadata],
+) -> Option<Arc<str>> {
+    selected_uuid
+        .filter(|uuid| {
+            accounts
+                .iter()
+                .any(|account| account.public_account_uuid.as_str() == uuid.as_ref())
+        })
+        .cloned()
+        .or_else(|| default_self_broadcast_gas_payer_uuid(accounts))
+}
+
+fn self_broadcast_gas_payer_select_items(
+    accounts: &[PublicAccountMetadata],
+    chain_id: u64,
+    snapshot: Option<&wallet_ops::PublicBalanceSnapshot>,
+) -> Vec<SelfBroadcastGasPayerSelectItem> {
+    accounts
+        .iter()
+        .map(|account| SelfBroadcastGasPayerSelectItem {
+            public_account_uuid: Arc::from(account.public_account_uuid.as_str()),
+            label: Arc::from(self_broadcast_gas_payer_label(account)),
+            address: account.address,
+            chain_id,
+            balance_label: Arc::from(self_broadcast_native_balance_label(
+                snapshot,
+                chain_id,
+                &account.public_account_uuid,
+            )),
+        })
+        .collect()
+}
+
+fn self_broadcast_gas_payer_select_index(
+    items: &[SelfBroadcastGasPayerSelectItem],
+    selected_uuid: Option<&str>,
+) -> Option<IndexPath> {
+    let selected_uuid = selected_uuid?;
+    items
+        .iter()
+        .position(|item| item.public_account_uuid.as_ref() == selected_uuid)
+        .map(|index| IndexPath::default().row(index))
+}
+
+fn sync_self_broadcast_gas_payer_select_entity(
+    select: &Entity<SelectState<SearchableVec<SelfBroadcastGasPayerSelectItem>>>,
+    accounts: &[PublicAccountMetadata],
+    chain_id: u64,
+    snapshot: Option<&wallet_ops::PublicBalanceSnapshot>,
+    selected_uuid: Option<&Arc<str>>,
+    window: &mut Window,
+    cx: &mut Context<'_, WalletRoot>,
+) {
+    let items = self_broadcast_gas_payer_select_items(accounts, chain_id, snapshot);
+    select.update(cx, |select, cx| {
+        select.set_items(SearchableVec::new(items), window, cx);
+        if let Some(uuid) = selected_uuid {
+            select.set_selected_value(uuid, window, cx);
+        } else {
+            select.set_selected_index(None, window, cx);
+        }
+    });
+}
+
 pub(super) fn render_delivery_selector(
     root: Entity<WalletRoot>,
     key: UnshieldAssetKey,
     kind: DeliveryFormKind,
     mode: DeliveryMode,
     generating: bool,
+    self_broadcast_available: bool,
 ) -> gpui::Div {
     let selector_root = root;
     div().flex().flex_col().gap_2().child(
@@ -684,12 +1066,16 @@ pub(super) fn render_delivery_selector(
                     mode == DeliveryMode::PublicBroadcaster,
                 )
                 .disabled(generating),
-                private_action_segment_button(
+                private_action_segment_button_with_accessory(
                     delivery_element_id(key, kind, "self"),
                     "Self-broadcast",
                     mode == DeliveryMode::SelfBroadcast,
+                    Some(render_self_broadcast_privacy_icon(
+                        delivery_element_id(key, kind, "self-privacy-warning"),
+                        mode == DeliveryMode::SelfBroadcast,
+                    )),
                 )
-                .disabled(true),
+                .disabled(generating || !self_broadcast_available),
                 private_action_segment_button(
                     delivery_element_id(key, kind, "manual"),
                     "Manual calldata",
@@ -703,6 +1089,7 @@ pub(super) fn render_delivery_selector(
                 };
                 let mode = match *index {
                     0 => DeliveryMode::PublicBroadcaster,
+                    1 => DeliveryMode::SelfBroadcast,
                     2 => DeliveryMode::ManualCalldata,
                     _ => return,
                 };
@@ -878,6 +1265,170 @@ pub(super) fn render_public_broadcaster_settings(
         ));
     }
     settings
+}
+
+pub(super) fn render_self_broadcast_settings(
+    root: Entity<WalletRoot>,
+    key: UnshieldAssetKey,
+    kind: DeliveryFormKind,
+    accounts: &[PublicAccountMetadata],
+    selected_uuid: Option<&str>,
+    balance_snapshot: Option<&PublicBalanceSnapshot>,
+    gas_payer_select: &Entity<SelectState<SearchableVec<SelfBroadcastGasPayerSelectItem>>>,
+    gas_fee: &Eip1559GasFeeEditorState,
+    generating: bool,
+) -> gpui::Div {
+    let random_root = root.clone();
+    let gas_fee_root = root;
+    let selected_uuid = selected_uuid.map(str::to_owned);
+    let selected_account = selected_uuid.as_deref().and_then(|uuid| {
+        accounts
+            .iter()
+            .find(|account| account.public_account_uuid == uuid)
+    });
+    let random_disabled = generating
+        || !accounts.iter().any(|account| {
+            self_broadcast_gas_payer_random_candidate(
+                account,
+                selected_uuid.as_deref(),
+                key.chain_id,
+                balance_snapshot,
+            )
+        });
+    let missing_selection = !accounts.is_empty() && selected_account.is_none();
+    let selected_zero_balance = selected_uuid.as_deref().is_some_and(|uuid| {
+        self_broadcast_native_balance_state(balance_snapshot, key.chain_id, uuid)
+            == SelfBroadcastNativeBalanceState::Zero
+    });
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .p(px(10.0))
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .child(
+                    div().min_w(px(0.0)).flex().flex_col().gap_1().child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(app_muted_text("Gas payer"))
+                            .when(selected_zero_balance, |this| {
+                                this.child(render_self_broadcast_gas_payer_warning_icon(
+                                    delivery_element_id(key, kind, "zero-gas-payer-warning"),
+                                ))
+                            }),
+                    ),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            app_button_base(delivery_element_id(key, kind, "random-gas-payer"))
+                                .icon(Icon::new(RailgunActionIcon::Dices))
+                                .ghost()
+                                .small()
+                                .compact()
+                                .tooltip("Choose random gas payer")
+                                .disabled(random_disabled)
+                                .on_click(move |_event, window, cx| {
+                                    random_root.update(cx, |root, cx| {
+                                        root.choose_random_self_broadcast_gas_payer(
+                                            kind, key, window, cx,
+                                        );
+                                    });
+                                }),
+                        )
+                        .child(
+                            div().w(px(320.0)).h(px(32.0)).child(
+                                Select::new(gas_payer_select)
+                                    .small()
+                                    .w_full()
+                                    .h(px(32.0))
+                                    .placeholder(if missing_selection {
+                                        "Gas payer required"
+                                    } else {
+                                        "Please select"
+                                    })
+                                    .menu_width(px(380.0))
+                                    .when(missing_selection || selected_zero_balance, |this| {
+                                        this.border_color(rgb(theme::WARNING))
+                                    })
+                                    .disabled(generating || accounts.is_empty()),
+                            ),
+                        ),
+                ),
+        )
+        .when(accounts.is_empty(), |this| {
+            this.child(app_muted_text(
+                "No active Public accounts are available for self-broadcast gas payment.",
+            ))
+        })
+        .child(render_eip1559_gas_fee_editor(
+            gas_fee_root,
+            key,
+            kind,
+            gas_fee,
+            generating,
+        ))
+}
+
+fn self_broadcast_gas_payer_select_trigger_row(label: &str, address: &Address) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .child(SharedString::from(label.to_string()))
+        .child(
+            app_muted_text(short_address(address))
+                .font_family(APP_FONT_FAMILY)
+                .text_size(px(12.0)),
+        )
+}
+
+fn self_broadcast_gas_payer_select_menu_row(
+    label: &str,
+    address: &Address,
+    chain_id: u64,
+    balance: &str,
+) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .child(
+            div()
+                .min_w(px(0.0))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(app_strong_text(label.to_string()))
+                .child(
+                    app_muted_text(short_address(address))
+                        .font_family(APP_FONT_FAMILY)
+                        .text_color(rgb(theme::TEXT_MUTED)),
+                ),
+        )
+        .child(
+            app_muted_text(format!(
+                "{balance} {}",
+                native_token_display_label(chain_id)
+            ))
+            .text_color(rgb(theme::TEXT_MUTED)),
+        )
 }
 
 fn render_danger_switch(
@@ -1081,6 +1632,14 @@ impl WalletRoot {
                 .placeholder("vault password")
                 .masked(true)
         });
+        let self_broadcast_gas_payer_uuid = self.default_self_broadcast_gas_payer_uuid();
+        let gas_payer_select = self.new_self_broadcast_gas_payer_select(
+            key.chain_id,
+            self_broadcast_gas_payer_uuid.as_deref(),
+            window,
+            cx,
+        );
+        let gas_fee_editor = Eip1559GasFeeEditorState::new(window, cx);
         cx.subscribe_in(
             &password_input,
             window,
@@ -1126,6 +1685,44 @@ impl WalletRoot {
             },
         )
         .detach();
+        cx.subscribe_in(
+            &gas_payer_select,
+            window,
+            move |this,
+                  _select,
+                  event: &SelectEvent<SearchableVec<SelfBroadcastGasPayerSelectItem>>,
+                  window,
+                  cx| {
+                if let SelectEvent::Confirm(Some(uuid)) = event {
+                    this.set_self_broadcast_gas_payer(
+                        DeliveryFormKind::Send,
+                        key,
+                        Some(Arc::clone(uuid)),
+                        window,
+                        cx,
+                    );
+                }
+            },
+        )
+        .detach();
+        cx.subscribe(
+            &gas_fee_editor.max_fee_input,
+            move |this, _input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.clear_send_form_text_edit_state(key, cx);
+                }
+            },
+        )
+        .detach();
+        cx.subscribe(
+            &gas_fee_editor.max_priority_fee_input,
+            move |this, _input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.clear_send_form_text_edit_state(key, cx);
+                }
+            },
+        )
+        .detach();
         self.send_forms.clear();
         self.unshield_forms.clear();
         self.private_broadcaster_progress = None;
@@ -1140,6 +1737,10 @@ impl WalletRoot {
                 amount_input,
                 password_input,
                 delivery_mode: DeliveryMode::PublicBroadcaster,
+                self_broadcast_gas_payer_uuid,
+                self_broadcast_gas_payer_select: gas_payer_select,
+                self_broadcast_gas_fee: gas_fee_editor,
+                self_broadcast_estimated_native_gas_cost: None,
                 selected_fee_token,
                 broadcaster_choice: BroadcasterChoice::Random,
                 broadcaster_fee_mode: PublicBroadcasterFeeMode::DeductFromAmount,
@@ -1290,10 +1891,19 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let self_broadcast_gas_payer_uuid = if mode == DeliveryMode::SelfBroadcast {
+            let default = self.default_self_broadcast_gas_payer_uuid();
+            if default.is_none() && self.active_self_broadcast_gas_payer_accounts().is_empty() {
+                return;
+            }
+            default
+        } else {
+            None
+        };
         let Some(form) = self.send_forms.get_mut(&key) else {
             return;
         };
-        if form.generating || form.delivery_mode == mode || mode == DeliveryMode::SelfBroadcast {
+        if form.generating || form.delivery_mode == mode {
             return;
         }
         let old_max =
@@ -1302,6 +1912,10 @@ impl WalletRoot {
         let adjusted =
             amount_adjustment_for_max_change(&form.amount_input, &form.asset, old_max, new_max, cx);
         form.delivery_mode = mode;
+        if mode == DeliveryMode::SelfBroadcast {
+            form.self_broadcast_gas_payer_uuid = self_broadcast_gas_payer_uuid;
+        }
+        form.self_broadcast_estimated_native_gas_cost = None;
         form.error = None;
         form.result = None;
         if mode == DeliveryMode::PublicBroadcaster || adjusted.is_some() {
@@ -1318,6 +1932,9 @@ impl WalletRoot {
         cx.notify();
         if mode == DeliveryMode::PublicBroadcaster {
             self.refresh_public_broadcaster_anchor(DeliveryFormKind::Send, key, cx);
+        } else if mode == DeliveryMode::SelfBroadcast {
+            self.schedule_self_broadcast_public_balance_refresh(window, cx);
+            self.refresh_self_broadcast_gas_fee_quote(DeliveryFormKind::Send, key, cx);
         }
         self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
     }
@@ -1527,6 +2144,252 @@ impl WalletRoot {
         }
     }
 
+    fn set_self_broadcast_gas_payer(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        public_account_uuid: Option<Arc<str>>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let changed = match kind {
+            DeliveryFormKind::Send => self.send_forms.get_mut(&key).is_some_and(|form| {
+                if form.generating || form.self_broadcast_gas_payer_uuid == public_account_uuid {
+                    return false;
+                }
+                form.self_broadcast_gas_payer_uuid = public_account_uuid;
+                form.self_broadcast_estimated_native_gas_cost = None;
+                form.error = None;
+                form.result = None;
+                true
+            }),
+            DeliveryFormKind::Unshield => self.unshield_forms.get_mut(&key).is_some_and(|form| {
+                if form.generating || form.self_broadcast_gas_payer_uuid == public_account_uuid {
+                    return false;
+                }
+                form.self_broadcast_gas_payer_uuid = public_account_uuid;
+                form.self_broadcast_estimated_native_gas_cost = None;
+                form.error = None;
+                form.result = None;
+                true
+            }),
+        };
+        if changed {
+            self.sync_self_broadcast_gas_payer_select(kind, key, window, cx);
+            cx.notify();
+        }
+    }
+
+    fn choose_random_self_broadcast_gas_payer(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let accounts = self.active_self_broadcast_gas_payer_accounts();
+        let selected_uuid = match kind {
+            DeliveryFormKind::Send => self
+                .send_forms
+                .get(&key)
+                .and_then(|form| form.self_broadcast_gas_payer_uuid.clone()),
+            DeliveryFormKind::Unshield => self
+                .unshield_forms
+                .get(&key)
+                .and_then(|form| form.self_broadcast_gas_payer_uuid.clone()),
+        };
+        let Some(account_uuid) = random_self_broadcast_gas_payer_uuid(
+            &accounts,
+            selected_uuid.as_deref(),
+            key.chain_id,
+            self.public_balance_snapshot.as_deref(),
+        ) else {
+            return;
+        };
+        self.set_self_broadcast_gas_payer(kind, key, Some(account_uuid), window, cx);
+    }
+
+    pub(super) fn set_self_broadcast_gas_fee_mode(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        mode: Eip1559GasFeeMode,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let changed = match kind {
+            DeliveryFormKind::Send => self.send_forms.get_mut(&key).is_some_and(|form| {
+                if form.generating || form.self_broadcast_gas_fee.mode == mode {
+                    return false;
+                }
+                if mode == Eip1559GasFeeMode::Custom {
+                    form.self_broadcast_gas_fee
+                        .seed_custom_from_auto_if_empty(window, cx);
+                }
+                form.self_broadcast_gas_fee.mode = mode;
+                form.self_broadcast_estimated_native_gas_cost = None;
+                form.error = None;
+                form.result = None;
+                true
+            }),
+            DeliveryFormKind::Unshield => self.unshield_forms.get_mut(&key).is_some_and(|form| {
+                if form.generating || form.self_broadcast_gas_fee.mode == mode {
+                    return false;
+                }
+                if mode == Eip1559GasFeeMode::Custom {
+                    form.self_broadcast_gas_fee
+                        .seed_custom_from_auto_if_empty(window, cx);
+                }
+                form.self_broadcast_gas_fee.mode = mode;
+                form.self_broadcast_estimated_native_gas_cost = None;
+                form.error = None;
+                form.result = None;
+                true
+            }),
+        };
+        if changed {
+            cx.notify();
+        }
+    }
+
+    pub(super) fn customize_self_broadcast_gas_fee_from_auto(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        target: Eip1559GasFeeEditTarget,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let mut focus_input: Option<Entity<InputState>> = None;
+        let changed = match kind {
+            DeliveryFormKind::Send => self.send_forms.get_mut(&key).is_some_and(|form| {
+                if form.generating
+                    || !form
+                        .self_broadcast_gas_fee
+                        .overwrite_custom_from_auto(window, cx)
+                {
+                    return false;
+                }
+                focus_input = Some(match target {
+                    Eip1559GasFeeEditTarget::MaxFee => {
+                        form.self_broadcast_gas_fee.max_fee_input.clone()
+                    }
+                    Eip1559GasFeeEditTarget::MaxTip => {
+                        form.self_broadcast_gas_fee.max_priority_fee_input.clone()
+                    }
+                });
+                form.self_broadcast_gas_fee.mode = Eip1559GasFeeMode::Custom;
+                form.self_broadcast_estimated_native_gas_cost = None;
+                form.error = None;
+                form.result = None;
+                true
+            }),
+            DeliveryFormKind::Unshield => self.unshield_forms.get_mut(&key).is_some_and(|form| {
+                if form.generating
+                    || !form
+                        .self_broadcast_gas_fee
+                        .overwrite_custom_from_auto(window, cx)
+                {
+                    return false;
+                }
+                focus_input = Some(match target {
+                    Eip1559GasFeeEditTarget::MaxFee => {
+                        form.self_broadcast_gas_fee.max_fee_input.clone()
+                    }
+                    Eip1559GasFeeEditTarget::MaxTip => {
+                        form.self_broadcast_gas_fee.max_priority_fee_input.clone()
+                    }
+                });
+                form.self_broadcast_gas_fee.mode = Eip1559GasFeeMode::Custom;
+                form.self_broadcast_estimated_native_gas_cost = None;
+                form.error = None;
+                form.result = None;
+                true
+            }),
+        };
+        if changed {
+            if let Some(input) = focus_input {
+                input.read(cx).focus_handle(cx).focus(window);
+            }
+            cx.notify();
+        }
+    }
+
+    pub(super) fn refresh_self_broadcast_gas_fee_quote(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let chain_id = key.chain_id;
+        let effective_chain = self.effective_chain_configs.get(&chain_id).cloned();
+        let refresh_id = match kind {
+            DeliveryFormKind::Send => {
+                let Some(form) = self.send_forms.get_mut(&key) else {
+                    return;
+                };
+                if form.generating || form.self_broadcast_gas_fee.refreshing {
+                    return;
+                }
+                form.self_broadcast_gas_fee.refresh_id =
+                    form.self_broadcast_gas_fee.refresh_id.wrapping_add(1);
+                form.self_broadcast_gas_fee.refreshing = true;
+                form.self_broadcast_gas_fee.error = None;
+                form.self_broadcast_gas_fee.refresh_id
+            }
+            DeliveryFormKind::Unshield => {
+                let Some(form) = self.unshield_forms.get_mut(&key) else {
+                    return;
+                };
+                if form.generating || form.self_broadcast_gas_fee.refreshing {
+                    return;
+                }
+                form.self_broadcast_gas_fee.refresh_id =
+                    form.self_broadcast_gas_fee.refresh_id.wrapping_add(1);
+                form.self_broadcast_gas_fee.refreshing = true;
+                form.self_broadcast_gas_fee.error = None;
+                form.self_broadcast_gas_fee.refresh_id
+            }
+        };
+        let http = self.http.clone();
+        cx.spawn(async move |this, cx| {
+            let result =
+                quote_desktop_self_broadcast_gas_fee(chain_id, effective_chain.as_ref(), &http)
+                    .await;
+            let _ = this.update(cx, |root, cx| {
+                let gas_fee = match kind {
+                    DeliveryFormKind::Send => root
+                        .send_forms
+                        .get_mut(&key)
+                        .map(|form| &mut form.self_broadcast_gas_fee),
+                    DeliveryFormKind::Unshield => root
+                        .unshield_forms
+                        .get_mut(&key)
+                        .map(|form| &mut form.self_broadcast_gas_fee),
+                };
+                let Some(gas_fee) = gas_fee else {
+                    return;
+                };
+                if gas_fee.refresh_id != refresh_id {
+                    return;
+                }
+                gas_fee.refreshing = false;
+                match result {
+                    Ok(quote) => {
+                        gas_fee.quote = Some(quote);
+                        gas_fee.error = None;
+                    }
+                    Err(error) => {
+                        gas_fee.error = Some(Arc::from(format_report_chain(&error)));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn clear_private_action_missing_password_error(
         &mut self,
         kind: DeliveryFormKind,
@@ -1609,6 +2472,14 @@ impl WalletRoot {
                 .placeholder("vault password")
                 .masked(true)
         });
+        let self_broadcast_gas_payer_uuid = self.default_self_broadcast_gas_payer_uuid();
+        let gas_payer_select = self.new_self_broadcast_gas_payer_select(
+            key.chain_id,
+            self_broadcast_gas_payer_uuid.as_deref(),
+            window,
+            cx,
+        );
+        let gas_fee_editor = Eip1559GasFeeEditorState::new(window, cx);
         cx.subscribe_in(
             &password_input,
             window,
@@ -1662,6 +2533,26 @@ impl WalletRoot {
             },
         )
         .detach();
+        cx.subscribe_in(
+            &gas_payer_select,
+            window,
+            move |this,
+                  _select,
+                  event: &SelectEvent<SearchableVec<SelfBroadcastGasPayerSelectItem>>,
+                  window,
+                  cx| {
+                if let SelectEvent::Confirm(Some(uuid)) = event {
+                    this.set_self_broadcast_gas_payer(
+                        DeliveryFormKind::Unshield,
+                        key,
+                        Some(Arc::clone(uuid)),
+                        window,
+                        cx,
+                    );
+                }
+            },
+        )
+        .detach();
         self.send_forms.clear();
         self.unshield_forms.clear();
         self.private_broadcaster_progress = None;
@@ -1677,6 +2568,10 @@ impl WalletRoot {
                 password_input,
                 unwrap: false,
                 delivery_mode: DeliveryMode::PublicBroadcaster,
+                self_broadcast_gas_payer_uuid,
+                self_broadcast_gas_payer_select: gas_payer_select,
+                self_broadcast_gas_fee: gas_fee_editor,
+                self_broadcast_estimated_native_gas_cost: None,
                 selected_fee_token,
                 broadcaster_choice: BroadcasterChoice::Random,
                 broadcaster_fee_mode: PublicBroadcasterFeeMode::DeductFromAmount,
@@ -1820,10 +2715,19 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let self_broadcast_gas_payer_uuid = if mode == DeliveryMode::SelfBroadcast {
+            let default = self.default_self_broadcast_gas_payer_uuid();
+            if default.is_none() && self.active_self_broadcast_gas_payer_accounts().is_empty() {
+                return;
+            }
+            default
+        } else {
+            None
+        };
         let Some(form) = self.unshield_forms.get_mut(&key) else {
             return;
         };
-        if form.generating || form.delivery_mode == mode || mode == DeliveryMode::SelfBroadcast {
+        if form.generating || form.delivery_mode == mode {
             return;
         }
         let old_max =
@@ -1832,6 +2736,10 @@ impl WalletRoot {
         let adjusted =
             amount_adjustment_for_max_change(&form.amount_input, &form.asset, old_max, new_max, cx);
         form.delivery_mode = mode;
+        if mode == DeliveryMode::SelfBroadcast {
+            form.self_broadcast_gas_payer_uuid = self_broadcast_gas_payer_uuid;
+        }
+        form.self_broadcast_estimated_native_gas_cost = None;
         form.error = None;
         form.result = None;
         if mode == DeliveryMode::PublicBroadcaster || adjusted.is_some() {
@@ -1848,6 +2756,9 @@ impl WalletRoot {
         cx.notify();
         if mode == DeliveryMode::PublicBroadcaster {
             self.refresh_public_broadcaster_anchor(DeliveryFormKind::Unshield, key, cx);
+        } else if mode == DeliveryMode::SelfBroadcast {
+            self.schedule_self_broadcast_public_balance_refresh(window, cx);
+            self.refresh_self_broadcast_gas_fee_quote(DeliveryFormKind::Unshield, key, cx);
         }
         self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
     }
@@ -2022,6 +2933,18 @@ impl WalletRoot {
         let broadcaster_choice = form.broadcaster_choice.clone();
         let cost_estimate = form.cost_estimate.clone();
         let fee_token = form.selected_fee_token;
+        let self_broadcast_gas_payer_uuid = form.self_broadcast_gas_payer_uuid.clone();
+        let self_broadcast_gas_fee = if delivery_mode == DeliveryMode::SelfBroadcast {
+            match form.self_broadcast_gas_fee.selection(cx) {
+                Ok(selection) => selection,
+                Err(error) => {
+                    self.set_send_form_error(key, error, cx);
+                    return;
+                }
+            }
+        } else {
+            SelfBroadcastGasFeeSelection::Auto
+        };
         let broadcaster_fee_mode = effective_public_broadcaster_fee_mode(
             asset.token,
             fee_token,
@@ -2082,6 +3005,27 @@ impl WalletRoot {
             return;
         }
 
+        let (self_broadcast_public_account_uuid, self_broadcast_gas_payer_display) =
+            if delivery_mode == DeliveryMode::SelfBroadcast {
+                let Some(uuid) = self_broadcast_gas_payer_uuid else {
+                    self.set_send_form_error(key, "Choose a Public account to pay gas", cx);
+                    return;
+                };
+                let Some(account) =
+                    self.selected_self_broadcast_gas_payer_account(Some(uuid.as_ref()))
+                else {
+                    self.set_send_form_error(key, "Choose an active Public account to pay gas", cx);
+                    return;
+                };
+                let gas_payer_display = public_account_display_label(account).map_or_else(
+                    || short_address(&account.address),
+                    |label| format!("{label} · {}", short_address(&account.address)),
+                );
+                (Some(uuid.to_string()), Some(gas_payer_display))
+            } else {
+                (None, None)
+            };
+
         let fee_rows = if delivery_mode == DeliveryMode::PublicBroadcaster {
             let rows = self.monitor_fee_rows();
             let policy = self.public_broadcaster_fee_policy(allow_suspicious_broadcasters);
@@ -2126,21 +3070,37 @@ impl WalletRoot {
             form.cost_estimate_pending = false;
             form.estimating_cost = false;
             form.estimate_id = 0;
+            form.self_broadcast_estimated_native_gas_cost = None;
             form.error = None;
             form.result = None;
         }
         cx.notify();
 
-        if delivery_mode == DeliveryMode::PublicBroadcaster {
-            self.start_private_broadcaster_progress(
-                DeliveryFormKind::Send,
-                key,
-                generation_id,
-                asset.label.clone(),
-                asset.icon_path.clone(),
-                recipient.clone(),
-                cost_estimate.clone(),
-            );
+        match delivery_mode {
+            DeliveryMode::PublicBroadcaster => {
+                self.start_private_broadcaster_progress(
+                    DeliveryFormKind::Send,
+                    key,
+                    generation_id,
+                    asset.label.clone(),
+                    asset.icon_path.clone(),
+                    recipient.clone(),
+                    cost_estimate.clone(),
+                );
+            }
+            DeliveryMode::SelfBroadcast => {
+                self.start_private_self_broadcast_progress(
+                    DeliveryFormKind::Send,
+                    key,
+                    generation_id,
+                    asset.label.clone(),
+                    asset.icon_path.clone(),
+                    recipient.clone(),
+                    self_broadcast_gas_payer_display
+                        .expect("self-broadcast gas payer was validated"),
+                );
+            }
+            DeliveryMode::ManualCalldata => {}
         }
 
         let http = self.http.clone();
@@ -2202,8 +3162,28 @@ impl WalletRoot {
                 })
             }
             DeliveryMode::SelfBroadcast => {
-                self.set_send_form_error(key, "Self-broadcast is not available yet", cx);
-                return;
+                let request = DesktopSendSelfBroadcastRequest {
+                    chain_id,
+                    effective_chain: self.effective_chain_configs.get(&chain_id).cloned(),
+                    view_session,
+                    session,
+                    vault_store,
+                    vault_password,
+                    public_account_uuid: self_broadcast_public_account_uuid
+                        .expect("self-broadcast gas payer was validated"),
+                    token,
+                    fee_token,
+                    amount,
+                    recipient,
+                    verify_proof: true,
+                    gas_fee: self_broadcast_gas_fee,
+                    progress_tx: Some(progress_tx),
+                };
+                self.runtime.spawn(async move {
+                    submit_desktop_send_self_broadcast(request, &http)
+                        .await
+                        .map(|result| SendResult::SelfBroadcast(Box::new(result)))
+                })
             }
         };
         let terminal_progress_rx = progress_rx.clone();
@@ -2215,6 +3195,7 @@ impl WalletRoot {
             let final_stage = *terminal_progress_rx.borrow();
             let _ = this.update(cx, |root, cx| {
                 let mut progress_result = None;
+                let mut self_broadcast_progress_result = None;
                 let mut progress_error = None;
                 {
                     let Some(form) = root.send_forms.get_mut(&key) else {
@@ -2231,6 +3212,11 @@ impl WalletRoot {
                         Ok(result) => {
                             if let SendResult::PublicBroadcaster(result) = &result {
                                 progress_result = Some((**result).clone());
+                            }
+                            if let SendResult::SelfBroadcast(result) = &result {
+                                form.self_broadcast_estimated_native_gas_cost =
+                                    Some(result.estimated_native_gas_cost);
+                                self_broadcast_progress_result = Some((**result).clone());
                             }
                             form.error = None;
                             form.result = Some(result);
@@ -2251,6 +3237,16 @@ impl WalletRoot {
                 }
                 if let Some(result) = progress_result {
                     root.finish_private_broadcaster_progress(
+                        DeliveryFormKind::Send,
+                        key,
+                        generation_id,
+                        final_stage,
+                        result,
+                        cx,
+                    );
+                }
+                if let Some(result) = self_broadcast_progress_result {
+                    root.finish_private_self_broadcast_progress(
                         DeliveryFormKind::Send,
                         key,
                         generation_id,
@@ -2353,6 +3349,18 @@ impl WalletRoot {
         let broadcaster_choice = form.broadcaster_choice.clone();
         let cost_estimate = form.cost_estimate.clone();
         let fee_token = form.selected_fee_token;
+        let self_broadcast_gas_payer_uuid = form.self_broadcast_gas_payer_uuid.clone();
+        let self_broadcast_gas_fee = if delivery_mode == DeliveryMode::SelfBroadcast {
+            match form.self_broadcast_gas_fee.selection(cx) {
+                Ok(selection) => selection,
+                Err(error) => {
+                    self.set_unshield_form_error(key, error, cx);
+                    return;
+                }
+            }
+        } else {
+            SelfBroadcastGasFeeSelection::Auto
+        };
         let broadcaster_fee_mode = effective_public_broadcaster_fee_mode(
             asset.token,
             fee_token,
@@ -2416,6 +3424,31 @@ impl WalletRoot {
             return;
         }
 
+        let (self_broadcast_public_account_uuid, self_broadcast_gas_payer_display) =
+            if delivery_mode == DeliveryMode::SelfBroadcast {
+                let Some(uuid) = self_broadcast_gas_payer_uuid else {
+                    self.set_unshield_form_error(key, "Choose a Public account to pay gas", cx);
+                    return;
+                };
+                let Some(account) =
+                    self.selected_self_broadcast_gas_payer_account(Some(uuid.as_ref()))
+                else {
+                    self.set_unshield_form_error(
+                        key,
+                        "Choose an active Public account to pay gas",
+                        cx,
+                    );
+                    return;
+                };
+                let gas_payer_display = public_account_display_label(account).map_or_else(
+                    || short_address(&account.address),
+                    |label| format!("{label} · {}", short_address(&account.address)),
+                );
+                (Some(uuid.to_string()), Some(gas_payer_display))
+            } else {
+                (None, None)
+            };
+
         let fee_rows = if delivery_mode == DeliveryMode::PublicBroadcaster {
             let rows = self.monitor_fee_rows();
             let policy = self.public_broadcaster_fee_policy(allow_suspicious_broadcasters);
@@ -2460,21 +3493,37 @@ impl WalletRoot {
             form.cost_estimate_pending = false;
             form.estimating_cost = false;
             form.estimate_id = 0;
+            form.self_broadcast_estimated_native_gas_cost = None;
             form.error = None;
             form.result = None;
         }
         cx.notify();
 
-        if delivery_mode == DeliveryMode::PublicBroadcaster {
-            self.start_private_broadcaster_progress(
-                DeliveryFormKind::Unshield,
-                key,
-                generation_id,
-                asset.label.clone(),
-                asset.icon_path.clone(),
-                recipient.to_checksum(None),
-                cost_estimate.clone(),
-            );
+        match delivery_mode {
+            DeliveryMode::PublicBroadcaster => {
+                self.start_private_broadcaster_progress(
+                    DeliveryFormKind::Unshield,
+                    key,
+                    generation_id,
+                    asset.label.clone(),
+                    asset.icon_path.clone(),
+                    recipient.to_checksum(None),
+                    cost_estimate.clone(),
+                );
+            }
+            DeliveryMode::SelfBroadcast => {
+                self.start_private_self_broadcast_progress(
+                    DeliveryFormKind::Unshield,
+                    key,
+                    generation_id,
+                    asset.label.clone(),
+                    asset.icon_path.clone(),
+                    recipient.to_checksum(None),
+                    self_broadcast_gas_payer_display
+                        .expect("self-broadcast gas payer was validated"),
+                );
+            }
+            DeliveryMode::ManualCalldata => {}
         }
 
         let http = self.http.clone();
@@ -2538,8 +3587,29 @@ impl WalletRoot {
                 })
             }
             DeliveryMode::SelfBroadcast => {
-                self.set_unshield_form_error(key, "Self-broadcast is not available yet", cx);
-                return;
+                let request = DesktopUnshieldSelfBroadcastRequest {
+                    chain_id,
+                    effective_chain: self.effective_chain_configs.get(&chain_id).cloned(),
+                    view_session,
+                    session,
+                    vault_store,
+                    vault_password,
+                    public_account_uuid: self_broadcast_public_account_uuid
+                        .expect("self-broadcast gas payer was validated"),
+                    token,
+                    fee_token,
+                    amount,
+                    recipient,
+                    unwrap,
+                    verify_proof: true,
+                    gas_fee: self_broadcast_gas_fee,
+                    progress_tx: Some(progress_tx),
+                };
+                self.runtime.spawn(async move {
+                    submit_desktop_unshield_self_broadcast(request, &http)
+                        .await
+                        .map(|result| UnshieldResult::SelfBroadcast(Box::new(result)))
+                })
             }
         };
         let terminal_progress_rx = progress_rx.clone();
@@ -2551,6 +3621,7 @@ impl WalletRoot {
             let final_stage = *terminal_progress_rx.borrow();
             let _ = this.update(cx, |root, cx| {
                 let mut progress_result = None;
+                let mut self_broadcast_progress_result = None;
                 let mut progress_error = None;
                 {
                     let Some(form) = root.unshield_forms.get_mut(&key) else {
@@ -2567,6 +3638,11 @@ impl WalletRoot {
                         Ok(result) => {
                             if let UnshieldResult::PublicBroadcaster(result) = &result {
                                 progress_result = Some((**result).clone());
+                            }
+                            if let UnshieldResult::SelfBroadcast(result) = &result {
+                                form.self_broadcast_estimated_native_gas_cost =
+                                    Some(result.estimated_native_gas_cost);
+                                self_broadcast_progress_result = Some((**result).clone());
                             }
                             form.error = None;
                             form.result = Some(result);
@@ -2587,6 +3663,16 @@ impl WalletRoot {
                 }
                 if let Some(result) = progress_result {
                     root.finish_private_broadcaster_progress(
+                        DeliveryFormKind::Unshield,
+                        key,
+                        generation_id,
+                        final_stage,
+                        result,
+                        cx,
+                    );
+                }
+                if let Some(result) = self_broadcast_progress_result {
+                    root.finish_private_self_broadcast_progress(
                         DeliveryFormKind::Unshield,
                         key,
                         generation_id,
@@ -2684,12 +3770,17 @@ impl WalletRoot {
         let estimate_root = root.clone();
         let progress_root = root.clone();
         let submit_root = root;
+        let self_broadcast_accounts = self.active_self_broadcast_gas_payer_accounts();
         let mut public_broadcaster_submit_disabled = false;
+        let mut self_broadcast_submit_disabled = false;
         let public_broadcaster_submitted = matches!(
             form.result.as_ref(),
-            Some(super::SendResult::PublicBroadcaster(result))
+            Some(SendResult::PublicBroadcaster(result))
                 if matches!(result.result, PublicBroadcasterResultKind::Submitted { .. })
         );
+        let self_broadcast_submitted =
+            matches!(form.result.as_ref(), Some(SendResult::SelfBroadcast(_)));
+        let submitted = public_broadcaster_submitted || self_broadcast_submitted;
 
         let mut card =
             div()
@@ -2718,6 +3809,7 @@ impl WalletRoot {
             DeliveryFormKind::Send,
             form.delivery_mode,
             form.generating,
+            !self_broadcast_accounts.is_empty(),
         ));
         if form.delivery_mode == DeliveryMode::PublicBroadcaster {
             let policy = self.public_broadcaster_fee_policy(form.allow_suspicious_broadcasters);
@@ -2776,6 +3868,23 @@ impl WalletRoot {
                     .small(),
                 );
             }
+        } else if form.delivery_mode == DeliveryMode::SelfBroadcast {
+            self_broadcast_submit_disabled = form
+                .self_broadcast_gas_payer_uuid
+                .as_deref()
+                .and_then(|uuid| self.selected_self_broadcast_gas_payer_account(Some(uuid)))
+                .is_none();
+            card = card.child(render_self_broadcast_settings(
+                chooser_root,
+                key,
+                DeliveryFormKind::Send,
+                &self_broadcast_accounts,
+                form.self_broadcast_gas_payer_uuid.as_deref(),
+                self.public_balance_snapshot.as_deref(),
+                &form.self_broadcast_gas_payer_select,
+                &form.self_broadcast_gas_fee,
+                form.generating,
+            ));
         }
 
         card = card
@@ -2832,10 +3941,12 @@ impl WalletRoot {
                             send_element_id(key, "generate"),
                             if form.generating {
                                 "Preparing..."
-                            } else if public_broadcaster_submitted {
+                            } else if submitted {
                                 "Submitted"
                             } else if form.delivery_mode == DeliveryMode::PublicBroadcaster {
                                 "Submit via broadcaster"
+                            } else if form.delivery_mode == DeliveryMode::SelfBroadcast {
+                                "Self-broadcast"
                             } else {
                                 "Generate calldata"
                             },
@@ -2845,7 +3956,8 @@ impl WalletRoot {
                         .disabled(
                             form.generating
                                 || public_broadcaster_submit_disabled
-                                || public_broadcaster_submitted,
+                                || self_broadcast_submit_disabled
+                                || submitted,
                         )
                         .on_click(move |_event, window, cx| {
                             submit_root.update(cx, |root, cx| {
@@ -2886,23 +3998,27 @@ impl WalletRoot {
         }
 
         if form.generating
-            && form.delivery_mode == DeliveryMode::PublicBroadcaster
-            && let Some(stage) = private_broadcaster_closed_active_stage(
+            && matches!(
+                form.delivery_mode,
+                DeliveryMode::PublicBroadcaster | DeliveryMode::SelfBroadcast
+            )
+            && let Some((flow, stage)) = private_broadcaster_closed_active_progress(
                 self.private_broadcaster_progress.as_ref(),
                 DeliveryFormKind::Send,
                 key,
                 form.generation_id,
             )
         {
-            card = card.child(render_private_broadcaster_active_status_notice(
+            card = card.child(render_private_submission_active_status_notice(
                 progress_root.clone(),
                 key,
                 DeliveryFormKind::Send,
+                flow,
                 stage,
             ));
         }
 
-        if form.generating && form.delivery_mode != DeliveryMode::PublicBroadcaster {
+        if form.generating && form.delivery_mode == DeliveryMode::ManualCalldata {
             card = card.child(render_unshield_generating_status(
                 self.unshield_spinner_tick,
                 form.generation_stage,
@@ -2926,15 +4042,25 @@ impl WalletRoot {
 
         if let Some(result) = form.result.as_ref() {
             match result {
-                super::SendResult::Manual(result) => {
+                SendResult::Manual(result) => {
                     card = card.child(render_send_result(key, result));
                 }
-                super::SendResult::PublicBroadcaster(result) => {
+                SendResult::PublicBroadcaster(result) => {
                     card = card.child(render_private_broadcaster_status_notice(
                         progress_root,
                         key,
                         DeliveryFormKind::Send,
                         &result.result,
+                    ));
+                }
+                SendResult::SelfBroadcast(result) => {
+                    card = card.child(div().flex().flex_col().gap_2().child(
+                        render_private_self_broadcast_status_notice(
+                            progress_root,
+                            key,
+                            DeliveryFormKind::Send,
+                            result,
+                        ),
                     ));
                 }
             }
@@ -2969,12 +4095,17 @@ impl WalletRoot {
         let estimate_root = root.clone();
         let progress_root = root.clone();
         let submit_root = root;
+        let self_broadcast_accounts = self.active_self_broadcast_gas_payer_accounts();
         let mut public_broadcaster_submit_disabled = false;
+        let mut self_broadcast_submit_disabled = false;
         let public_broadcaster_submitted = matches!(
             form.result.as_ref(),
-            Some(super::UnshieldResult::PublicBroadcaster(result))
+            Some(UnshieldResult::PublicBroadcaster(result))
                 if matches!(result.result, PublicBroadcasterResultKind::Submitted { .. })
         );
+        let self_broadcast_submitted =
+            matches!(form.result.as_ref(), Some(UnshieldResult::SelfBroadcast(_)));
+        let submitted = public_broadcaster_submitted || self_broadcast_submitted;
 
         let mut card =
             div()
@@ -2993,7 +4124,7 @@ impl WalletRoot {
         if asset.total > asset.max_batched {
             card = card.child(Alert::warning(
                 unshield_element_id(key, "spend-capacity-warning"),
-                "Spend capacity is limited by private note fragmentation and POI verification status. One unshield can spend up to 8 proof chunks.",
+                "Spend capacity is limited by private note fragmentation and POI verification status.",
             ).small());
         }
 
@@ -3003,6 +4134,7 @@ impl WalletRoot {
             DeliveryFormKind::Unshield,
             form.delivery_mode,
             form.generating,
+            !self_broadcast_accounts.is_empty(),
         ));
         if form.delivery_mode == DeliveryMode::PublicBroadcaster {
             let policy = self.public_broadcaster_fee_policy(form.allow_suspicious_broadcasters);
@@ -3064,6 +4196,23 @@ impl WalletRoot {
                     .small(),
                 );
             }
+        } else if form.delivery_mode == DeliveryMode::SelfBroadcast {
+            self_broadcast_submit_disabled = form
+                .self_broadcast_gas_payer_uuid
+                .as_deref()
+                .and_then(|uuid| self.selected_self_broadcast_gas_payer_account(Some(uuid)))
+                .is_none();
+            card = card.child(render_self_broadcast_settings(
+                chooser_root,
+                key,
+                DeliveryFormKind::Unshield,
+                &self_broadcast_accounts,
+                form.self_broadcast_gas_payer_uuid.as_deref(),
+                self.public_balance_snapshot.as_deref(),
+                &form.self_broadcast_gas_payer_select,
+                &form.self_broadcast_gas_fee,
+                form.generating,
+            ));
         }
 
         card = card
@@ -3129,10 +4278,12 @@ impl WalletRoot {
                             unshield_element_id(key, "generate"),
                             if form.generating {
                                 "Preparing..."
-                            } else if public_broadcaster_submitted {
+                            } else if submitted {
                                 "Submitted"
                             } else if form.delivery_mode == DeliveryMode::PublicBroadcaster {
                                 "Submit via broadcaster"
+                            } else if form.delivery_mode == DeliveryMode::SelfBroadcast {
+                                "Self-broadcast"
                             } else {
                                 "Generate calldata"
                             },
@@ -3142,7 +4293,8 @@ impl WalletRoot {
                         .disabled(
                             form.generating
                                 || public_broadcaster_submit_disabled
-                                || public_broadcaster_submitted,
+                                || self_broadcast_submit_disabled
+                                || submitted,
                         )
                         .on_click(move |_event, window, cx| {
                             submit_root.update(cx, |root, cx| {
@@ -3183,23 +4335,27 @@ impl WalletRoot {
         }
 
         if form.generating
-            && form.delivery_mode == DeliveryMode::PublicBroadcaster
-            && let Some(stage) = private_broadcaster_closed_active_stage(
+            && matches!(
+                form.delivery_mode,
+                DeliveryMode::PublicBroadcaster | DeliveryMode::SelfBroadcast
+            )
+            && let Some((flow, stage)) = private_broadcaster_closed_active_progress(
                 self.private_broadcaster_progress.as_ref(),
                 DeliveryFormKind::Unshield,
                 key,
                 form.generation_id,
             )
         {
-            card = card.child(render_private_broadcaster_active_status_notice(
+            card = card.child(render_private_submission_active_status_notice(
                 progress_root.clone(),
                 key,
                 DeliveryFormKind::Unshield,
+                flow,
                 stage,
             ));
         }
 
-        if form.generating && form.delivery_mode != DeliveryMode::PublicBroadcaster {
+        if form.generating && form.delivery_mode == DeliveryMode::ManualCalldata {
             card = card.child(render_unshield_generating_status(
                 self.unshield_spinner_tick,
                 form.generation_stage,
@@ -3223,15 +4379,25 @@ impl WalletRoot {
 
         if let Some(result) = form.result.as_ref() {
             match result {
-                super::UnshieldResult::Manual(result) => {
+                UnshieldResult::Manual(result) => {
                     card = card.child(render_unshield_result(key, result));
                 }
-                super::UnshieldResult::PublicBroadcaster(result) => {
+                UnshieldResult::PublicBroadcaster(result) => {
                     card = card.child(render_private_broadcaster_status_notice(
                         progress_root,
                         key,
                         DeliveryFormKind::Unshield,
                         &result.result,
+                    ));
+                }
+                UnshieldResult::SelfBroadcast(result) => {
+                    card = card.child(div().flex().flex_col().gap_2().child(
+                        render_private_self_broadcast_status_notice(
+                            progress_root,
+                            key,
+                            DeliveryFormKind::Unshield,
+                            result,
+                        ),
                     ));
                 }
             }
@@ -3481,11 +4647,56 @@ fn render_fee_mode_info_icon(id: SharedString, tooltip: &'static str) -> Button 
 }
 
 fn private_action_segment_button(id: SharedString, label: &'static str, selected: bool) -> Button {
-    let button = app_button(id, label)
+    private_action_segment_button_with_accessory(id, label, selected, None)
+}
+
+fn private_action_segment_button_with_accessory(
+    id: SharedString,
+    label: &'static str,
+    selected: bool,
+    accessory: Option<gpui::AnyElement>,
+) -> Button {
+    let button = app_button_base(id)
         .flex_1()
         .min_w(px(0.0))
-        .selected(selected);
+        .selected(selected)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap_1()
+                .child(app_button_label(label))
+                .children(accessory),
+        );
     if selected { button.primary() } else { button }
+}
+
+fn render_self_broadcast_privacy_icon(id: SharedString, selected: bool) -> gpui::AnyElement {
+    let color = if selected {
+        theme::PRIMARY_FOREGROUND
+    } else {
+        theme::WARNING
+    };
+    Button::new(id)
+        .text()
+        .xsmall()
+        .compact()
+        .icon(IconName::TriangleAlert)
+        .text_color(rgb(color))
+        .tooltip(SELF_BROADCAST_PRIVACY_WARNING)
+        .into_any_element()
+}
+
+fn render_self_broadcast_gas_payer_warning_icon(id: SharedString) -> gpui::AnyElement {
+    Button::new(id)
+        .text()
+        .xsmall()
+        .compact()
+        .icon(IconName::TriangleAlert)
+        .text_color(rgb(theme::DANGER))
+        .tooltip(SELF_BROADCAST_ZERO_GAS_PAYER_WARNING)
+        .into_any_element()
 }
 
 pub(super) fn render_send_result(key: UnshieldAssetKey, result: &PreparedSendCall) -> gpui::Div {

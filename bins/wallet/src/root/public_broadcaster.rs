@@ -178,12 +178,11 @@ pub(super) fn send_form_max_entered_amount(
     fee_mode: PublicBroadcasterFeeMode,
 ) -> Option<U256> {
     match delivery_mode {
-        DeliveryMode::ManualCalldata => Some(form.asset.max_batched),
+        DeliveryMode::ManualCalldata | DeliveryMode::SelfBroadcast => Some(form.asset.max_batched),
         DeliveryMode::PublicBroadcaster => form
             .cost_estimate
             .as_ref()
             .map(|estimate| cost_estimate_max_entered_amount_for_mode(estimate, fee_mode)),
-        DeliveryMode::SelfBroadcast => None,
     }
 }
 
@@ -193,12 +192,11 @@ pub(super) fn unshield_form_max_entered_amount(
     fee_mode: PublicBroadcasterFeeMode,
 ) -> Option<U256> {
     match delivery_mode {
-        DeliveryMode::ManualCalldata => Some(form.asset.max_batched),
+        DeliveryMode::ManualCalldata | DeliveryMode::SelfBroadcast => Some(form.asset.max_batched),
         DeliveryMode::PublicBroadcaster => form
             .cost_estimate
             .as_ref()
             .map(|estimate| cost_estimate_max_entered_amount_for_mode(estimate, fee_mode)),
-        DeliveryMode::SelfBroadcast => None,
     }
 }
 

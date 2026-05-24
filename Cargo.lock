@@ -15406,6 +15406,7 @@ dependencies = [
  "gpui-component-assets",
  "qrcodegen",
  "railgun-ui",
+ "rand 0.10.1",
  "reqwest 0.13.3",
  "structopt",
  "tokio",

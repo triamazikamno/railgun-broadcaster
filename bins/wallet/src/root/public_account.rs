@@ -407,6 +407,7 @@ impl WalletRoot {
         let Some(view_session) = self.view_session.as_ref() else {
             self.public_accounts.clear();
             self.public_form.selected_account_uuid = None;
+            self.sync_self_broadcast_gas_payer_selects(window, cx);
             return;
         };
         match store.list_public_accounts_for_session(view_session.as_ref(), true) {
@@ -434,6 +435,7 @@ impl WalletRoot {
                 self.public_form.next_derived_index = store
                     .next_derived_public_account_index_for_session(view_session.as_ref())
                     .ok();
+                self.sync_self_broadcast_gas_payer_selects(window, cx);
                 self.sync_public_edit_label_input(window, cx);
             }
             Err(error) => {

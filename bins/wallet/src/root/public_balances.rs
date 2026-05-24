@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use gpui::Context;
+use gpui::{Context, Window};
 use railgun_ui::{chain_icon_path, chain_name, format_token_amount, short_address};
 use wallet_ops::{
     PublicAssetId, PublicBalanceAmount, PublicBalanceEntry, PublicBalanceSnapshot,
@@ -187,6 +187,22 @@ impl WalletRoot {
     }
 
     pub(super) fn schedule_public_balance_refresh(&mut self, cx: &mut Context<'_, Self>) {
+        self.schedule_public_balance_refresh_internal(None, cx);
+    }
+
+    pub(super) fn schedule_self_broadcast_public_balance_refresh(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.schedule_public_balance_refresh_internal(Some(window), cx);
+    }
+
+    fn schedule_public_balance_refresh_internal(
+        &mut self,
+        window: Option<&mut Window>,
+        cx: &mut Context<'_, Self>,
+    ) {
         let accounts = self
             .public_accounts
             .iter()
@@ -209,6 +225,7 @@ impl WalletRoot {
         self.public_balance_generation = self.public_balance_generation.wrapping_add(1);
         let generation = self.public_balance_generation;
         let active_wallet_id = self.selected_wallet_id.clone();
+        let window_handle = window.map(|window| window.window_handle());
         let join = self.runtime.spawn(async move {
             refresh_public_balances(
                 chain_id,
@@ -221,55 +238,92 @@ impl WalletRoot {
         });
         cx.spawn(async move |this, cx| {
             let result = join.await;
-            let _ = this.update(cx, |root, cx| {
-                if root.public_balance_generation != generation {
-                    return;
-                }
-                root.public_balance_refreshing = false;
-                let current_account_ids = root
-                    .public_accounts
-                    .iter()
-                    .filter(|account| account.status == PublicAccountStatus::Active)
-                    .map(|account| account.public_account_uuid.as_str())
-                    .collect::<Vec<_>>();
-                let account_set_unchanged = current_account_ids.len() == account_ids.len()
-                    && current_account_ids
-                        .into_iter()
-                        .eq(account_ids.iter().map(String::as_str));
-                if root.selected_wallet_id != active_wallet_id
-                    || root.selected_chain != chain_id
-                    || !account_set_unchanged
-                {
-                    if root.active_wallet_tab == WalletTab::Public
-                        && root.has_active_public_accounts()
-                    {
-                        root.schedule_public_balance_refresh(cx);
-                    }
-                    cx.notify();
-                    return;
-                }
-                match result {
-                    Ok(Ok(snapshot)) => {
-                        root.public_balance_snapshot =
-                            Some(Arc::new(merge_public_balance_snapshot(
-                                root.public_balance_snapshot.as_deref(),
-                                snapshot,
-                                PublicAccountStatus::Active,
-                            )));
-                        root.public_balance_error = None;
-                    }
-                    Ok(Err(error)) => {
-                        root.public_balance_error = Some(Arc::from(format_report_chain(&error)));
-                    }
-                    Err(error) => {
-                        root.public_balance_error =
-                            Some(Arc::from(format!("Public balance refresh failed: {error}")));
-                    }
-                }
-                cx.notify();
-            });
+            if let Some(window_handle) = window_handle {
+                let _ = window_handle.update(cx, |_, window, cx| {
+                    let _ = this.update(cx, |root, cx| {
+                        root.apply_public_balance_refresh_result(
+                            result,
+                            generation,
+                            active_wallet_id.as_ref(),
+                            chain_id,
+                            &account_ids,
+                            Some(window),
+                            cx,
+                        );
+                    });
+                });
+            } else {
+                let _ = this.update(cx, |root, cx| {
+                    root.apply_public_balance_refresh_result(
+                        result,
+                        generation,
+                        active_wallet_id.as_ref(),
+                        chain_id,
+                        &account_ids,
+                        None,
+                        cx,
+                    );
+                });
+            }
         })
         .detach();
+        cx.notify();
+    }
+
+    fn apply_public_balance_refresh_result(
+        &mut self,
+        result: Result<Result<PublicBalanceSnapshot, eyre::Report>, tokio::task::JoinError>,
+        generation: u64,
+        active_wallet_id: Option<&Arc<str>>,
+        chain_id: u64,
+        account_ids: &[String],
+        sync_window: Option<&mut Window>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.public_balance_generation != generation {
+            return;
+        }
+        self.public_balance_refreshing = false;
+        let current_account_ids = self
+            .public_accounts
+            .iter()
+            .filter(|account| account.status == PublicAccountStatus::Active)
+            .map(|account| account.public_account_uuid.as_str())
+            .collect::<Vec<_>>();
+        let account_set_unchanged = current_account_ids.len() == account_ids.len()
+            && current_account_ids
+                .into_iter()
+                .eq(account_ids.iter().map(String::as_str));
+        if self.selected_wallet_id.as_ref() != active_wallet_id
+            || self.selected_chain != chain_id
+            || !account_set_unchanged
+        {
+            if self.active_wallet_tab == WalletTab::Public && self.has_active_public_accounts() {
+                self.schedule_public_balance_refresh(cx);
+            }
+            cx.notify();
+            return;
+        }
+        match result {
+            Ok(Ok(snapshot)) => {
+                self.public_balance_snapshot = Some(Arc::new(merge_public_balance_snapshot(
+                    self.public_balance_snapshot.as_deref(),
+                    snapshot,
+                    PublicAccountStatus::Active,
+                )));
+                self.public_balance_error = None;
+                if let Some(window) = sync_window {
+                    self.sync_self_broadcast_gas_payer_selects(window, cx);
+                }
+            }
+            Ok(Err(error)) => {
+                self.public_balance_error = Some(Arc::from(format_report_chain(&error)));
+            }
+            Err(error) => {
+                self.public_balance_error =
+                    Some(Arc::from(format!("Public balance refresh failed: {error}")));
+            }
+        }
         cx.notify();
     }
 
