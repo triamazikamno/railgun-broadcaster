@@ -15259,6 +15259,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vanity-address"
+version = "0.1.0"
+dependencies = [
+ "bech32 0.11.1",
+ "eyre",
+ "getrandom 0.4.2",
+ "railgun-wallet",
+ "structopt",
+]
+
+[[package]]
 name = "vcpkg"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"

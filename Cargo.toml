@@ -3,6 +3,7 @@ members = [
     "bins/broadcaster",
     "bins/db-cli",
     "bins/poi-indexer",
+    "bins/vanity-address",
     "bins/wallet",
     "crates/config",
     "crates/core",
