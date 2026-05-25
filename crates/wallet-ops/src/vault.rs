@@ -838,20 +838,27 @@ impl DesktopVaultStore {
         metadata: &WalletMetadataBundle,
     ) -> Result<(), VaultError> {
         let view = self.unlock_view(password)?;
-        let (key, data) = wallet_metadata_record_entry(&view, metadata)?;
+        self.store_wallet_metadata_with_view(&view, metadata)
+    }
+
+    fn store_wallet_metadata_with_view(
+        &self,
+        view: &ViewUnlock,
+        metadata: &WalletMetadataBundle,
+    ) -> Result<(), VaultError> {
+        let (key, data) = wallet_metadata_record_entry(view, metadata)?;
         self.db.put_desktop_wallet_vault_record(&key, &data)?;
         Ok(())
     }
 
-    fn store_wallet_metadata_batch(
+    fn store_wallet_metadata_batch_with_view(
         &self,
-        password: &str,
+        view: &ViewUnlock,
         metadata: &[WalletMetadataBundle],
     ) -> Result<(), VaultError> {
-        let view = self.unlock_view(password)?;
         let records = metadata
             .iter()
-            .map(|metadata| wallet_metadata_record_entry(&view, metadata))
+            .map(|metadata| wallet_metadata_record_entry(view, metadata))
             .collect::<Result<Vec<_>, _>>()?;
         self.db.put_desktop_wallet_vault_records(&records)?;
         Ok(())
@@ -872,6 +879,26 @@ impl DesktopVaultStore {
         password: &str,
     ) -> Result<Vec<WalletMetadataBundle>, VaultError> {
         let view = self.unlock_view(password)?;
+        self.list_wallet_metadata_with_view(&view)
+    }
+
+    pub fn list_wallet_metadata_for_session(
+        &self,
+        view_session: &DesktopViewSession,
+        include_inactive: bool,
+    ) -> Result<Vec<WalletMetadataBundle>, VaultError> {
+        let mut metadata = self.list_wallet_metadata_with_view(&view_session.view)?;
+        if !include_inactive {
+            metadata.retain(|metadata| metadata.status == WalletStatus::Active);
+        }
+        sort_wallet_metadata(&mut metadata);
+        Ok(metadata)
+    }
+
+    fn list_wallet_metadata_with_view(
+        &self,
+        view: &ViewUnlock,
+    ) -> Result<Vec<WalletMetadataBundle>, VaultError> {
         let mut wallet_ids = self.list_wallet_ids()?;
         wallet_ids.sort();
 
@@ -923,7 +950,7 @@ impl DesktopVaultStore {
         if loaded.iter().any(|loaded| loaded.needs_persist) {
             let mut records = Vec::new();
             for loaded in loaded.iter().filter(|loaded| loaded.needs_persist) {
-                records.push(wallet_metadata_record_entry(&view, &loaded.metadata)?);
+                records.push(wallet_metadata_record_entry(view, &loaded.metadata)?);
             }
             self.db.put_desktop_wallet_vault_records(&records)?;
         }
@@ -978,7 +1005,26 @@ impl DesktopVaultStore {
         wallet_uuid: &str,
         label: &str,
     ) -> Result<WalletMetadataBundle, VaultError> {
-        let mut metadata = self.list_wallet_metadata(password)?;
+        let view = self.unlock_view(password)?;
+        self.update_wallet_label_with_view(&view, wallet_uuid, label)
+    }
+
+    pub fn update_wallet_label_for_session(
+        &self,
+        view_session: &DesktopViewSession,
+        wallet_uuid: &str,
+        label: &str,
+    ) -> Result<WalletMetadataBundle, VaultError> {
+        self.update_wallet_label_with_view(&view_session.view, wallet_uuid, label)
+    }
+
+    fn update_wallet_label_with_view(
+        &self,
+        view: &ViewUnlock,
+        wallet_uuid: &str,
+        label: &str,
+    ) -> Result<WalletMetadataBundle, VaultError> {
+        let mut metadata = self.list_wallet_metadata_with_view(view)?;
         let label = validate_wallet_label(label, &metadata, Some(wallet_uuid))?;
         let Some(target) = metadata
             .iter_mut()
@@ -988,7 +1034,7 @@ impl DesktopVaultStore {
         };
         target.label = label;
         let updated = target.clone();
-        self.store_wallet_metadata(password, &updated)?;
+        self.store_wallet_metadata_with_view(view, &updated)?;
         Ok(updated)
     }
 
@@ -997,7 +1043,24 @@ impl DesktopVaultStore {
         password: &str,
         ordered_wallet_uuids: &[String],
     ) -> Result<Vec<WalletMetadataBundle>, VaultError> {
-        let mut metadata = self.list_wallet_metadata(password)?;
+        let view = self.unlock_view(password)?;
+        self.reorder_active_wallets_with_view(&view, ordered_wallet_uuids)
+    }
+
+    pub fn reorder_active_wallets_for_session(
+        &self,
+        view_session: &DesktopViewSession,
+        ordered_wallet_uuids: &[String],
+    ) -> Result<Vec<WalletMetadataBundle>, VaultError> {
+        self.reorder_active_wallets_with_view(&view_session.view, ordered_wallet_uuids)
+    }
+
+    fn reorder_active_wallets_with_view(
+        &self,
+        view: &ViewUnlock,
+        ordered_wallet_uuids: &[String],
+    ) -> Result<Vec<WalletMetadataBundle>, VaultError> {
+        let mut metadata = self.list_wallet_metadata_with_view(view)?;
         let active_ids = metadata
             .iter()
             .filter(|metadata| metadata.status == WalletStatus::Active)
@@ -1023,7 +1086,7 @@ impl DesktopVaultStore {
             target.display_order = display_order;
         }
 
-        self.store_wallet_metadata_batch(password, &metadata)?;
+        self.store_wallet_metadata_batch_with_view(view, &metadata)?;
         metadata.retain(|metadata| metadata.status == WalletStatus::Active);
         sort_wallet_metadata(&mut metadata);
         Ok(metadata)
@@ -1034,28 +1097,133 @@ impl DesktopVaultStore {
         password: &str,
         wallet_uuid: &str,
     ) -> Result<WalletMetadataBundle, VaultError> {
-        let mut metadata = self.list_wallet_metadata(password)?;
+        let view = self.unlock_view(password)?;
+        self.set_wallet_active_with_view(&view, wallet_uuid, false)
+    }
+
+    pub fn set_wallet_active_for_session(
+        &self,
+        view_session: &DesktopViewSession,
+        wallet_uuid: &str,
+        active: bool,
+    ) -> Result<WalletMetadataBundle, VaultError> {
+        self.set_wallet_active_with_view(&view_session.view, wallet_uuid, active)
+    }
+
+    fn set_wallet_active_with_view(
+        &self,
+        view: &ViewUnlock,
+        wallet_uuid: &str,
+        active: bool,
+    ) -> Result<WalletMetadataBundle, VaultError> {
+        let mut metadata = self.list_wallet_metadata_with_view(view)?;
         let active_count = metadata
             .iter()
             .filter(|metadata| metadata.status == WalletStatus::Active)
             .count();
-        let Some(target) = metadata
-            .iter_mut()
-            .find(|metadata| metadata.wallet_uuid == wallet_uuid)
+        let Some(target_index) = metadata
+            .iter()
+            .position(|metadata| metadata.wallet_uuid == wallet_uuid)
         else {
             return Err(VaultError::WalletNotFound);
         };
-        if target.status == WalletStatus::Inactive {
-            return Ok(target.clone());
+
+        let target_status = metadata[target_index].status;
+        if active {
+            if target_status == WalletStatus::Active {
+                return Ok(metadata[target_index].clone());
+            }
+            metadata[target_index].status = WalletStatus::Active;
+            metadata[target_index].display_order = next_wallet_display_order(&metadata)?;
+        } else {
+            if target_status == WalletStatus::Inactive {
+                return Ok(metadata[target_index].clone());
+            }
+            if active_count <= 1 {
+                return Err(VaultError::LastActiveWallet);
+            }
+            metadata[target_index].status = WalletStatus::Inactive;
         }
-        if active_count <= 1 {
+
+        let updated = metadata[target_index].clone();
+        self.store_wallet_metadata_with_view(view, &updated)?;
+        Ok(updated)
+    }
+
+    pub fn delete_wallet_for_session(
+        &self,
+        view_session: &DesktopViewSession,
+        wallet_uuid: &str,
+    ) -> Result<WalletMetadataBundle, VaultError> {
+        self.delete_wallet_with_view(&view_session.view, wallet_uuid)
+    }
+
+    fn delete_wallet_with_view(
+        &self,
+        view: &ViewUnlock,
+        wallet_uuid: &str,
+    ) -> Result<WalletMetadataBundle, VaultError> {
+        let metadata = self.list_wallet_metadata_with_view(view)?;
+        let Some(target) = metadata
+            .iter()
+            .find(|metadata| metadata.wallet_uuid == wallet_uuid)
+            .cloned()
+        else {
+            return Err(VaultError::WalletNotFound);
+        };
+        let active_count = metadata
+            .iter()
+            .filter(|metadata| metadata.status == WalletStatus::Active)
+            .count();
+        if target.status == WalletStatus::Active && active_count <= 1 {
             return Err(VaultError::LastActiveWallet);
         }
 
-        target.status = WalletStatus::Inactive;
-        let updated = target.clone();
-        self.store_wallet_metadata(password, &updated)?;
-        Ok(updated)
+        let mut keys_to_delete = vec![
+            wallet_metadata_record_key(wallet_uuid),
+            wallet_view_record_key(wallet_uuid),
+            wallet_spend_record_key(wallet_uuid),
+        ];
+
+        let chain_records = self
+            .db
+            .list_desktop_wallet_vault_records(WALLET_CHAIN_METADATA_PREFIX)?;
+        for stored in chain_records {
+            let Some(wallet_chain_uuid) = stored.key.strip_prefix(WALLET_CHAIN_METADATA_PREFIX)
+            else {
+                continue;
+            };
+            let record: EncryptedRecord = rmp_serde::from_slice(&stored.payload)?;
+            let metadata = view.decrypt_wallet_chain_metadata(wallet_chain_uuid, &record)?;
+            if metadata.wallet_uuid != wallet_uuid {
+                continue;
+            }
+            let cache_rows = self
+                .db
+                .list_desktop_wallet_vault_records(&wallet_cache_row_prefix(wallet_chain_uuid))?;
+            keys_to_delete.push(stored.key);
+            keys_to_delete.extend(cache_rows.into_iter().map(|row| row.key));
+        }
+
+        for account in self.list_public_account_metadata_with_view(view)? {
+            if matches!(
+                &account.scope,
+                PublicAccountScope::PrivateWallet { wallet_uuid: scoped } if scoped == wallet_uuid
+            ) {
+                keys_to_delete.push(public_account_metadata_record_key(
+                    &account.public_account_uuid,
+                ));
+                keys_to_delete.push(public_account_secret_record_key(
+                    &account.public_account_uuid,
+                ));
+            }
+        }
+
+        for key in keys_to_delete {
+            self.db.delete_desktop_wallet_vault_record(&key)?;
+        }
+
+        Ok(target)
     }
 
     pub fn store_wallet_chain_metadata(
@@ -3822,6 +3990,288 @@ mod tests {
             store.deactivate_wallet(TEST_PASSWORD, first_wallet_id),
             Err(VaultError::LastActiveWallet)
         ));
+
+        drop(store);
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn session_wallet_management_renames_hides_shows_reorders_and_guards_last_active() {
+        let (root_dir, db, store) = desktop_store_with_vault();
+        let first_wallet_id = "session-wallet-a";
+        let second_wallet_id = "session-wallet-b";
+        let third_wallet_id = "session-wallet-c";
+        let first_session = import_wallet_with_metadata(&store, first_wallet_id, "Alpha");
+        let _second_session = import_wallet_with_metadata(&store, second_wallet_id, "Beta");
+        let _third_session = import_wallet_with_metadata(&store, third_wallet_id, "Gamma");
+
+        let metadata = store
+            .list_wallet_metadata_for_session(&first_session, true)
+            .expect("list all wallet metadata");
+        assert_eq!(metadata.len(), 3);
+        assert_eq!(
+            metadata
+                .iter()
+                .map(|metadata| metadata.wallet_uuid.as_str())
+                .collect::<Vec<_>>(),
+            vec![first_wallet_id, second_wallet_id, third_wallet_id]
+        );
+        assert_eq!(
+            store
+                .list_wallet_metadata_for_session(&first_session, false)
+                .expect("list active wallet metadata")
+                .len(),
+            3
+        );
+
+        let updated = store
+            .update_wallet_label_for_session(&first_session, second_wallet_id, "  Main  ")
+            .expect("rename wallet");
+        assert_eq!(updated.label, "Main");
+        assert!(matches!(
+            store.update_wallet_label_for_session(&first_session, third_wallet_id, "alpha"),
+            Err(VaultError::DuplicateWalletLabel)
+        ));
+        assert!(matches!(
+            store.update_wallet_label_for_session(&first_session, third_wallet_id, "   "),
+            Err(VaultError::InvalidWalletLabel)
+        ));
+
+        let hidden = store
+            .set_wallet_active_for_session(&first_session, second_wallet_id, false)
+            .expect("hide wallet");
+        assert_eq!(hidden.status, WalletStatus::Inactive);
+        let active = store
+            .list_wallet_metadata_for_session(&first_session, false)
+            .expect("list active after hide");
+        assert_eq!(
+            active
+                .iter()
+                .map(|metadata| metadata.wallet_uuid.as_str())
+                .collect::<Vec<_>>(),
+            vec![first_wallet_id, third_wallet_id]
+        );
+        assert!(
+            store
+                .load_view_session(TEST_PASSWORD, second_wallet_id)
+                .is_ok()
+        );
+
+        let shown = store
+            .set_wallet_active_for_session(&first_session, second_wallet_id, true)
+            .expect("show wallet");
+        assert_eq!(shown.status, WalletStatus::Active);
+        let active = store
+            .list_wallet_metadata_for_session(&first_session, false)
+            .expect("list active after show");
+        assert_eq!(
+            active
+                .iter()
+                .map(|metadata| metadata.wallet_uuid.as_str())
+                .collect::<Vec<_>>(),
+            vec![first_wallet_id, third_wallet_id, second_wallet_id]
+        );
+
+        let reordered = store
+            .reorder_active_wallets_for_session(
+                &first_session,
+                &[
+                    second_wallet_id.to_string(),
+                    first_wallet_id.to_string(),
+                    third_wallet_id.to_string(),
+                ],
+            )
+            .expect("reorder active wallets");
+        assert_eq!(reordered[0].wallet_uuid, second_wallet_id);
+        assert_eq!(reordered[0].display_order, 0);
+        assert_eq!(reordered[1].wallet_uuid, first_wallet_id);
+        assert_eq!(reordered[1].display_order, 1);
+        assert_eq!(reordered[2].wallet_uuid, third_wallet_id);
+        assert_eq!(reordered[2].display_order, 2);
+        assert!(matches!(
+            store
+                .reorder_active_wallets_for_session(&first_session, &[first_wallet_id.to_string()]),
+            Err(VaultError::InvalidWalletOrder)
+        ));
+
+        store
+            .set_wallet_active_for_session(&first_session, first_wallet_id, false)
+            .expect("hide first wallet");
+        store
+            .set_wallet_active_for_session(&first_session, second_wallet_id, false)
+            .expect("hide second wallet");
+        assert!(matches!(
+            store.set_wallet_active_for_session(&first_session, third_wallet_id, false),
+            Err(VaultError::LastActiveWallet)
+        ));
+
+        drop(store);
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn permanent_wallet_delete_purges_wallet_scoped_records_and_guards_last_active() {
+        let (root_dir, db, store) = desktop_store_with_vault();
+        let first_wallet_id = "delete-wallet-a";
+        let second_wallet_id = "delete-wallet-b";
+        let third_wallet_id = "delete-wallet-c";
+        let first_session = import_wallet_with_metadata(&store, first_wallet_id, "Alpha");
+        let second_session = import_wallet_with_metadata(&store, second_wallet_id, "Beta");
+        let _third_session = import_wallet_with_metadata(&store, third_wallet_id, "Gamma");
+        let first_chain = store
+            .wallet_chain_metadata_for_session(
+                &first_session,
+                0,
+                1,
+                "0x1111111111111111111111111111111111111111",
+                100,
+            )
+            .expect("first chain metadata");
+        let second_chain = store
+            .wallet_chain_metadata_for_session(
+                &second_session,
+                0,
+                1,
+                "0x2222222222222222222222222222222222222222",
+                100,
+            )
+            .expect("second chain metadata");
+        let first_cache_key =
+            wallet_cache_row_record_key(&first_chain.wallet_chain_uuid, &[0x11; KEY_LEN]);
+        let second_cache_key =
+            wallet_cache_row_record_key(&second_chain.wallet_chain_uuid, &[0x22; KEY_LEN]);
+        db.put_desktop_wallet_vault_record(&first_cache_key, b"first cache")
+            .expect("store first cache row");
+        db.put_desktop_wallet_vault_record(&second_cache_key, b"second cache")
+            .expect("store second cache row");
+        let private_account = store
+            .import_public_account(
+                TEST_PASSWORD,
+                &second_session,
+                IMPORT_PRIVATE_KEY_ONE,
+                Some("Private"),
+                false,
+            )
+            .expect("import private scoped account");
+        let global_account = store
+            .import_public_account(
+                TEST_PASSWORD,
+                &second_session,
+                IMPORT_PRIVATE_KEY_TWO,
+                Some("Global"),
+                true,
+            )
+            .expect("import global account");
+        let private_account_ids = store
+            .list_public_accounts_for_session(&second_session, true)
+            .expect("list second wallet public accounts")
+            .into_iter()
+            .filter_map(|account| match account.scope {
+                PublicAccountScope::PrivateWallet { wallet_uuid }
+                    if wallet_uuid == second_wallet_id =>
+                {
+                    Some(account.public_account_uuid)
+                }
+                PublicAccountScope::PrivateWallet { .. } | PublicAccountScope::Global => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(private_account_ids.contains(&private_account.public_account_uuid));
+
+        let deleted = store
+            .delete_wallet_for_session(&first_session, second_wallet_id)
+            .expect("delete active wallet");
+        assert_eq!(deleted.wallet_uuid, second_wallet_id);
+        assert_eq!(deleted.status, WalletStatus::Active);
+        assert!(
+            store
+                .load_view_session(TEST_PASSWORD, second_wallet_id)
+                .is_err()
+        );
+
+        for key in [
+            wallet_metadata_record_key(second_wallet_id),
+            wallet_view_record_key(second_wallet_id),
+            wallet_spend_record_key(second_wallet_id),
+            wallet_chain_metadata_record_key(&second_chain.wallet_chain_uuid),
+            second_cache_key,
+        ] {
+            assert!(
+                db.get_desktop_wallet_vault_record(&key)
+                    .expect("load deleted record")
+                    .is_none(),
+                "expected {key} to be deleted"
+            );
+        }
+        for key in [
+            wallet_metadata_record_key(first_wallet_id),
+            wallet_view_record_key(first_wallet_id),
+            wallet_spend_record_key(first_wallet_id),
+            wallet_chain_metadata_record_key(&first_chain.wallet_chain_uuid),
+            first_cache_key,
+        ] {
+            assert!(
+                db.get_desktop_wallet_vault_record(&key)
+                    .expect("load retained record")
+                    .is_some(),
+                "expected {key} to be retained"
+            );
+        }
+        for account_id in private_account_ids {
+            assert!(
+                db.get_desktop_wallet_vault_record(&public_account_metadata_record_key(
+                    &account_id
+                ))
+                .expect("load deleted public account metadata")
+                .is_none()
+            );
+            assert!(
+                db.get_desktop_wallet_vault_record(&public_account_secret_record_key(&account_id))
+                    .expect("load deleted public account secret")
+                    .is_none()
+            );
+        }
+        assert!(
+            db.get_desktop_wallet_vault_record(&public_account_metadata_record_key(
+                &global_account.public_account_uuid,
+            ))
+            .expect("load global metadata")
+            .is_some()
+        );
+        assert!(
+            db.get_desktop_wallet_vault_record(&public_account_secret_record_key(
+                &global_account.public_account_uuid,
+            ))
+            .expect("load global secret")
+            .is_some()
+        );
+
+        store
+            .set_wallet_active_for_session(&first_session, third_wallet_id, false)
+            .expect("hide third wallet");
+        let deleted_hidden = store
+            .delete_wallet_for_session(&first_session, third_wallet_id)
+            .expect("delete hidden wallet");
+        assert_eq!(deleted_hidden.status, WalletStatus::Inactive);
+        assert!(
+            store
+                .load_view_session(TEST_PASSWORD, third_wallet_id)
+                .is_err()
+        );
+        assert!(matches!(
+            store.delete_wallet_for_session(&first_session, first_wallet_id),
+            Err(VaultError::LastActiveWallet)
+        ));
+        assert_eq!(
+            store
+                .list_wallet_metadata_for_session(&first_session, true)
+                .expect("list remaining metadata")
+                .iter()
+                .map(|metadata| metadata.wallet_uuid.as_str())
+                .collect::<Vec<_>>(),
+            vec![first_wallet_id]
+        );
 
         drop(store);
         drop(db);

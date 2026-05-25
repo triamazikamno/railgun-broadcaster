@@ -5,9 +5,10 @@ use gpui::{
     StatefulInteractiveElement, Styled, Window, div, img, px, rgb,
 };
 use gpui_component::{
-    Disableable, Sizable, WindowExt,
+    IconName, Sizable, WindowExt,
     dialog::DialogButtonProps,
     divider::Divider,
+    menu::{DropdownMenu, PopupMenuItem},
     select::{Select, SelectItem},
     tooltip::Tooltip,
 };
@@ -160,7 +161,7 @@ impl WalletRoot {
                     .items_center()
                     .gap_1()
                     .child(self.render_wallet_selector())
-                    .child(Self::render_add_wallet_button(root.clone())),
+                    .child(self.render_wallet_actions_menu(root.clone())),
             )
             .child(self.render_chain_selector())
             .child(div().flex_1())
@@ -174,7 +175,6 @@ impl WalletRoot {
                     .child(clipboard_with_toast("wallet-receive-address-copy", address))
             }))
             .children(receive_address.map(|_| header_divider()))
-            .child(self.render_repair_cache_button(root.clone()))
             .child(
                 app_button_base("wallet-lock-vault")
                     .outline()
@@ -191,29 +191,52 @@ impl WalletRoot {
             )
     }
 
-    fn render_repair_cache_button(&self, root: Entity<Self>) -> impl IntoElement {
+    fn render_wallet_actions_menu(&self, root: Entity<Self>) -> impl IntoElement {
         let disabled = matches!(
             self.chain_states.get(&self.selected_chain),
             Some(state) if state.is_syncing()
         );
+        let add_root = root.clone();
+        let manage_root = root.clone();
+        let repair_root = root;
 
-        app_button_base("wallet-repair-cache-trigger")
+        app_button_base("wallet-actions-menu-trigger")
             .outline()
             .xsmall()
-            .px(px(10.0))
-            .py(px(15.0))
-            .disabled(disabled)
-            .tooltip("Repair wallet cache")
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .child(img(icons::wrench_icon_path()).size(px(12.0)).flex_none()),
-            )
-            .on_click(move |_event, window, cx| {
-                root.update(cx, |_root, cx| {
-                    Self::open_repair_cache_dialog(window, cx);
-                });
+            .h(px(24.0))
+            .w(px(28.0))
+            .tooltip("Wallet actions")
+            .icon(IconName::Ellipsis)
+            .dropdown_menu(move |menu, _window, _cx| {
+                let add_root = add_root.clone();
+                let manage_root = manage_root.clone();
+                let repair_root = repair_root.clone();
+                menu.min_w(px(190.0))
+                    .item(
+                        PopupMenuItem::new("Add wallet")
+                            .icon(IconName::Plus)
+                            .on_click(move |_event, window, cx| {
+                                add_root.update(cx, |root, cx| {
+                                    root.open_add_wallet_dialog(window, cx);
+                                });
+                            }),
+                    )
+                    .item(PopupMenuItem::new("Manage wallets").on_click(
+                        move |_event, window, cx| {
+                            manage_root.update(cx, |root, cx| {
+                                root.open_manage_wallets_dialog(window, cx);
+                            });
+                        },
+                    ))
+                    .item(
+                        PopupMenuItem::new("Repair wallet cache")
+                            .disabled(disabled)
+                            .on_click(move |_event, window, cx| {
+                                repair_root.update(cx, |_root, cx| {
+                                    Self::open_repair_cache_dialog(window, cx);
+                                });
+                            }),
+                    )
             })
     }
 
@@ -277,21 +300,6 @@ impl WalletRoot {
                 .menu_width(px(220.0))
                 .search_placeholder("Search wallets"),
         )
-    }
-
-    fn render_add_wallet_button(root: Entity<Self>) -> impl IntoElement {
-        app_button_base("wallet-add-wallet-trigger")
-            .outline()
-            .xsmall()
-            .h(px(24.0))
-            .w(px(28.0))
-            .tooltip("Add wallet")
-            .icon(gpui_component::IconName::Plus)
-            .on_click(move |_event, window, cx| {
-                root.update(cx, |root, cx| {
-                    root.open_add_wallet_dialog(window, cx);
-                });
-            })
     }
 
     fn render_chain_selector(&self) -> impl IntoElement {

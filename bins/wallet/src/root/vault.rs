@@ -585,9 +585,32 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        self.install_view_session_with_dialog_policy(session, metadata, true, window, cx);
+    }
+
+    pub(super) fn install_view_session_after_management(
+        &mut self,
+        session: DesktopViewSession,
+        metadata: Vec<WalletMetadataBundle>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.install_view_session_with_dialog_policy(session, metadata, false, window, cx);
+    }
+
+    fn install_view_session_with_dialog_policy(
+        &mut self,
+        session: DesktopViewSession,
+        metadata: Vec<WalletMetadataBundle>,
+        close_dialogs: bool,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         let session = Arc::new(session);
         let wallet_id: Arc<str> = Arc::from(session.wallet_id().to_owned());
-        window.close_all_dialogs(cx);
+        if close_dialogs {
+            window.close_all_dialogs(cx);
+        }
         self.active_wallet_generation = self.active_wallet_generation.wrapping_add(1);
         self.view_session = Some(session);
         self.wallet_metadata = metadata;
@@ -610,7 +633,7 @@ impl WalletRoot {
     }
 
     #[allow(clippy::needless_pass_by_ref_mut)]
-    fn sync_wallet_select(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+    pub(super) fn sync_wallet_select(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         let items: Vec<_> = self
             .wallet_options
             .iter()
@@ -685,7 +708,7 @@ impl WalletRoot {
         value
     }
 
-    fn handle_vault_error(&mut self, error: &VaultError, cx: &mut Context<'_, Self>) {
+    pub(super) fn handle_vault_error(&mut self, error: &VaultError, cx: &mut Context<'_, Self>) {
         tracing::warn!(
             error_kind = vault_error_kind(error),
             "desktop wallet vault operation failed"
@@ -701,7 +724,11 @@ impl WalletRoot {
         self.set_vault_error(message, cx);
     }
 
-    fn set_vault_error(&mut self, message: impl Into<Arc<str>>, cx: &mut Context<'_, Self>) {
+    pub(super) fn set_vault_error(
+        &mut self,
+        message: impl Into<Arc<str>>,
+        cx: &mut Context<'_, Self>,
+    ) {
         self.vault_error = Some(message.into());
         cx.notify();
     }

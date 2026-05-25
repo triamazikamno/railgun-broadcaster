@@ -34,6 +34,7 @@ mod broadcaster_picker;
 mod chain_load;
 mod dialogs;
 mod gas_fee;
+mod manage_wallets;
 mod network;
 mod private_action;
 mod private_assets;
@@ -63,6 +64,7 @@ pub(crate) use shell::{WalletAppOptions, open_wallet_window};
 use broadcaster_picker::BroadcasterPickerState;
 use chain_load::{ChainUtxoState, chain_load_overrides, start_shared_poi_cache_service};
 use gas_fee::Eip1559GasFeeEditorState;
+use manage_wallets::ManageWalletsState;
 use network::TorExitIpQueryState;
 use private_action::{
     DeliveryFormKind, DeliveryMode, PrivateActionFormState, SendFormState, UnshieldAsset,
@@ -109,6 +111,11 @@ use broadcaster_picker::{
 use chain_load::{loading_summary, progress_detail, wallet_generation_matches};
 #[cfg(test)]
 use gas_fee::{format_gwei, parse_gwei_to_wei, validate_custom_gas_fee};
+#[cfg(test)]
+use manage_wallets::{
+    WalletManagementSelection, active_wallet_management_rows, hidden_wallet_management_rows,
+    selected_wallet_after_metadata_refresh, wallet_ids_after_drop,
+};
 #[cfg(test)]
 use private_action::{
     PrivateActionMetric, SEND_AUTHORIZATION_FAILED_ERROR, SEND_MISSING_PASSWORD_ERROR,
@@ -281,6 +288,8 @@ pub(crate) struct WalletRoot {
     wallet_select: Entity<SelectState<SearchableVec<WalletSelectItem>>>,
     wallet_metadata: Vec<WalletMetadataBundle>,
     wallet_options: Vec<WalletOption>,
+    manage_wallets: ManageWalletsState,
+    manage_wallet_label_input: Entity<InputState>,
     selected_wallet_id: Option<Arc<str>>,
     active_wallet_generation: u64,
     wallet_switch_generation: u64,
@@ -533,6 +542,7 @@ impl WalletRoot {
         let new_password_input = new_masked_input(window, cx, "new vault password");
         let confirm_password_input = new_masked_input(window, cx, "confirm vault password");
         let wallet_name_input = new_text_input(window, cx, "wallet name");
+        let manage_wallet_label_input = new_text_input(window, cx, "wallet label");
         let add_wallet_password_input = new_masked_input(window, cx, "vault password");
         let import_mnemonic_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -647,6 +657,8 @@ impl WalletRoot {
             wallet_select: wallet_select.clone(),
             wallet_metadata: Vec::new(),
             wallet_options: Vec::new(),
+            manage_wallets: ManageWalletsState::default(),
+            manage_wallet_label_input,
             selected_wallet_id: None,
             active_wallet_generation: 0,
             wallet_switch_generation: 0,
@@ -788,6 +800,16 @@ impl WalletRoot {
             |this, _input, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
                     this.repair_wallet_cache_from_input(cx);
+                }
+            },
+        )
+        .detach();
+        cx.subscribe_in(
+            &root.manage_wallet_label_input,
+            window,
+            |this, _input, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.save_wallet_label_edit(window, cx);
                 }
             },
         )

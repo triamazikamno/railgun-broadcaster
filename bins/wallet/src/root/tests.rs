@@ -49,8 +49,9 @@ use super::{
     SECONDS_PER_MONTH, SECONDS_PER_YEAR, SEND_AUTHORIZATION_FAILED_ERROR,
     SEND_MISSING_PASSWORD_ERROR, SelfBroadcastNativeBalanceState, SettingsApplyMode,
     UNSHIELD_AUTHORIZATION_FAILED_ERROR, UNSHIELD_MISSING_PASSWORD_ERROR, UnshieldAsset,
-    UnshieldAssetKey, VaultState, WalletAppOptions, WalletRoot, WalletSelectItem, WalletTab,
-    add_chain_rpc_endpoint, add_poi_gateway_url, add_waku_direct_peer, add_waku_dns_enr_tree,
+    UnshieldAssetKey, VaultState, WalletAppOptions, WalletManagementSelection, WalletRoot,
+    WalletSelectItem, WalletTab, active_wallet_management_rows, add_chain_rpc_endpoint,
+    add_poi_gateway_url, add_waku_direct_peer, add_waku_dns_enr_tree,
     add_waku_doh_fallback_endpoint, adjusted_amount_for_max_change,
     apply_private_broadcaster_progress_stage, broadcaster_choice_supported_by_candidates,
     classify_settings_apply_mode, default_self_broadcast_gas_payer_uuid,
@@ -68,16 +69,17 @@ use super::{
     format_compact_age, format_exact_asset_amount_for_display, format_form_error_for_asset,
     format_gwei, format_native_token_amount_for_display, format_private_asset_rows,
     format_public_broadcaster_fee_margin, format_report_chain, format_send_amount_input,
-    format_total, format_unshield_amount_input, is_effective_wrapped_native_token,
-    load_validated_startup_settings, loading_summary, mark_private_broadcaster_active_step_stopped,
-    mark_public_action_active_step_stopped, max_send_amount_from_snapshot,
-    max_unshield_amount_from_snapshot, merge_public_balance_snapshot, native_token_display_label,
-    native_wrapped_output_labels, next_public_account_label_number, parse_gwei_to_wei,
-    parse_repair_cache_block, price_anchor_dialog_values_from_entry,
-    price_anchor_override_from_dialog_values, price_anchor_token_primary_label,
-    private_action_metrics, private_broadcaster_progress_footer_action,
-    private_broadcaster_progress_steps, private_progress_stage_disables_stop, progress_detail,
-    progress_footer_action, public_account_identicon_color, public_account_identicon_pattern,
+    format_total, format_unshield_amount_input, hidden_wallet_management_rows,
+    is_effective_wrapped_native_token, load_validated_startup_settings, loading_summary,
+    mark_private_broadcaster_active_step_stopped, mark_public_action_active_step_stopped,
+    max_send_amount_from_snapshot, max_unshield_amount_from_snapshot,
+    merge_public_balance_snapshot, native_token_display_label, native_wrapped_output_labels,
+    next_public_account_label_number, parse_gwei_to_wei, parse_repair_cache_block,
+    price_anchor_dialog_values_from_entry, price_anchor_override_from_dialog_values,
+    price_anchor_token_primary_label, private_action_metrics,
+    private_broadcaster_progress_footer_action, private_broadcaster_progress_steps,
+    private_progress_stage_disables_stop, progress_detail, progress_footer_action,
+    public_account_identicon_color, public_account_identicon_pattern,
     public_account_matches_search, public_account_visible_balances_for_chain,
     public_action_accepts_update, public_action_closed_active_step, public_action_error_copy_value,
     public_action_error_details, public_action_error_summary,
@@ -93,11 +95,11 @@ use super::{
     remove_chain_rpc_endpoint, remove_poi_gateway_url, remove_waku_direct_peer,
     remove_waku_dns_enr_tree, remove_waku_doh_fallback_endpoint, repair_cache_help_text,
     required_relay_adapt_for_unwrap, resolve_selected_public_broadcaster_fee_token,
-    self_broadcast_gas_payer_matches_search, self_broadcast_native_balance_label,
-    self_broadcast_native_balance_state, self_broadcast_progress_steps,
-    send_asset_key_from_formatted, send_element_id, send_key_matches_asset,
-    send_public_broadcaster_estimate_input_error, set_chain_rpc_endpoint, set_poi_gateway_url,
-    set_price_anchor_override, set_waku_direct_peer, set_waku_dns_enr_tree,
+    selected_wallet_after_metadata_refresh, self_broadcast_gas_payer_matches_search,
+    self_broadcast_native_balance_label, self_broadcast_native_balance_state,
+    self_broadcast_progress_steps, send_asset_key_from_formatted, send_element_id,
+    send_key_matches_asset, send_public_broadcaster_estimate_input_error, set_chain_rpc_endpoint,
+    set_poi_gateway_url, set_price_anchor_override, set_waku_direct_peer, set_waku_dns_enr_tree,
     set_waku_doh_fallback_endpoint, settings_draft_after_discard, settings_restart_action_enabled,
     settings_restart_reuses_active_network, settings_save_action_enabled,
     should_clear_private_action_error_on_password_change, should_focus_utxo_table,
@@ -108,7 +110,7 @@ use super::{
     sidebar_primary_activity_order, startup_settings_action_state,
     unshield_asset_key_from_formatted, unshield_element_id, unshield_key_matches_asset,
     unshield_public_broadcaster_estimate_input_error, validate_custom_gas_fee,
-    wallet_generation_matches, wallet_options_from_metadata,
+    wallet_generation_matches, wallet_ids_after_drop, wallet_options_from_metadata,
 };
 
 fn utxo_output(token: &str, value: &str, is_spent: bool) -> UtxoOutput {
@@ -336,6 +338,107 @@ fn wallet_options_hide_inactive_and_sort_active_metadata() {
     assert_eq!(options[0].label.as_ref(), "Alpha");
     assert_eq!(options[0].source, WalletSource::Generated);
     assert_eq!(options[1].wallet_id.as_ref(), "wallet-b");
+}
+
+#[test]
+fn wallet_management_rows_split_and_sort_like_selector() {
+    let metadata = vec![
+        wallet_metadata(
+            "wallet-b",
+            "Beta",
+            WalletSource::Imported,
+            WalletStatus::Active,
+            2,
+        ),
+        wallet_metadata(
+            "wallet-hidden",
+            "Hidden",
+            WalletSource::Imported,
+            WalletStatus::Inactive,
+            0,
+        ),
+        wallet_metadata(
+            "wallet-a",
+            "Alpha",
+            WalletSource::Generated,
+            WalletStatus::Active,
+            1,
+        ),
+    ];
+
+    let active = active_wallet_management_rows(&metadata);
+    let hidden = hidden_wallet_management_rows(&metadata);
+
+    assert_eq!(
+        active
+            .iter()
+            .map(|metadata| metadata.wallet_uuid.as_str())
+            .collect::<Vec<_>>(),
+        vec!["wallet-a", "wallet-b"]
+    );
+    assert_eq!(hidden.len(), 1);
+    assert_eq!(hidden[0].wallet_uuid, "wallet-hidden");
+}
+
+#[test]
+fn wallet_ids_after_drop_moves_active_wallets_between_drop_zones() {
+    let active = vec![
+        Arc::from("wallet-a"),
+        Arc::from("wallet-b"),
+        Arc::from("wallet-c"),
+    ];
+
+    assert_eq!(
+        wallet_ids_after_drop(&active, "wallet-c", 0),
+        Some(vec![
+            "wallet-c".to_string(),
+            "wallet-a".to_string(),
+            "wallet-b".to_string(),
+        ])
+    );
+    assert_eq!(
+        wallet_ids_after_drop(&active, "wallet-a", active.len()),
+        Some(vec![
+            "wallet-b".to_string(),
+            "wallet-c".to_string(),
+            "wallet-a".to_string(),
+        ])
+    );
+    assert_eq!(wallet_ids_after_drop(&active, "wallet-b", 1), None);
+    assert_eq!(wallet_ids_after_drop(&active, "missing", 1), None);
+}
+
+#[test]
+fn selected_wallet_after_metadata_refresh_keeps_or_switches_selection() {
+    let options = wallet_options_from_metadata(vec![
+        wallet_metadata(
+            "wallet-a",
+            "Alpha",
+            WalletSource::Generated,
+            WalletStatus::Active,
+            0,
+        ),
+        wallet_metadata(
+            "wallet-b",
+            "Beta",
+            WalletSource::Imported,
+            WalletStatus::Active,
+            1,
+        ),
+    ]);
+
+    assert_eq!(
+        selected_wallet_after_metadata_refresh(Some("wallet-b"), &options),
+        WalletManagementSelection::KeepSelected
+    );
+    assert_eq!(
+        selected_wallet_after_metadata_refresh(Some("wallet-hidden"), &options),
+        WalletManagementSelection::SwitchTo(Arc::from("wallet-a"))
+    );
+    assert_eq!(
+        selected_wallet_after_metadata_refresh(None, &[]),
+        WalletManagementSelection::NoActiveWallet
+    );
 }
 
 #[test]
