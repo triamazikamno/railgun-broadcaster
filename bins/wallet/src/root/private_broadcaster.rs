@@ -1084,7 +1084,7 @@ fn render_pending_public_broadcaster_progress_context(
             progress.recipient.to_string(),
         ))
         .child(cost_estimate_detail_text(
-            "Fee and gas cost will appear after the broadcaster fee is calculated.",
+            "Fee and gas cost will appear after the transaction fee is calculated.",
         ))
 }
 
@@ -1488,7 +1488,7 @@ const fn private_broadcaster_stage_detail(
             TransactionGenerationStage::SelectingPrivateNotes => "Waiting to select private notes.",
             TransactionGenerationStage::ProvingTransaction => "Waiting to generate the proof.",
             TransactionGenerationStage::EstimatingBroadcasterFee => {
-                "Waiting to settle the broadcaster fee."
+                "Waiting to settle the transaction fee."
             }
             TransactionGenerationStage::GeneratingPoiProofs => "Waiting to generate POI proofs.",
             TransactionGenerationStage::PublishingToBroadcaster => {

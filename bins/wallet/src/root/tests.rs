@@ -47,18 +47,17 @@ use super::{
     ProgressFooterAction, PublicActionMode, PublicActionStepState, PublicActionStepStatus,
     PublicBroadcasterFeeTokenOption, SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_MINUTE,
     SECONDS_PER_MONTH, SECONDS_PER_YEAR, SEND_AUTHORIZATION_FAILED_ERROR,
-    SEND_MISSING_PASSWORD_ERROR, SelfBroadcastNativeBalanceState, SettingsApplyMode,
-    UNSHIELD_AUTHORIZATION_FAILED_ERROR, UNSHIELD_MISSING_PASSWORD_ERROR, UnshieldAsset,
-    UnshieldAssetKey, VaultState, WalletAppOptions, WalletManagementSelection, WalletRoot,
-    WalletSelectItem, WalletTab, active_wallet_management_rows, add_chain_rpc_endpoint,
-    add_poi_gateway_url, add_waku_direct_peer, add_waku_dns_enr_tree,
-    add_waku_doh_fallback_endpoint, adjusted_amount_for_max_change,
-    apply_private_broadcaster_progress_stage, broadcaster_choice_supported_by_candidates,
-    classify_settings_apply_mode, default_self_broadcast_gas_payer_uuid,
-    display_chain_contract_settings, display_chain_quick_sync_endpoint,
-    display_chain_rpc_endpoints, display_price_anchor_entries, display_rows_from_output,
-    display_token_entries, display_waku_direct_peers, display_waku_dns_enr_trees,
-    display_waku_doh_endpoint, display_waku_doh_fallback_endpoints,
+    SelfBroadcastNativeBalanceState, SettingsApplyMode, SpendAuthorizationLifetime,
+    UNSHIELD_AUTHORIZATION_FAILED_ERROR, UnshieldAsset, UnshieldAssetKey, VaultState,
+    WalletAppOptions, WalletManagementSelection, WalletRoot, WalletSelectItem, WalletTab,
+    active_wallet_management_rows, add_chain_rpc_endpoint, add_poi_gateway_url,
+    add_waku_direct_peer, add_waku_dns_enr_tree, add_waku_doh_fallback_endpoint,
+    adjusted_amount_for_max_change, apply_private_broadcaster_progress_stage,
+    broadcaster_choice_supported_by_candidates, classify_settings_apply_mode,
+    default_self_broadcast_gas_payer_uuid, display_chain_contract_settings,
+    display_chain_quick_sync_endpoint, display_chain_rpc_endpoints, display_price_anchor_entries,
+    display_rows_from_output, display_token_entries, display_waku_direct_peers,
+    display_waku_dns_enr_trees, display_waku_doh_endpoint, display_waku_doh_fallback_endpoints,
     effective_public_broadcaster_fee_mode, ensure_self_broadcast_unshield_progress_stage,
     ethereum_weth_public_broadcaster_count, fail_private_broadcaster_progress_steps_at_stage,
     fee_token_option_has_eligible_broadcaster, finish_private_broadcaster_progress_steps,
@@ -70,16 +69,16 @@ use super::{
     format_gwei, format_native_token_amount_for_display, format_private_asset_rows,
     format_public_broadcaster_fee_margin, format_report_chain, format_send_amount_input,
     format_total, format_unshield_amount_input, hidden_wallet_management_rows,
-    is_effective_wrapped_native_token, load_validated_startup_settings, loading_summary,
-    mark_private_broadcaster_active_step_stopped, mark_public_action_active_step_stopped,
-    max_send_amount_from_snapshot, max_unshield_amount_from_snapshot,
-    merge_public_balance_snapshot, native_token_display_label, native_wrapped_output_labels,
-    next_public_account_label_number, parse_gwei_to_wei, parse_repair_cache_block,
-    price_anchor_dialog_values_from_entry, price_anchor_override_from_dialog_values,
-    price_anchor_token_primary_label, private_action_metrics,
-    private_broadcaster_progress_footer_action, private_broadcaster_progress_steps,
-    private_progress_stage_disables_stop, progress_detail, progress_footer_action,
-    public_account_identicon_color, public_account_identicon_pattern,
+    is_effective_wrapped_native_token, is_spend_authorization_failure_error,
+    load_validated_startup_settings, loading_summary, mark_private_broadcaster_active_step_stopped,
+    mark_public_action_active_step_stopped, max_send_amount_from_snapshot,
+    max_unshield_amount_from_snapshot, merge_public_balance_snapshot, native_token_display_label,
+    native_wrapped_output_labels, next_public_account_label_number, parse_gwei_to_wei,
+    parse_repair_cache_block, price_anchor_dialog_values_from_entry,
+    price_anchor_override_from_dialog_values, price_anchor_token_primary_label,
+    private_action_metrics, private_broadcaster_progress_footer_action,
+    private_broadcaster_progress_steps, private_progress_stage_disables_stop, progress_detail,
+    progress_footer_action, public_account_identicon_color, public_account_identicon_pattern,
     public_account_matches_search, public_account_visible_balances_for_chain,
     public_action_accepts_update, public_action_closed_active_step, public_action_error_copy_value,
     public_action_error_details, public_action_error_summary,
@@ -92,17 +91,17 @@ use super::{
     public_broadcaster_cost_status_text, public_broadcaster_fee_token_options_from_snapshot,
     public_broadcaster_fee_token_warning, public_broadcaster_submit_disabled_for_fee_token_options,
     random_self_broadcast_gas_payer_uuid, refresh_form_asset_from_snapshot,
-    remove_chain_rpc_endpoint, remove_poi_gateway_url, remove_waku_direct_peer,
-    remove_waku_dns_enr_tree, remove_waku_doh_fallback_endpoint, repair_cache_help_text,
-    required_relay_adapt_for_unwrap, resolve_selected_public_broadcaster_fee_token,
-    selected_wallet_after_metadata_refresh, self_broadcast_gas_payer_matches_search,
-    self_broadcast_native_balance_label, self_broadcast_native_balance_state,
-    self_broadcast_progress_steps, send_asset_key_from_formatted, send_element_id,
-    send_key_matches_asset, send_public_broadcaster_estimate_input_error, set_chain_rpc_endpoint,
-    set_poi_gateway_url, set_price_anchor_override, set_waku_direct_peer, set_waku_dns_enr_tree,
+    remembered_spend_authorization_valid_for_test, remove_chain_rpc_endpoint,
+    remove_poi_gateway_url, remove_waku_direct_peer, remove_waku_dns_enr_tree,
+    remove_waku_doh_fallback_endpoint, repair_cache_help_text, required_relay_adapt_for_unwrap,
+    resolve_selected_public_broadcaster_fee_token, selected_wallet_after_metadata_refresh,
+    self_broadcast_gas_payer_matches_search, self_broadcast_native_balance_label,
+    self_broadcast_native_balance_state, self_broadcast_progress_steps,
+    send_asset_key_from_formatted, send_element_id, send_key_matches_asset,
+    send_public_broadcaster_estimate_input_error, set_chain_rpc_endpoint, set_poi_gateway_url,
+    set_price_anchor_override, set_waku_direct_peer, set_waku_dns_enr_tree,
     set_waku_doh_fallback_endpoint, settings_draft_after_discard, settings_restart_action_enabled,
-    settings_restart_reuses_active_network, settings_save_action_enabled,
-    should_clear_private_action_error_on_password_change, should_focus_utxo_table,
+    settings_restart_reuses_active_network, settings_save_action_enabled, should_focus_utxo_table,
     should_preserve_estimate_after_broadcaster_policy_change,
     should_render_public_broadcaster_cost_preview, should_show_broadcaster_fee_mode_toggle,
     should_show_distinct_amount, should_show_pre_unlock_settings_action,
@@ -643,7 +642,7 @@ fn form_error_formats_fee_token_balance_in_selected_fee_token_units() {
     };
 
     let formatted = format_form_error_for_asset(
-        "build public broadcaster unshield proof: public broadcaster fee-token max spendable: 388585770",
+        "build public broadcaster unshield proof: public broadcaster fee-token max spendable: 388585770; required fee: 400000000",
         &asset,
         usdc,
         None,
@@ -651,7 +650,36 @@ fn form_error_formats_fee_token_balance_in_selected_fee_token_units() {
 
     assert_eq!(
         formatted,
-        "Broadcaster fee exceeds available fee-token balance: 388.58577 USDC. Choose a fee token with more spendable balance or a lower-fee broadcaster."
+        "Transaction fee exceeds available fee-token balance. Required fee: 400 USDC; available: 388.58577 USDC; short by: 11.41423 USDC. Choose a fee token with more spendable balance or a lower-fee broadcaster."
+    );
+}
+
+#[test]
+fn form_error_formats_legacy_fee_token_balance_without_required_fee() {
+    let usdc = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+        .parse::<Address>()
+        .expect("usdc address");
+    let asset = UnshieldAsset {
+        chain_id: 1,
+        token: usdc,
+        label: "USDC".to_string(),
+        decimals: Some(6),
+        total: U256::ZERO,
+        poi_verified_total: U256::ZERO,
+        max_batched: U256::ZERO,
+        icon_path: None,
+    };
+
+    let formatted = format_form_error_for_asset(
+        "build public broadcaster send proof: public broadcaster fee-token max spendable: 388585770",
+        &asset,
+        usdc,
+        None,
+    );
+
+    assert_eq!(
+        formatted,
+        "Transaction fee exceeds available fee-token balance: 388.58577 USDC. Choose a fee token with more spendable balance or a lower-fee broadcaster."
     );
 }
 
@@ -714,15 +742,7 @@ fn public_broadcaster_cost_preview_hides_on_form_error() {
 }
 
 #[test]
-fn public_broadcaster_missing_password_errors_preserve_estimate() {
-    assert!(!form_error_clears_public_broadcaster_cost_estimate(
-        DeliveryFormKind::Send,
-        SEND_MISSING_PASSWORD_ERROR,
-    ));
-    assert!(!form_error_clears_public_broadcaster_cost_estimate(
-        DeliveryFormKind::Unshield,
-        UNSHIELD_MISSING_PASSWORD_ERROR,
-    ));
+fn spend_authorization_errors_preserve_estimate() {
     assert!(!form_error_clears_public_broadcaster_cost_estimate(
         DeliveryFormKind::Send,
         SEND_AUTHORIZATION_FAILED_ERROR,
@@ -737,35 +757,46 @@ fn public_broadcaster_missing_password_errors_preserve_estimate() {
     ));
     assert!(form_error_clears_public_broadcaster_cost_estimate(
         DeliveryFormKind::Unshield,
-        SEND_MISSING_PASSWORD_ERROR,
+        "amount exceeds balance",
     ));
 }
 
 #[test]
-fn password_change_only_clears_missing_password_errors() {
-    assert!(should_clear_private_action_error_on_password_change(
-        DeliveryFormKind::Send,
-        SEND_MISSING_PASSWORD_ERROR,
-    ));
-    assert!(should_clear_private_action_error_on_password_change(
-        DeliveryFormKind::Unshield,
-        UNSHIELD_MISSING_PASSWORD_ERROR,
-    ));
-    assert!(should_clear_private_action_error_on_password_change(
-        DeliveryFormKind::Send,
+fn spend_authorization_failure_detection_is_specific() {
+    assert!(is_spend_authorization_failure_error(
         SEND_AUTHORIZATION_FAILED_ERROR,
     ));
-    assert!(should_clear_private_action_error_on_password_change(
-        DeliveryFormKind::Unshield,
+    assert!(is_spend_authorization_failure_error(
         UNSHIELD_AUTHORIZATION_FAILED_ERROR,
     ));
-    assert!(!should_clear_private_action_error_on_password_change(
-        DeliveryFormKind::Send,
+    assert!(is_spend_authorization_failure_error(
+        "authorize public account spend: unlock failed",
+    ));
+    assert!(!is_spend_authorization_failure_error(
+        "Unlock failed. Check the password and try again.",
+    ));
+    assert!(!is_spend_authorization_failure_error(
         "invalid recipient 0zk address",
     ));
-    assert!(!should_clear_private_action_error_on_password_change(
-        DeliveryFormKind::Unshield,
-        SEND_MISSING_PASSWORD_ERROR,
+}
+
+#[test]
+fn remembered_spend_authorization_expires_by_lifetime() {
+    assert!(!remembered_spend_authorization_valid_for_test(
+        SpendAuthorizationLifetime::Once,
+        Duration::ZERO,
+    ));
+    assert!(remembered_spend_authorization_valid_for_test(
+        SpendAuthorizationLifetime::FiveMinutes,
+        Duration::from_secs(60),
+    ));
+    assert!(!remembered_spend_authorization_valid_for_test(
+        SpendAuthorizationLifetime::FiveMinutes,
+        Duration::from_secs(5 * 60),
+    ));
+    assert!(remembered_spend_authorization_valid_for_test(
+        SpendAuthorizationLifetime::UntilVaultLock,
+        Duration::from_secs(60 * 60 * 24),
     ));
 }
 

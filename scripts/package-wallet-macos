@@ -6,6 +6,8 @@ repo_root="$(cd "$script_dir/.." && pwd)"
 bundle_root="$repo_root/target/macos"
 app_name="RailOxide"
 app_bundle="$bundle_root/$app_name.app"
+dmg_staging_dir="$bundle_root/dmg"
+dmg_path="$bundle_root/$app_name.dmg"
 contents_dir="$app_bundle/Contents"
 macos_dir="$contents_dir/MacOS"
 resources_dir="$contents_dir/Resources"
@@ -24,6 +26,8 @@ require_tool() {
 
 require_tool cargo
 require_tool codesign
+require_tool ditto
+require_tool hdiutil
 require_tool plutil
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
@@ -55,4 +59,18 @@ plutil -lint "$contents_dir/Info.plist"
 codesign --force --deep --sign "$codesign_identity" "$app_bundle"
 codesign --verify --deep --strict --verbose=2 "$app_bundle"
 
+rm -rf "$dmg_staging_dir" "$dmg_path"
+mkdir -p "$dmg_staging_dir"
+ditto "$app_bundle" "$dmg_staging_dir/$app_name.app"
+ln -s /Applications "$dmg_staging_dir/Applications"
+
+hdiutil create \
+  -volname "$app_name" \
+  -srcfolder "$dmg_staging_dir" \
+  -ov \
+  -format UDZO \
+  "$dmg_path"
+hdiutil verify "$dmg_path"
+
 printf 'packaged %s\n' "$app_bundle"
+printf 'packaged %s\n' "$dmg_path"

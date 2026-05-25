@@ -147,7 +147,7 @@ fn public_broadcaster_fee_mode_summary(
         PublicBroadcasterFeeMode::DeductFromAmount => {
             let reduction = entered_amount.saturating_sub(receiver_amount);
             if reduction.is_zero() && protocol_fee_amount.is_zero() {
-                "Recipient receives the entered amount because the broadcaster fee is zero."
+                "Recipient receives the entered amount because the transaction fee is zero."
                     .to_string()
             } else if protocol_fee_amount.is_zero() {
                 format!(
@@ -1042,7 +1042,7 @@ pub(super) const fn public_broadcaster_cost_status_text(
     match status {
         CostEstimateStatus::Estimating => (
             "Estimating public broadcaster cost...",
-            "Using current gas price, broadcaster fee rate, and selected private note shape.",
+            "Using current gas price, transaction fee rate, and selected private note shape.",
         ),
     }
 }
@@ -1182,7 +1182,7 @@ pub(super) fn render_private_broadcaster_progress_context(
             display.native_gas_cost_value(&breakdown),
         ))
         .child(private_broadcaster_context_row(
-            "Broadcaster fee",
+            "Transaction fee",
             display.broadcaster_fee_value(&breakdown),
         ))
         .child(private_broadcaster_context_row(

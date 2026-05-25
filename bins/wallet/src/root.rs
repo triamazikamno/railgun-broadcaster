@@ -47,6 +47,7 @@ mod public_broadcaster_cost;
 mod settings;
 mod shell;
 mod sidebar;
+mod spend_authorization;
 mod startup;
 mod tokens;
 mod ui_helpers;
@@ -87,6 +88,7 @@ use public_broadcaster::{
 use settings::WalletSettingsEditor;
 use shell::WalletTab;
 use sidebar::Activity;
+use spend_authorization::{SpendAuthorizationCache, SpendAuthorizationLifetime};
 use startup::WalletStartupRoot;
 use tokens::{
     format_exact_token_amount_for_display, format_native_token_amount_for_display,
@@ -118,15 +120,13 @@ use manage_wallets::{
 };
 #[cfg(test)]
 use private_action::{
-    PrivateActionMetric, SEND_AUTHORIZATION_FAILED_ERROR, SEND_MISSING_PASSWORD_ERROR,
-    SelfBroadcastNativeBalanceState, UNSHIELD_AUTHORIZATION_FAILED_ERROR,
-    UNSHIELD_MISSING_PASSWORD_ERROR, adjusted_amount_for_max_change,
+    PrivateActionMetric, SEND_AUTHORIZATION_FAILED_ERROR, SelfBroadcastNativeBalanceState,
+    UNSHIELD_AUTHORIZATION_FAILED_ERROR, adjusted_amount_for_max_change,
     default_self_broadcast_gas_payer_uuid, form_error_clears_public_broadcaster_cost_estimate,
     format_exact_asset_amount_for_display, format_form_error_for_asset, private_action_metrics,
     random_self_broadcast_gas_payer_uuid, self_broadcast_gas_payer_matches_search,
     self_broadcast_native_balance_label, self_broadcast_native_balance_state, send_element_id,
-    send_public_broadcaster_estimate_input_error,
-    should_clear_private_action_error_on_password_change, unshield_element_id,
+    send_public_broadcaster_estimate_input_error, unshield_element_id,
     unshield_public_broadcaster_estimate_input_error,
 };
 #[cfg(test)]
@@ -199,6 +199,10 @@ use settings::{
 #[cfg(test)]
 use sidebar::sidebar_primary_activity_order;
 #[cfg(test)]
+use spend_authorization::{
+    is_spend_authorization_failure_error, remembered_spend_authorization_valid_for_test,
+};
+#[cfg(test)]
 use startup::load_validated_startup_settings;
 #[cfg(test)]
 use utxo::{display_rows_from_output, format_compact_age};
@@ -258,6 +262,8 @@ pub(crate) struct WalletRoot {
     unlock_in_progress: bool,
     repair_cache_error: Option<Arc<str>>,
     setup_password: Option<Zeroizing<String>>,
+    spend_authorization_cache: Option<SpendAuthorizationCache>,
+    spend_authorization_lifetime: SpendAuthorizationLifetime,
     view_session: Option<Arc<DesktopViewSession>>,
     generated_seed: Option<GeneratedSeedMaterial>,
     http: HttpContext,
@@ -560,9 +566,7 @@ impl WalletRoot {
             search_input: public_account_search_input.clone(),
             send_recipient_input: new_text_input(window, cx, "0x recipient"),
             send_amount_input: new_text_input(window, cx, "amount"),
-            send_password_input: new_masked_input(window, cx, "vault password"),
             shield_amount_input: new_text_input(window, cx, "amount"),
-            shield_password_input: new_masked_input(window, cx, "vault password"),
             send_gas_fee: Eip1559GasFeeEditorState::new(window, cx),
             shield_gas_fee: Eip1559GasFeeEditorState::new(window, cx),
             import_global: false,
@@ -627,6 +631,8 @@ impl WalletRoot {
             unlock_in_progress: false,
             repair_cache_error: None,
             setup_password: None,
+            spend_authorization_cache: None,
+            spend_authorization_lifetime: SpendAuthorizationLifetime::Once,
             view_session: None,
             generated_seed: None,
             http,
@@ -879,26 +885,6 @@ impl WalletRoot {
             |this, _input, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
                     this.update_selected_public_account_label(window, cx);
-                }
-            },
-        )
-        .detach();
-        cx.subscribe_in(
-            &root.public_form.send_password_input,
-            window,
-            |this, _input, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.submit_public_send_from_form(window, cx);
-                }
-            },
-        )
-        .detach();
-        cx.subscribe_in(
-            &root.public_form.shield_password_input,
-            window,
-            |this, _input, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.submit_public_shield_from_form(window, cx);
                 }
             },
         )

@@ -1065,7 +1065,7 @@ impl WalletSettingsEditor {
                     )
             }),
         )
-        .description("Public broadcaster fees outside this percentage range are marked suspicious.")
+        .description("Transaction fees outside this percentage range are marked suspicious.")
         .layout(Axis::Vertical)
     }
 
@@ -2755,7 +2755,7 @@ impl Render for WalletSettingsEditor {
                         )
                     }),
                 )
-                .description("Token price anchors used to evaluate public broadcaster fees.")
+                .description("Token price anchors used to evaluate transaction fees.")
                 .layout(Axis::Vertical),
             ),
         );

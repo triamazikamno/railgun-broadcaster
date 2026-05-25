@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::primitives::{Address, U256};
+use broadcaster_monitor::FeeRow;
 use gpui::{
     Animation, AnimationExt as _, App, AppContext, Context, ElementId, Entity, Focusable,
     InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, SharedString,
@@ -26,14 +27,15 @@ use ui::controls::{
 };
 use ui::theme::{self, APP_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
-    DesktopSelfBroadcastResult, DesktopSendCalldataRequest, DesktopSendPublicBroadcasterRequest,
-    DesktopSendSelfBroadcastRequest, DesktopUnshieldCalldataRequest,
-    DesktopUnshieldPublicBroadcasterRequest, DesktopUnshieldSelfBroadcastRequest, ListUtxosOutput,
-    PreparedSendCall, PreparedUnshieldCall, PublicAssetId, PublicBalanceAmount, PublicBalanceEntry,
-    PublicBalanceSnapshot, PublicBroadcasterCandidate, PublicBroadcasterCostEstimate,
-    PublicBroadcasterFeeMode, PublicBroadcasterResultKind, PublicBroadcasterSubmissionResult,
-    SelfBroadcastGasFeeQuote, SelfBroadcastGasFeeSelection, SelfBroadcastSessionEvent,
-    TransactionGenerationStage, fee_policy_eligible_public_broadcasters, parse_railgun_recipient,
+    BroadcasterFeePolicy, DesktopSelfBroadcastResult, DesktopSendCalldataRequest,
+    DesktopSendPublicBroadcasterRequest, DesktopSendSelfBroadcastRequest,
+    DesktopUnshieldCalldataRequest, DesktopUnshieldPublicBroadcasterRequest,
+    DesktopUnshieldSelfBroadcastRequest, ListUtxosOutput, PreparedSendCall, PreparedUnshieldCall,
+    PublicAssetId, PublicBalanceAmount, PublicBalanceEntry, PublicBalanceSnapshot,
+    PublicBroadcasterCandidate, PublicBroadcasterCostEstimate, PublicBroadcasterFeeMode,
+    PublicBroadcasterResultKind, PublicBroadcasterSubmissionResult, SelfBroadcastGasFeeQuote,
+    SelfBroadcastGasFeeSelection, SelfBroadcastSessionEvent, TransactionGenerationStage,
+    WalletSession, fee_policy_eligible_public_broadcasters, parse_railgun_recipient,
     parse_send_amount, parse_unshield_amount, prepare_desktop_send_calldata,
     prepare_desktop_unshield_calldata, quote_desktop_self_broadcast_gas_fee,
     select_public_broadcaster_with_policy,
@@ -41,8 +43,9 @@ use wallet_ops::{
     sort_specific_public_broadcasters, submit_desktop_send_public_broadcaster,
     submit_desktop_send_self_broadcast, submit_desktop_unshield_public_broadcaster,
     submit_desktop_unshield_self_broadcast,
-    vault::{PublicAccountMetadata, PublicAccountStatus},
+    vault::{DesktopVaultStore, DesktopViewSession, PublicAccountMetadata, PublicAccountStatus},
 };
+use zeroize::Zeroizing;
 
 use crate::assets::RailgunActionIcon;
 
@@ -67,24 +70,25 @@ use super::public_broadcaster_cost::{
     render_public_broadcaster_cost_estimate, render_public_broadcaster_cost_status,
     should_render_public_broadcaster_cost_preview,
 };
+use super::spend_authorization::{
+    SpendAuthorizationIntent, SpendAuthorizationSummary, SpendAuthorizationSummaryRow,
+    is_spend_authorization_failure_error,
+};
 use super::{
     ChainUtxoState, PRIVATE_ACTION_FORM_MAX_HEIGHT, PRIVATE_ASSET_LIST_WIDTH,
     PublicBroadcasterFeeTokenOption, WalletRoot, effective_public_broadcaster_fee_mode,
     format_exact_token_amount_for_display, format_report_chain, format_send_amount_input,
     format_unshield_amount_input, is_effective_wrapped_native_token, labeled_field,
-    native_token_display_label, native_wrapped_output_labels, new_masked_input,
-    new_prefilled_input, new_text_input, parse_address, public_balance_amount_label,
-    public_broadcaster_fee_token_warning, public_broadcaster_submit_disabled_for_fee_token_options,
-    send_form_max_entered_amount, should_show_broadcaster_fee_mode_toggle, token_label_row,
-    unshield_form_max_entered_amount,
+    native_token_display_label, native_wrapped_output_labels, new_prefilled_input, new_text_input,
+    parse_address, public_balance_amount_label, public_broadcaster_fee_token_warning,
+    public_broadcaster_submit_disabled_for_fee_token_options, send_form_max_entered_amount,
+    should_show_broadcaster_fee_mode_toggle, token_label_row, unshield_form_max_entered_amount,
 };
 
-pub(super) const SEND_MISSING_PASSWORD_ERROR: &str =
-    "Enter the vault password to prepare this send";
-pub(super) const UNSHIELD_MISSING_PASSWORD_ERROR: &str =
-    "Enter the vault password to prepare this unshield";
+#[cfg(test)]
 pub(super) const SEND_AUTHORIZATION_FAILED_ERROR: &str =
     "authorize public broadcaster send spend: unlock failed";
+#[cfg(test)]
 pub(super) const UNSHIELD_AUTHORIZATION_FAILED_ERROR: &str =
     "authorize public broadcaster unshield spend: unlock failed";
 const SELF_BROADCAST_PRIVACY_WARNING: &str = "Self-broadcast links the selected Public account, RPC metadata, and transaction timing to this private action.";
@@ -96,6 +100,16 @@ pub(super) enum DeliveryMode {
     #[default]
     PublicBroadcaster,
     SelfBroadcast,
+}
+
+impl DeliveryMode {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::ManualCalldata => "Manual calldata",
+            Self::PublicBroadcaster => "Public broadcaster",
+            Self::SelfBroadcast => "Self-broadcast",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -190,11 +204,92 @@ impl UnshieldAssetKey {
     }
 }
 
+struct SendSpendDraft {
+    asset: UnshieldAsset,
+    delivery_mode: DeliveryMode,
+    broadcaster_choice: BroadcasterChoice,
+    cost_estimate: Option<PublicBroadcasterCostEstimate>,
+    fee_token: Address,
+    self_broadcast_gas_fee: SelfBroadcastGasFeeSelection,
+    self_broadcast_initial_gas_fee: Option<(u128, u128)>,
+    broadcaster_fee_mode: PublicBroadcasterFeeMode,
+    view_session: Arc<DesktopViewSession>,
+    vault_store: Arc<DesktopVaultStore>,
+    session: Arc<WalletSession>,
+    recipient: String,
+    amount: U256,
+    self_broadcast_public_account_uuid: Option<String>,
+    self_broadcast_gas_payer_display: Option<String>,
+    fee_rows: Vec<FeeRow>,
+    fee_policy: BroadcasterFeePolicy,
+}
+
+struct UnshieldSpendDraft {
+    asset: UnshieldAsset,
+    unwrap: bool,
+    delivery_mode: DeliveryMode,
+    broadcaster_choice: BroadcasterChoice,
+    cost_estimate: Option<PublicBroadcasterCostEstimate>,
+    fee_token: Address,
+    self_broadcast_gas_fee: SelfBroadcastGasFeeSelection,
+    self_broadcast_initial_gas_fee: Option<(u128, u128)>,
+    broadcaster_fee_mode: PublicBroadcasterFeeMode,
+    view_session: Arc<DesktopViewSession>,
+    vault_store: Arc<DesktopVaultStore>,
+    session: Arc<WalletSession>,
+    recipient: Address,
+    amount: U256,
+    self_broadcast_public_account_uuid: Option<String>,
+    self_broadcast_gas_payer_display: Option<String>,
+    fee_rows: Vec<FeeRow>,
+    fee_policy: BroadcasterFeePolicy,
+}
+
+fn private_send_authorization_summary(draft: &SendSpendDraft) -> SpendAuthorizationSummary {
+    SpendAuthorizationSummary::new(
+        "Private send",
+        "Enter your vault password to authorize this private send.",
+        vec![
+            SpendAuthorizationSummaryRow::new(
+                "Amount",
+                private_amount_label(draft.amount, &draft.asset, true),
+            )
+            .with_icon(draft.asset.icon_path.clone()),
+            SpendAuthorizationSummaryRow::new("Recipient", draft.recipient.clone()),
+            SpendAuthorizationSummaryRow::new("Delivery", draft.delivery_mode.label()),
+        ],
+    )
+}
+
+fn private_unshield_authorization_summary(draft: &UnshieldSpendDraft) -> SpendAuthorizationSummary {
+    SpendAuthorizationSummary::new(
+        "Private unshield",
+        "Enter your vault password to authorize this unshield.",
+        vec![
+            SpendAuthorizationSummaryRow::new(
+                "Amount",
+                private_amount_label(draft.amount, &draft.asset, false),
+            )
+            .with_icon(draft.asset.icon_path.clone()),
+            SpendAuthorizationSummaryRow::new("Recipient", draft.recipient.to_checksum(None)),
+            SpendAuthorizationSummaryRow::new("Delivery", draft.delivery_mode.label()),
+        ],
+    )
+}
+
+fn private_amount_label(amount: U256, asset: &UnshieldAsset, send: bool) -> String {
+    let formatted = if send {
+        format_send_amount_input(amount, asset.decimals)
+    } else {
+        format_unshield_amount_input(amount, asset.decimals)
+    };
+    format!("{formatted} {}", asset.label)
+}
+
 pub(super) struct UnshieldFormState {
     pub(super) asset: UnshieldAsset,
     pub(super) recipient_input: Entity<InputState>,
     pub(super) amount_input: Entity<InputState>,
-    pub(super) password_input: Entity<InputState>,
     pub(super) unwrap: bool,
     pub(super) delivery_mode: DeliveryMode,
     pub(super) self_broadcast_gas_payer_uuid: Option<Arc<str>>,
@@ -223,7 +318,6 @@ pub(super) struct SendFormState {
     pub(super) asset: UnshieldAsset,
     pub(super) recipient_input: Entity<InputState>,
     pub(super) amount_input: Entity<InputState>,
-    pub(super) password_input: Entity<InputState>,
     pub(super) delivery_mode: DeliveryMode,
     pub(super) self_broadcast_gas_payer_uuid: Option<Arc<str>>,
     pub(super) self_broadcast_gas_payer_select:
@@ -301,15 +395,32 @@ pub(super) fn format_form_error_for_asset(
     fee_token: Address,
     registry: Option<&EffectiveTokenRegistry>,
 ) -> String {
-    if let Some(max_spendable) = form_error_public_broadcaster_fee_token_max_spendable(error) {
-        return format!(
-            "Broadcaster fee exceeds available fee-token balance: {}. Choose a fee token with more spendable balance or a lower-fee broadcaster.",
-            format_exact_token_amount_for_display(
+    if let Some(balance_error) = form_error_public_broadcaster_fee_token_balance(error) {
+        let available = format_exact_token_amount_for_display(
+            asset.chain_id,
+            fee_token,
+            balance_error.max_spendable,
+            registry,
+        );
+        if let Some(required_fee) = balance_error.required_fee {
+            let required = format_exact_token_amount_for_display(
                 asset.chain_id,
                 fee_token,
-                max_spendable,
-                registry
-            )
+                required_fee,
+                registry,
+            );
+            let shortfall = format_exact_token_amount_for_display(
+                asset.chain_id,
+                fee_token,
+                required_fee.saturating_sub(balance_error.max_spendable),
+                registry,
+            );
+            return format!(
+                "Transaction fee exceeds available fee-token balance. Required fee: {required}; available: {available}; short by: {shortfall}. Choose a fee token with more spendable balance or a lower-fee broadcaster."
+            );
+        }
+        return format!(
+            "Transaction fee exceeds available fee-token balance: {available}. Choose a fee token with more spendable balance or a lower-fee broadcaster."
         );
     }
 
@@ -329,11 +440,16 @@ pub(super) fn format_form_error_for_asset(
 
     match error {
         "entered amount must be greater than the broadcaster fee" => format!(
-            "Entered amount must be greater than the broadcaster fee for {}. Choose add fee on top or enter a larger amount.",
+            "Entered amount must be greater than the transaction fee for {}. Choose add fee on top or enter a larger amount.",
             asset.label
         ),
         _ => error.to_string(),
     }
+}
+
+struct PublicBroadcasterFeeTokenBalanceError {
+    max_spendable: U256,
+    required_fee: Option<U256>,
 }
 
 pub(super) fn format_exact_asset_amount_for_display(amount: U256, asset: &UnshieldAsset) -> String {
@@ -349,27 +465,11 @@ pub(super) fn format_exact_asset_amount_for_display(amount: U256, asset: &Unshie
     )
 }
 
-pub(super) fn should_clear_private_action_error_on_password_change(
-    kind: DeliveryFormKind,
-    error: &str,
-) -> bool {
-    matches!(
-        (kind, error),
-        (
-            DeliveryFormKind::Send,
-            SEND_MISSING_PASSWORD_ERROR | SEND_AUTHORIZATION_FAILED_ERROR,
-        ) | (
-            DeliveryFormKind::Unshield,
-            UNSHIELD_MISSING_PASSWORD_ERROR | UNSHIELD_AUTHORIZATION_FAILED_ERROR,
-        )
-    )
-}
-
 pub(super) fn form_error_clears_public_broadcaster_cost_estimate(
-    kind: DeliveryFormKind,
+    _kind: DeliveryFormKind,
     error: &str,
 ) -> bool {
-    !should_clear_private_action_error_on_password_change(kind, error)
+    !is_spend_authorization_failure_error(error)
 }
 
 pub(super) fn send_public_broadcaster_estimate_input_error(
@@ -419,9 +519,15 @@ pub(super) fn form_error_public_broadcaster_max_entered_amount(error: &str) -> O
     form_error_decimal_after_marker(error, MARKER)
 }
 
-fn form_error_public_broadcaster_fee_token_max_spendable(error: &str) -> Option<U256> {
-    const MARKER: &str = "public broadcaster fee-token max spendable: ";
-    form_error_decimal_after_marker(error, MARKER)
+fn form_error_public_broadcaster_fee_token_balance(
+    error: &str,
+) -> Option<PublicBroadcasterFeeTokenBalanceError> {
+    const MAX_SPENDABLE_MARKER: &str = "public broadcaster fee-token max spendable: ";
+    const REQUIRED_FEE_MARKER: &str = "; required fee: ";
+    Some(PublicBroadcasterFeeTokenBalanceError {
+        max_spendable: form_error_decimal_after_marker(error, MAX_SPENDABLE_MARKER)?,
+        required_fee: form_error_decimal_after_marker(error, REQUIRED_FEE_MARKER),
+    })
 }
 
 fn form_error_max_immediately_spendable(error: &str) -> Option<U256> {
@@ -1648,7 +1754,6 @@ impl WalletRoot {
         let amount_input = new_prefilled_input(window, cx, "amount", amount);
         let recipient_input = new_text_input(window, cx, "0zk recipient");
         let focus_recipient_input = recipient_input.clone();
-        let password_input = new_masked_input(window, cx, "vault password");
         let self_broadcast_gas_payer_uuid = self.default_self_broadcast_gas_payer_uuid();
         let gas_payer_select = self.new_self_broadcast_gas_payer_select(
             key.chain_id,
@@ -1657,24 +1762,6 @@ impl WalletRoot {
             cx,
         );
         let gas_fee_editor = Eip1559GasFeeEditorState::new(window, cx);
-        cx.subscribe_in(
-            &password_input,
-            window,
-            move |this, _input, event: &InputEvent, window, cx| match event {
-                InputEvent::PressEnter { .. } => {
-                    this.generate_send_calldata_from_form(key, window, cx);
-                }
-                InputEvent::Change => {
-                    this.clear_private_action_missing_password_error(
-                        DeliveryFormKind::Send,
-                        key,
-                        cx,
-                    );
-                }
-                _ => {}
-            },
-        )
-        .detach();
         cx.subscribe(
             &recipient_input,
             move |this, _input, event: &InputEvent, cx| {
@@ -1752,7 +1839,6 @@ impl WalletRoot {
                 asset,
                 recipient_input,
                 amount_input,
-                password_input,
                 delivery_mode: DeliveryMode::PublicBroadcaster,
                 self_broadcast_gas_payer_uuid,
                 self_broadcast_gas_payer_select: gas_payer_select,
@@ -2407,41 +2493,6 @@ impl WalletRoot {
         cx.notify();
     }
 
-    fn clear_private_action_missing_password_error(
-        &mut self,
-        kind: DeliveryFormKind,
-        key: UnshieldAssetKey,
-        cx: &mut Context<'_, Self>,
-    ) {
-        let cleared = match kind {
-            DeliveryFormKind::Send => self.send_forms.get_mut(&key).is_some_and(|form| {
-                if form.generating
-                    || !form.error.as_deref().is_some_and(|error| {
-                        should_clear_private_action_error_on_password_change(kind, error)
-                    })
-                {
-                    return false;
-                }
-                form.error = None;
-                true
-            }),
-            DeliveryFormKind::Unshield => self.unshield_forms.get_mut(&key).is_some_and(|form| {
-                if form.generating
-                    || !form.error.as_deref().is_some_and(|error| {
-                        should_clear_private_action_error_on_password_change(kind, error)
-                    })
-                {
-                    return false;
-                }
-                form.error = None;
-                true
-            }),
-        };
-        if cleared {
-            cx.notify();
-        }
-    }
-
     pub(super) fn set_send_form_error(
         &mut self,
         key: UnshieldAssetKey,
@@ -2480,7 +2531,6 @@ impl WalletRoot {
         let amount_input = new_prefilled_input(window, cx, "amount", amount);
         let recipient_input = new_text_input(window, cx, "0x recipient");
         let focus_recipient_input = recipient_input.clone();
-        let password_input = new_masked_input(window, cx, "vault password");
         let self_broadcast_gas_payer_uuid = self.default_self_broadcast_gas_payer_uuid();
         let gas_payer_select = self.new_self_broadcast_gas_payer_select(
             key.chain_id,
@@ -2489,24 +2539,6 @@ impl WalletRoot {
             cx,
         );
         let gas_fee_editor = Eip1559GasFeeEditorState::new(window, cx);
-        cx.subscribe_in(
-            &password_input,
-            window,
-            move |this, _input, event: &InputEvent, window, cx| match event {
-                InputEvent::PressEnter { .. } => {
-                    this.generate_unshield_calldata_from_form(key, window, cx);
-                }
-                InputEvent::Change => {
-                    this.clear_private_action_missing_password_error(
-                        DeliveryFormKind::Unshield,
-                        key,
-                        cx,
-                    );
-                }
-                _ => {}
-            },
-        )
-        .detach();
         cx.subscribe(
             &recipient_input,
             move |this, _input, event: &InputEvent, cx| {
@@ -2574,7 +2606,6 @@ impl WalletRoot {
                 asset,
                 recipient_input,
                 amount_input,
-                password_input,
                 unwrap: false,
                 delivery_mode: DeliveryMode::PublicBroadcaster,
                 self_broadcast_gas_payer_uuid,
@@ -2928,16 +2959,29 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some(form) = self.send_forms.get(&key) else {
+        let Some(draft) = self.send_spend_draft(key, cx) else {
             return;
         };
+        self.request_spend_authorization(
+            SpendAuthorizationIntent::PrivateSend(key),
+            private_send_authorization_summary(&draft),
+            window,
+            cx,
+        );
+    }
+
+    fn send_spend_draft(
+        &mut self,
+        key: UnshieldAssetKey,
+        cx: &mut Context<'_, Self>,
+    ) -> Option<SendSpendDraft> {
+        let form = self.send_forms.get(&key)?;
         if form.generating {
-            return;
+            return None;
         }
         let asset = form.asset.clone();
         let recipient_input = form.recipient_input.clone();
         let amount_input = form.amount_input.clone();
-        let password_input = form.password_input.clone();
         let delivery_mode = form.delivery_mode;
         let broadcaster_choice = form.broadcaster_choice.clone();
         let cost_estimate = form.cost_estimate.clone();
@@ -2948,7 +2992,7 @@ impl WalletRoot {
                 Ok(selection) => selection,
                 Err(error) => {
                     self.set_send_form_error(key, error, cx);
-                    return;
+                    return None;
                 }
             }
         } else {
@@ -2971,16 +3015,16 @@ impl WalletRoot {
 
         let Some(view_session) = self.view_session.clone() else {
             self.set_send_form_error(key, "Unlock the wallet vault before sending", cx);
-            return;
+            return None;
         };
         let Some(vault_store) = self.vault_store.clone() else {
             self.set_send_form_error(key, "Wallet vault storage is unavailable", cx);
-            return;
+            return None;
         };
         let Some(ChainUtxoState::Ready { session, .. }) = self.chain_states.get(&asset.chain_id)
         else {
             self.set_send_form_error(key, "Wait for wallet sync to finish before sending", cx);
-            return;
+            return None;
         };
         let session = Arc::clone(session);
         if asset.max_batched.is_zero() {
@@ -2989,13 +3033,13 @@ impl WalletRoot {
                 "No POI-verified private notes are spendable in a batched send",
                 cx,
             );
-            return;
+            return None;
         }
 
         let recipient_raw = recipient_input.read(cx).value().to_string();
         if let Err(error) = parse_railgun_recipient(recipient_raw.as_str()) {
             self.set_send_form_error(key, error.to_string(), cx);
-            return;
+            return None;
         }
         let recipient = recipient_raw.trim().to_string();
         let amount_raw = amount_input.read(cx).value().to_string();
@@ -3003,11 +3047,11 @@ impl WalletRoot {
             Ok(amount) if !amount.is_zero() => amount,
             Ok(_) => {
                 self.set_send_form_error(key, "Enter an amount greater than zero", cx);
-                return;
+                return None;
             }
             Err(error) => {
                 self.set_send_form_error(key, error.to_string(), cx);
-                return;
+                return None;
             }
         };
         if amount > asset.max_batched {
@@ -3019,20 +3063,20 @@ impl WalletRoot {
                 ),
                 cx,
             );
-            return;
+            return None;
         }
 
         let (self_broadcast_public_account_uuid, self_broadcast_gas_payer_display) =
             if delivery_mode == DeliveryMode::SelfBroadcast {
                 let Some(uuid) = self_broadcast_gas_payer_uuid else {
                     self.set_send_form_error(key, "Choose a Public account to pay gas", cx);
-                    return;
+                    return None;
                 };
                 let Some(account) =
                     self.selected_self_broadcast_gas_payer_account(Some(uuid.as_ref()))
                 else {
                     self.set_send_form_error(key, "Choose an active Public account to pay gas", cx);
-                    return;
+                    return None;
                 };
                 let gas_payer_display = public_account_display_label(account).map_or_else(
                     || short_address(&account.address),
@@ -3062,7 +3106,7 @@ impl WalletRoot {
                 policy,
             ) {
                 self.set_send_form_error(key, error.to_string(), cx);
-                return;
+                return None;
             }
             rows
         } else {
@@ -3070,12 +3114,56 @@ impl WalletRoot {
         };
         let fee_policy = self.public_broadcaster_fee_policy(allow_suspicious_broadcasters);
 
-        let password_empty = password_input.read(cx).value().trim().is_empty();
-        if password_empty {
-            self.set_send_form_error(key, SEND_MISSING_PASSWORD_ERROR, cx);
+        Some(SendSpendDraft {
+            asset,
+            delivery_mode,
+            broadcaster_choice,
+            cost_estimate,
+            fee_token,
+            self_broadcast_gas_fee,
+            self_broadcast_initial_gas_fee,
+            broadcaster_fee_mode,
+            view_session,
+            vault_store,
+            session,
+            recipient,
+            amount,
+            self_broadcast_public_account_uuid,
+            self_broadcast_gas_payer_display,
+            fee_rows,
+            fee_policy,
+        })
+    }
+
+    pub(super) fn generate_send_calldata_authorized(
+        &mut self,
+        key: UnshieldAssetKey,
+        vault_password: Zeroizing<String>,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(draft) = self.send_spend_draft(key, cx) else {
             return;
-        }
-        let vault_password = Self::read_and_clear_input(&password_input, window, cx);
+        };
+        let SendSpendDraft {
+            asset,
+            delivery_mode,
+            broadcaster_choice,
+            cost_estimate,
+            fee_token,
+            self_broadcast_gas_fee,
+            self_broadcast_initial_gas_fee,
+            broadcaster_fee_mode,
+            view_session,
+            vault_store,
+            session,
+            recipient,
+            amount,
+            self_broadcast_public_account_uuid,
+            self_broadcast_gas_payer_display,
+            fee_rows,
+            fee_policy,
+        } = draft;
 
         self.send_generation_seq = self.send_generation_seq.wrapping_add(1);
         let generation_id = self.send_generation_seq;
@@ -3250,6 +3338,7 @@ impl WalletRoot {
                 let mut progress_result = None;
                 let mut self_broadcast_progress_result = None;
                 let mut progress_error = None;
+                let mut clear_spend_authorization = false;
                 {
                     let Some(form) = root.send_forms.get_mut(&key) else {
                         return;
@@ -3276,6 +3365,9 @@ impl WalletRoot {
                         }
                         Err(error) => {
                             let message = format_report_chain(&error);
+                            if is_spend_authorization_failure_error(&message) {
+                                clear_spend_authorization = true;
+                            }
                             progress_error = Some(message.clone());
                             if form_error_clears_public_broadcaster_cost_estimate(
                                 DeliveryFormKind::Send,
@@ -3287,6 +3379,9 @@ impl WalletRoot {
                             form.error = Some(Arc::from(message));
                         }
                     }
+                }
+                if clear_spend_authorization {
+                    root.clear_spend_authorization(cx);
                 }
                 if let Some(result) = progress_result {
                     root.finish_private_broadcaster_progress(
@@ -3387,17 +3482,30 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some(form) = self.unshield_forms.get(&key) else {
+        let Some(draft) = self.unshield_spend_draft(key, cx) else {
             return;
         };
+        self.request_spend_authorization(
+            SpendAuthorizationIntent::PrivateUnshield(key),
+            private_unshield_authorization_summary(&draft),
+            window,
+            cx,
+        );
+    }
+
+    fn unshield_spend_draft(
+        &mut self,
+        key: UnshieldAssetKey,
+        cx: &mut Context<'_, Self>,
+    ) -> Option<UnshieldSpendDraft> {
+        let form = self.unshield_forms.get(&key)?;
         if form.generating {
-            return;
+            return None;
         }
         let asset = form.asset.clone();
         let unwrap = form.unwrap;
         let recipient_input = form.recipient_input.clone();
         let amount_input = form.amount_input.clone();
-        let password_input = form.password_input.clone();
         let delivery_mode = form.delivery_mode;
         let broadcaster_choice = form.broadcaster_choice.clone();
         let cost_estimate = form.cost_estimate.clone();
@@ -3408,7 +3516,7 @@ impl WalletRoot {
                 Ok(selection) => selection,
                 Err(error) => {
                     self.set_unshield_form_error(key, error, cx);
-                    return;
+                    return None;
                 }
             }
         } else {
@@ -3431,11 +3539,11 @@ impl WalletRoot {
 
         let Some(view_session) = self.view_session.clone() else {
             self.set_unshield_form_error(key, "Unlock the wallet vault before unshielding", cx);
-            return;
+            return None;
         };
         let Some(vault_store) = self.vault_store.clone() else {
             self.set_unshield_form_error(key, "Wallet vault storage is unavailable", cx);
-            return;
+            return None;
         };
         let Some(ChainUtxoState::Ready { session, .. }) = self.chain_states.get(&asset.chain_id)
         else {
@@ -3444,7 +3552,7 @@ impl WalletRoot {
                 "Wait for wallet sync to finish before unshielding",
                 cx,
             );
-            return;
+            return None;
         };
         let session = Arc::clone(session);
         if asset.max_batched.is_zero() {
@@ -3453,24 +3561,24 @@ impl WalletRoot {
                 "No POI-verified private notes are spendable in a batched unshield",
                 cx,
             );
-            return;
+            return None;
         }
 
         let recipient_raw = recipient_input.read(cx).value().to_string();
         let Some(recipient) = parse_address(recipient_raw.trim()) else {
             self.set_unshield_form_error(key, "Enter a valid public EVM recipient address", cx);
-            return;
+            return None;
         };
         let amount_raw = amount_input.read(cx).value().to_string();
         let amount = match parse_unshield_amount(amount_raw.as_str(), asset.decimals) {
             Ok(amount) if !amount.is_zero() => amount,
             Ok(_) => {
                 self.set_unshield_form_error(key, "Enter an amount greater than zero", cx);
-                return;
+                return None;
             }
             Err(error) => {
                 self.set_unshield_form_error(key, error.to_string(), cx);
-                return;
+                return None;
             }
         };
         if amount > asset.max_batched {
@@ -3482,14 +3590,14 @@ impl WalletRoot {
                 ),
                 cx,
             );
-            return;
+            return None;
         }
 
         let (self_broadcast_public_account_uuid, self_broadcast_gas_payer_display) =
             if delivery_mode == DeliveryMode::SelfBroadcast {
                 let Some(uuid) = self_broadcast_gas_payer_uuid else {
                     self.set_unshield_form_error(key, "Choose a Public account to pay gas", cx);
-                    return;
+                    return None;
                 };
                 let Some(account) =
                     self.selected_self_broadcast_gas_payer_account(Some(uuid.as_ref()))
@@ -3499,7 +3607,7 @@ impl WalletRoot {
                         "Choose an active Public account to pay gas",
                         cx,
                     );
-                    return;
+                    return None;
                 };
                 let gas_payer_display = public_account_display_label(account).map_or_else(
                     || short_address(&account.address),
@@ -3529,7 +3637,7 @@ impl WalletRoot {
                 policy,
             ) {
                 self.set_unshield_form_error(key, error.to_string(), cx);
-                return;
+                return None;
             }
             rows
         } else {
@@ -3537,12 +3645,58 @@ impl WalletRoot {
         };
         let fee_policy = self.public_broadcaster_fee_policy(allow_suspicious_broadcasters);
 
-        let password_empty = password_input.read(cx).value().trim().is_empty();
-        if password_empty {
-            self.set_unshield_form_error(key, UNSHIELD_MISSING_PASSWORD_ERROR, cx);
+        Some(UnshieldSpendDraft {
+            asset,
+            unwrap,
+            delivery_mode,
+            broadcaster_choice,
+            cost_estimate,
+            fee_token,
+            self_broadcast_gas_fee,
+            self_broadcast_initial_gas_fee,
+            broadcaster_fee_mode,
+            view_session,
+            vault_store,
+            session,
+            recipient,
+            amount,
+            self_broadcast_public_account_uuid,
+            self_broadcast_gas_payer_display,
+            fee_rows,
+            fee_policy,
+        })
+    }
+
+    pub(super) fn generate_unshield_calldata_authorized(
+        &mut self,
+        key: UnshieldAssetKey,
+        vault_password: Zeroizing<String>,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(draft) = self.unshield_spend_draft(key, cx) else {
             return;
-        }
-        let vault_password = Self::read_and_clear_input(&password_input, window, cx);
+        };
+        let UnshieldSpendDraft {
+            asset,
+            unwrap,
+            delivery_mode,
+            broadcaster_choice,
+            cost_estimate,
+            fee_token,
+            self_broadcast_gas_fee,
+            self_broadcast_initial_gas_fee,
+            broadcaster_fee_mode,
+            view_session,
+            vault_store,
+            session,
+            recipient,
+            amount,
+            self_broadcast_public_account_uuid,
+            self_broadcast_gas_payer_display,
+            fee_rows,
+            fee_policy,
+        } = draft;
 
         self.unshield_generation_seq = self.unshield_generation_seq.wrapping_add(1);
         let generation_id = self.unshield_generation_seq;
@@ -3720,6 +3874,7 @@ impl WalletRoot {
                 let mut progress_result = None;
                 let mut self_broadcast_progress_result = None;
                 let mut progress_error = None;
+                let mut clear_spend_authorization = false;
                 {
                     let Some(form) = root.unshield_forms.get_mut(&key) else {
                         return;
@@ -3746,6 +3901,9 @@ impl WalletRoot {
                         }
                         Err(error) => {
                             let message = format_report_chain(&error);
+                            if is_spend_authorization_failure_error(&message) {
+                                clear_spend_authorization = true;
+                            }
                             progress_error = Some(message.clone());
                             if form_error_clears_public_broadcaster_cost_estimate(
                                 DeliveryFormKind::Unshield,
@@ -3757,6 +3915,9 @@ impl WalletRoot {
                             form.error = Some(Arc::from(message));
                         }
                     }
+                }
+                if clear_spend_authorization {
+                    root.clear_spend_authorization(cx);
                 }
                 if let Some(result) = progress_result {
                     root.finish_private_broadcaster_progress(
@@ -4063,47 +4224,35 @@ impl WalletRoot {
                     ),
             )
             .child(
-                div()
-                    .flex()
-                    .items_end()
-                    .gap_3()
-                    .child(
-                        labeled_field(
-                            "Vault password",
-                            private_action_input(&form.password_input).disabled(form.generating),
-                        )
-                        .flex_1()
-                        .min_w(px(0.0)),
+                div().flex().items_end().gap_3().justify_end().child(
+                    app_button(
+                        send_element_id(key, "generate"),
+                        if form.generating {
+                            "Preparing..."
+                        } else if submitted {
+                            "Submitted"
+                        } else if form.delivery_mode == DeliveryMode::PublicBroadcaster {
+                            "Submit via broadcaster"
+                        } else if form.delivery_mode == DeliveryMode::SelfBroadcast {
+                            "Self-broadcast"
+                        } else {
+                            "Generate calldata"
+                        },
                     )
-                    .child(
-                        app_button(
-                            send_element_id(key, "generate"),
-                            if form.generating {
-                                "Preparing..."
-                            } else if submitted {
-                                "Submitted"
-                            } else if form.delivery_mode == DeliveryMode::PublicBroadcaster {
-                                "Submit via broadcaster"
-                            } else if form.delivery_mode == DeliveryMode::SelfBroadcast {
-                                "Self-broadcast"
-                            } else {
-                                "Generate calldata"
-                            },
-                        )
-                        .primary()
-                        .loading(form.generating)
-                        .disabled(
-                            form.generating
-                                || public_broadcaster_submit_disabled
-                                || self_broadcast_submit_disabled
-                                || submitted,
-                        )
-                        .on_click(move |_event, window, cx| {
-                            submit_root.update(cx, |root, cx| {
-                                root.generate_send_calldata_from_form(key, window, cx);
-                            });
-                        }),
-                    ),
+                    .primary()
+                    .loading(form.generating)
+                    .disabled(
+                        form.generating
+                            || public_broadcaster_submit_disabled
+                            || self_broadcast_submit_disabled
+                            || submitted,
+                    )
+                    .on_click(move |_event, window, cx| {
+                        submit_root.update(cx, |root, cx| {
+                            root.generate_send_calldata_from_form(key, window, cx);
+                        });
+                    }),
+                ),
             );
 
         if should_render_public_broadcaster_cost_preview(
@@ -4386,47 +4535,35 @@ impl WalletRoot {
                     ),
             )
             .child(
-                div()
-                    .flex()
-                    .items_end()
-                    .gap_3()
-                    .child(
-                        labeled_field(
-                            "Vault password",
-                            private_action_input(&form.password_input).disabled(form.generating),
-                        )
-                        .flex_1()
-                        .min_w(px(0.0)),
+                div().flex().items_end().gap_3().justify_end().child(
+                    app_button(
+                        unshield_element_id(key, "generate"),
+                        if form.generating {
+                            "Preparing..."
+                        } else if submitted {
+                            "Submitted"
+                        } else if form.delivery_mode == DeliveryMode::PublicBroadcaster {
+                            "Submit via broadcaster"
+                        } else if form.delivery_mode == DeliveryMode::SelfBroadcast {
+                            "Self-broadcast"
+                        } else {
+                            "Generate calldata"
+                        },
                     )
-                    .child(
-                        app_button(
-                            unshield_element_id(key, "generate"),
-                            if form.generating {
-                                "Preparing..."
-                            } else if submitted {
-                                "Submitted"
-                            } else if form.delivery_mode == DeliveryMode::PublicBroadcaster {
-                                "Submit via broadcaster"
-                            } else if form.delivery_mode == DeliveryMode::SelfBroadcast {
-                                "Self-broadcast"
-                            } else {
-                                "Generate calldata"
-                            },
-                        )
-                        .primary()
-                        .loading(form.generating)
-                        .disabled(
-                            form.generating
-                                || public_broadcaster_submit_disabled
-                                || self_broadcast_submit_disabled
-                                || submitted,
-                        )
-                        .on_click(move |_event, window, cx| {
-                            submit_root.update(cx, |root, cx| {
-                                root.generate_unshield_calldata_from_form(key, window, cx);
-                            });
-                        }),
-                    ),
+                    .primary()
+                    .loading(form.generating)
+                    .disabled(
+                        form.generating
+                            || public_broadcaster_submit_disabled
+                            || self_broadcast_submit_disabled
+                            || submitted,
+                    )
+                    .on_click(move |_event, window, cx| {
+                        submit_root.update(cx, |root, cx| {
+                            root.generate_unshield_calldata_from_form(key, window, cx);
+                        });
+                    }),
+                ),
             );
 
         if should_render_public_broadcaster_cost_preview(
@@ -4553,7 +4690,7 @@ fn render_fee_token_selector(
         .child(
             div()
                 .min_w(px(0.0))
-                .child(app_muted_text("Broadcaster fee token")),
+                .child(app_muted_text("Transaction fee token")),
         )
         .child(
             Popover::new(delivery_element_id(key, kind, "fee-token-selector"))
@@ -4699,7 +4836,7 @@ fn render_broadcaster_fee_mode_toggle(
         .items_center()
         .justify_between()
         .gap_3()
-        .child(div().min_w(px(0.0)).child(app_muted_text("Broadcaster fee")))
+        .child(div().min_w(px(0.0)).child(app_muted_text("Transaction fee")))
         .child(
             div().flex_none().child(
                 ButtonGroup::new(delivery_element_id(key, kind, "fee-mode-toggle"))
@@ -4710,14 +4847,14 @@ fn render_broadcaster_fee_mode_toggle(
                         delivery_element_id(key, kind, "fee-mode-deduct"),
                         delivery_element_id(key, kind, "fee-mode-deduct-info"),
                         "Deduct fee from amount",
-                        "Recipient receives the entered amount minus the broadcaster fee.",
+                        "Recipient receives the entered amount minus the transaction fee.",
                         mode == PublicBroadcasterFeeMode::DeductFromAmount,
                     ))
                     .child(fee_mode_segment_button(
                         delivery_element_id(key, kind, "fee-mode-add"),
                         delivery_element_id(key, kind, "fee-mode-add-info"),
                         "Add fee on top",
-                        "Recipient receives the full entered amount; broadcaster fee is added to spend.",
+                        "Recipient receives the full entered amount; transaction fee is added to spend.",
                         mode == PublicBroadcasterFeeMode::AddToAmount,
                     ))
                     .on_click(move |selected, window, cx| {

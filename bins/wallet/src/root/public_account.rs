@@ -79,9 +79,7 @@ pub(super) struct PublicAccountFormState {
     pub(super) search_input: Entity<InputState>,
     pub(super) send_recipient_input: Entity<InputState>,
     pub(super) send_amount_input: Entity<InputState>,
-    pub(super) send_password_input: Entity<InputState>,
     pub(super) shield_amount_input: Entity<InputState>,
-    pub(super) shield_password_input: Entity<InputState>,
     pub(super) send_gas_fee: Eip1559GasFeeEditorState,
     pub(super) shield_gas_fee: Eip1559GasFeeEditorState,
     pub(super) import_global: bool,
@@ -358,9 +356,7 @@ impl WalletRoot {
             &self.public_form.edit_label_input,
             &self.public_form.send_recipient_input,
             &self.public_form.send_amount_input,
-            &self.public_form.send_password_input,
             &self.public_form.shield_amount_input,
-            &self.public_form.shield_password_input,
         ] {
             input.update(cx, |input, cx| input.set_value("", window, cx));
         }

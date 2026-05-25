@@ -670,6 +670,7 @@ impl WalletRoot {
             });
         }
         window.close_all_dialogs(cx);
+        self.clear_spend_authorization(cx);
         self.view_session = None;
         self.wallet_metadata.clear();
         self.wallet_options.clear();

@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use alloy::primitives::U256;
+use alloy::primitives::{Address, U256};
 use gpui::{
     AppContext, Context, Entity, Focusable, InteractiveElement, IntoElement, ParentElement, Pixels,
     SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder as _, px,
@@ -28,14 +28,20 @@ use wallet_ops::{
     PublicSendRequest, PublicShieldRequest, estimate_public_native_action_gas_reserve,
     parse_send_amount, public_action_replacement_bumped_fee, quote_public_action_gas_fee,
     submit_public_send_with_progress, submit_public_shield_with_progress,
-    vault::PublicAccountStatus,
+    vault::{DesktopVaultStore, DesktopViewSession, PublicAccountStatus},
 };
+use zeroize::Zeroizing;
 
 use super::gas_fee::{
     Eip1559GasFeeEditTarget, Eip1559GasFeeMode, Eip1559GasFeeTarget, GasRetryInputs, format_gwei,
     render_eip1559_gas_fee_editor,
 };
+use super::public_account::public_account_display_label;
 use super::public_balances::public_asset_icon_path;
+use super::spend_authorization::{
+    SpendAuthorizationIntent, SpendAuthorizationSummary, SpendAuthorizationSummaryRow,
+    is_spend_authorization_failure_error,
+};
 use super::utxo::short_hash;
 use super::{
     PUBLIC_ACTION_DIALOG_WIDTH, WalletRoot, format_report_chain, format_send_amount_input,
@@ -46,6 +52,77 @@ use super::{
 use crate::assets::RailgunActionIcon;
 
 const PUBLIC_ACTION_RETRY_DEFAULT_FEE_WEI: u128 = 1_000_000_000;
+
+struct PublicSendDraft {
+    chain_id: u64,
+    asset: PublicAssetId,
+    asset_label: String,
+    asset_icon_path: Option<PathBuf>,
+    asset_decimals: Option<u8>,
+    public_account_uuid: Arc<str>,
+    public_account_label: String,
+    view_session: Arc<DesktopViewSession>,
+    vault_store: Arc<DesktopVaultStore>,
+    amount: U256,
+    recipient: Address,
+    gas_fee: PublicActionGasFeeSelection,
+}
+
+struct PublicShieldDraft {
+    chain_id: u64,
+    asset: PublicAssetId,
+    asset_label: String,
+    asset_icon_path: Option<PathBuf>,
+    asset_decimals: Option<u8>,
+    public_account_uuid: Arc<str>,
+    public_account_label: String,
+    view_session: Arc<DesktopViewSession>,
+    vault_store: Arc<DesktopVaultStore>,
+    amount: U256,
+    gas_fee: PublicActionGasFeeSelection,
+}
+
+fn public_send_authorization_summary(draft: &PublicSendDraft) -> SpendAuthorizationSummary {
+    SpendAuthorizationSummary::new(
+        "Public send",
+        "Enter your vault password to authorize this public send.",
+        vec![
+            SpendAuthorizationSummaryRow::new("Amount", public_action_amount_label(draft))
+                .with_icon(draft.asset_icon_path.clone()),
+            SpendAuthorizationSummaryRow::new("From", draft.public_account_label.clone()),
+            SpendAuthorizationSummaryRow::new("Recipient", draft.recipient.to_checksum(None)),
+        ],
+    )
+}
+
+fn public_shield_authorization_summary(draft: &PublicShieldDraft) -> SpendAuthorizationSummary {
+    SpendAuthorizationSummary::new(
+        "Public shield",
+        "Enter your vault password to authorize this public shield.",
+        vec![
+            SpendAuthorizationSummaryRow::new("Amount", public_shield_amount_label(draft))
+                .with_icon(draft.asset_icon_path.clone()),
+            SpendAuthorizationSummaryRow::new("From", draft.public_account_label.clone()),
+            SpendAuthorizationSummaryRow::new("Recipient", "Selected private wallet"),
+        ],
+    )
+}
+
+fn public_action_amount_label(draft: &PublicSendDraft) -> String {
+    format!(
+        "{} {}",
+        format_send_amount_input(draft.amount, draft.asset_decimals),
+        draft.asset_label
+    )
+}
+
+fn public_shield_amount_label(draft: &PublicShieldDraft) -> String {
+    format!(
+        "{} {}",
+        format_send_amount_input(draft.amount, draft.asset_decimals),
+        draft.asset_label
+    )
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PublicActionMode {
@@ -416,10 +493,6 @@ impl WalletRoot {
                         max_label,
                         disabled || self.public_form.shielding,
                     ))
-                    .child(
-                        app_input(&self.public_form.shield_password_input)
-                            .disabled(disabled || self.public_form.shielding),
-                    )
                     .child(render_eip1559_gas_fee_editor(
                         gas_fee_root,
                         Eip1559GasFeeTarget::Public {
@@ -467,10 +540,6 @@ impl WalletRoot {
                         max_label,
                         disabled || self.public_form.sending,
                     ))
-                    .child(
-                        app_input(&self.public_form.send_password_input)
-                            .disabled(disabled || self.public_form.sending),
-                    )
                     .child(render_eip1559_gas_fee_editor(
                         gas_fee_root,
                         Eip1559GasFeeTarget::Public {
@@ -527,9 +596,7 @@ impl WalletRoot {
         for input in [
             &self.public_form.send_recipient_input,
             &self.public_form.send_amount_input,
-            &self.public_form.send_password_input,
             &self.public_form.shield_amount_input,
-            &self.public_form.shield_password_input,
         ] {
             input.update(cx, |input, cx| input.set_value("", window, cx));
         }
@@ -1277,50 +1344,71 @@ impl WalletRoot {
             return;
         }
         self.clear_public_action_progress_state();
+        let Some(draft) = self.public_send_draft(cx) else {
+            return;
+        };
+        self.request_spend_authorization(
+            SpendAuthorizationIntent::PublicSend,
+            public_send_authorization_summary(&draft),
+            window,
+            cx,
+        );
+    }
+
+    fn public_send_draft(&mut self, cx: &mut Context<'_, Self>) -> Option<PublicSendDraft> {
         let Some(asset) = self.public_form.selected_asset else {
             self.public_form.send_error = Some(Arc::from("Select an asset to send"));
             cx.notify();
-            return;
+            return None;
         };
         let Some(public_account_uuid) = self.public_form.selected_account_uuid.clone() else {
             self.public_form.send_error = Some(Arc::from("Select a public account first"));
             cx.notify();
-            return;
+            return None;
         };
         let Some(view_session) = self.view_session.clone() else {
             self.public_form.send_error = Some(Arc::from("Wallet vault is locked"));
             cx.notify();
-            return;
+            return None;
         };
         let Some(vault_store) = self.vault_store.clone() else {
             self.public_form.send_error = Some(Arc::from("Wallet vault storage is unavailable"));
             cx.notify();
-            return;
+            return None;
         };
+        let chain_id = self.selected_chain;
+        let asset_decimals =
+            public_asset_decimals(chain_id, asset, Some(&self.effective_token_registry));
+        let asset_label =
+            public_action_asset_label(chain_id, asset, Some(&self.effective_token_registry));
+        let asset_icon_path =
+            public_asset_icon_path(chain_id, asset, Some(&self.effective_token_registry));
+        let public_account_label = self
+            .public_account_for_uuid(Some(public_account_uuid.as_ref()))
+            .map_or_else(
+                || public_account_uuid.to_string(),
+                |account| {
+                    public_account_display_label(account)
+                        .unwrap_or_else(|| short_address(&account.address))
+                },
+            );
         let amount_input = self
             .public_form
             .send_amount_input
             .read(cx)
             .value()
             .to_string();
-        let amount = match parse_send_amount(
-            &amount_input,
-            public_asset_decimals(
-                self.selected_chain,
-                asset,
-                Some(&self.effective_token_registry),
-            ),
-        ) {
+        let amount = match parse_send_amount(&amount_input, asset_decimals) {
             Ok(amount) if !amount.is_zero() => amount,
             Ok(_) => {
                 self.public_form.send_error = Some(Arc::from("Amount must be greater than zero"));
                 cx.notify();
-                return;
+                return None;
             }
             Err(error) => {
                 self.public_form.send_error = Some(Arc::from(error.to_string()));
                 cx.notify();
-                return;
+                return None;
             }
         };
         let Some(recipient) = parse_address(
@@ -1332,30 +1420,60 @@ impl WalletRoot {
         ) else {
             self.public_form.send_error = Some(Arc::from("Enter a valid EVM recipient address"));
             cx.notify();
-            return;
+            return None;
         };
         let gas_fee = match self.public_action_gas_fee_selection(PublicActionMode::Send, cx) {
             Ok(selection) => selection,
             Err(error) => {
                 self.public_form.send_error = Some(Arc::from(error));
                 cx.notify();
-                return;
+                return None;
             }
         };
-        let vault_password =
-            Self::read_and_clear_input(&self.public_form.send_password_input, window, cx);
-        if vault_password.trim().is_empty() {
-            self.public_form.send_error = Some(Arc::from("Enter the vault password to send"));
-            cx.notify();
+        Some(PublicSendDraft {
+            chain_id,
+            asset,
+            asset_label,
+            asset_icon_path,
+            asset_decimals,
+            public_account_uuid,
+            public_account_label,
+            view_session,
+            vault_store,
+            amount,
+            recipient,
+            gas_fee,
+        })
+    }
+
+    pub(super) fn submit_public_send_authorized(
+        &mut self,
+        vault_password: Zeroizing<String>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.public_form.sending {
             return;
         }
+        let Some(draft) = self.public_send_draft(cx) else {
+            return;
+        };
+        let PublicSendDraft {
+            chain_id,
+            asset,
+            asset_label,
+            public_account_uuid,
+            view_session,
+            vault_store,
+            amount,
+            recipient,
+            gas_fee,
+            ..
+        } = draft;
         self.public_form.sending = true;
         self.public_form.send_error = None;
-        let chain_id = self.selected_chain;
         let http = self.http.clone();
         let active_wallet_id = self.selected_wallet_id.clone();
-        let asset_label =
-            public_action_asset_label(chain_id, asset, Some(&self.effective_token_registry));
         let icon_path =
             public_asset_icon_path(chain_id, asset, Some(&self.effective_token_registry));
         let initial_gas_fee =
@@ -1439,6 +1557,9 @@ impl WalletRoot {
                     }
                     Ok(Err(error)) => {
                         let message = error.to_string();
+                        if is_spend_authorization_failure_error(&message) {
+                            root.clear_spend_authorization(cx);
+                        }
                         root.public_form.action_command_tx = None;
                         root.fail_public_action_progress(generation, message.clone(), cx);
                         root.public_form.send_error = Some(Arc::from(message));
@@ -1466,50 +1587,71 @@ impl WalletRoot {
             return;
         }
         self.clear_public_action_progress_state();
+        let Some(draft) = self.public_shield_draft(cx) else {
+            return;
+        };
+        self.request_spend_authorization(
+            SpendAuthorizationIntent::PublicShield,
+            public_shield_authorization_summary(&draft),
+            window,
+            cx,
+        );
+    }
+
+    fn public_shield_draft(&mut self, cx: &mut Context<'_, Self>) -> Option<PublicShieldDraft> {
         let Some(asset) = self.public_form.selected_asset else {
             self.public_form.shield_error = Some(Arc::from("Select an asset to shield"));
             cx.notify();
-            return;
+            return None;
         };
         let Some(public_account_uuid) = self.public_form.selected_account_uuid.clone() else {
             self.public_form.shield_error = Some(Arc::from("Select a public account first"));
             cx.notify();
-            return;
+            return None;
         };
         let Some(view_session) = self.view_session.clone() else {
             self.public_form.shield_error = Some(Arc::from("Wallet vault is locked"));
             cx.notify();
-            return;
+            return None;
         };
         let Some(vault_store) = self.vault_store.clone() else {
             self.public_form.shield_error = Some(Arc::from("Wallet vault storage is unavailable"));
             cx.notify();
-            return;
+            return None;
         };
+        let chain_id = self.selected_chain;
+        let asset_decimals =
+            public_asset_decimals(chain_id, asset, Some(&self.effective_token_registry));
+        let asset_label =
+            public_action_asset_label(chain_id, asset, Some(&self.effective_token_registry));
+        let asset_icon_path =
+            public_asset_icon_path(chain_id, asset, Some(&self.effective_token_registry));
+        let public_account_label = self
+            .public_account_for_uuid(Some(public_account_uuid.as_ref()))
+            .map_or_else(
+                || public_account_uuid.to_string(),
+                |account| {
+                    public_account_display_label(account)
+                        .unwrap_or_else(|| short_address(&account.address))
+                },
+            );
         let amount_input = self
             .public_form
             .shield_amount_input
             .read(cx)
             .value()
             .to_string();
-        let amount = match parse_send_amount(
-            &amount_input,
-            public_asset_decimals(
-                self.selected_chain,
-                asset,
-                Some(&self.effective_token_registry),
-            ),
-        ) {
+        let amount = match parse_send_amount(&amount_input, asset_decimals) {
             Ok(amount) if !amount.is_zero() => amount,
             Ok(_) => {
                 self.public_form.shield_error = Some(Arc::from("Amount must be greater than zero"));
                 cx.notify();
-                return;
+                return None;
             }
             Err(error) => {
                 self.public_form.shield_error = Some(Arc::from(error.to_string()));
                 cx.notify();
-                return;
+                return None;
             }
         };
         let gas_fee = match self.public_action_gas_fee_selection(PublicActionMode::Shield, cx) {
@@ -1517,23 +1659,51 @@ impl WalletRoot {
             Err(error) => {
                 self.public_form.shield_error = Some(Arc::from(error));
                 cx.notify();
-                return;
+                return None;
             }
         };
-        let vault_password =
-            Self::read_and_clear_input(&self.public_form.shield_password_input, window, cx);
-        if vault_password.trim().is_empty() {
-            self.public_form.shield_error = Some(Arc::from("Enter the vault password to shield"));
-            cx.notify();
+        Some(PublicShieldDraft {
+            chain_id,
+            asset,
+            asset_label,
+            asset_icon_path,
+            asset_decimals,
+            public_account_uuid,
+            public_account_label,
+            view_session,
+            vault_store,
+            amount,
+            gas_fee,
+        })
+    }
+
+    pub(super) fn submit_public_shield_authorized(
+        &mut self,
+        vault_password: Zeroizing<String>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.public_form.shielding {
             return;
         }
+        let Some(draft) = self.public_shield_draft(cx) else {
+            return;
+        };
+        let PublicShieldDraft {
+            chain_id,
+            asset,
+            asset_label,
+            public_account_uuid,
+            view_session,
+            vault_store,
+            amount,
+            gas_fee,
+            ..
+        } = draft;
         self.public_form.shielding = true;
         self.public_form.shield_error = None;
-        let chain_id = self.selected_chain;
         let http = self.http.clone();
         let active_wallet_id = self.selected_wallet_id.clone();
-        let asset_label =
-            public_action_asset_label(chain_id, asset, Some(&self.effective_token_registry));
         let icon_path =
             public_asset_icon_path(chain_id, asset, Some(&self.effective_token_registry));
         let initial_gas_fee =
@@ -1616,6 +1786,9 @@ impl WalletRoot {
                     }
                     Ok(Err(error)) => {
                         let message = error.to_string();
+                        if is_spend_authorization_failure_error(&message) {
+                            root.clear_spend_authorization(cx);
+                        }
                         root.public_form.action_command_tx = None;
                         root.fail_public_action_progress(generation, message.clone(), cx);
                         root.public_form.shield_error = Some(Arc::from(message));

@@ -291,6 +291,7 @@ const APPROX_GAS_UPLIFT_DENOMINATOR: u64 = 100;
 const PUBLIC_BROADCASTER_MAX_ENTERED_AMOUNT_ERROR: &str = "public broadcaster max entered amount: ";
 const PUBLIC_BROADCASTER_FEE_TOKEN_MAX_SPENDABLE_ERROR: &str =
     "public broadcaster fee-token max spendable: ";
+const PUBLIC_BROADCASTER_REQUIRED_FEE_ERROR: &str = "; required fee: ";
 const FEE_BASIS_POINTS_DENOMINATOR: U256 = uint!(10_000_U256);
 pub const RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS: U256 = uint!(25_U256);
 
@@ -630,7 +631,7 @@ impl TransactionGenerationStage {
         match self {
             Self::SelectingPrivateNotes => "Selecting private notes",
             Self::ProvingTransaction => "Proving transaction",
-            Self::EstimatingBroadcasterFee => "Estimating broadcaster fee",
+            Self::EstimatingBroadcasterFee => "Estimating transaction fee",
             Self::GeneratingPoiProofs => "Generating POI proofs",
             Self::PublishingToBroadcaster => "Publishing to broadcaster",
             Self::WaitingForBroadcasterResponse => "Waiting for broadcaster response",
@@ -649,7 +650,7 @@ impl TransactionGenerationStage {
             Self::ProvingTransaction => {
                 "Generating the zero-knowledge proof. This is usually the slowest step."
             }
-            Self::EstimatingBroadcasterFee => "Checking gas cost and broadcaster fee requirements.",
+            Self::EstimatingBroadcasterFee => "Checking gas cost and transaction fee requirements.",
             Self::GeneratingPoiProofs => "Generating POI proofs for transaction outputs.",
             Self::PublishingToBroadcaster => "Encrypting and publishing the request over Waku.",
             Self::WaitingForBroadcasterResponse => {
@@ -1373,7 +1374,9 @@ fn public_broadcaster_build_error(
             )
         ),
         BuildError::InsufficientFeeTokenBalance(max_spendable) => {
-            eyre!("{PUBLIC_BROADCASTER_FEE_TOKEN_MAX_SPENDABLE_ERROR}{max_spendable}")
+            eyre!(
+                "{PUBLIC_BROADCASTER_FEE_TOKEN_MAX_SPENDABLE_ERROR}{max_spendable}{PUBLIC_BROADCASTER_REQUIRED_FEE_ERROR}{fee_amount}"
+            )
         }
         other => Report::new(other),
     }
@@ -7296,7 +7299,7 @@ mod tests {
 
         assert_eq!(
             report.to_string(),
-            "public broadcaster fee-token max spendable: 123"
+            "public broadcaster fee-token max spendable: 123; required fee: 7"
         );
     }
 
