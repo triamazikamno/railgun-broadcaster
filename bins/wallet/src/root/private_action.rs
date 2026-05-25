@@ -1566,7 +1566,7 @@ impl WalletRoot {
             .as_ref()
             .is_some_and(|progress| progress.kind == DeliveryFormKind::Send && progress.key == key)
         {
-            self.private_broadcaster_progress = None;
+            self.clear_private_broadcaster_progress_state();
         }
         cx.notify();
     }
@@ -1588,7 +1588,7 @@ impl WalletRoot {
                 progress.kind == DeliveryFormKind::Unshield && progress.key == key
             })
         {
-            self.private_broadcaster_progress = None;
+            self.clear_private_broadcaster_progress_state();
         }
         cx.notify();
     }
@@ -1742,7 +1742,7 @@ impl WalletRoot {
         .detach();
         self.send_forms.clear();
         self.unshield_forms.clear();
-        self.private_broadcaster_progress = None;
+        self.clear_private_broadcaster_progress_state();
         self.broadcaster_picker = None;
         let selected_fee_token =
             self.default_public_broadcaster_fee_token(key.chain_id, key.token, false, false);
@@ -2564,7 +2564,7 @@ impl WalletRoot {
         .detach();
         self.send_forms.clear();
         self.unshield_forms.clear();
-        self.private_broadcaster_progress = None;
+        self.clear_private_broadcaster_progress_state();
         self.broadcaster_picker = None;
         let selected_fee_token =
             self.default_public_broadcaster_fee_token(key.chain_id, key.token, false, false);
@@ -3221,6 +3221,14 @@ impl WalletRoot {
                 })
             }
         };
+        if delivery_mode != DeliveryMode::ManualCalldata {
+            self.set_private_broadcaster_task_abort_handle(
+                DeliveryFormKind::Send,
+                key,
+                generation_id,
+                join.abort_handle(),
+            );
+        }
         let terminal_progress_rx = progress_rx.clone();
         Self::watch_send_generation_stage(key, generation_id, progress_rx, window, cx);
         if let Some(event_rx) = self_broadcast_event_rx {
@@ -3683,6 +3691,14 @@ impl WalletRoot {
                 })
             }
         };
+        if delivery_mode != DeliveryMode::ManualCalldata {
+            self.set_private_broadcaster_task_abort_handle(
+                DeliveryFormKind::Unshield,
+                key,
+                generation_id,
+                join.abort_handle(),
+            );
+        }
         let terminal_progress_rx = progress_rx.clone();
         Self::watch_unshield_generation_stage(key, generation_id, progress_rx, window, cx);
         if let Some(event_rx) = self_broadcast_event_rx {
@@ -3846,6 +3862,15 @@ impl WalletRoot {
         cx.spawn_in(window, async move |this, cx| {
             while let Some(event) = event_rx.recv().await {
                 let _ = this.update_in(cx, |root, window, cx| match event {
+                    SelfBroadcastSessionEvent::PendingOutputPoiProofsRequired { required } => {
+                        root.set_private_self_broadcast_unshield_poi_step(
+                            kind,
+                            key,
+                            generation_id,
+                            required,
+                            cx,
+                        );
+                    }
                     SelfBroadcastSessionEvent::StepFailed { stage, message } => {
                         if root.record_private_broadcaster_progress_step_error(
                             kind,

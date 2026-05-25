@@ -416,6 +416,9 @@ pub struct SelfBroadcastAttemptInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelfBroadcastSessionEvent {
+    PendingOutputPoiProofsRequired {
+        required: bool,
+    },
     StepFailed {
         stage: TransactionGenerationStage,
         message: String,
@@ -2217,6 +2220,12 @@ async fn persist_manual_send_pending_pois(
     Ok(())
 }
 
+fn unshield_chunks_require_pending_output_pois(chunks: &[TransactionPlanChunk]) -> bool {
+    chunks
+        .iter()
+        .any(|chunk| chunk.private_output_count().is_none_or(|count| count > 0))
+}
+
 fn prepared_unshield_call_from_plan(
     chain_id: u64,
     token: Address,
@@ -2659,21 +2668,31 @@ pub async fn submit_desktop_unshield_self_broadcast(
         http,
     )
     .await?;
-    update_transaction_generation_stage(
-        request.progress_tx.as_ref(),
-        TransactionGenerationStage::GeneratingPoiProofs,
+    let pending_output_pois_required =
+        unshield_chunks_require_pending_output_pois(&prepared.plan.chunks);
+    emit_self_broadcast_event(
+        request.event_tx.as_ref(),
+        SelfBroadcastSessionEvent::PendingOutputPoiProofsRequired {
+            required: pending_output_pois_required,
+        },
     );
-    persist_manual_unshield_pending_pois(
-        &prepared.plan,
-        request.session.as_ref(),
-        request.chain_id,
-        request.view_session.wallet_id(),
-        &prepared.prover,
-        request.verify_proof,
-        http,
-        "generate self-broadcast unshield pending output pre-transaction POI",
-    )
-    .await?;
+    if pending_output_pois_required {
+        update_transaction_generation_stage(
+            request.progress_tx.as_ref(),
+            TransactionGenerationStage::GeneratingPoiProofs,
+        );
+        persist_manual_unshield_pending_pois(
+            &prepared.plan,
+            request.session.as_ref(),
+            request.chain_id,
+            request.view_session.wallet_id(),
+            &prepared.prover,
+            request.verify_proof,
+            http,
+            "generate self-broadcast unshield pending output pre-transaction POI",
+        )
+        .await?;
+    }
     let pending_spent_inputs = prepared
         .plan
         .inputs
@@ -6436,6 +6455,33 @@ mod tests {
             records[0].output_commitment,
             FixedBytes::from(unshield_note.commitment().to_be_bytes::<32>())
         );
+    }
+
+    #[test]
+    fn self_broadcast_unshield_pending_pois_only_when_private_outputs_exist() {
+        let token = address(0x3d);
+        let unshield_note = Note::new_unshield(address(0xde), token, uint!(9_U256));
+        let no_change_chunk = sample_chunk(14, 0x84, vec![unshield_note.clone()], true);
+
+        assert!(!super::unshield_chunks_require_pending_output_pois(
+            std::slice::from_ref(&no_change_chunk)
+        ));
+
+        let change_note = sample_note(18, token, 1);
+        let change_chunk = sample_chunk(15, 0x85, vec![change_note, unshield_note], true);
+
+        assert!(super::unshield_chunks_require_pending_output_pois(
+            std::slice::from_ref(&change_chunk)
+        ));
+    }
+
+    #[test]
+    fn self_broadcast_unshield_pending_pois_are_required_for_malformed_chunks() {
+        let malformed_chunk = sample_chunk(16, 0x86, Vec::new(), true);
+
+        assert!(super::unshield_chunks_require_pending_output_pois(
+            std::slice::from_ref(&malformed_chunk)
+        ));
     }
 
     #[test]

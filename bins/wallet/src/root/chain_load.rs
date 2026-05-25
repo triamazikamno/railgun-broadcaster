@@ -246,7 +246,7 @@ impl WalletRoot {
         self.unshield_forms.clear();
         self.clear_public_wallet_runtime_state();
         self.private_action_form = None;
-        self.private_broadcaster_progress = None;
+        self.clear_private_broadcaster_progress_state();
         self.broadcaster_picker = None;
         self.active_wallet_tab = WalletTab::default();
         for state in self.chain_states.values_mut() {
@@ -635,7 +635,7 @@ impl WalletRoot {
         self.send_forms.clear();
         self.unshield_forms.clear();
         self.private_action_form = None;
-        self.private_broadcaster_progress = None;
+        self.clear_private_broadcaster_progress_state();
         self.broadcaster_picker = None;
         self.local_pending_spent_clear_confirming = false;
         self.clear_public_chain_balance_state();

@@ -44,7 +44,7 @@ use super::{
     DeliveryMode, PUBLIC_ACCOUNT_IDENTICON_CELL_COUNT, PUBLIC_ACCOUNT_IDENTICON_GRID_SIZE,
     PUBLIC_ADDRESS_QR_QUIET_ZONE_MODULES, PriceAnchorComponentDialogValues,
     PriceAnchorDialogValues, PrivateActionMetric, PrivateBroadcasterProgressState,
-    PublicActionMode, PublicActionStepState, PublicActionStepStatus,
+    ProgressFooterAction, PublicActionMode, PublicActionStepState, PublicActionStepStatus,
     PublicBroadcasterFeeTokenOption, SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_MINUTE,
     SECONDS_PER_MONTH, SECONDS_PER_YEAR, SEND_AUTHORIZATION_FAILED_ERROR,
     SEND_MISSING_PASSWORD_ERROR, SelfBroadcastNativeBalanceState, SettingsApplyMode,
@@ -58,9 +58,10 @@ use super::{
     display_chain_rpc_endpoints, display_price_anchor_entries, display_rows_from_output,
     display_token_entries, display_waku_direct_peers, display_waku_dns_enr_trees,
     display_waku_doh_endpoint, display_waku_doh_fallback_endpoints,
-    effective_public_broadcaster_fee_mode, ethereum_weth_public_broadcaster_count,
-    fail_private_broadcaster_progress_steps_at_stage, fee_token_option_has_eligible_broadcaster,
-    finish_private_broadcaster_progress_steps, finish_private_broadcaster_progress_steps_at_stage,
+    effective_public_broadcaster_fee_mode, ensure_self_broadcast_unshield_progress_stage,
+    ethereum_weth_public_broadcaster_count, fail_private_broadcaster_progress_steps_at_stage,
+    fee_token_option_has_eligible_broadcaster, finish_private_broadcaster_progress_steps,
+    finish_private_broadcaster_progress_steps_at_stage,
     finish_private_self_broadcast_progress_steps_at_stage,
     form_error_clears_public_broadcaster_cost_estimate, format_anchor_bps_exact_range,
     format_anchor_bps_percent, format_anchor_bps_percent_range, format_anchor_premium_range,
@@ -68,18 +69,23 @@ use super::{
     format_gwei, format_native_token_amount_for_display, format_private_asset_rows,
     format_public_broadcaster_fee_margin, format_report_chain, format_send_amount_input,
     format_total, format_unshield_amount_input, is_effective_wrapped_native_token,
-    load_validated_startup_settings, loading_summary, max_send_amount_from_snapshot,
+    load_validated_startup_settings, loading_summary, mark_private_broadcaster_active_step_stopped,
+    mark_public_action_active_step_stopped, max_send_amount_from_snapshot,
     max_unshield_amount_from_snapshot, merge_public_balance_snapshot, native_token_display_label,
     native_wrapped_output_labels, next_public_account_label_number, parse_gwei_to_wei,
     parse_repair_cache_block, price_anchor_dialog_values_from_entry,
     price_anchor_override_from_dialog_values, price_anchor_token_primary_label,
-    private_action_metrics, private_broadcaster_progress_steps, progress_detail,
-    public_account_identicon_color, public_account_identicon_pattern,
+    private_action_metrics, private_broadcaster_progress_footer_action,
+    private_broadcaster_progress_steps, private_progress_stage_disables_stop, progress_detail,
+    progress_footer_action, public_account_identicon_color, public_account_identicon_pattern,
     public_account_matches_search, public_account_visible_balances_for_chain,
-    public_action_closed_active_step, public_action_error_copy_value, public_action_error_details,
-    public_action_error_summary, public_action_max_amount_after_reserve,
-    public_action_progress_steps, public_address_qr_module_range, public_address_qr_payload,
-    public_asset_decimals, public_asset_icon_path, public_asset_label, public_balance_amount_label,
+    public_action_accepts_update, public_action_closed_active_step, public_action_error_copy_value,
+    public_action_error_details, public_action_error_summary,
+    public_action_max_amount_after_reserve, public_action_progress_footer_action,
+    public_action_progress_steps, public_action_step_color, public_action_step_detail,
+    public_action_step_is_final_handoff, public_action_step_uses_stop_marker,
+    public_address_qr_module_range, public_address_qr_payload, public_asset_decimals,
+    public_asset_icon_path, public_asset_label, public_balance_amount_label,
     public_balance_entry_for_chain, public_broadcaster_candidates_for_asset,
     public_broadcaster_cost_status_text, public_broadcaster_fee_token_options_from_snapshot,
     public_broadcaster_fee_token_warning, public_broadcaster_submit_disabled_for_fee_token_options,
@@ -242,6 +248,43 @@ fn public_broadcaster_cost_estimate(
         input_count: 1,
         private_output_count: 2,
         public_output_count: 0,
+    }
+}
+
+fn private_progress_state(
+    flow: PrivateSubmissionProgressFlow,
+    key: UnshieldAssetKey,
+) -> PrivateBroadcasterProgressState {
+    PrivateBroadcasterProgressState {
+        flow,
+        kind: DeliveryFormKind::Send,
+        key,
+        generation_id: 7,
+        asset_label: Arc::from("ETH"),
+        icon_path: None,
+        recipient: Arc::from("0zk"),
+        gas_payer: None,
+        steps: match flow {
+            PrivateSubmissionProgressFlow::PublicBroadcaster => {
+                private_broadcaster_progress_steps()
+            }
+            PrivateSubmissionProgressFlow::SelfBroadcast => {
+                self_broadcast_progress_steps(DeliveryFormKind::Send)
+            }
+        },
+        estimate: None,
+        result: None,
+        self_broadcast_result: None,
+        self_broadcast_command_tx: None,
+        self_broadcast_attempts: Vec::new(),
+        self_broadcast_current_gas_fee: None,
+        self_broadcast_action_error: None,
+        task_abort_handle: None,
+        stop_available: true,
+        stopped: false,
+        error: None,
+        dialog_open: false,
+        stage_seen: false,
     }
 }
 
@@ -2526,7 +2569,7 @@ fn private_broadcaster_terminal_result_applies_latest_stage_before_timeout() {
 
 #[test]
 fn self_broadcast_progress_stage_sequence_tracks_direct_submission() {
-    let mut steps = self_broadcast_progress_steps();
+    let mut steps = self_broadcast_progress_steps(DeliveryFormKind::Send);
 
     assert_eq!(
         steps.iter().map(|step| step.stage).collect::<Vec<_>>(),
@@ -2559,8 +2602,61 @@ fn self_broadcast_progress_stage_sequence_tracks_direct_submission() {
 }
 
 #[test]
+fn self_broadcast_unshield_progress_omits_poi_until_requested() {
+    let mut steps = self_broadcast_progress_steps(DeliveryFormKind::Unshield);
+
+    assert_eq!(
+        steps.iter().map(|step| step.stage).collect::<Vec<_>>(),
+        vec![
+            TransactionGenerationStage::SelectingPrivateNotes,
+            TransactionGenerationStage::ProvingTransaction,
+            TransactionGenerationStage::EstimatingSelfBroadcastGas,
+            TransactionGenerationStage::SigningSelfBroadcast,
+            TransactionGenerationStage::WaitingForSelfBroadcastReceipt,
+        ]
+    );
+
+    apply_private_broadcaster_progress_stage(
+        &mut steps,
+        TransactionGenerationStage::EstimatingSelfBroadcastGas,
+    );
+    assert!(
+        !steps
+            .iter()
+            .any(|step| step.stage == TransactionGenerationStage::GeneratingPoiProofs)
+    );
+    ensure_self_broadcast_unshield_progress_stage(
+        &mut steps,
+        TransactionGenerationStage::GeneratingPoiProofs,
+    );
+    assert_eq!(steps[2].status, PublicActionStepStatus::Done);
+
+    let mut steps = self_broadcast_progress_steps(DeliveryFormKind::Unshield);
+    ensure_self_broadcast_unshield_progress_stage(
+        &mut steps,
+        TransactionGenerationStage::GeneratingPoiProofs,
+    );
+    apply_private_broadcaster_progress_stage(
+        &mut steps,
+        TransactionGenerationStage::GeneratingPoiProofs,
+    );
+    assert_eq!(
+        steps.iter().map(|step| step.stage).collect::<Vec<_>>(),
+        vec![
+            TransactionGenerationStage::SelectingPrivateNotes,
+            TransactionGenerationStage::ProvingTransaction,
+            TransactionGenerationStage::GeneratingPoiProofs,
+            TransactionGenerationStage::EstimatingSelfBroadcastGas,
+            TransactionGenerationStage::SigningSelfBroadcast,
+            TransactionGenerationStage::WaitingForSelfBroadcastReceipt,
+        ]
+    );
+    assert_eq!(steps[2].status, PublicActionStepStatus::Pending);
+}
+
+#[test]
 fn self_broadcast_reverted_receipt_marks_receipt_step_error() {
-    let mut steps = self_broadcast_progress_steps();
+    let mut steps = self_broadcast_progress_steps(DeliveryFormKind::Send);
 
     finish_private_self_broadcast_progress_steps_at_stage(
         &mut steps,
@@ -2584,6 +2680,253 @@ fn self_broadcast_reverted_receipt_marks_receipt_step_error() {
 }
 
 #[test]
+fn stopped_progress_status_uses_danger_stop_marker_and_copy() {
+    assert_eq!(
+        public_action_step_color(PublicActionStepStatus::Stopped),
+        ui::theme::DANGER,
+    );
+    assert!(public_action_step_uses_stop_marker(
+        PublicActionStepStatus::Stopped
+    ));
+    assert_eq!(
+        public_action_step_detail(
+            PublicActionProgressStep::Send,
+            PublicActionStepStatus::Stopped,
+        ),
+        "Stopped locally. Already-submitted network work may continue.",
+    );
+}
+
+#[test]
+fn stopped_active_step_selection_prefers_pending_error_then_latest_not_started() {
+    let mut steps = vec![
+        PublicActionStepState {
+            step: PublicActionProgressStep::Wrap,
+            status: PublicActionStepStatus::Error,
+            tx_hash: None,
+            message: None,
+        },
+        PublicActionStepState {
+            step: PublicActionProgressStep::Approve,
+            status: PublicActionStepStatus::Pending,
+            tx_hash: None,
+            message: None,
+        },
+        PublicActionStepState {
+            step: PublicActionProgressStep::Shield,
+            status: PublicActionStepStatus::NotStarted,
+            tx_hash: None,
+            message: None,
+        },
+    ];
+    assert!(mark_public_action_active_step_stopped(&mut steps));
+    assert_eq!(steps[1].status, PublicActionStepStatus::Stopped);
+
+    let mut steps = vec![
+        PublicActionStepState {
+            step: PublicActionProgressStep::Approve,
+            status: PublicActionStepStatus::Error,
+            tx_hash: None,
+            message: None,
+        },
+        PublicActionStepState {
+            step: PublicActionProgressStep::Shield,
+            status: PublicActionStepStatus::NotStarted,
+            tx_hash: None,
+            message: None,
+        },
+    ];
+    assert!(mark_public_action_active_step_stopped(&mut steps));
+    assert_eq!(steps[0].status, PublicActionStepStatus::Stopped);
+
+    let mut steps = vec![
+        PublicActionStepState {
+            step: PublicActionProgressStep::Approve,
+            status: PublicActionStepStatus::NotStarted,
+            tx_hash: None,
+            message: None,
+        },
+        PublicActionStepState {
+            step: PublicActionProgressStep::Shield,
+            status: PublicActionStepStatus::NotStarted,
+            tx_hash: None,
+            message: None,
+        },
+    ];
+    assert!(mark_public_action_active_step_stopped(&mut steps));
+    assert_eq!(steps[1].status, PublicActionStepStatus::Stopped);
+
+    let mut private_steps = self_broadcast_progress_steps(DeliveryFormKind::Send);
+    assert!(mark_private_broadcaster_active_step_stopped(
+        &mut private_steps
+    ));
+    assert_eq!(private_steps[0].status, PublicActionStepStatus::Stopped);
+}
+
+#[test]
+fn public_send_stop_footer_follows_send_handoff_boundary() {
+    let steps = vec![PublicActionStepState {
+        step: PublicActionProgressStep::Send,
+        status: PublicActionStepStatus::Pending,
+        tx_hash: None,
+        message: None,
+    }];
+
+    assert_eq!(
+        progress_footer_action(true, false),
+        ProgressFooterAction::Stop
+    );
+    assert_eq!(
+        public_action_progress_footer_action(true, &steps),
+        ProgressFooterAction::Stop,
+    );
+    assert!(public_action_step_is_final_handoff(
+        PublicActionMode::Send,
+        PublicActionProgressStep::Send,
+    ));
+    assert_eq!(
+        public_action_progress_footer_action(false, &steps),
+        ProgressFooterAction::Close,
+    );
+}
+
+#[test]
+fn public_shield_stop_footer_allows_prerequisites_until_final_shield() {
+    let prerequisite_attempt_steps = vec![
+        PublicActionStepState {
+            step: PublicActionProgressStep::Wrap,
+            status: PublicActionStepStatus::Pending,
+            tx_hash: Some(Arc::from("0xwrap")),
+            message: None,
+        },
+        PublicActionStepState {
+            step: PublicActionProgressStep::Approve,
+            status: PublicActionStepStatus::NotStarted,
+            tx_hash: None,
+            message: None,
+        },
+        PublicActionStepState {
+            step: PublicActionProgressStep::Shield,
+            status: PublicActionStepStatus::NotStarted,
+            tx_hash: None,
+            message: None,
+        },
+    ];
+
+    assert!(!public_action_step_is_final_handoff(
+        PublicActionMode::Shield,
+        PublicActionProgressStep::Wrap,
+    ));
+    assert!(!public_action_step_is_final_handoff(
+        PublicActionMode::Shield,
+        PublicActionProgressStep::Approve,
+    ));
+    assert!(public_action_step_is_final_handoff(
+        PublicActionMode::Shield,
+        PublicActionProgressStep::Shield,
+    ));
+    assert_eq!(
+        public_action_progress_footer_action(true, &prerequisite_attempt_steps),
+        ProgressFooterAction::Stop,
+    );
+    let approve_attempt_steps = vec![
+        PublicActionStepState {
+            step: PublicActionProgressStep::Wrap,
+            status: PublicActionStepStatus::Done,
+            tx_hash: Some(Arc::from("0xwrap")),
+            message: None,
+        },
+        PublicActionStepState {
+            step: PublicActionProgressStep::Approve,
+            status: PublicActionStepStatus::Pending,
+            tx_hash: Some(Arc::from("0xapprove")),
+            message: None,
+        },
+        PublicActionStepState {
+            step: PublicActionProgressStep::Shield,
+            status: PublicActionStepStatus::NotStarted,
+            tx_hash: None,
+            message: None,
+        },
+    ];
+    assert_eq!(
+        public_action_progress_footer_action(true, &approve_attempt_steps),
+        ProgressFooterAction::Stop,
+    );
+    assert_eq!(
+        public_action_progress_footer_action(false, &prerequisite_attempt_steps),
+        ProgressFooterAction::Close,
+    );
+}
+
+#[test]
+fn private_self_broadcast_stop_footer_follows_signing_handoff_boundary() {
+    let key = UnshieldAssetKey::new(1, Address::from([0x11; 20]));
+    let mut progress = private_progress_state(PrivateSubmissionProgressFlow::SelfBroadcast, key);
+
+    assert!(!private_progress_stage_disables_stop(
+        PrivateSubmissionProgressFlow::SelfBroadcast,
+        TransactionGenerationStage::EstimatingSelfBroadcastGas,
+    ));
+    assert!(private_progress_stage_disables_stop(
+        PrivateSubmissionProgressFlow::SelfBroadcast,
+        TransactionGenerationStage::SigningSelfBroadcast,
+    ));
+    assert_eq!(
+        private_broadcaster_progress_footer_action(&progress),
+        ProgressFooterAction::Stop,
+    );
+    progress.stop_available = false;
+    assert_eq!(
+        private_broadcaster_progress_footer_action(&progress),
+        ProgressFooterAction::Close,
+    );
+}
+
+#[test]
+fn private_public_broadcaster_stop_footer_follows_publication_boundary() {
+    let key = UnshieldAssetKey::new(1, Address::from([0x11; 20]));
+    let mut progress =
+        private_progress_state(PrivateSubmissionProgressFlow::PublicBroadcaster, key);
+
+    assert!(!private_progress_stage_disables_stop(
+        PrivateSubmissionProgressFlow::PublicBroadcaster,
+        TransactionGenerationStage::GeneratingPoiProofs,
+    ));
+    assert!(private_progress_stage_disables_stop(
+        PrivateSubmissionProgressFlow::PublicBroadcaster,
+        TransactionGenerationStage::PublishingToBroadcaster,
+    ));
+    assert_eq!(
+        private_broadcaster_progress_footer_action(&progress),
+        ProgressFooterAction::Stop,
+    );
+    progress.stop_available = false;
+    assert_eq!(
+        private_broadcaster_progress_footer_action(&progress),
+        ProgressFooterAction::Close,
+    );
+}
+
+#[test]
+fn stale_progress_update_guards_reject_stopped_generations() {
+    assert!(public_action_accepts_update(7, 7, false));
+    assert!(!public_action_accepts_update(7, 6, false));
+    assert!(!public_action_accepts_update(7, 7, true));
+
+    let key = UnshieldAssetKey::new(1, Address::from([0x11; 20]));
+    let mut progress =
+        private_progress_state(PrivateSubmissionProgressFlow::PublicBroadcaster, key);
+    progress.stage_seen = true;
+    progress.stopped = true;
+
+    assert_eq!(
+        private_broadcaster_closed_active_stage(Some(&progress), DeliveryFormKind::Send, key, 7,),
+        None,
+    );
+}
+
+#[test]
 fn closed_private_broadcaster_progress_exposes_active_stage() {
     let key = UnshieldAssetKey::new(1, Address::from([0x11; 20]));
     let mut progress = PrivateBroadcasterProgressState {
@@ -2603,6 +2946,9 @@ fn closed_private_broadcaster_progress_exposes_active_stage() {
         self_broadcast_attempts: Vec::new(),
         self_broadcast_current_gas_fee: None,
         self_broadcast_action_error: None,
+        task_abort_handle: None,
+        stop_available: true,
+        stopped: false,
         error: None,
         dialog_open: false,
         stage_seen: false,

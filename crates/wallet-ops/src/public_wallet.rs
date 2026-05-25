@@ -231,6 +231,9 @@ pub enum PublicActionSessionEvent {
         step: PublicActionProgressStep,
         message: String,
     },
+    AttemptHandoff {
+        step: PublicActionProgressStep,
+    },
     AttemptSubmitted {
         step: PublicActionProgressStep,
         attempt: PublicActionAttemptInfo,
@@ -802,6 +805,7 @@ async fn submit_public_action_step_session(
         };
         nonce = Some(preflight.nonce);
 
+        emit_public_action_event(event_tx, PublicActionSessionEvent::AttemptHandoff { step });
         let attempt = match submit_public_action_attempt(
             step,
             preflight,
@@ -884,6 +888,10 @@ async fn submit_public_action_step_session(
                                 continue;
                             }
                         };
+                        emit_public_action_event(
+                            event_tx,
+                            PublicActionSessionEvent::AttemptHandoff { step },
+                        );
                         match submit_public_action_attempt(
                             step,
                             replacement,

@@ -59,6 +59,7 @@ pub(super) enum PublicActionStepStatus {
     Pending,
     Done,
     Error,
+    Stopped,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -67,6 +68,87 @@ pub(super) struct PublicActionStepState {
     pub(super) status: PublicActionStepStatus,
     pub(super) tx_hash: Option<Arc<str>>,
     pub(super) message: Option<Arc<str>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ProgressFooterAction {
+    Stop,
+    Close,
+}
+
+const STOPPED_PROGRESS_MESSAGE: &str =
+    "Stopped locally. Already-submitted network work may continue.";
+
+pub(super) const fn progress_footer_action(
+    stop_available: bool,
+    terminal: bool,
+) -> ProgressFooterAction {
+    if stop_available && !terminal {
+        ProgressFooterAction::Stop
+    } else {
+        ProgressFooterAction::Close
+    }
+}
+
+pub(super) const fn public_action_step_is_final_handoff(
+    mode: PublicActionMode,
+    step: PublicActionProgressStep,
+) -> bool {
+    match mode {
+        PublicActionMode::Shield => matches!(step, PublicActionProgressStep::Shield),
+        PublicActionMode::Send => matches!(step, PublicActionProgressStep::Send),
+    }
+}
+
+pub(super) const fn public_action_accepts_update(
+    current_generation: u64,
+    update_generation: u64,
+    stopped: bool,
+) -> bool {
+    current_generation == update_generation && !stopped
+}
+
+pub(super) fn public_action_progress_footer_action(
+    stop_available: bool,
+    steps: &[PublicActionStepState],
+) -> ProgressFooterAction {
+    progress_footer_action(stop_available, public_action_progress_is_terminal(steps))
+}
+
+pub(super) fn public_action_progress_is_terminal(steps: &[PublicActionStepState]) -> bool {
+    !steps.is_empty()
+        && (steps
+            .iter()
+            .all(|step| step.status == PublicActionStepStatus::Done)
+            || steps.iter().any(|step| {
+                matches!(
+                    step.status,
+                    PublicActionStepStatus::Error | PublicActionStepStatus::Stopped
+                )
+            }))
+}
+
+pub(super) fn mark_public_action_active_step_stopped(steps: &mut [PublicActionStepState]) -> bool {
+    let step_index = steps
+        .iter()
+        .position(|step| step.status == PublicActionStepStatus::Pending)
+        .or_else(|| {
+            steps
+                .iter()
+                .position(|step| step.status == PublicActionStepStatus::Error)
+        })
+        .or_else(|| {
+            steps
+                .iter()
+                .rposition(|step| step.status == PublicActionStepStatus::NotStarted)
+        });
+    let Some(step_index) = step_index else {
+        return false;
+    };
+    let step = &mut steps[step_index];
+    step.status = PublicActionStepStatus::Stopped;
+    step.message = Some(Arc::from(STOPPED_PROGRESS_MESSAGE));
+    true
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -483,11 +565,16 @@ impl WalletRoot {
     }
 
     pub(super) fn clear_public_action_progress_state(&mut self) {
+        if let Some(handle) = self.public_form.action_task_abort_handle.take() {
+            handle.abort();
+        }
         self.public_form.action_progress.clear();
         self.public_form.expanded_action_error_steps.clear();
         self.public_form.action_progress_dialog_open = false;
         self.public_form.action_progress_asset_label = Arc::from("");
         self.public_form.action_progress_icon_path = None;
+        self.public_form.action_stop_available = false;
+        self.public_form.action_stopped = false;
         self.public_form.action_command_tx = None;
         self.public_form.action_attempts.clear();
         self.public_form.action_current_gas_fee = None;
@@ -607,6 +694,9 @@ impl WalletRoot {
         self.public_form.action_progress_asset_label = Arc::from(asset_label);
         self.public_form.action_progress_icon_path = icon_path;
         self.public_form.action_progress_dialog_open = false;
+        self.public_form.action_task_abort_handle = None;
+        self.public_form.action_stop_available = true;
+        self.public_form.action_stopped = false;
         self.public_form.action_command_tx = command_tx;
         self.public_form.action_attempts.clear();
         self.public_form.action_current_gas_fee = initial_gas_fee;
@@ -632,7 +722,11 @@ impl WalletRoot {
         update: PublicActionProgressUpdate,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.public_form.action_generation != generation {
+        if !public_action_accepts_update(
+            self.public_form.action_generation,
+            generation,
+            self.public_form.action_stopped,
+        ) {
             return;
         }
         let Some(step) = self
@@ -665,7 +759,11 @@ impl WalletRoot {
         message: String,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.public_form.action_generation != generation {
+        if !public_action_accepts_update(
+            self.public_form.action_generation,
+            generation,
+            self.public_form.action_stopped,
+        ) {
             return;
         }
         if let Some(step) = self
@@ -756,7 +854,11 @@ impl WalletRoot {
         event: PublicActionSessionEvent,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.public_form.action_generation != generation {
+        if !public_action_accepts_update(
+            self.public_form.action_generation,
+            generation,
+            self.public_form.action_stopped,
+        ) {
             return;
         }
         match event {
@@ -772,7 +874,15 @@ impl WalletRoot {
                     progress_step.message = Some(Arc::from(message));
                 }
             }
-            PublicActionSessionEvent::AttemptSubmitted { attempt, .. } => {
+            PublicActionSessionEvent::AttemptHandoff { step } => {
+                if public_action_step_is_final_handoff(self.public_form.action_mode, step) {
+                    self.public_form.action_stop_available = false;
+                }
+            }
+            PublicActionSessionEvent::AttemptSubmitted { step, attempt } => {
+                if public_action_step_is_final_handoff(self.public_form.action_mode, step) {
+                    self.public_form.action_stop_available = false;
+                }
                 self.public_form.action_current_gas_fee =
                     Some((attempt.max_fee_per_gas, attempt.max_priority_fee_per_gas));
                 self.public_form.action_action_error = None;
@@ -813,7 +923,11 @@ impl WalletRoot {
                 .on_close(move |_event, _window, cx| {
                     close_root.update(cx, |root, cx| {
                         if root.public_form.action_generation == generation {
-                            root.public_form.action_progress_dialog_open = false;
+                            if root.public_form.action_stopped {
+                                root.clear_public_action_progress_state();
+                            } else {
+                                root.public_form.action_progress_dialog_open = false;
+                            }
                             cx.notify();
                         }
                     });
@@ -824,6 +938,43 @@ impl WalletRoot {
                         .render_public_action_progress_dialog_content(&content_root, content_width),
                 )
         });
+    }
+
+    fn stop_public_action_progress(&mut self, cx: &mut Context<'_, Self>) {
+        if public_action_progress_footer_action(
+            self.public_form.action_stop_available,
+            &self.public_form.action_progress,
+        ) != ProgressFooterAction::Stop
+        {
+            return;
+        }
+        if let Some(handle) = self.public_form.action_task_abort_handle.take() {
+            handle.abort();
+        }
+        self.public_form.action_command_tx = None;
+        self.public_form.action_action_error = None;
+        self.public_form.action_stop_available = false;
+        self.public_form.action_stopped = true;
+        match self.public_form.action_mode {
+            PublicActionMode::Shield => self.public_form.shielding = false,
+            PublicActionMode::Send => self.public_form.sending = false,
+        }
+        mark_public_action_active_step_stopped(&mut self.public_form.action_progress);
+        cx.notify();
+    }
+
+    fn close_public_action_progress_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.public_form.action_stopped {
+            self.clear_public_action_progress_state();
+        } else {
+            self.public_form.action_progress_dialog_open = false;
+        }
+        window.close_dialog(cx);
+        cx.notify();
     }
 
     pub(super) fn render_public_action_progress_dialog_content(
@@ -875,6 +1026,13 @@ impl WalletRoot {
                     )),
             );
         }
+        content = content.child(render_public_action_progress_footer(
+            root.clone(),
+            public_action_progress_footer_action(
+                self.public_form.action_stop_available,
+                &self.public_form.action_progress,
+            ),
+        ));
         content
     }
 
@@ -1249,16 +1407,22 @@ impl WalletRoot {
             })
             .await
         });
+        self.public_form.action_task_abort_handle = Some(join.abort_handle());
         cx.spawn(async move |this, cx| {
             let result = join.await;
             let _ = this.update(cx, |root, cx| {
                 if root.selected_wallet_id != active_wallet_id || root.selected_chain != chain_id {
                     return;
                 }
-                if root.public_form.action_generation != generation {
+                if !public_action_accepts_update(
+                    root.public_form.action_generation,
+                    generation,
+                    root.public_form.action_stopped,
+                ) {
                     return;
                 }
                 root.public_form.sending = false;
+                root.public_form.action_task_abort_handle = None;
                 match result {
                     Ok(Ok(_result)) => {
                         root.public_form.action_command_tx = None;
@@ -1301,8 +1465,7 @@ impl WalletRoot {
         if self.public_form.shielding {
             return;
         }
-        self.public_form.action_progress.clear();
-        self.public_form.expanded_action_error_steps.clear();
+        self.clear_public_action_progress_state();
         let Some(asset) = self.public_form.selected_asset else {
             self.public_form.shield_error = Some(Arc::from("Select an asset to shield"));
             cx.notify();
@@ -1421,16 +1584,22 @@ impl WalletRoot {
             })
             .await
         });
+        self.public_form.action_task_abort_handle = Some(join.abort_handle());
         cx.spawn(async move |this, cx| {
             let result = join.await;
             let _ = this.update(cx, |root, cx| {
                 if root.selected_wallet_id != active_wallet_id || root.selected_chain != chain_id {
                     return;
                 }
-                if root.public_form.action_generation != generation {
+                if !public_action_accepts_update(
+                    root.public_form.action_generation,
+                    generation,
+                    root.public_form.action_stopped,
+                ) {
                     return;
                 }
                 root.public_form.shielding = false;
+                root.public_form.action_task_abort_handle = None;
                 match result {
                     Ok(Ok(_result)) => {
                         root.public_form.action_command_tx = None;
@@ -1606,6 +1775,33 @@ fn render_public_action_active_status_notice(
                 });
             }),
         )
+}
+
+fn render_public_action_progress_footer(
+    root: Entity<WalletRoot>,
+    action: ProgressFooterAction,
+) -> gpui::Div {
+    let button_root = root;
+    let (id, label) = match action {
+        ProgressFooterAction::Stop => ("wallet-public-action-stop", "Stop"),
+        ProgressFooterAction::Close => ("wallet-public-action-close", "Close"),
+    };
+    let button = app_button(id, label).small().flex_none();
+    let button = match action {
+        ProgressFooterAction::Stop => button.danger().icon(Icon::new(RailgunActionIcon::Square)),
+        ProgressFooterAction::Close => button.outline(),
+    };
+    div()
+        .w_full()
+        .flex()
+        .justify_end()
+        .pt(px(2.0))
+        .child(button.on_click(move |_event, window, cx| {
+            button_root.update(cx, |root, cx| match action {
+                ProgressFooterAction::Stop => root.stop_public_action_progress(cx),
+                ProgressFooterAction::Close => root.close_public_action_progress_dialog(window, cx),
+            });
+        }))
 }
 
 pub(super) fn public_action_closed_active_step(
@@ -1942,7 +2138,15 @@ pub(super) fn render_public_action_step_marker(
             PublicActionStepStatus::Error => Icon::new(IconName::TriangleAlert)
                 .small()
                 .into_any_element(),
+            PublicActionStepStatus::Stopped => Icon::new(RailgunActionIcon::Square)
+                .small()
+                .into_any_element(),
         })
+}
+
+#[cfg(test)]
+pub(super) const fn public_action_step_uses_stop_marker(status: PublicActionStepStatus) -> bool {
+    matches!(status, PublicActionStepStatus::Stopped)
 }
 
 fn render_public_action_step_hash(step: PublicActionProgressStep, tx_hash: &str) -> gpui::Div {
@@ -1967,7 +2171,7 @@ pub(super) const fn public_action_step_color(status: PublicActionStepStatus) -> 
         PublicActionStepStatus::NotStarted => theme::TEXT,
         PublicActionStepStatus::Pending => theme::WARNING,
         PublicActionStepStatus::Done => theme::SUCCESS,
-        PublicActionStepStatus::Error => theme::DANGER,
+        PublicActionStepStatus::Error | PublicActionStepStatus::Stopped => theme::DANGER,
     }
 }
 
@@ -1980,7 +2184,7 @@ const fn public_action_step_label(step: PublicActionProgressStep) -> &'static st
     }
 }
 
-const fn public_action_step_detail(
+pub(super) const fn public_action_step_detail(
     step: PublicActionProgressStep,
     status: PublicActionStepStatus,
 ) -> &'static str {
@@ -1994,6 +2198,7 @@ const fn public_action_step_detail(
         PublicActionStepStatus::Pending => "Broadcasting and waiting for confirmation.",
         PublicActionStepStatus::Done => "Confirmed on-chain.",
         PublicActionStepStatus::Error => "Failed.",
+        PublicActionStepStatus::Stopped => STOPPED_PROGRESS_MESSAGE,
     }
 }
 

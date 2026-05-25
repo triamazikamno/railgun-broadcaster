@@ -5,7 +5,7 @@ use gpui::{
     AppContext, Context, Entity, IntoElement, ParentElement, Pixels, SharedString, Styled, Window,
     div, prelude::FluentBuilder as _, px, rgb,
 };
-use gpui_component::{Sizable, WindowExt, button::ButtonVariants};
+use gpui_component::{Icon, Sizable, WindowExt, button::ButtonVariants};
 use ui::clipboard::clipboard_with_toast;
 use ui::controls::{app_button, app_muted_text, app_strong_text};
 use ui::theme;
@@ -19,7 +19,8 @@ use wallet_ops::{
 use super::gas_fee::{GasRetryInputs, format_gwei};
 use super::private_action::{delivery_element_id, private_action_title_row};
 use super::public_action::{
-    PublicActionStepStatus, public_action_step_color, render_public_action_step_marker,
+    ProgressFooterAction, PublicActionStepStatus, progress_footer_action, public_action_step_color,
+    render_public_action_step_marker,
 };
 use super::public_broadcaster_cost::{
     PrivateBroadcasterProgressContext, PublicBroadcasterCostDisplay, cost_estimate_detail_text,
@@ -30,6 +31,8 @@ use super::{
     DeliveryFormKind, PRIVATE_BROADCASTER_PROGRESS_DIALOG_WIDTH, UnshieldAssetKey, WalletRoot,
     format_native_token_amount_for_display, secondary_dialog_content_width,
 };
+
+use crate::assets::RailgunActionIcon;
 
 const PRIVATE_BROADCASTER_PROGRESS_STAGES: [TransactionGenerationStage; 6] = [
     TransactionGenerationStage::SelectingPrivateNotes,
@@ -44,6 +47,13 @@ const SELF_BROADCAST_PROGRESS_STAGES: [TransactionGenerationStage; 6] = [
     TransactionGenerationStage::SelectingPrivateNotes,
     TransactionGenerationStage::ProvingTransaction,
     TransactionGenerationStage::GeneratingPoiProofs,
+    TransactionGenerationStage::EstimatingSelfBroadcastGas,
+    TransactionGenerationStage::SigningSelfBroadcast,
+    TransactionGenerationStage::WaitingForSelfBroadcastReceipt,
+];
+const SELF_BROADCAST_UNSHIELD_PROGRESS_STAGES: [TransactionGenerationStage; 5] = [
+    TransactionGenerationStage::SelectingPrivateNotes,
+    TransactionGenerationStage::ProvingTransaction,
     TransactionGenerationStage::EstimatingSelfBroadcastGas,
     TransactionGenerationStage::SigningSelfBroadcast,
     TransactionGenerationStage::WaitingForSelfBroadcastReceipt,
@@ -80,6 +90,9 @@ pub(super) struct PrivateBroadcasterProgressState {
     pub(super) self_broadcast_attempts: Vec<SelfBroadcastAttemptInfo>,
     pub(super) self_broadcast_current_gas_fee: Option<(u128, u128)>,
     pub(super) self_broadcast_action_error: Option<Arc<str>>,
+    pub(super) task_abort_handle: Option<tokio::task::AbortHandle>,
+    pub(super) stop_available: bool,
+    pub(super) stopped: bool,
     pub(super) error: Option<Arc<str>>,
     pub(super) dialog_open: bool,
     pub(super) stage_seen: bool,
@@ -98,6 +111,7 @@ impl PrivateBroadcasterProgressState {
             && self.result.is_none()
             && self.self_broadcast_result.is_none()
             && self.error.is_none()
+            && !self.stopped
     }
 }
 
@@ -261,8 +275,55 @@ pub(super) fn private_broadcaster_progress_steps() -> Vec<PrivateBroadcasterProg
     progress_steps(&PRIVATE_BROADCASTER_PROGRESS_STAGES)
 }
 
-pub(super) fn self_broadcast_progress_steps() -> Vec<PrivateBroadcasterProgressStepState> {
-    progress_steps(&SELF_BROADCAST_PROGRESS_STAGES)
+pub(super) fn self_broadcast_progress_steps(
+    kind: DeliveryFormKind,
+) -> Vec<PrivateBroadcasterProgressStepState> {
+    match kind {
+        DeliveryFormKind::Send => progress_steps(&SELF_BROADCAST_PROGRESS_STAGES),
+        DeliveryFormKind::Unshield => progress_steps(&SELF_BROADCAST_UNSHIELD_PROGRESS_STAGES),
+    }
+}
+
+pub(super) fn ensure_self_broadcast_unshield_progress_stage(
+    steps: &mut Vec<PrivateBroadcasterProgressStepState>,
+    stage: TransactionGenerationStage,
+) {
+    if stage != TransactionGenerationStage::GeneratingPoiProofs
+        || steps.iter().any(|step| step.stage == stage)
+    {
+        return;
+    }
+    let insert_index = steps
+        .iter()
+        .position(|step| step.stage == TransactionGenerationStage::EstimatingSelfBroadcastGas)
+        .unwrap_or(steps.len());
+    let status = if steps
+        .get(insert_index)
+        .is_some_and(|step| step.status != PublicActionStepStatus::NotStarted)
+    {
+        PublicActionStepStatus::Done
+    } else {
+        PublicActionStepStatus::NotStarted
+    };
+    steps.insert(
+        insert_index,
+        PrivateBroadcasterProgressStepState {
+            stage,
+            status,
+            message: None,
+        },
+    );
+}
+
+fn ensure_private_broadcaster_progress_stage(
+    progress: &mut PrivateBroadcasterProgressState,
+    stage: TransactionGenerationStage,
+) {
+    if progress.flow == PrivateSubmissionProgressFlow::SelfBroadcast
+        && progress.kind == DeliveryFormKind::Unshield
+    {
+        ensure_self_broadcast_unshield_progress_stage(&mut progress.steps, stage);
+    }
 }
 
 fn progress_steps(
@@ -314,7 +375,102 @@ pub(super) fn private_broadcaster_closed_active_stage(
         .map(|(_, stage)| stage)
 }
 
+pub(super) const fn private_progress_stage_disables_stop(
+    flow: PrivateSubmissionProgressFlow,
+    stage: TransactionGenerationStage,
+) -> bool {
+    match flow {
+        PrivateSubmissionProgressFlow::PublicBroadcaster => matches!(
+            stage,
+            TransactionGenerationStage::PublishingToBroadcaster
+                | TransactionGenerationStage::WaitingForBroadcasterResponse
+        ),
+        PrivateSubmissionProgressFlow::SelfBroadcast => matches!(
+            stage,
+            TransactionGenerationStage::SigningSelfBroadcast
+                | TransactionGenerationStage::WaitingForSelfBroadcastReceipt
+        ),
+    }
+}
+
+pub(super) fn private_broadcaster_progress_footer_action(
+    progress: &PrivateBroadcasterProgressState,
+) -> ProgressFooterAction {
+    progress_footer_action(
+        progress.stop_available,
+        private_broadcaster_progress_is_terminal(progress),
+    )
+}
+
+pub(super) fn private_broadcaster_progress_is_terminal(
+    progress: &PrivateBroadcasterProgressState,
+) -> bool {
+    progress.stopped
+        || progress.result.is_some()
+        || progress.self_broadcast_result.is_some()
+        || progress.error.is_some()
+        || (!progress.steps.is_empty()
+            && (progress
+                .steps
+                .iter()
+                .all(|step| step.status == PublicActionStepStatus::Done)
+                || progress.steps.iter().any(|step| {
+                    matches!(
+                        step.status,
+                        PublicActionStepStatus::Error | PublicActionStepStatus::Stopped
+                    )
+                })))
+}
+
+pub(super) fn mark_private_broadcaster_active_step_stopped(
+    steps: &mut [PrivateBroadcasterProgressStepState],
+) -> bool {
+    let step_index = steps
+        .iter()
+        .position(|step| step.status == PublicActionStepStatus::Pending)
+        .or_else(|| {
+            steps
+                .iter()
+                .position(|step| step.status == PublicActionStepStatus::Error)
+        })
+        .or_else(|| {
+            steps
+                .iter()
+                .rposition(|step| step.status == PublicActionStepStatus::NotStarted)
+        });
+    let Some(step_index) = step_index else {
+        return false;
+    };
+    let step = &mut steps[step_index];
+    step.status = PublicActionStepStatus::Stopped;
+    step.message = None;
+    true
+}
+
 impl WalletRoot {
+    pub(super) fn clear_private_broadcaster_progress_state(&mut self) {
+        if let Some(mut progress) = self.private_broadcaster_progress.take()
+            && let Some(handle) = progress.task_abort_handle.take()
+        {
+            handle.abort();
+        }
+    }
+
+    pub(super) fn set_private_broadcaster_task_abort_handle(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        generation_id: u64,
+        handle: tokio::task::AbortHandle,
+    ) {
+        let Some(progress) = self.private_broadcaster_progress.as_mut() else {
+            return;
+        };
+        if progress.kind == kind && progress.key == key && progress.generation_id == generation_id {
+            progress.task_abort_handle = Some(handle);
+        }
+    }
+
     pub(super) fn start_private_broadcaster_progress(
         &mut self,
         kind: DeliveryFormKind,
@@ -347,6 +503,9 @@ impl WalletRoot {
             self_broadcast_attempts: Vec::new(),
             self_broadcast_current_gas_fee: None,
             self_broadcast_action_error: None,
+            task_abort_handle: None,
+            stop_available: true,
+            stopped: false,
             error: None,
             dialog_open,
             stage_seen: false,
@@ -379,7 +538,7 @@ impl WalletRoot {
             icon_path,
             recipient: Arc::from(recipient),
             gas_payer: Some(Arc::from(gas_payer)),
-            steps: self_broadcast_progress_steps(),
+            steps: self_broadcast_progress_steps(kind),
             estimate: None,
             result: None,
             self_broadcast_result: None,
@@ -387,6 +546,9 @@ impl WalletRoot {
             self_broadcast_attempts: Vec::new(),
             self_broadcast_current_gas_fee: current_gas_fee,
             self_broadcast_action_error: None,
+            task_abort_handle: None,
+            stop_available: true,
+            stopped: false,
             error: None,
             dialog_open,
             stage_seen: false,
@@ -427,14 +589,27 @@ impl WalletRoot {
                 ))
                 .on_close(move |_event, _window, cx| {
                     close_root.update(cx, |root, cx| {
-                        if let Some(progress) = root.private_broadcaster_progress.as_mut()
-                            && progress.kind == kind
-                            && progress.key == key
-                            && progress.generation_id == generation_id
-                        {
-                            progress.dialog_open = false;
-                            cx.notify();
+                        let matches_progress = root
+                            .private_broadcaster_progress
+                            .as_ref()
+                            .is_some_and(|progress| {
+                                progress.kind == kind
+                                    && progress.key == key
+                                    && progress.generation_id == generation_id
+                            });
+                        if !matches_progress {
+                            return;
                         }
+                        if root
+                            .private_broadcaster_progress
+                            .as_ref()
+                            .is_some_and(|progress| progress.stopped)
+                        {
+                            root.clear_private_broadcaster_progress_state();
+                        } else if let Some(progress) = root.private_broadcaster_progress.as_mut() {
+                            progress.dialog_open = false;
+                        }
+                        cx.notify();
                     });
                 })
                 .child(
@@ -446,6 +621,65 @@ impl WalletRoot {
                         ),
                 )
         });
+    }
+
+    fn stop_private_broadcaster_progress(&mut self, cx: &mut Context<'_, Self>) {
+        let Some(progress) = self.private_broadcaster_progress.as_mut() else {
+            return;
+        };
+        if private_broadcaster_progress_footer_action(progress) != ProgressFooterAction::Stop {
+            return;
+        }
+        let kind = progress.kind;
+        let key = progress.key;
+        let generation_id = progress.generation_id;
+        if let Some(handle) = progress.task_abort_handle.take() {
+            handle.abort();
+        }
+        progress.self_broadcast_command_tx = None;
+        progress.self_broadcast_action_error = None;
+        progress.stop_available = false;
+        progress.stopped = true;
+        progress.error = None;
+        mark_private_broadcaster_active_step_stopped(&mut progress.steps);
+
+        match kind {
+            DeliveryFormKind::Send => {
+                if let Some(form) = self.send_forms.get_mut(&key)
+                    && form.generation_id == generation_id
+                {
+                    form.generating = false;
+                    form.error = None;
+                }
+            }
+            DeliveryFormKind::Unshield => {
+                if let Some(form) = self.unshield_forms.get_mut(&key)
+                    && form.generation_id == generation_id
+                {
+                    form.generating = false;
+                    form.error = None;
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn close_private_broadcaster_progress_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self
+            .private_broadcaster_progress
+            .as_ref()
+            .is_some_and(|progress| progress.stopped)
+        {
+            self.clear_private_broadcaster_progress_state();
+        } else if let Some(progress) = self.private_broadcaster_progress.as_mut() {
+            progress.dialog_open = false;
+        }
+        window.close_dialog(cx);
+        cx.notify();
     }
 
     pub(super) fn update_private_broadcaster_progress_stage(
@@ -464,9 +698,44 @@ impl WalletRoot {
         }
         let should_open_dialog = !progress.stage_seen && !progress.dialog_open;
         progress.stage_seen = true;
+        if private_progress_stage_disables_stop(progress.flow, stage) {
+            progress.stop_available = false;
+        }
+        ensure_private_broadcaster_progress_stage(progress, stage);
         apply_private_broadcaster_progress_stage(&mut progress.steps, stage);
         cx.notify();
         should_open_dialog
+    }
+
+    pub(super) fn set_private_self_broadcast_unshield_poi_step(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        generation_id: u64,
+        required: bool,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(progress) = self.private_broadcaster_progress.as_mut() else {
+            return;
+        };
+        if !progress.accepts_update(kind, key, generation_id)
+            || progress.flow != PrivateSubmissionProgressFlow::SelfBroadcast
+            || progress.kind != DeliveryFormKind::Unshield
+        {
+            return;
+        }
+        if required {
+            ensure_self_broadcast_unshield_progress_stage(
+                &mut progress.steps,
+                TransactionGenerationStage::GeneratingPoiProofs,
+            );
+        } else if let Some(index) = progress.steps.iter().position(|step| {
+            step.stage == TransactionGenerationStage::GeneratingPoiProofs
+                && step.status == PublicActionStepStatus::NotStarted
+        }) {
+            progress.steps.remove(index);
+        }
+        cx.notify();
     }
 
     pub(super) fn finish_private_broadcaster_progress(
@@ -489,6 +758,8 @@ impl WalletRoot {
             final_stage,
             &result.result,
         );
+        progress.task_abort_handle = None;
+        progress.stop_available = false;
         progress.result = Some(result);
         progress.error = None;
         cx.notify();
@@ -509,6 +780,7 @@ impl WalletRoot {
         if !progress.accepts_update(kind, key, generation_id) {
             return;
         }
+        ensure_private_broadcaster_progress_stage(progress, final_stage);
         finish_private_self_broadcast_progress_steps_at_stage(
             &mut progress.steps,
             final_stage,
@@ -522,6 +794,8 @@ impl WalletRoot {
         progress.self_broadcast_action_error = None;
         progress.self_broadcast_result = Some(result);
         progress.self_broadcast_command_tx = None;
+        progress.task_abort_handle = None;
+        progress.stop_available = false;
         progress.error = None;
         cx.notify();
     }
@@ -541,6 +815,7 @@ impl WalletRoot {
         if !progress.accepts_update(kind, key, generation_id) {
             return;
         }
+        ensure_private_broadcaster_progress_stage(progress, final_stage);
         fail_private_broadcaster_progress_steps_at_stage(
             &mut progress.steps,
             final_stage,
@@ -549,6 +824,8 @@ impl WalletRoot {
         progress.self_broadcast_action_error = None;
         progress.error = Some(Arc::from(message));
         progress.self_broadcast_command_tx = None;
+        progress.task_abort_handle = None;
+        progress.stop_available = false;
         cx.notify();
     }
 
@@ -568,6 +845,7 @@ impl WalletRoot {
             return false;
         }
         progress.stage_seen = true;
+        ensure_private_broadcaster_progress_stage(progress, stage);
         fail_private_broadcaster_progress_steps_at_stage(&mut progress.steps, stage, message);
         progress.self_broadcast_action_error = None;
         cx.notify();
@@ -591,6 +869,7 @@ impl WalletRoot {
         progress.self_broadcast_current_gas_fee =
             Some((attempt.max_fee_per_gas, attempt.max_priority_fee_per_gas));
         progress.self_broadcast_action_error = None;
+        progress.stop_available = false;
         progress.self_broadcast_attempts.push(attempt);
         cx.notify();
     }
@@ -743,6 +1022,10 @@ impl WalletRoot {
                 delivery_element_id(progress.key, progress.kind, "progress-copy-self-tx"),
             ));
         }
+        content = content.child(render_private_broadcaster_progress_footer(
+            root.clone(),
+            progress,
+        ));
         content
     }
 
@@ -860,6 +1143,41 @@ fn render_self_broadcast_progress_context(progress: &PrivateBroadcasterProgressS
             ));
     }
     context
+}
+
+fn render_private_broadcaster_progress_footer(
+    root: Entity<WalletRoot>,
+    progress: &PrivateBroadcasterProgressState,
+) -> gpui::Div {
+    let action = private_broadcaster_progress_footer_action(progress);
+    let button_root = root;
+    let (id_suffix, label) = match action {
+        ProgressFooterAction::Stop => ("progress-stop", "Stop"),
+        ProgressFooterAction::Close => ("progress-close", "Close"),
+    };
+    let button = app_button(
+        delivery_element_id(progress.key, progress.kind, id_suffix),
+        label,
+    )
+    .small()
+    .flex_none();
+    let button = match action {
+        ProgressFooterAction::Stop => button.danger().icon(Icon::new(RailgunActionIcon::Square)),
+        ProgressFooterAction::Close => button.outline(),
+    };
+    div()
+        .w_full()
+        .flex()
+        .justify_end()
+        .pt(px(2.0))
+        .child(button.on_click(move |_event, window, cx| {
+            button_root.update(cx, |root, cx| match action {
+                ProgressFooterAction::Stop => root.stop_private_broadcaster_progress(cx),
+                ProgressFooterAction::Close => {
+                    root.close_private_broadcaster_progress_dialog(window, cx);
+                }
+            });
+        }))
 }
 
 pub(super) fn apply_private_broadcaster_progress_stage(
@@ -1093,6 +1411,7 @@ fn render_self_broadcast_step_action(
 ) -> Option<gpui::AnyElement> {
     if progress.flow != PrivateSubmissionProgressFlow::SelfBroadcast
         || progress.self_broadcast_command_tx.is_none()
+        || progress.stopped
         || progress.error.is_some()
         || progress.self_broadcast_result.is_some()
     {
@@ -1187,6 +1506,9 @@ const fn private_broadcaster_stage_detail(
         PublicActionStepStatus::Pending => stage.detail(),
         PublicActionStepStatus::Done => "Complete.",
         PublicActionStepStatus::Error => "Failed.",
+        PublicActionStepStatus::Stopped => {
+            "Stopped locally. Already-submitted network work may continue."
+        }
     }
 }
 

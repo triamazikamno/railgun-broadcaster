@@ -657,7 +657,7 @@ impl WalletRoot {
         self.unshield_forms.clear();
         self.reset_public_wallet_state(window, cx);
         self.private_action_form = None;
-        self.private_broadcaster_progress = None;
+        self.clear_private_broadcaster_progress_state();
         self.broadcaster_picker = None;
         self.active_wallet_tab = WalletTab::default();
         self.setup_password = None;

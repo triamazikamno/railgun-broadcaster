@@ -131,9 +131,12 @@ use private_assets::{
 };
 #[cfg(test)]
 use private_broadcaster::{
-    apply_private_broadcaster_progress_stage, fail_private_broadcaster_progress_steps_at_stage,
-    finish_private_broadcaster_progress_steps, finish_private_broadcaster_progress_steps_at_stage,
-    finish_private_self_broadcast_progress_steps_at_stage, private_broadcaster_progress_steps,
+    apply_private_broadcaster_progress_stage, ensure_self_broadcast_unshield_progress_stage,
+    fail_private_broadcaster_progress_steps_at_stage, finish_private_broadcaster_progress_steps,
+    finish_private_broadcaster_progress_steps_at_stage,
+    finish_private_self_broadcast_progress_steps_at_stage,
+    mark_private_broadcaster_active_step_stopped, private_broadcaster_progress_footer_action,
+    private_broadcaster_progress_steps, private_progress_stage_disables_stop,
     self_broadcast_progress_steps,
 };
 #[cfg(test)]
@@ -145,9 +148,13 @@ use public_account::{
 };
 #[cfg(test)]
 use public_action::{
-    PublicActionStepState, PublicActionStepStatus, public_action_closed_active_step,
-    public_action_error_copy_value, public_action_error_details, public_action_error_summary,
-    public_action_max_amount_after_reserve, public_action_progress_steps,
+    ProgressFooterAction, PublicActionStepState, PublicActionStepStatus,
+    mark_public_action_active_step_stopped, progress_footer_action, public_action_accepts_update,
+    public_action_closed_active_step, public_action_error_copy_value, public_action_error_details,
+    public_action_error_summary, public_action_max_amount_after_reserve,
+    public_action_progress_footer_action, public_action_progress_steps, public_action_step_color,
+    public_action_step_detail, public_action_step_is_final_handoff,
+    public_action_step_uses_stop_marker,
 };
 #[cfg(test)]
 use public_balances::{
@@ -560,6 +567,9 @@ impl WalletRoot {
             action_progress_dialog_open: false,
             action_progress_asset_label: Arc::from(""),
             action_progress_icon_path: None,
+            action_task_abort_handle: None,
+            action_stop_available: false,
+            action_stopped: false,
             action_command_tx: None,
             action_attempts: Vec::new(),
             action_current_gas_fee: None,
