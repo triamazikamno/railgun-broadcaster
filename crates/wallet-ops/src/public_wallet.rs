@@ -2,10 +2,11 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
-use alloy::network::{EthereumWallet, TransactionBuilder as _};
-use alloy::primitives::{Address, U256};
+use alloy::eips::Encodable2718;
+use alloy::network::{EthereumWallet, NetworkTransactionBuilder, TransactionBuilder as _};
+use alloy::primitives::{Address, FixedBytes, U256, keccak256};
 use alloy::providers::{CallItem, Provider};
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol;
@@ -22,11 +23,23 @@ use crate::settings::{EffectiveChainConfig, EffectiveChainGasSettings, Effective
 use crate::signer::{EvmMessageSigner, EvmTransactionSigner, SoftwareEvmSigner};
 use crate::vault::{DesktopVaultStore, DesktopViewSession, PublicAccountMetadata};
 use crate::{
-    GAS_LIMIT_BUFFER, HttpContext, ShieldSendOutput, TxReceiptOutput, WETH_DEPOSIT_SELECTOR,
-    buffered_gas_price_from_rpc_pool, buffered_gas_price_with_policy, chain_defaults_for_chain,
-    effective_rpc_urls_for_chain, query_rpc_pool_with_http_client,
-    sign_send_wait_with_sent_with_gas_buffer,
+    GAS_LIMIT_BUFFER, HttpContext, SelfBroadcastTipFallback, ShieldSendOutput, TxReceiptOutput,
+    WETH_DEPOSIT_SELECTOR, chain_defaults_for_chain, effective_rpc_urls_for_chain,
+    query_rpc_pool_with_http_client, report_chain_string, resolve_self_broadcast_gas_fee,
+    self_broadcast_gas_fee_quote_from_rpc_pool_with_tip_fallback,
+    self_broadcast_replacement_bumped_fee, self_broadcast_send_raw_transaction_to_rpc_pool,
+    tx_receipt_output,
 };
+
+pub type PublicActionGasFeeQuote = crate::SelfBroadcastGasFeeQuote;
+pub type PublicActionGasFeeSelection = crate::SelfBroadcastGasFeeSelection;
+pub type PublicActionCommandKind = crate::SelfBroadcastCommandKind;
+pub type PublicActionCommand = crate::SelfBroadcastCommand;
+pub type PublicActionCommandSender = tokio::sync::mpsc::UnboundedSender<PublicActionCommand>;
+pub type PublicActionCommandReceiver = tokio::sync::mpsc::UnboundedReceiver<PublicActionCommand>;
+pub type PublicActionAttemptInfo = crate::SelfBroadcastAttemptInfo;
+pub type PublicActionSessionEventSender =
+    tokio::sync::mpsc::UnboundedSender<PublicActionSessionEvent>;
 
 sol! {
     interface PublicErc20 {
@@ -44,6 +57,7 @@ const PUBLIC_NATIVE_SEND_GAS_UNITS: u64 = 21_000;
 const PUBLIC_NATIVE_WRAP_GAS_UNITS: u64 = 50_000;
 const PUBLIC_NATIVE_APPROVE_GAS_UNITS: u64 = 65_000;
 const PUBLIC_NATIVE_SHIELD_GAS_UNITS: u64 = 650_000;
+const PUBLIC_ACTION_BNB_CHAIN_ID: u64 = 56;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PublicAssetId {
@@ -164,6 +178,9 @@ pub struct PublicSendRequest {
     pub asset: PublicAssetId,
     pub amount: U256,
     pub recipient: Address,
+    pub gas_fee: PublicActionGasFeeSelection,
+    pub command_rx: Option<PublicActionCommandReceiver>,
+    pub event_tx: Option<PublicActionSessionEventSender>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,6 +197,9 @@ pub struct PublicShieldRequest {
     pub public_account_uuid: String,
     pub asset: PublicAssetId,
     pub amount: U256,
+    pub gas_fee: PublicActionGasFeeSelection,
+    pub command_rx: Option<PublicActionCommandReceiver>,
+    pub event_tx: Option<PublicActionSessionEventSender>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -203,6 +223,22 @@ pub struct PublicActionProgressUpdate {
     pub status: PublicActionProgressStatus,
     pub tx_hash: Option<String>,
     pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublicActionSessionEvent {
+    StepFailed {
+        step: PublicActionProgressStep,
+        message: String,
+    },
+    AttemptSubmitted {
+        step: PublicActionProgressStep,
+        attempt: PublicActionAttemptInfo,
+    },
+    AttemptRejected {
+        step: PublicActionProgressStep,
+        message: String,
+    },
 }
 
 #[must_use]
@@ -269,38 +305,74 @@ fn public_native_action_gas_units_with_buffer(
 
 #[must_use]
 pub fn public_native_action_gas_reserve(
-    gas_price: u128,
+    max_fee_per_gas: u128,
     steps: &[PublicActionProgressStep],
 ) -> U256 {
-    public_native_action_gas_reserve_with_buffer(gas_price, steps, GAS_LIMIT_BUFFER)
+    public_native_action_gas_reserve_with_buffer(max_fee_per_gas, steps, GAS_LIMIT_BUFFER)
 }
 
 #[must_use]
 fn public_native_action_gas_reserve_with_buffer(
-    gas_price: u128,
+    max_fee_per_gas: u128,
     steps: &[PublicActionProgressStep],
     gas_limit_buffer: u64,
 ) -> U256 {
     U256::from(public_native_action_gas_units_with_buffer(
         steps,
         gas_limit_buffer,
-    )) * U256::from(gas_price)
+    )) * U256::from(max_fee_per_gas)
+}
+
+pub async fn quote_public_action_gas_fee(
+    chain_id: u64,
+    effective_chain: Option<&EffectiveChainConfig>,
+    http: &HttpContext,
+) -> Result<PublicActionGasFeeQuote> {
+    let chain = public_chain_runtime_config(chain_id, effective_chain)?;
+    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
+    public_action_gas_fee_quote_from_rpc_pool(&query_rpc_pool, http.network_mode(), chain_id).await
 }
 
 pub async fn estimate_public_native_action_gas_reserve(
     chain_id: u64,
     steps: &[PublicActionProgressStep],
     effective_chain: Option<&EffectiveChainConfig>,
+    gas_fee: PublicActionGasFeeSelection,
     http: &HttpContext,
 ) -> Result<U256> {
     let chain = public_chain_runtime_config(chain_id, effective_chain)?;
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
-    let gas_price = buffered_gas_price_from_rpc_pool(&query_rpc_pool, &chain.gas).await?;
+    let quote =
+        public_action_gas_fee_quote_from_rpc_pool(&query_rpc_pool, http.network_mode(), chain_id)
+            .await
+            .wrap_err("fetch public action gas price")?;
+    let gas = resolve_self_broadcast_gas_fee(gas_fee, quote)?;
     Ok(public_native_action_gas_reserve_with_buffer(
-        gas_price,
+        gas.max_fee_per_gas,
         steps,
         chain.gas.gas_limit_buffer,
     ))
+}
+
+async fn public_action_gas_fee_quote_from_rpc_pool(
+    query_rpc_pool: &QueryRpcPool,
+    network_mode: crate::WalletNetworkMode,
+    chain_id: u64,
+) -> Result<PublicActionGasFeeQuote> {
+    self_broadcast_gas_fee_quote_from_rpc_pool_with_tip_fallback(
+        query_rpc_pool,
+        network_mode,
+        public_action_tip_fallback(chain_id),
+    )
+    .await
+}
+
+const fn public_action_tip_fallback(chain_id: u64) -> SelfBroadcastTipFallback {
+    if chain_id == PUBLIC_ACTION_BNB_CHAIN_ID {
+        SelfBroadcastTipFallback::RpcGasPrice
+    } else {
+        SelfBroadcastTipFallback::Minimum
+    }
 }
 
 const fn public_native_step_gas_units(step: PublicActionProgressStep) -> u64 {
@@ -442,28 +514,32 @@ pub async fn submit_public_send_with_progress(
     let from_address = signer.address();
     let wallet = signer.ethereum_wallet();
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
-    let (provider_handle, gas_price, nonce) =
-        public_action_provider_with_nonce(&query_rpc_pool, from_address, &chain.gas).await?;
-    let provider = provider_handle.provider;
     let tx_req = public_send_transaction_request(
         request.chain_id,
         from_address,
         request.asset,
         request.amount,
         request.recipient,
-        gas_price,
-        nonce,
     );
-    let tx = sign_public_action_step(
+    let mut command_rx = request.command_rx;
+    let tx = submit_public_action_step_session(
         PublicActionProgressStep::Send,
-        &provider,
-        &wallet,
         tx_req,
+        &wallet,
         "public-send",
-        chain.gas.gas_limit_buffer,
+        &query_rpc_pool,
+        http.network_mode(),
+        request.chain_id,
+        from_address,
+        &chain.gas,
+        None,
+        request.gas_fee,
+        &mut command_rx,
+        request.event_tx.as_ref(),
         &mut progress,
     )
-    .await?;
+    .await?
+    .receipt;
     if !tx.status {
         return Err(eyre!("public send transaction reverted ({})", tx.tx_hash));
     }
@@ -517,9 +593,10 @@ pub async fn submit_public_shield_with_progress(
     let from_address = signer.address();
     let wallet = signer.ethereum_wallet();
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
-    let (provider_handle, gas_price, mut nonce) =
-        public_action_provider_with_nonce(&query_rpc_pool, from_address, &chain.gas).await?;
-    let provider = provider_handle.provider;
+    let mut nonce = None;
+    let mut gas_fee = request.gas_fee;
+    let mut command_rx = request.command_rx;
+    let event_tx = request.event_tx;
 
     let wrap_receipt = if request.asset == PublicAssetId::Native {
         let tx_req = TransactionRequest::default()
@@ -528,25 +605,33 @@ pub async fn submit_public_shield_with_progress(
             .with_to(token)
             .with_input(WETH_DEPOSIT_SELECTOR.to_vec())
             .with_value(request.amount)
-            .with_gas_price(gas_price)
-            .with_nonce(nonce);
-        let receipt = sign_public_action_step(
+            .with_nonce(0);
+        let outcome = submit_public_action_step_session(
             PublicActionProgressStep::Wrap,
-            &provider,
-            &wallet,
             tx_req,
+            &wallet,
             "public-shield-wrap",
-            chain.gas.gas_limit_buffer,
+            &query_rpc_pool,
+            http.network_mode(),
+            request.chain_id,
+            from_address,
+            &chain.gas,
+            nonce,
+            gas_fee,
+            &mut command_rx,
+            event_tx.as_ref(),
             &mut progress,
         )
         .await?;
+        let receipt = outcome.receipt;
         if !receipt.status {
             return Err(eyre!(
                 "public shield wrap transaction reverted ({})",
                 receipt.tx_hash
             ));
         }
-        nonce += 1;
+        nonce = Some(outcome.next_nonce);
+        gas_fee = outcome.gas_fee;
         Some(receipt)
     } else {
         None
@@ -557,43 +642,58 @@ pub async fn submit_public_shield_with_progress(
         .with_from(from_address)
         .with_to(token)
         .with_input(approve_data)
-        .with_gas_price(gas_price)
-        .with_nonce(nonce);
-    let approve_receipt = sign_public_action_step(
+        .with_nonce(0);
+    let approve_outcome = submit_public_action_step_session(
         PublicActionProgressStep::Approve,
-        &provider,
-        &wallet,
         approve_tx,
+        &wallet,
         "public-shield-approve",
-        chain.gas.gas_limit_buffer,
+        &query_rpc_pool,
+        http.network_mode(),
+        request.chain_id,
+        from_address,
+        &chain.gas,
+        nonce,
+        gas_fee,
+        &mut command_rx,
+        event_tx.as_ref(),
         &mut progress,
     )
     .await?;
+    let approve_receipt = approve_outcome.receipt;
     if !approve_receipt.status {
         return Err(eyre!(
             "public shield approve transaction reverted ({})",
             approve_receipt.tx_hash
         ));
     }
-    nonce += 1;
+    nonce = Some(approve_outcome.next_nonce);
+    gas_fee = approve_outcome.gas_fee;
 
     let shield_tx = TransactionRequest::default()
         .with_chain_id(request.chain_id)
         .with_from(from_address)
         .with_to(chain.railgun_contract)
         .with_input(shield_data)
-        .with_gas_price(gas_price)
-        .with_nonce(nonce);
-    let shield_receipt = sign_public_action_step(
+        .with_nonce(0);
+    let shield_receipt = submit_public_action_step_session(
         PublicActionProgressStep::Shield,
-        &provider,
-        &wallet,
         shield_tx,
+        &wallet,
         "public-shield",
-        chain.gas.gas_limit_buffer,
+        &query_rpc_pool,
+        http.network_mode(),
+        request.chain_id,
+        from_address,
+        &chain.gas,
+        nonce,
+        gas_fee,
+        &mut command_rx,
+        event_tx.as_ref(),
         &mut progress,
     )
-    .await?;
+    .await?
+    .receipt;
     if !shield_receipt.status {
         return Err(eyre!(
             "public shield transaction reverted ({})",
@@ -608,68 +708,542 @@ pub async fn submit_public_shield_with_progress(
     })
 }
 
-async fn sign_public_action_step(
+struct PublicActionStepOutcome {
+    receipt: TxReceiptOutput,
+    next_nonce: u64,
+    gas_fee: PublicActionGasFeeSelection,
+}
+
+struct PublicActionPreflight {
+    tx_req: TransactionRequest,
+    nonce: u64,
+    gas_limit: u64,
+    rpc_gas_price: u128,
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+    estimated_native_gas_cost: U256,
+    live_native_balance: U256,
+}
+
+struct SubmittedPublicActionAttempt {
+    provider_handles: Vec<ProviderHandle>,
+    tx_hash: FixedBytes<32>,
+    info: PublicActionAttemptInfo,
+    rpc_gas_price: u128,
+    estimated_native_gas_cost: U256,
+    live_native_balance: U256,
+}
+
+struct PublicActionSentTx {
+    tx_hash: FixedBytes<32>,
+    tx_hash_string: String,
+    provider_handles: Vec<ProviderHandle>,
+}
+
+async fn submit_public_action_step_session(
     step: PublicActionProgressStep,
-    provider: &(impl Provider + Clone),
+    base_tx_req: TransactionRequest,
+    wallet: &EthereumWallet,
+    label: &str,
+    query_rpc_pool: &QueryRpcPool,
+    network_mode: crate::WalletNetworkMode,
+    chain_id: u64,
+    from_address: Address,
+    gas: &EffectiveChainGasSettings,
+    mut nonce: Option<u64>,
+    gas_fee: PublicActionGasFeeSelection,
+    command_rx: &mut Option<PublicActionCommandReceiver>,
+    event_tx: Option<&PublicActionSessionEventSender>,
+    progress: &mut (impl FnMut(PublicActionProgressUpdate) + Send),
+) -> Result<PublicActionStepOutcome> {
+    let mut next_gas_fee = gas_fee;
+    let mut submitted_attempts = Vec::new();
+
+    loop {
+        progress(public_action_progress_update(
+            step,
+            PublicActionProgressStatus::Pending,
+            None,
+            None,
+        ));
+
+        let preflight = match public_action_preflight_from_rpc_pool(
+            query_rpc_pool,
+            network_mode,
+            chain_id,
+            from_address,
+            base_tx_req.clone(),
+            next_gas_fee,
+            gas,
+            nonce,
+            None,
+        )
+        .await
+        {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                let message = report_chain_string(&error);
+                progress(public_action_progress_update(
+                    step,
+                    PublicActionProgressStatus::Error,
+                    None,
+                    Some(message.clone()),
+                ));
+                emit_public_action_event(
+                    event_tx,
+                    PublicActionSessionEvent::StepFailed { step, message },
+                );
+                let Some(command) = recv_public_action_command(command_rx).await else {
+                    return Err(error);
+                };
+                next_gas_fee = command.gas_fee;
+                continue;
+            }
+        };
+        nonce = Some(preflight.nonce);
+
+        let attempt = match submit_public_action_attempt(
+            step,
+            preflight,
+            query_rpc_pool,
+            network_mode,
+            wallet,
+            label,
+            event_tx,
+        )
+        .await
+        {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                let message = report_chain_string(&error);
+                progress(public_action_progress_update(
+                    step,
+                    PublicActionProgressStatus::Error,
+                    None,
+                    Some(message.clone()),
+                ));
+                emit_public_action_event(
+                    event_tx,
+                    PublicActionSessionEvent::StepFailed { step, message },
+                );
+                let Some(command) = recv_public_action_command(command_rx).await else {
+                    return Err(error);
+                };
+                next_gas_fee = command.gas_fee;
+                continue;
+            }
+        };
+        progress(public_action_progress_update(
+            step,
+            PublicActionProgressStatus::Pending,
+            Some(attempt.info.tx_hash.clone()),
+            None,
+        ));
+        submitted_attempts.push(attempt);
+
+        loop {
+            let receipt = if command_rx.is_some() {
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_secs(3)) => {
+                        poll_public_action_attempt_receipts(&submitted_attempts).await?
+                    }
+                    command = recv_public_action_command(command_rx) => {
+                        let Some(command) = command else {
+                            *command_rx = None;
+                            continue;
+                        };
+                        let Some(nonce) = nonce else {
+                            next_gas_fee = command.gas_fee;
+                            break;
+                        };
+                        let gas_limit = submitted_attempts
+                            .last()
+                            .map_or(0, |attempt| attempt.info.gas_limit);
+                        let replacement = match public_action_preflight_from_rpc_pool(
+                            query_rpc_pool,
+                            network_mode,
+                            chain_id,
+                            from_address,
+                            base_tx_req.clone(),
+                            command.gas_fee,
+                            gas,
+                            Some(nonce),
+                            Some(gas_limit),
+                        )
+                        .await
+                        {
+                            Ok(preflight) => preflight,
+                            Err(error) => {
+                                emit_public_action_event(
+                                    event_tx,
+                                    PublicActionSessionEvent::AttemptRejected {
+                                        step,
+                                        message: report_chain_string(&error),
+                                    },
+                                );
+                                continue;
+                            }
+                        };
+                        match submit_public_action_attempt(
+                            step,
+                            replacement,
+                            query_rpc_pool,
+                            network_mode,
+                            wallet,
+                            label,
+                            event_tx,
+                        )
+                        .await
+                        {
+                            Ok(attempt) => {
+                                progress(public_action_progress_update(
+                                    step,
+                                    PublicActionProgressStatus::Pending,
+                                    Some(attempt.info.tx_hash.clone()),
+                                    None,
+                                ));
+                                submitted_attempts.push(attempt);
+                            }
+                            Err(error) => emit_public_action_event(
+                                event_tx,
+                                PublicActionSessionEvent::AttemptRejected {
+                                    step,
+                                    message: report_chain_string(&error),
+                                },
+                            ),
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                poll_public_action_attempt_receipts(&submitted_attempts).await?
+            };
+
+            if let Some((winner_index, receipt)) = receipt {
+                let winner = &submitted_attempts[winner_index];
+                tracing::info!(
+                    step = ?step,
+                    tx_hash = %receipt.tx_hash,
+                    rpc_gas_price = winner.rpc_gas_price,
+                    estimated_native_gas_cost = %winner.estimated_native_gas_cost,
+                    live_native_balance = %winner.live_native_balance,
+                    "public action receipt confirmed from submitted attempts"
+                );
+                if receipt.status {
+                    progress(public_action_progress_update(
+                        step,
+                        PublicActionProgressStatus::Done,
+                        Some(receipt.tx_hash.clone()),
+                        None,
+                    ));
+                } else {
+                    progress(public_action_progress_update(
+                        step,
+                        PublicActionProgressStatus::Error,
+                        Some(receipt.tx_hash.clone()),
+                        Some("Transaction reverted".to_string()),
+                    ));
+                }
+                let gas_fee = PublicActionGasFeeSelection::Custom {
+                    max_fee_per_gas: winner.info.max_fee_per_gas,
+                    max_priority_fee_per_gas: winner.info.max_priority_fee_per_gas,
+                };
+                return Ok(PublicActionStepOutcome {
+                    receipt,
+                    next_nonce: winner.info.nonce.saturating_add(1),
+                    gas_fee,
+                });
+            }
+        }
+    }
+}
+
+async fn submit_public_action_attempt(
+    step: PublicActionProgressStep,
+    preflight: PublicActionPreflight,
+    query_rpc_pool: &QueryRpcPool,
+    network_mode: crate::WalletNetworkMode,
+    wallet: &EthereumWallet,
+    label: &str,
+    event_tx: Option<&PublicActionSessionEventSender>,
+) -> Result<SubmittedPublicActionAttempt> {
+    let sent = sign_send_public_action_transaction(
+        query_rpc_pool,
+        network_mode,
+        wallet,
+        preflight.tx_req,
+        label,
+    )
+    .await?;
+    let info = PublicActionAttemptInfo {
+        tx_hash: sent.tx_hash_string,
+        nonce: preflight.nonce,
+        gas_limit: preflight.gas_limit,
+        max_fee_per_gas: preflight.max_fee_per_gas,
+        max_priority_fee_per_gas: preflight.max_priority_fee_per_gas,
+    };
+    emit_public_action_event(
+        event_tx,
+        PublicActionSessionEvent::AttemptSubmitted {
+            step,
+            attempt: info.clone(),
+        },
+    );
+    Ok(SubmittedPublicActionAttempt {
+        provider_handles: sent.provider_handles,
+        tx_hash: sent.tx_hash,
+        info,
+        rpc_gas_price: preflight.rpc_gas_price,
+        estimated_native_gas_cost: preflight.estimated_native_gas_cost,
+        live_native_balance: preflight.live_native_balance,
+    })
+}
+
+async fn public_action_preflight_from_rpc_pool(
+    query_rpc_pool: &QueryRpcPool,
+    network_mode: crate::WalletNetworkMode,
+    chain_id: u64,
+    from: Address,
+    base_tx_req: TransactionRequest,
+    gas_fee: PublicActionGasFeeSelection,
+    gas: &EffectiveChainGasSettings,
+    nonce: Option<u64>,
+    gas_limit: Option<u64>,
+) -> Result<PublicActionPreflight> {
+    let quote = public_action_gas_fee_quote_from_rpc_pool(query_rpc_pool, network_mode, chain_id)
+        .await
+        .wrap_err("fetch public action gas price")?;
+    let mut last_error = None;
+    for _ in 0..query_rpc_pool.len() {
+        let Some(provider_handle) = query_rpc_pool.random_provider() else {
+            break;
+        };
+        match public_action_preflight(
+            provider_handle,
+            chain_id,
+            from,
+            base_tx_req.clone(),
+            gas_fee,
+            quote,
+            gas,
+            nonce,
+            gas_limit,
+        )
+        .await
+        {
+            Ok(preflight) => return Ok(preflight),
+            Err(error) => {
+                tracing::warn!(%error, "public action preflight failed");
+                last_error = Some(error);
+            }
+        }
+    }
+    if let Some(error) = last_error {
+        Err(error).wrap_err("all public action query RPC attempts failed")
+    } else {
+        Err(eyre!("no healthy query RPC available"))
+    }
+}
+
+async fn public_action_preflight(
+    provider_handle: ProviderHandle,
+    chain_id: u64,
+    from: Address,
+    base_tx_req: TransactionRequest,
+    gas_fee: PublicActionGasFeeSelection,
+    quote: PublicActionGasFeeQuote,
+    gas: &EffectiveChainGasSettings,
+    nonce: Option<u64>,
+    gas_limit: Option<u64>,
+) -> Result<PublicActionPreflight> {
+    let provider = &provider_handle.provider;
+    let resolved = resolve_self_broadcast_gas_fee(gas_fee, quote)?;
+    let nonce = if let Some(nonce) = nonce {
+        nonce
+    } else {
+        provider
+            .get_transaction_count(from)
+            .await
+            .wrap_err("fetch public action nonce")?
+    };
+    let tx_req = public_action_eip1559_transaction_request(
+        base_tx_req,
+        chain_id,
+        from,
+        resolved.max_fee_per_gas,
+        resolved.max_priority_fee_per_gas,
+        nonce,
+    );
+    let gas_limit = if let Some(gas_limit) = gas_limit {
+        gas_limit
+    } else {
+        provider
+            .estimate_gas(tx_req.clone())
+            .await
+            .wrap_err("estimate public action gas")?
+            .saturating_add(gas.gas_limit_buffer)
+    };
+    let estimated_native_gas_cost = public_action_native_gas_cost(
+        tx_req.value.unwrap_or_default(),
+        gas_limit,
+        resolved.max_fee_per_gas,
+    );
+    let live_native_balance = provider
+        .get_balance(from)
+        .await
+        .wrap_err("fetch public action native balance")?;
+    if live_native_balance < estimated_native_gas_cost {
+        return Err(eyre!(
+            "insufficient native gas for public action: live balance {live_native_balance}, estimated max cost {estimated_native_gas_cost}"
+        ));
+    }
+    Ok(PublicActionPreflight {
+        tx_req: tx_req.with_gas_limit(gas_limit),
+        nonce,
+        gas_limit,
+        rpc_gas_price: resolved.rpc_gas_price,
+        max_fee_per_gas: resolved.max_fee_per_gas,
+        max_priority_fee_per_gas: resolved.max_priority_fee_per_gas,
+        estimated_native_gas_cost,
+        live_native_balance,
+    })
+}
+
+fn public_action_eip1559_transaction_request(
+    tx_req: TransactionRequest,
+    chain_id: u64,
+    from: Address,
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+    nonce: u64,
+) -> TransactionRequest {
+    tx_req
+        .with_chain_id(chain_id)
+        .with_from(from)
+        .with_max_fee_per_gas(max_fee_per_gas)
+        .with_max_priority_fee_per_gas(max_priority_fee_per_gas)
+        .with_nonce(nonce)
+}
+
+fn public_action_native_gas_cost(value: U256, gas_limit: u64, max_fee_per_gas: u128) -> U256 {
+    value + (U256::from(gas_limit) * U256::from(max_fee_per_gas))
+}
+
+async fn sign_send_public_action_transaction(
+    query_rpc_pool: &QueryRpcPool,
+    network_mode: crate::WalletNetworkMode,
     wallet: &EthereumWallet,
     tx_req: TransactionRequest,
     label: &str,
-    gas_limit_buffer: u64,
-    progress: &mut (impl FnMut(PublicActionProgressUpdate) + Send),
-) -> Result<TxReceiptOutput> {
-    progress(public_action_progress_update(
-        step,
-        PublicActionProgressStatus::Pending,
-        None,
-        None,
-    ));
-    let mut sent_hash = None;
-    let receipt = match sign_send_wait_with_sent_with_gas_buffer(
-        provider,
-        wallet,
-        tx_req,
+) -> Result<PublicActionSentTx> {
+    tracing::info!(
+        from = %tx_req.from.unwrap_or_default(),
+        to = ?tx_req.to,
+        gas = ?tx_req.gas,
         label,
-        gas_limit_buffer,
-        |tx_hash| {
-            sent_hash = Some(tx_hash.clone());
-            progress(public_action_progress_update(
-                step,
-                PublicActionProgressStatus::Pending,
-                Some(tx_hash),
-                None,
-            ));
-        },
+        "signing and sending public action transaction",
+    );
+    let signed_tx = tx_req
+        .build(wallet)
+        .await
+        .wrap_err_with(|| format!("{label}: sign"))?
+        .encoded_2718();
+    let tx_hash = keccak256(&signed_tx);
+    let provider_handles = self_broadcast_send_raw_transaction_to_rpc_pool(
+        query_rpc_pool,
+        network_mode,
+        signed_tx,
+        tx_hash,
     )
     .await
-    {
-        Ok(receipt) => receipt,
-        Err(error) => {
-            let message = format_report_chain(&error);
-            progress(public_action_progress_update(
-                step,
-                PublicActionProgressStatus::Error,
-                sent_hash,
-                Some(message),
-            ));
-            return Err(error);
+    .wrap_err_with(|| format!("{label}: send"))?;
+    let tx_hash_string = alloy::hex::encode_prefixed(tx_hash);
+    tracing::info!(%tx_hash, providers = provider_handles.len(), label, "sent public action transaction");
+    Ok(PublicActionSentTx {
+        tx_hash,
+        tx_hash_string,
+        provider_handles,
+    })
+}
+
+async fn poll_public_action_attempt_receipts(
+    attempts: &[SubmittedPublicActionAttempt],
+) -> Result<Option<(usize, TxReceiptOutput)>> {
+    let mut queried_provider_count = 0;
+    let mut pending_response_count = 0;
+    let mut last_error = None;
+    for (index, attempt) in attempts.iter().enumerate() {
+        for provider_handle in &attempt.provider_handles {
+            match provider_handle
+                .provider
+                .get_transaction_receipt(attempt.tx_hash)
+                .await
+            {
+                Ok(Some(receipt)) => {
+                    return Ok(Some((index, tx_receipt_output(attempt.tx_hash, &receipt))));
+                }
+                Ok(None) => {
+                    queried_provider_count += 1;
+                    pending_response_count += 1;
+                }
+                Err(error) => {
+                    queried_provider_count += 1;
+                    last_error = Some(format!("{}: {error}", provider_handle.url));
+                    tracing::warn!(
+                        url = %provider_handle.url,
+                        %error,
+                        "public action receipt fetch failed"
+                    );
+                }
+            }
         }
-    };
-    if receipt.status {
-        progress(public_action_progress_update(
-            step,
-            PublicActionProgressStatus::Done,
-            Some(receipt.tx_hash.clone()),
-            None,
-        ));
-    } else {
-        progress(public_action_progress_update(
-            step,
-            PublicActionProgressStatus::Error,
-            Some(receipt.tx_hash.clone()),
-            Some("Transaction reverted".to_string()),
-        ));
     }
-    Ok(receipt)
+    if let Some(message) = public_action_receipt_poll_error_message(
+        queried_provider_count,
+        pending_response_count,
+        last_error,
+    ) {
+        return Err(eyre!("{message}"));
+    }
+    Ok(None)
+}
+
+#[must_use]
+fn public_action_receipt_poll_error_message(
+    queried_provider_count: usize,
+    pending_response_count: usize,
+    last_error: Option<String>,
+) -> Option<String> {
+    if queried_provider_count == 0 || pending_response_count > 0 {
+        return None;
+    }
+    last_error.map(|error| {
+        format!(
+            "public action receipt fetch failed for all accepted RPC providers ({queried_provider_count} checked): {error}"
+        )
+    })
+}
+
+fn emit_public_action_event(
+    event_tx: Option<&PublicActionSessionEventSender>,
+    event: PublicActionSessionEvent,
+) {
+    if let Some(event_tx) = event_tx {
+        let _ = event_tx.send(event);
+    }
+}
+
+async fn recv_public_action_command(
+    command_rx: &mut Option<PublicActionCommandReceiver>,
+) -> Option<PublicActionCommand> {
+    let command_rx = command_rx.as_mut()?;
+    command_rx.recv().await
+}
+
+#[must_use]
+pub const fn public_action_replacement_bumped_fee(value: u128) -> u128 {
+    self_broadcast_replacement_bumped_fee(value)
 }
 
 const fn public_action_progress_update(
@@ -684,21 +1258,6 @@ const fn public_action_progress_update(
         tx_hash,
         message,
     }
-}
-
-fn format_report_chain(error: &eyre::Report) -> String {
-    let mut parts = error.chain().map(ToString::to_string);
-    let Some(mut message) = parts.next() else {
-        return error.to_string();
-    };
-    for part in parts {
-        if message.ends_with(&part) {
-            continue;
-        }
-        message.push_str(": ");
-        message.push_str(&part);
-    }
-    message
 }
 
 fn public_balance_snapshot_from_results(
@@ -830,53 +1389,6 @@ fn public_chain_runtime_config(
     })
 }
 
-async fn public_action_provider_with_nonce(
-    query_rpc_pool: &QueryRpcPool,
-    from_address: Address,
-    gas: &EffectiveChainGasSettings,
-) -> Result<(ProviderHandle, u128, u64)> {
-    let mut last_error = None;
-    for _ in 0..query_rpc_pool.len() {
-        let Some(provider_handle) = query_rpc_pool.random_provider() else {
-            break;
-        };
-        let gas_price = match buffered_gas_price_with_policy(
-            &provider_handle.provider,
-            u128::from(gas.gas_price_buffer_numerator),
-            u128::from(gas.gas_price_buffer_denominator),
-        )
-        .await
-        {
-            Ok(gas_price) => gas_price,
-            Err(error) => {
-                tracing::warn!(%error, rpc = %provider_handle.url, "fetch public action gas price failed");
-                query_rpc_pool.mark_bad_provider(&provider_handle);
-                last_error = Some(error);
-                continue;
-            }
-        };
-        let nonce = match provider_handle
-            .provider
-            .get_transaction_count(from_address)
-            .await
-        {
-            Ok(nonce) => nonce,
-            Err(error) => {
-                tracing::warn!(%error, rpc = %provider_handle.url, "fetch public action nonce failed");
-                query_rpc_pool.mark_bad_provider(&provider_handle);
-                last_error = Some(eyre!("fetch public action nonce: {error}"));
-                continue;
-            }
-        };
-        return Ok((provider_handle, gas_price, nonce));
-    }
-    if let Some(error) = last_error {
-        Err(error).wrap_err("all public action query RPC attempts failed")
-    } else {
-        Err(eyre!("no healthy query RPC available"))
-    }
-}
-
 fn parse_effective_address(label: &str, value: &str) -> Result<Address> {
     Address::from_str(value).wrap_err_with(|| format!("parse effective {label} address"))
 }
@@ -902,14 +1414,10 @@ fn public_send_transaction_request(
     asset: PublicAssetId,
     amount: U256,
     recipient: Address,
-    gas_price: u128,
-    nonce: u64,
 ) -> TransactionRequest {
     let mut tx_req = TransactionRequest::default()
         .with_chain_id(chain_id)
-        .with_from(from)
-        .with_gas_price(gas_price)
-        .with_nonce(nonce);
+        .with_from(from);
     match asset {
         PublicAssetId::Native => {
             tx_req = tx_req.with_to(recipient).with_value(amount);
@@ -1242,15 +1750,8 @@ mod tests {
         let token = address!("0x3333333333333333333333333333333333333333");
         let amount = U256::from(5_u64);
 
-        let native = public_send_transaction_request(
-            1,
-            from,
-            PublicAssetId::Native,
-            amount,
-            recipient,
-            10,
-            3,
-        );
+        let native =
+            public_send_transaction_request(1, from, PublicAssetId::Native, amount, recipient);
         assert_eq!(native.to, Some(recipient.into()));
         assert_eq!(native.value, Some(amount));
 
@@ -1260,8 +1761,6 @@ mod tests {
             PublicAssetId::Erc20(token),
             amount,
             recipient,
-            10,
-            3,
         );
         assert_eq!(erc20.to, Some(token.into()));
         let expected_transfer = PublicErc20::transferCall { recipient, amount }.abi_encode();
@@ -1269,6 +1768,70 @@ mod tests {
             erc20.input.input().expect("transfer input").as_ref(),
             expected_transfer.as_slice()
         );
+    }
+
+    #[test]
+    fn public_action_eip1559_request_sets_fee_caps_and_nonce() {
+        let from = address!("0x1111111111111111111111111111111111111111");
+        let recipient = address!("0x2222222222222222222222222222222222222222");
+        let base = public_send_transaction_request(
+            1,
+            from,
+            PublicAssetId::Native,
+            U256::from(5_u64),
+            recipient,
+        );
+
+        let tx = public_action_eip1559_transaction_request(base, 1, from, 42, 3, 9);
+
+        assert_eq!(tx.chain_id, Some(1));
+        assert_eq!(tx.from, Some(from));
+        assert_eq!(tx.to, Some(recipient.into()));
+        assert_eq!(tx.max_fee_per_gas, Some(42));
+        assert_eq!(tx.max_priority_fee_per_gas, Some(3));
+        assert_eq!(tx.nonce, Some(9));
+    }
+
+    #[test]
+    fn public_action_replacement_bump_reuses_self_broadcast_policy() {
+        assert_eq!(public_action_replacement_bumped_fee(8), 9);
+        assert_eq!(public_action_replacement_bumped_fee(9), 11);
+    }
+
+    #[test]
+    fn public_action_tip_fallback_uses_rpc_gas_price_only_for_bnb() {
+        assert_eq!(
+            public_action_tip_fallback(56),
+            SelfBroadcastTipFallback::RpcGasPrice,
+        );
+        assert_eq!(
+            public_action_tip_fallback(1),
+            SelfBroadcastTipFallback::Minimum,
+        );
+    }
+
+    #[test]
+    fn public_action_receipt_poll_error_message_requires_all_checked_providers_to_fail() {
+        assert!(public_action_receipt_poll_error_message(0, 0, None).is_none());
+        assert!(
+            public_action_receipt_poll_error_message(
+                2,
+                1,
+                Some("https://rpc.example: rate limited".to_string()),
+            )
+            .is_none()
+        );
+
+        let message = public_action_receipt_poll_error_message(
+            2,
+            0,
+            Some("https://rpc.example: rate limited".to_string()),
+        )
+        .expect("all checked providers failed");
+
+        assert!(message.contains("all accepted RPC providers"));
+        assert!(message.contains("2 checked"));
+        assert!(message.contains("rate limited"));
     }
 
     #[test]
@@ -1292,6 +1855,9 @@ mod tests {
                 asset: PublicAssetId::Native,
                 amount: U256::ZERO,
                 recipient,
+                gas_fee: PublicActionGasFeeSelection::Auto,
+                command_rx: None,
+                event_tx: None,
             },
             &http,
         ));
@@ -1310,6 +1876,9 @@ mod tests {
                 public_account_uuid: "unused".to_string(),
                 asset: PublicAssetId::Native,
                 amount: U256::ZERO,
+                gas_fee: PublicActionGasFeeSelection::Auto,
+                command_rx: None,
+                event_tx: None,
             },
             &http,
         ));

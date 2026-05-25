@@ -5,13 +5,9 @@ use gpui::{
     AppContext, Context, Entity, IntoElement, ParentElement, Pixels, SharedString, Styled, Window,
     div, prelude::FluentBuilder as _, px, rgb,
 };
-use gpui_component::{
-    Sizable, WindowExt,
-    button::ButtonVariants,
-    input::{InputEvent, InputState},
-};
+use gpui_component::{Sizable, WindowExt, button::ButtonVariants};
 use ui::clipboard::clipboard_with_toast;
-use ui::controls::{app_button, app_input, app_muted_text, app_strong_text};
+use ui::controls::{app_button, app_muted_text, app_strong_text};
 use ui::theme;
 use wallet_ops::{
     DesktopSelfBroadcastResult, PublicBroadcasterCostEstimate, PublicBroadcasterResultKind,
@@ -20,8 +16,7 @@ use wallet_ops::{
     TransactionGenerationStage, self_broadcast_replacement_bumped_fee,
 };
 
-use super::dialogs::PrivateBroadcasterProgressDialogContent;
-use super::gas_fee::{format_gwei, parse_gwei_to_wei, validate_custom_gas_fee};
+use super::gas_fee::{GasRetryInputs, format_gwei};
 use super::private_action::{delivery_element_id, private_action_title_row};
 use super::public_action::{
     PublicActionStepStatus, public_action_step_color, render_public_action_step_marker,
@@ -90,6 +85,22 @@ pub(super) struct PrivateBroadcasterProgressState {
     pub(super) stage_seen: bool,
 }
 
+impl PrivateBroadcasterProgressState {
+    fn accepts_update(
+        &self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        generation_id: u64,
+    ) -> bool {
+        self.kind == kind
+            && self.key == key
+            && self.generation_id == generation_id
+            && self.result.is_none()
+            && self.self_broadcast_result.is_none()
+            && self.error.is_none()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SelfBroadcastGasRetryKind {
     RetryEstimate,
@@ -102,8 +113,7 @@ pub(super) struct SelfBroadcastGasRetryDialogContent {
     key: UnshieldAssetKey,
     generation_id: u64,
     retry_kind: SelfBroadcastGasRetryKind,
-    max_fee_input: Entity<InputState>,
-    max_tip_input: Entity<InputState>,
+    gas_inputs: GasRetryInputs,
     error: Option<Arc<str>>,
 }
 
@@ -143,39 +153,24 @@ impl SelfBroadcastGasRetryDialogContent {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
-        let max_fee_input = cx.new(|cx| {
-            let mut input = InputState::new(window, cx).placeholder("max fee gwei");
-            input.set_value(format_gwei(initial_max_fee_per_gas), window, cx);
-            input
-        });
-        let max_tip_input = cx.new(|cx| {
-            let mut input = InputState::new(window, cx).placeholder("max tip gwei");
-            input.set_value(format_gwei(initial_max_priority_fee_per_gas), window, cx);
-            input
-        });
+        let gas_inputs = GasRetryInputs::new(
+            initial_max_fee_per_gas,
+            initial_max_priority_fee_per_gas,
+            window,
+            cx,
+        );
         cx.observe(&root, |_this, _root, cx| cx.notify()).detach();
-        cx.subscribe(&max_fee_input, |this, _input, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                this.error = None;
-                cx.notify();
-            }
-        })
-        .detach();
-        cx.subscribe(&max_tip_input, |this, _input, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                this.error = None;
-                cx.notify();
-            }
-        })
-        .detach();
+        gas_inputs.subscribe_clear_error(cx, |this, cx| {
+            this.error = None;
+            cx.notify();
+        });
         Self {
             root,
             kind,
             key,
             generation_id,
             retry_kind,
-            max_fee_input,
-            max_tip_input,
+            gas_inputs,
             error: None,
         }
     }
@@ -198,8 +193,7 @@ impl gpui::Render for SelfBroadcastGasRetryDialogContent {
         let submit_root = self.root.clone();
         let cancel_root = self.root.clone();
         let dialog = cx.entity();
-        let max_fee_input = self.max_fee_input.clone();
-        let max_tip_input = self.max_tip_input.clone();
+        let gas_inputs = self.gas_inputs.clone();
         let kind = self.kind;
         let key = self.key;
         let generation_id = self.generation_id;
@@ -211,33 +205,7 @@ impl gpui::Render for SelfBroadcastGasRetryDialogContent {
             .gap_3()
             .child(app_strong_text(title))
             .child(app_muted_text(detail).whitespace_normal())
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_wrap()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(150.0))
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(app_muted_text("Max fee (gwei)"))
-                            .child(app_input(&self.max_fee_input).w_full()),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(150.0))
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(app_muted_text("Max tip (gwei)"))
-                            .child(app_input(&self.max_tip_input).w_full()),
-                    ),
-            )
+            .child(self.gas_inputs.render_fields())
             .when_some(self.error.as_ref(), |this, error| {
                 this.child(app_muted_text(error.to_string()).text_color(rgb(theme::DANGER)))
             })
@@ -261,10 +229,8 @@ impl gpui::Render for SelfBroadcastGasRetryDialogContent {
                             .primary()
                             .flex_none()
                             .on_click(move |_event, window, cx| {
-                                let max_fee_raw = max_fee_input.read(cx).value().to_string();
-                                let max_tip_raw = max_tip_input.read(cx).value().to_string();
-                                let max_fee = match parse_gwei_to_wei(&max_fee_raw) {
-                                    Ok(value) => value,
+                                let (max_fee, max_tip) = match gas_inputs.parse(cx) {
+                                    Ok(values) => values,
                                     Err(error) => {
                                         dialog.update(cx, |this, cx| {
                                             this.error = Some(Arc::from(error));
@@ -273,23 +239,6 @@ impl gpui::Render for SelfBroadcastGasRetryDialogContent {
                                         return;
                                     }
                                 };
-                                let max_tip = match parse_gwei_to_wei(&max_tip_raw) {
-                                    Ok(value) => value,
-                                    Err(error) => {
-                                        dialog.update(cx, |this, cx| {
-                                            this.error = Some(Arc::from(error));
-                                            cx.notify();
-                                        });
-                                        return;
-                                    }
-                                };
-                                if let Err(error) = validate_custom_gas_fee(max_fee, max_tip) {
-                                    dialog.update(cx, |this, cx| {
-                                        this.error = Some(Arc::from(error));
-                                        cx.notify();
-                                    });
-                                    return;
-                                }
                                 submit_root.update(cx, |root, cx| {
                                     root.submit_self_broadcast_gas_retry(
                                         kind,
@@ -341,14 +290,9 @@ pub(super) fn private_broadcaster_closed_active_progress(
     generation_id: u64,
 ) -> Option<(PrivateSubmissionProgressFlow, TransactionGenerationStage)> {
     let progress = progress?;
-    if progress.kind != kind
-        || progress.key != key
-        || progress.generation_id != generation_id
+    if !progress.accepts_update(kind, key, generation_id)
         || progress.dialog_open
         || !progress.stage_seen
-        || progress.result.is_some()
-        || progress.self_broadcast_result.is_some()
-        || progress.error.is_some()
     {
         return None;
     }
@@ -467,16 +411,13 @@ impl WalletRoot {
         let generation_id = progress.generation_id;
         let asset_label = Arc::clone(&progress.asset_label);
         let icon_path = progress.icon_path.clone();
-        let content_root = cx.entity();
+        let root = cx.entity();
         let dialog_width =
             (window.viewport_size().width * 0.92).min(PRIVATE_BROADCASTER_PROGRESS_DIALOG_WIDTH);
         let content_width = secondary_dialog_content_width(dialog_width);
-        let content = cx.new(|cx| {
-            PrivateBroadcasterProgressDialogContent::new(content_root, content_width, cx)
-        });
-        let close_root = cx.entity();
-        window.open_dialog(cx, move |dialog, _window, _cx| {
-            let close_root = close_root.clone();
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            let close_root = root.clone();
+            let content_root = root.clone();
             dialog
                 .w(dialog_width)
                 .title(private_action_title_row(
@@ -496,7 +437,14 @@ impl WalletRoot {
                         }
                     });
                 })
-                .child(content.clone())
+                .child(
+                    content_root
+                        .read(cx)
+                        .render_private_broadcaster_progress_dialog_content(
+                            &content_root,
+                            content_width,
+                        ),
+                )
         });
     }
 
@@ -511,13 +459,7 @@ impl WalletRoot {
         let Some(progress) = self.private_broadcaster_progress.as_mut() else {
             return false;
         };
-        if progress.kind != kind
-            || progress.key != key
-            || progress.generation_id != generation_id
-            || progress.result.is_some()
-            || progress.self_broadcast_result.is_some()
-            || progress.error.is_some()
-        {
+        if !progress.accepts_update(kind, key, generation_id) {
             return false;
         }
         let should_open_dialog = !progress.stage_seen && !progress.dialog_open;
@@ -539,13 +481,7 @@ impl WalletRoot {
         let Some(progress) = self.private_broadcaster_progress.as_mut() else {
             return;
         };
-        if progress.kind != kind
-            || progress.key != key
-            || progress.generation_id != generation_id
-            || progress.result.is_some()
-            || progress.self_broadcast_result.is_some()
-            || progress.error.is_some()
-        {
+        if !progress.accepts_update(kind, key, generation_id) {
             return;
         }
         finish_private_broadcaster_progress_steps_at_stage(
@@ -570,13 +506,7 @@ impl WalletRoot {
         let Some(progress) = self.private_broadcaster_progress.as_mut() else {
             return;
         };
-        if progress.kind != kind
-            || progress.key != key
-            || progress.generation_id != generation_id
-            || progress.result.is_some()
-            || progress.self_broadcast_result.is_some()
-            || progress.error.is_some()
-        {
+        if !progress.accepts_update(kind, key, generation_id) {
             return;
         }
         finish_private_self_broadcast_progress_steps_at_stage(
@@ -608,13 +538,7 @@ impl WalletRoot {
         let Some(progress) = self.private_broadcaster_progress.as_mut() else {
             return;
         };
-        if progress.kind != kind
-            || progress.key != key
-            || progress.generation_id != generation_id
-            || progress.result.is_some()
-            || progress.self_broadcast_result.is_some()
-            || progress.error.is_some()
-        {
+        if !progress.accepts_update(kind, key, generation_id) {
             return;
         }
         fail_private_broadcaster_progress_steps_at_stage(
@@ -640,13 +564,7 @@ impl WalletRoot {
         let Some(progress) = self.private_broadcaster_progress.as_mut() else {
             return false;
         };
-        if progress.kind != kind
-            || progress.key != key
-            || progress.generation_id != generation_id
-            || progress.result.is_some()
-            || progress.self_broadcast_result.is_some()
-            || progress.error.is_some()
-        {
+        if !progress.accepts_update(kind, key, generation_id) {
             return false;
         }
         progress.stage_seen = true;
@@ -667,13 +585,7 @@ impl WalletRoot {
         let Some(progress) = self.private_broadcaster_progress.as_mut() else {
             return;
         };
-        if progress.kind != kind
-            || progress.key != key
-            || progress.generation_id != generation_id
-            || progress.result.is_some()
-            || progress.self_broadcast_result.is_some()
-            || progress.error.is_some()
-        {
+        if !progress.accepts_update(kind, key, generation_id) {
             return;
         }
         progress.self_broadcast_current_gas_fee =
@@ -694,13 +606,7 @@ impl WalletRoot {
         let Some(progress) = self.private_broadcaster_progress.as_mut() else {
             return;
         };
-        if progress.kind != kind
-            || progress.key != key
-            || progress.generation_id != generation_id
-            || progress.result.is_some()
-            || progress.self_broadcast_result.is_some()
-            || progress.error.is_some()
-        {
+        if !progress.accepts_update(kind, key, generation_id) {
             return;
         }
         progress.self_broadcast_action_error = Some(Arc::from(message));
@@ -719,9 +625,7 @@ impl WalletRoot {
         let Some(progress) = self.private_broadcaster_progress.as_ref() else {
             return;
         };
-        if progress.kind != kind
-            || progress.key != key
-            || progress.generation_id != generation_id
+        if !progress.accepts_update(kind, key, generation_id)
             || progress.self_broadcast_command_tx.is_none()
         {
             return;
@@ -767,12 +671,7 @@ impl WalletRoot {
         let Some(progress) = self.private_broadcaster_progress.as_ref() else {
             return;
         };
-        if progress.kind != kind
-            || progress.key != key
-            || progress.generation_id != generation_id
-            || progress.self_broadcast_result.is_some()
-            || progress.error.is_some()
-        {
+        if !progress.accepts_update(kind, key, generation_id) {
             return;
         }
         let Some(command_tx) = progress.self_broadcast_command_tx.as_ref() else {

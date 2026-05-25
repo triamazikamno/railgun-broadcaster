@@ -44,13 +44,14 @@ use super::{
     DeliveryMode, PUBLIC_ACCOUNT_IDENTICON_CELL_COUNT, PUBLIC_ACCOUNT_IDENTICON_GRID_SIZE,
     PUBLIC_ADDRESS_QR_QUIET_ZONE_MODULES, PriceAnchorComponentDialogValues,
     PriceAnchorDialogValues, PrivateActionMetric, PrivateBroadcasterProgressState,
-    PublicActionMode, PublicActionStepStatus, PublicBroadcasterFeeTokenOption, SECONDS_PER_DAY,
-    SECONDS_PER_HOUR, SECONDS_PER_MINUTE, SECONDS_PER_MONTH, SECONDS_PER_YEAR,
-    SEND_AUTHORIZATION_FAILED_ERROR, SEND_MISSING_PASSWORD_ERROR, SelfBroadcastNativeBalanceState,
-    SettingsApplyMode, UNSHIELD_AUTHORIZATION_FAILED_ERROR, UNSHIELD_MISSING_PASSWORD_ERROR,
-    UnshieldAsset, UnshieldAssetKey, VaultState, WalletAppOptions, WalletRoot, WalletSelectItem,
-    WalletTab, add_chain_rpc_endpoint, add_poi_gateway_url, add_waku_direct_peer,
-    add_waku_dns_enr_tree, add_waku_doh_fallback_endpoint, adjusted_amount_for_max_change,
+    PublicActionMode, PublicActionStepState, PublicActionStepStatus,
+    PublicBroadcasterFeeTokenOption, SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_MINUTE,
+    SECONDS_PER_MONTH, SECONDS_PER_YEAR, SEND_AUTHORIZATION_FAILED_ERROR,
+    SEND_MISSING_PASSWORD_ERROR, SelfBroadcastNativeBalanceState, SettingsApplyMode,
+    UNSHIELD_AUTHORIZATION_FAILED_ERROR, UNSHIELD_MISSING_PASSWORD_ERROR, UnshieldAsset,
+    UnshieldAssetKey, VaultState, WalletAppOptions, WalletRoot, WalletSelectItem, WalletTab,
+    add_chain_rpc_endpoint, add_poi_gateway_url, add_waku_direct_peer, add_waku_dns_enr_tree,
+    add_waku_doh_fallback_endpoint, adjusted_amount_for_max_change,
     apply_private_broadcaster_progress_stage, broadcaster_choice_supported_by_candidates,
     classify_settings_apply_mode, default_self_broadcast_gas_payer_uuid,
     display_chain_contract_settings, display_chain_quick_sync_endpoint,
@@ -75,10 +76,10 @@ use super::{
     private_action_metrics, private_broadcaster_progress_steps, progress_detail,
     public_account_identicon_color, public_account_identicon_pattern,
     public_account_matches_search, public_account_visible_balances_for_chain,
-    public_action_error_copy_value, public_action_error_details, public_action_error_summary,
-    public_action_max_amount_after_reserve, public_action_progress_steps,
-    public_address_qr_module_range, public_address_qr_payload, public_asset_decimals,
-    public_asset_icon_path, public_asset_label, public_balance_amount_label,
+    public_action_closed_active_step, public_action_error_copy_value, public_action_error_details,
+    public_action_error_summary, public_action_max_amount_after_reserve,
+    public_action_progress_steps, public_address_qr_module_range, public_address_qr_payload,
+    public_asset_decimals, public_asset_icon_path, public_asset_label, public_balance_amount_label,
     public_balance_entry_for_chain, public_broadcaster_candidates_for_asset,
     public_broadcaster_cost_status_text, public_broadcaster_fee_token_options_from_snapshot,
     public_broadcaster_fee_token_warning, public_broadcaster_submit_disabled_for_fee_token_options,
@@ -3512,6 +3513,84 @@ fn public_action_progress_steps_use_single_send_step() {
         public_action_progress_steps(PublicActionMode::Send, PublicAssetId::Native),
         vec![PublicActionProgressStep::Send],
     );
+}
+
+#[test]
+fn public_action_closed_active_step_uses_pending_step() {
+    let steps = vec![
+        PublicActionStepState {
+            step: PublicActionProgressStep::Wrap,
+            status: PublicActionStepStatus::Error,
+            tx_hash: None,
+            message: Some(Arc::from("wrap failed")),
+        },
+        PublicActionStepState {
+            step: PublicActionProgressStep::Approve,
+            status: PublicActionStepStatus::Pending,
+            tx_hash: None,
+            message: None,
+        },
+        PublicActionStepState {
+            step: PublicActionProgressStep::Shield,
+            status: PublicActionStepStatus::NotStarted,
+            tx_hash: None,
+            message: None,
+        },
+    ];
+
+    assert_eq!(
+        public_action_closed_active_step(&steps).map(|step| step.step),
+        Some(PublicActionProgressStep::Approve),
+    );
+}
+
+#[test]
+fn public_action_closed_active_step_uses_error_without_pending() {
+    let steps = vec![
+        PublicActionStepState {
+            step: PublicActionProgressStep::Wrap,
+            status: PublicActionStepStatus::Done,
+            tx_hash: None,
+            message: None,
+        },
+        PublicActionStepState {
+            step: PublicActionProgressStep::Approve,
+            status: PublicActionStepStatus::Error,
+            tx_hash: None,
+            message: Some(Arc::from("approve failed")),
+        },
+        PublicActionStepState {
+            step: PublicActionProgressStep::Shield,
+            status: PublicActionStepStatus::NotStarted,
+            tx_hash: None,
+            message: None,
+        },
+    ];
+
+    assert_eq!(
+        public_action_closed_active_step(&steps).map(|step| step.step),
+        Some(PublicActionProgressStep::Approve),
+    );
+}
+
+#[test]
+fn public_action_closed_active_step_ignores_inactive_steps() {
+    let steps = vec![
+        PublicActionStepState {
+            step: PublicActionProgressStep::Wrap,
+            status: PublicActionStepStatus::Done,
+            tx_hash: None,
+            message: None,
+        },
+        PublicActionStepState {
+            step: PublicActionProgressStep::Approve,
+            status: PublicActionStepStatus::NotStarted,
+            tx_hash: None,
+            message: None,
+        },
+    ];
+
+    assert!(public_action_closed_active_step(&steps).is_none());
 }
 
 #[test]

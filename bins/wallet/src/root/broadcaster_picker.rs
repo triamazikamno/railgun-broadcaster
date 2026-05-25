@@ -25,7 +25,7 @@ use wallet_ops::{
 
 use super::{
     BROADCASTER_PICKER_MAX_HEIGHT, DeliveryFormKind, PRIVATE_ASSET_LIST_WIDTH, UnshieldAssetKey,
-    WalletRoot, dialogs::BroadcasterPickerDialogContent, token_display_label,
+    WalletRoot, dialogs::render_broadcaster_picker_dialog_content, token_display_label,
     token_display_metadata,
 };
 
@@ -320,13 +320,12 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         let root = cx.entity();
-        let content_root = root.clone();
-        let content = cx.new(|cx| BroadcasterPickerDialogContent::new(content_root, cx));
-        window.open_dialog(cx, move |dialog, window, _cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let dialog_width = (window.viewport_size().width * 0.92).min(PRIVATE_ASSET_LIST_WIDTH);
             let max_height =
                 (window.viewport_size().height * 0.82).min(BROADCASTER_PICKER_MAX_HEIGHT);
             let close_root = root.clone();
+            let content_root = root.clone();
             dialog
                 .w(dialog_width)
                 .h(max_height)
@@ -343,7 +342,11 @@ impl WalletRoot {
                         root.close_broadcaster_picker(cx);
                     });
                 })
-                .child(content.clone())
+                .child(render_broadcaster_picker_dialog_content(
+                    &content_root,
+                    window,
+                    cx,
+                ))
         });
     }
 

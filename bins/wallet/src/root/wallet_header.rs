@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use gpui::{
-    App, AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Pixels,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, img, px, rgb,
+    App, Context, Entity, InteractiveElement, IntoElement, ParentElement, Pixels, SharedString,
+    StatefulInteractiveElement, Styled, Window, div, img, px, rgb,
 };
 use gpui_component::{
     Disableable, Sizable, WindowExt,
@@ -17,7 +17,6 @@ use ui::controls::{app_button_base, app_input, app_muted_text, app_strong_text};
 use ui::{icons, theme};
 use wallet_ops::vault::WalletSource;
 
-use super::dialogs::RepairCacheDialogContent;
 use super::utxo::short_hash;
 use super::{
     APP_TEXT_SIZE, ChainUtxoState, WalletRoot, chain_load_overrides, secondary_dialog_content_width,
@@ -117,12 +116,11 @@ impl WalletRoot {
 
     fn open_repair_cache_dialog(window: &mut Window, cx: &mut Context<'_, Self>) {
         let root = cx.entity();
-        let content_root = root.clone();
         let dialog_width = (window.viewport_size().width * 0.92).min(px(420.0));
         let content_width = secondary_dialog_content_width(dialog_width);
-        let content = cx.new(|cx| RepairCacheDialogContent::new(content_root, content_width, cx));
-        window.open_dialog(cx, move |dialog, _window, _cx| {
+        window.open_dialog(cx, move |dialog, _window, cx| {
             let submit_root = root.clone();
+            let content_root = root.clone();
             dialog
                 .w(dialog_width)
                 .title(app_strong_text("Repair wallet cache"))
@@ -131,7 +129,11 @@ impl WalletRoot {
                 .on_ok(move |_event, _window, cx| {
                     submit_root.update(cx, Self::repair_wallet_cache_from_input)
                 })
-                .child(content.clone())
+                .child(
+                    content_root
+                        .read(cx)
+                        .render_repair_cache_dialog_content(content_width),
+                )
         });
     }
 

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use broadcaster_monitor::{EventRx, Shared};
-use gpui::{AppContext, Context, Entity, Focusable, Pixels, Window, px};
+use gpui::{AppContext, Context, Entity, Focusable, Pixels, SharedString, Window, px};
 use gpui_component::{
     IndexPath,
     input::{InputEvent, InputState},
@@ -62,6 +62,7 @@ pub(crate) use shell::{WalletAppOptions, open_wallet_window};
 
 use broadcaster_picker::BroadcasterPickerState;
 use chain_load::{ChainUtxoState, chain_load_overrides, start_shared_poi_cache_service};
+use gas_fee::Eip1559GasFeeEditorState;
 use network::TorExitIpQueryState;
 use private_action::{
     DeliveryFormKind, DeliveryMode, PrivateActionFormState, SendFormState, UnshieldAsset,
@@ -92,7 +93,8 @@ use tokens::{
     token_display_metadata,
 };
 use ui_helpers::{
-    centered_message, rgb_with_alpha, secondary_dialog_content_width, token_label_row,
+    centered_message, labeled_field, rgb_with_alpha, secondary_dialog_content_width,
+    token_label_row,
 };
 use utxo::{UtxoDelegate, should_focus_utxo_table};
 use vault::{VaultState, WalletOption, WalletSetupMode, vault_error_kind};
@@ -143,9 +145,9 @@ use public_account::{
 };
 #[cfg(test)]
 use public_action::{
-    PublicActionStepStatus, public_action_error_copy_value, public_action_error_details,
-    public_action_error_summary, public_action_max_amount_after_reserve,
-    public_action_progress_steps,
+    PublicActionStepState, PublicActionStepStatus, public_action_closed_active_step,
+    public_action_error_copy_value, public_action_error_details, public_action_error_summary,
+    public_action_max_amount_after_reserve, public_action_progress_steps,
 };
 #[cfg(test)]
 use public_balances::{
@@ -520,69 +522,32 @@ impl WalletRoot {
             vault_state,
             VaultState::CreateVault | VaultState::UnlockVault
         );
-        let unlock_password_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("vault password")
-                .masked(true)
-        });
-        let new_password_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("new vault password")
-                .masked(true)
-        });
-        let confirm_password_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("confirm vault password")
-                .masked(true)
-        });
-        let wallet_name_input = cx.new(|cx| InputState::new(window, cx).placeholder("wallet name"));
-        let add_wallet_password_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("vault password")
-                .masked(true)
-        });
+        let unlock_password_input = new_masked_input(window, cx, "vault password");
+        let new_password_input = new_masked_input(window, cx, "new vault password");
+        let confirm_password_input = new_masked_input(window, cx, "confirm vault password");
+        let wallet_name_input = new_text_input(window, cx, "wallet name");
+        let add_wallet_password_input = new_masked_input(window, cx, "vault password");
         let import_mnemonic_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .auto_grow(3, 6)
                 .placeholder("paste recovery phrase")
         });
-        let public_account_search_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("search accounts"));
+        let public_account_search_input = new_text_input(window, cx, "search accounts");
         let public_form = PublicAccountFormState {
-            add_label_input: cx.new(|cx| InputState::new(window, cx).placeholder("account label")),
-            add_password_input: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("vault password")
-                    .masked(true)
-            }),
-            import_label_input: cx
-                .new(|cx| InputState::new(window, cx).placeholder("account label")),
-            import_private_key_input: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("private key hex")
-                    .masked(true)
-            }),
-            import_password_input: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("vault password")
-                    .masked(true)
-            }),
-            edit_label_input: cx.new(|cx| InputState::new(window, cx).placeholder("account label")),
+            add_label_input: new_text_input(window, cx, "account label"),
+            add_password_input: new_masked_input(window, cx, "vault password"),
+            import_label_input: new_text_input(window, cx, "account label"),
+            import_private_key_input: new_masked_input(window, cx, "private key hex"),
+            import_password_input: new_masked_input(window, cx, "vault password"),
+            edit_label_input: new_text_input(window, cx, "account label"),
             search_input: public_account_search_input.clone(),
-            send_recipient_input: cx
-                .new(|cx| InputState::new(window, cx).placeholder("0x recipient")),
-            send_amount_input: cx.new(|cx| InputState::new(window, cx).placeholder("amount")),
-            send_password_input: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("vault password")
-                    .masked(true)
-            }),
-            shield_amount_input: cx.new(|cx| InputState::new(window, cx).placeholder("amount")),
-            shield_password_input: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("vault password")
-                    .masked(true)
-            }),
+            send_recipient_input: new_text_input(window, cx, "0x recipient"),
+            send_amount_input: new_text_input(window, cx, "amount"),
+            send_password_input: new_masked_input(window, cx, "vault password"),
+            shield_amount_input: new_text_input(window, cx, "amount"),
+            shield_password_input: new_masked_input(window, cx, "vault password"),
+            send_gas_fee: Eip1559GasFeeEditorState::new(window, cx),
+            shield_gas_fee: Eip1559GasFeeEditorState::new(window, cx),
             import_global: false,
             selected_account_uuid: None,
             editing_account_uuid: None,
@@ -592,6 +557,13 @@ impl WalletRoot {
             action_generation: 0,
             action_progress: Vec::new(),
             expanded_action_error_steps: BTreeSet::new(),
+            action_progress_dialog_open: false,
+            action_progress_asset_label: Arc::from(""),
+            action_progress_icon_path: None,
+            action_command_tx: None,
+            action_attempts: Vec::new(),
+            action_current_gas_fee: None,
+            action_action_error: None,
             next_derived_index: None,
             next_account_label_number: 1,
             error: None,
@@ -605,10 +577,8 @@ impl WalletRoot {
             inactive_accounts_open: false,
             pending_global_delete_uuid: None,
         };
-        let repair_cache_block_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("0 = deployment block"));
-        let tx_search_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("search tx hash"));
+        let repair_cache_block_input = new_text_input(window, cx, "0 = deployment block");
+        let tx_search_input = new_text_input(window, cx, "search tx hash");
         let chain_select =
             cx.new(|cx| SelectState::new(chain_select_items, selected_chain_index, window, cx));
         let wallet_select = cx.new(|cx| {
@@ -967,6 +937,40 @@ impl WalletRoot {
         root.spawn_network_health_monitor(cx);
         root
     }
+}
+
+pub(super) fn new_text_input<T>(
+    window: &mut Window,
+    cx: &mut Context<'_, T>,
+    placeholder: &'static str,
+) -> Entity<InputState> {
+    cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))
+}
+
+pub(super) fn new_masked_input<T>(
+    window: &mut Window,
+    cx: &mut Context<'_, T>,
+    placeholder: &'static str,
+) -> Entity<InputState> {
+    cx.new(|cx| {
+        InputState::new(window, cx)
+            .placeholder(placeholder)
+            .masked(true)
+    })
+}
+
+pub(super) fn new_prefilled_input<T>(
+    window: &mut Window,
+    cx: &mut Context<'_, T>,
+    placeholder: &'static str,
+    value: impl Into<SharedString>,
+) -> Entity<InputState> {
+    let value = value.into();
+    cx.new(move |cx| {
+        let mut input = InputState::new(window, cx).placeholder(placeholder);
+        input.set_value(value.clone(), window, cx);
+        input
+    })
 }
 
 fn format_report_chain(error: &eyre::Report) -> String {

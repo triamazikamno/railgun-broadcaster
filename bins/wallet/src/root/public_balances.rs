@@ -180,8 +180,7 @@ impl WalletRoot {
         self.public_inactive_balance_generation =
             self.public_inactive_balance_generation.wrapping_add(1);
         self.public_form.selected_asset = None;
-        self.public_form.action_progress.clear();
-        self.public_form.expanded_action_error_steps.clear();
+        self.clear_public_action_progress_state();
         self.public_form.send_error = None;
         self.public_form.shield_error = None;
     }

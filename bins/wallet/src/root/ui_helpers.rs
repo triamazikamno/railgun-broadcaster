@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
-use gpui::{ParentElement, Pixels, SharedString, Styled, div, img, px, rgb};
+use gpui::{IntoElement, ParentElement, Pixels, SharedString, Styled, div, img, px, rgb};
+use ui::controls::app_muted_text;
 use ui::theme;
 
 const DIALOG_CONTENT_HORIZONTAL_INSET: Pixels = px(56.0);
@@ -24,6 +25,18 @@ pub(super) fn centered_message(message: impl Into<SharedString>) -> gpui::Div {
 
 pub(super) fn secondary_dialog_content_width(dialog_width: Pixels) -> Pixels {
     (dialog_width - DIALOG_CONTENT_HORIZONTAL_INSET).max(px(0.0))
+}
+
+pub(super) fn labeled_field(
+    label: impl Into<SharedString>,
+    content: impl IntoElement,
+) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(app_muted_text(label))
+        .child(content)
 }
 
 pub(super) fn token_label_row(

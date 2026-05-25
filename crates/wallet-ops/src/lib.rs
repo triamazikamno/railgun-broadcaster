@@ -101,12 +101,16 @@ pub use http::{
 };
 use public_wallet::vaulted_public_signer;
 pub use public_wallet::{
-    PublicAccountBalance, PublicActionProgressStatus, PublicActionProgressStep,
-    PublicActionProgressUpdate, PublicAssetId, PublicBalanceAmount, PublicBalanceAsset,
-    PublicBalanceEntry, PublicBalanceRefreshCoordinator, PublicBalanceSnapshot, PublicSendRequest,
-    PublicSendResult, PublicShieldRequest, estimate_public_native_action_gas_reserve,
-    public_balance_assets_for_chain, public_balance_refresh_interval_secs,
-    public_native_action_gas_reserve, public_native_action_gas_units, refresh_public_balances,
+    PublicAccountBalance, PublicActionAttemptInfo, PublicActionCommand, PublicActionCommandKind,
+    PublicActionCommandReceiver, PublicActionCommandSender, PublicActionGasFeeQuote,
+    PublicActionGasFeeSelection, PublicActionProgressStatus, PublicActionProgressStep,
+    PublicActionProgressUpdate, PublicActionSessionEvent, PublicActionSessionEventSender,
+    PublicAssetId, PublicBalanceAmount, PublicBalanceAsset, PublicBalanceEntry,
+    PublicBalanceRefreshCoordinator, PublicBalanceSnapshot, PublicSendRequest, PublicSendResult,
+    PublicShieldRequest, estimate_public_native_action_gas_reserve,
+    public_action_replacement_bumped_fee, public_balance_assets_for_chain,
+    public_balance_refresh_interval_secs, public_native_action_gas_reserve,
+    public_native_action_gas_units, quote_public_action_gas_fee, refresh_public_balances,
     submit_public_send, submit_public_send_with_progress, submit_public_shield,
     submit_public_shield_with_progress,
 };
@@ -365,6 +369,12 @@ const SELF_BROADCAST_DIRECT_FEE_QUOTE_GRACE: Duration = Duration::from_millis(75
 const SELF_BROADCAST_DIRECT_FEE_QUOTE_DEADLINE: Duration = Duration::from_secs(8);
 const SELF_BROADCAST_TOR_FEE_QUOTE_GRACE: Duration = Duration::from_secs(2);
 const SELF_BROADCAST_TOR_FEE_QUOTE_DEADLINE: Duration = Duration::from_secs(15);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SelfBroadcastTipFallback {
+    Minimum,
+    RpcGasPrice,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelfBroadcastGasFeeQuote {
@@ -3349,6 +3359,16 @@ async fn self_broadcast_provider_fee_sample(
 fn self_broadcast_quote_from_fee_samples(
     samples: &[SelfBroadcastFeeSample],
 ) -> Option<SelfBroadcastGasFeeQuote> {
+    self_broadcast_quote_from_fee_samples_with_tip_fallback(
+        samples,
+        SelfBroadcastTipFallback::Minimum,
+    )
+}
+
+fn self_broadcast_quote_from_fee_samples_with_tip_fallback(
+    samples: &[SelfBroadcastFeeSample],
+    tip_fallback: SelfBroadcastTipFallback,
+) -> Option<SelfBroadcastGasFeeQuote> {
     if samples.is_empty() {
         return None;
     }
@@ -3369,11 +3389,17 @@ fn self_broadcast_quote_from_fee_samples(
             .filter_map(|sample| sample.next_base_fee_per_gas),
     );
 
+    let rpc_gas_price = upper_quartile(&mut gas_prices);
+    let fallback_tip = match tip_fallback {
+        SelfBroadcastTipFallback::Minimum => SELF_BROADCAST_MIN_PRIORITY_FEE_PER_GAS,
+        SelfBroadcastTipFallback::RpcGasPrice => rpc_gas_price
+            .unwrap_or(SELF_BROADCAST_MIN_PRIORITY_FEE_PER_GAS)
+            .max(SELF_BROADCAST_MIN_PRIORITY_FEE_PER_GAS),
+    };
     let selected_tip = upper_quartile(&mut fee_history_rewards)
         .or_else(|| upper_quartile(&mut priority_fee_suggestions))
-        .unwrap_or(SELF_BROADCAST_MIN_PRIORITY_FEE_PER_GAS)
+        .unwrap_or(fallback_tip)
         .max(SELF_BROADCAST_MIN_PRIORITY_FEE_PER_GAS);
-    let rpc_gas_price = upper_quartile(&mut gas_prices);
     let gas_price_max_fee = rpc_gas_price.map_or(0, self_broadcast_auto_max_fee_per_gas);
     let fee_history_max_fee = upper_quartile(&mut next_base_fees).map_or(0, |base_fee| {
         self_broadcast_auto_max_fee_per_gas(base_fee).saturating_add(selected_tip)
@@ -3403,13 +3429,28 @@ async fn self_broadcast_gas_fee_quote_from_rpc_pool(
     query_rpc_pool: &QueryRpcPool,
     network_mode: WalletNetworkMode,
 ) -> Result<SelfBroadcastGasFeeQuote> {
+    self_broadcast_gas_fee_quote_from_rpc_pool_with_tip_fallback(
+        query_rpc_pool,
+        network_mode,
+        SelfBroadcastTipFallback::Minimum,
+    )
+    .await
+}
+
+async fn self_broadcast_gas_fee_quote_from_rpc_pool_with_tip_fallback(
+    query_rpc_pool: &QueryRpcPool,
+    network_mode: WalletNetworkMode,
+    tip_fallback: SelfBroadcastTipFallback,
+) -> Result<SelfBroadcastGasFeeQuote> {
     let providers = query_rpc_pool.available_providers();
     if providers.is_empty() {
         return Err(eyre!("no healthy query RPC available"));
     }
     let policy = SelfBroadcastFeeQuoteTimeoutPolicy::for_network_mode(network_mode);
     let samples = self_broadcast_parallel_fee_samples(providers, policy).await;
-    if let Some(quote) = self_broadcast_quote_from_fee_samples(&samples) {
+    if let Some(quote) =
+        self_broadcast_quote_from_fee_samples_with_tip_fallback(&samples, tip_fallback)
+    {
         return Ok(quote);
     }
 
@@ -5214,75 +5255,6 @@ async fn buffered_gas_price_with_policy(
     Ok(gas_price * numerator / denominator)
 }
 
-pub(crate) async fn sign_send_wait_with_sent_with_gas_buffer(
-    provider: &(impl Provider + Clone),
-    wallet: &EthereumWallet,
-    tx_req: TransactionRequest,
-    label: &str,
-    gas_limit_buffer: u64,
-    on_sent: impl FnOnce(String) + Send,
-) -> Result<TxReceiptOutput> {
-    let gas = provider
-        .estimate_gas(tx_req.clone())
-        .await
-        .wrap_err_with(|| format!("{label}: estimate gas"))?
-        + gas_limit_buffer;
-    let tx_req = tx_req.with_gas_limit(gas);
-
-    tracing::info!(
-        from = %tx_req.from.unwrap_or_default(),
-        to = ?tx_req.to,
-        gas,
-        label,
-        "signing and sending",
-    );
-
-    let signed_tx = tx_req
-        .build(wallet)
-        .await
-        .wrap_err_with(|| format!("{label}: sign"))?
-        .encoded_2718();
-
-    let tx_hash = provider
-        .send_raw_transaction(&signed_tx)
-        .await
-        .wrap_err_with(|| format!("{label}: send"))?
-        .tx_hash()
-        .to_owned();
-
-    tracing::info!(%tx_hash, label, "sent, waiting for confirmation...");
-    let tx_hash_string = hex::encode_prefixed(tx_hash);
-    on_sent(tx_hash_string.clone());
-
-    let receipt = loop {
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        if let Some(r) = provider
-            .get_transaction_receipt(tx_hash)
-            .await
-            .wrap_err_with(|| format!("{label}: fetch receipt"))?
-        {
-            break r;
-        }
-    };
-
-    let status = receipt.status();
-    let block_number = receipt.block_number.unwrap_or(0);
-    let gas_used = receipt.gas_used;
-
-    if status {
-        tracing::info!(%tx_hash, block_number, gas_used, label, "confirmed");
-    } else {
-        tracing::warn!(%tx_hash, block_number, gas_used, label, "reverted");
-    }
-
-    Ok(TxReceiptOutput {
-        tx_hash: tx_hash_string,
-        status,
-        block_number,
-        gas_used,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -5320,13 +5292,13 @@ mod tests {
         DesktopWalletChainStart, DesktopWalletSyncStartPolicy, ListUtxosOutput,
         PublicBroadcasterCandidate, PublicBroadcasterFeeMargin, PublicBroadcasterFeeMode,
         PublicBroadcasterResultKind, PublicBroadcasterSelection, RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
-        SelfBroadcastFeeSample, SelfBroadcastGasFeeQuote, SelfBroadcastGasFeeSelection, TokenTotal,
-        UtxoOutput, WalletPendingOverlay, WalletPendingSpent, apply_pending_overlay_to_outputs,
-        approximate_public_broadcaster_cost, approximate_public_broadcaster_gas,
-        broadcaster_fee_amount, broadcaster_fee_covers, buffered_public_broadcaster_fee,
-        decode_public_broadcaster_response, eligible_public_broadcasters,
-        fee_policy_eligible_public_broadcasters, fixed_token_anchor_rate,
-        initial_separate_token_public_broadcaster_fee,
+        SelfBroadcastFeeSample, SelfBroadcastGasFeeQuote, SelfBroadcastGasFeeSelection,
+        SelfBroadcastTipFallback, TokenTotal, UtxoOutput, WalletPendingOverlay, WalletPendingSpent,
+        apply_pending_overlay_to_outputs, approximate_public_broadcaster_cost,
+        approximate_public_broadcaster_gas, broadcaster_fee_amount, broadcaster_fee_covers,
+        buffered_public_broadcaster_fee, decode_public_broadcaster_response,
+        eligible_public_broadcasters, fee_policy_eligible_public_broadcasters,
+        fixed_token_anchor_rate, initial_separate_token_public_broadcaster_fee,
         is_self_broadcast_insufficient_native_gas_error,
         is_self_broadcast_tx_already_known_message, is_wrapped_native_token,
         max_broadcaster_fee_token_amount_from_outputs, max_send_amount_from_outputs,
@@ -5341,6 +5313,7 @@ mod tests {
         select_public_broadcaster, select_public_broadcaster_with_policy,
         self_broadcast_gas_limit_with_buffer, self_broadcast_insufficient_native_gas_error,
         self_broadcast_native_gas_cost, self_broadcast_quote_from_fee_samples,
+        self_broadcast_quote_from_fee_samples_with_tip_fallback,
         self_broadcast_transaction_request, send_approximate_shape,
         sort_specific_public_broadcasters, transact_topic, unshield_approximate_shape,
         utxo_outputs_from_utxos, validate_self_broadcast_gas_fee, wrapped_native_token_for_chain,
@@ -5939,6 +5912,46 @@ mod tests {
         assert_eq!(quote.suggested_max_priority_fee_per_gas, 7);
         assert_eq!(quote.rpc_gas_price, 110);
         assert_eq!(quote.suggested_max_fee_per_gas, 132);
+    }
+
+    #[test]
+    fn self_broadcast_fee_samples_can_use_rpc_gas_price_as_tip_fallback() {
+        let samples = [SelfBroadcastFeeSample {
+            rpc_gas_price: Some(100),
+            max_priority_fee_per_gas: Some(0),
+            next_base_fee_per_gas: None,
+            priority_fee_rewards: vec![0],
+        }];
+
+        let default_quote = self_broadcast_quote_from_fee_samples(&samples).expect("fee quote");
+        let rpc_fallback_quote = self_broadcast_quote_from_fee_samples_with_tip_fallback(
+            &samples,
+            SelfBroadcastTipFallback::RpcGasPrice,
+        )
+        .expect("fee quote with rpc gas price fallback");
+
+        assert_eq!(default_quote.suggested_max_priority_fee_per_gas, 1);
+        assert_eq!(rpc_fallback_quote.suggested_max_fee_per_gas, 120);
+        assert_eq!(rpc_fallback_quote.suggested_max_priority_fee_per_gas, 100);
+    }
+
+    #[test]
+    fn self_broadcast_fee_samples_prefer_non_zero_tip_over_rpc_gas_price_fallback() {
+        let samples = [SelfBroadcastFeeSample {
+            rpc_gas_price: Some(100),
+            max_priority_fee_per_gas: Some(5),
+            next_base_fee_per_gas: None,
+            priority_fee_rewards: vec![0],
+        }];
+
+        let quote = self_broadcast_quote_from_fee_samples_with_tip_fallback(
+            &samples,
+            SelfBroadcastTipFallback::RpcGasPrice,
+        )
+        .expect("fee quote");
+
+        assert_eq!(quote.suggested_max_fee_per_gas, 120);
+        assert_eq!(quote.suggested_max_priority_fee_per_gas, 5);
     }
 
     #[test]

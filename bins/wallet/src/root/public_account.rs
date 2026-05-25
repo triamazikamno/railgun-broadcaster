@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use alloy::primitives::Address;
 use gpui::{
-    AppContext, Context, ElementId, Entity, Focusable, InteractiveElement, IntoElement,
-    MouseButton, ParentElement, Pixels, SharedString, StatefulInteractiveElement, Styled, Window,
-    div, img, prelude::FluentBuilder as _, px, rgb,
+    Context, ElementId, Entity, Focusable, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, Pixels, SharedString, StatefulInteractiveElement, Styled, Window, div, img,
+    prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
     Disableable, Icon, IconName, Sizable, WindowExt,
@@ -25,7 +25,8 @@ use ui::clipboard::{clipboard_with_toast, copy_to_clipboard_with_toast};
 use ui::controls::{app_button, app_button_base, app_input, app_muted_text, app_strong_text};
 use ui::theme::{self, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
-    PublicActionProgressStep, PublicAssetId, PublicBalanceEntry,
+    PublicActionAttemptInfo, PublicActionCommandSender, PublicActionProgressStep, PublicAssetId,
+    PublicBalanceEntry,
     vault::{
         PublicAccountMetadata, PublicAccountSource, PublicAccountStatus,
         public_account_default_label,
@@ -34,7 +35,8 @@ use wallet_ops::{
 
 use crate::assets::{RailgunActionIcon, RailgunPublicAccountIcon};
 
-use super::dialogs::{PublicAccountDialogContent, PublicAccountDialogKind};
+use super::dialogs::PublicAccountDialogKind;
+use super::gas_fee::Eip1559GasFeeEditorState;
 use super::public_action::{PublicActionMode, PublicActionStepState};
 use super::public_balances::{public_asset_icon_path, public_balance_amount_label};
 use super::{
@@ -80,6 +82,8 @@ pub(super) struct PublicAccountFormState {
     pub(super) send_password_input: Entity<InputState>,
     pub(super) shield_amount_input: Entity<InputState>,
     pub(super) shield_password_input: Entity<InputState>,
+    pub(super) send_gas_fee: Eip1559GasFeeEditorState,
+    pub(super) shield_gas_fee: Eip1559GasFeeEditorState,
     pub(super) import_global: bool,
     pub(super) selected_account_uuid: Option<Arc<str>>,
     pub(super) editing_account_uuid: Option<Arc<str>>,
@@ -89,6 +93,13 @@ pub(super) struct PublicAccountFormState {
     pub(super) action_generation: u64,
     pub(super) action_progress: Vec<PublicActionStepState>,
     pub(super) expanded_action_error_steps: BTreeSet<PublicActionProgressStep>,
+    pub(super) action_progress_dialog_open: bool,
+    pub(super) action_progress_asset_label: Arc<str>,
+    pub(super) action_progress_icon_path: Option<std::path::PathBuf>,
+    pub(super) action_command_tx: Option<PublicActionCommandSender>,
+    pub(super) action_attempts: Vec<PublicActionAttemptInfo>,
+    pub(super) action_current_gas_fee: Option<(u128, u128)>,
+    pub(super) action_action_error: Option<Arc<str>>,
     pub(super) next_derived_index: Option<u32>,
     pub(super) next_account_label_number: u32,
     pub(super) error: Option<Arc<str>>,
@@ -114,13 +125,11 @@ impl WalletRoot {
         self.public_form.error = None;
         self.clear_public_account_dialog_inputs(kind, window, cx);
         let root = cx.entity();
-        let content_root = root.clone();
         let dialog_width = (window.viewport_size().width * 0.92).min(PUBLIC_ACCOUNT_DIALOG_WIDTH);
         let content_width = secondary_dialog_content_width(dialog_width);
-        let content =
-            cx.new(|cx| PublicAccountDialogContent::new(content_root, kind, content_width, cx));
-        window.open_dialog(cx, move |dialog, _window, _cx| {
+        window.open_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
+            let content_root = root.clone();
             dialog
                 .w(dialog_width)
                 .title(app_strong_text(kind.title()))
@@ -130,7 +139,11 @@ impl WalletRoot {
                         root.clear_public_account_dialog_inputs(kind, window, cx);
                     });
                 })
-                .child(content.clone())
+                .child(content_root.read(cx).render_public_account_dialog_content(
+                    content_root.clone(),
+                    kind,
+                    content_width,
+                ))
         });
         cx.defer_in(window, move |root, window, cx| {
             root.focus_public_account_dialog_input(kind, window, cx);
@@ -148,19 +161,11 @@ impl WalletRoot {
         self.public_form.editing_account_uuid = Some(public_account_uuid);
         self.sync_public_edit_label_input(window, cx);
         let root = cx.entity();
-        let content_root = root.clone();
         let dialog_width = (window.viewport_size().width * 0.92).min(PUBLIC_ACCOUNT_DIALOG_WIDTH);
         let content_width = secondary_dialog_content_width(dialog_width);
-        let content = cx.new(|cx| {
-            PublicAccountDialogContent::new(
-                content_root,
-                PublicAccountDialogKind::EditLabel,
-                content_width,
-                cx,
-            )
-        });
-        window.open_dialog(cx, move |dialog, _window, _cx| {
+        window.open_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
+            let content_root = root.clone();
             dialog
                 .w(dialog_width)
                 .title(app_strong_text(PublicAccountDialogKind::EditLabel.title()))
@@ -174,7 +179,11 @@ impl WalletRoot {
                         );
                     });
                 })
-                .child(content.clone())
+                .child(content_root.read(cx).render_public_account_dialog_content(
+                    content_root.clone(),
+                    PublicAccountDialogKind::EditLabel,
+                    content_width,
+                ))
         });
         cx.defer_in(window, |root, window, cx| {
             root.focus_public_account_dialog_input(PublicAccountDialogKind::EditLabel, window, cx);
@@ -316,8 +325,7 @@ impl WalletRoot {
         self.public_form.selected_account_uuid = None;
         self.public_form.editing_account_uuid = None;
         self.public_form.selected_asset = None;
-        self.public_form.action_progress.clear();
-        self.public_form.expanded_action_error_steps.clear();
+        self.clear_public_action_progress_state();
         self.public_form.next_derived_index = None;
         self.public_form.next_account_label_number = 1;
         self.public_form.error = None;

@@ -650,7 +650,7 @@ impl GraphPostError {
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::Request(error) => error.is_timeout() || error.is_connect(),
+            Self::Request(error) => error.is_timeout() || error.is_connect() || error.is_request(),
             Self::ReadBody(_) => true,
             Self::HttpStatus { status, .. } => matches!(
                 *status,
@@ -838,5 +838,108 @@ impl GraphList for IndexedNullifiersData {
 
     fn items(self) -> Vec<Self::Item> {
         self.nullifiers
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration as StdDuration;
+
+    use reqwest::Client;
+    use serde::Deserialize;
+
+    use super::{EmptyVariables, post_graphql_data};
+
+    #[derive(Debug, Deserialize)]
+    struct TestData {
+        ok: bool,
+    }
+
+    #[tokio::test]
+    async fn post_graphql_data_retries_request_stage_eof() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let endpoint = url::Url::parse(&format!(
+            "http://{}/graphql",
+            listener.local_addr().expect("read test server address")
+        ))
+        .expect("parse test server URL");
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let server = thread::spawn(move || {
+            let (first_stream, _) = listener.accept().expect("accept first request");
+            drop(first_stream);
+
+            let (mut second_stream, _) = listener.accept().expect("accept retry request");
+            second_stream
+                .set_read_timeout(Some(StdDuration::from_secs(5)))
+                .expect("set retry read timeout");
+            read_http_request(&mut second_stream);
+
+            let body = r#"{"data":{"ok":true}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            second_stream
+                .write_all(response.as_bytes())
+                .expect("write retry response");
+            done_tx.send(()).expect("send server completion");
+        });
+
+        let client = Client::builder().no_proxy().build().expect("build client");
+        let data: TestData =
+            post_graphql_data(&client, &endpoint, "query Test { ok }", &EmptyVariables {})
+                .await
+                .expect("request should succeed after retry");
+
+        assert!(data.ok);
+        done_rx
+            .recv_timeout(StdDuration::from_secs(5))
+            .expect("server should observe retry request");
+        server.join().expect("server thread should finish");
+    }
+
+    fn read_http_request(stream: &mut TcpStream) {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+
+        loop {
+            let read = stream.read(&mut buffer).expect("read retry request");
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if request_is_complete(&request) {
+                break;
+            }
+        }
+
+        assert!(request.starts_with(b"POST "));
+    }
+
+    fn request_is_complete(request: &[u8]) -> bool {
+        let Some(header_end) = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|position| position + 4)
+        else {
+            return false;
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find_map(|(name, value)| {
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().expect("parse content length"))
+            })
+            .unwrap_or(0);
+
+        request.len() >= header_end + content_length
     }
 }

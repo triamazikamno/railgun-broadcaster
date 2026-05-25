@@ -51,9 +51,8 @@ use super::broadcaster_picker::{
     selected_broadcaster_fee_warning, selected_broadcaster_label,
     should_preserve_estimate_after_broadcaster_policy_change,
 };
-use super::dialogs::PrivateActionDialogContent;
 use super::gas_fee::{
-    Eip1559GasFeeEditTarget, Eip1559GasFeeEditorState, Eip1559GasFeeMode,
+    Eip1559GasFeeEditTarget, Eip1559GasFeeEditorState, Eip1559GasFeeMode, Eip1559GasFeeTarget,
     render_eip1559_gas_fee_editor,
 };
 use super::private_assets::refresh_form_asset_from_snapshot;
@@ -72,8 +71,9 @@ use super::{
     ChainUtxoState, PRIVATE_ACTION_FORM_MAX_HEIGHT, PRIVATE_ASSET_LIST_WIDTH,
     PublicBroadcasterFeeTokenOption, WalletRoot, effective_public_broadcaster_fee_mode,
     format_exact_token_amount_for_display, format_report_chain, format_send_amount_input,
-    format_unshield_amount_input, is_effective_wrapped_native_token, native_token_display_label,
-    native_wrapped_output_labels, parse_address, public_balance_amount_label,
+    format_unshield_amount_input, is_effective_wrapped_native_token, labeled_field,
+    native_token_display_label, native_wrapped_output_labels, new_masked_input,
+    new_prefilled_input, new_text_input, parse_address, public_balance_amount_label,
     public_broadcaster_fee_token_warning, public_broadcaster_submit_disabled_for_fee_token_options,
     send_form_max_entered_amount, should_show_broadcaster_fee_mode_toggle, token_label_row,
     unshield_form_max_entered_amount,
@@ -1017,7 +1017,7 @@ fn normalized_self_broadcast_gas_payer_uuid(
 fn self_broadcast_gas_payer_select_items(
     accounts: &[PublicAccountMetadata],
     chain_id: u64,
-    snapshot: Option<&wallet_ops::PublicBalanceSnapshot>,
+    snapshot: Option<&PublicBalanceSnapshot>,
 ) -> Vec<SelfBroadcastGasPayerSelectItem> {
     accounts
         .iter()
@@ -1050,7 +1050,7 @@ fn sync_self_broadcast_gas_payer_select_entity(
     select: &Entity<SelectState<SearchableVec<SelfBroadcastGasPayerSelectItem>>>,
     accounts: &[PublicAccountMetadata],
     chain_id: u64,
-    snapshot: Option<&wallet_ops::PublicBalanceSnapshot>,
+    snapshot: Option<&PublicBalanceSnapshot>,
     selected_uuid: Option<&Arc<str>>,
     window: &mut Window,
     cx: &mut Context<'_, WalletRoot>,
@@ -1397,8 +1397,7 @@ pub(super) fn render_self_broadcast_settings(
         })
         .child(render_eip1559_gas_fee_editor(
             gas_fee_root,
-            key,
-            kind,
+            Eip1559GasFeeTarget::Private { key, kind },
             gas_fee,
             generating,
         ))
@@ -1604,12 +1603,12 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         let root = cx.entity();
-        let content = cx.new(|cx| PrivateActionDialogContent::new(root.clone(), kind, key, cx));
-        window.open_dialog(cx, move |dialog, window, _cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let dialog_width = (window.viewport_size().width * 0.92).min(PRIVATE_ASSET_LIST_WIDTH);
             let max_height =
                 (window.viewport_size().height * 0.88).min(PRIVATE_ACTION_FORM_MAX_HEIGHT);
             let close_root = root.clone();
+            let content_root = root.clone();
             dialog
                 .w(dialog_width)
                 .h(max_height)
@@ -1624,7 +1623,14 @@ impl WalletRoot {
                         DeliveryFormKind::Unshield => root.close_unshield_form(key, cx),
                     });
                 })
-                .child(content.clone())
+                .child(match kind {
+                    DeliveryFormKind::Send => content_root
+                        .read(cx)
+                        .render_send_form(content_root.clone(), key),
+                    DeliveryFormKind::Unshield => content_root
+                        .read(cx)
+                        .render_unshield_form(content_root.clone(), key),
+                })
         });
     }
 
@@ -1639,18 +1645,10 @@ impl WalletRoot {
         let dialog_asset_label = asset.label.clone();
         let dialog_icon_path = asset.icon_path.clone();
         let amount = format_send_amount_input(asset.max_batched, asset.decimals);
-        let amount_input = cx.new(|cx| {
-            let mut input = InputState::new(window, cx).placeholder("amount");
-            input.set_value(&amount, window, cx);
-            input
-        });
-        let recipient_input = cx.new(|cx| InputState::new(window, cx).placeholder("0zk recipient"));
+        let amount_input = new_prefilled_input(window, cx, "amount", amount);
+        let recipient_input = new_text_input(window, cx, "0zk recipient");
         let focus_recipient_input = recipient_input.clone();
-        let password_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("vault password")
-                .masked(true)
-        });
+        let password_input = new_masked_input(window, cx, "vault password");
         let self_broadcast_gas_payer_uuid = self.default_self_broadcast_gas_payer_uuid();
         let gas_payer_select = self.new_self_broadcast_gas_payer_select(
             key.chain_id,
@@ -2479,18 +2477,10 @@ impl WalletRoot {
         let dialog_asset_label = asset.label.clone();
         let dialog_icon_path = asset.icon_path.clone();
         let amount = format_unshield_amount_input(asset.max_batched, asset.decimals);
-        let amount_input = cx.new(|cx| {
-            let mut input = InputState::new(window, cx).placeholder("amount");
-            input.set_value(&amount, window, cx);
-            input
-        });
-        let recipient_input = cx.new(|cx| InputState::new(window, cx).placeholder("0x recipient"));
+        let amount_input = new_prefilled_input(window, cx, "amount", amount);
+        let recipient_input = new_text_input(window, cx, "0x recipient");
         let focus_recipient_input = recipient_input.clone();
-        let password_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("vault password")
-                .masked(true)
-        });
+        let password_input = new_masked_input(window, cx, "vault password");
         let self_broadcast_gas_payer_uuid = self.default_self_broadcast_gas_payer_uuid();
         let gas_payer_select = self.new_self_broadcast_gas_payer_select(
             key.chain_id,
@@ -4032,28 +4022,19 @@ impl WalletRoot {
                     .items_end()
                     .gap_3()
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(app_muted_text("Recipient 0zk address"))
-                            .child(
-                                private_action_input(&form.recipient_input)
-                                    .disabled(form.generating),
-                            ),
+                        labeled_field(
+                            "Recipient 0zk address",
+                            private_action_input(&form.recipient_input).disabled(form.generating),
+                        )
+                        .flex_1()
+                        .min_w(px(0.0)),
                     )
                     .child(
-                        div()
-                            .w(px(220.0))
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(app_muted_text(unit_hint))
-                            .child(
-                                private_action_input(&form.amount_input).disabled(form.generating),
-                            ),
+                        labeled_field(
+                            unit_hint,
+                            private_action_input(&form.amount_input).disabled(form.generating),
+                        )
+                        .w(px(220.0)),
                     ),
             )
             .child(
@@ -4062,17 +4043,12 @@ impl WalletRoot {
                     .items_end()
                     .gap_3()
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(app_muted_text("Vault password"))
-                            .child(
-                                private_action_input(&form.password_input)
-                                    .disabled(form.generating),
-                            ),
+                        labeled_field(
+                            "Vault password",
+                            private_action_input(&form.password_input).disabled(form.generating),
+                        )
+                        .flex_1()
+                        .min_w(px(0.0)),
                     )
                     .child(
                         app_button(
@@ -4360,17 +4336,12 @@ impl WalletRoot {
                     .items_end()
                     .gap_3()
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(app_muted_text("Recipient"))
-                            .child(
-                                private_action_input(&form.recipient_input)
-                                    .disabled(form.generating),
-                            ),
+                        labeled_field(
+                            "Recipient",
+                            private_action_input(&form.recipient_input).disabled(form.generating),
+                        )
+                        .flex_1()
+                        .min_w(px(0.0)),
                     )
                     .children(unwrap_supported.then(|| {
                         render_unshield_output_toggle(
@@ -4382,15 +4353,11 @@ impl WalletRoot {
                         )
                     }))
                     .child(
-                        div()
-                            .w(px(220.0))
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(app_muted_text(unit_hint))
-                            .child(
-                                private_action_input(&form.amount_input).disabled(form.generating),
-                            ),
+                        labeled_field(
+                            unit_hint,
+                            private_action_input(&form.amount_input).disabled(form.generating),
+                        )
+                        .w(px(220.0)),
                     ),
             )
             .child(
@@ -4399,17 +4366,12 @@ impl WalletRoot {
                     .items_end()
                     .gap_3()
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(app_muted_text("Vault password"))
-                            .child(
-                                private_action_input(&form.password_input)
-                                    .disabled(form.generating),
-                            ),
+                        labeled_field(
+                            "Vault password",
+                            private_action_input(&form.password_input).disabled(form.generating),
+                        )
+                        .flex_1()
+                        .min_w(px(0.0)),
                     )
                     .child(
                         app_button(

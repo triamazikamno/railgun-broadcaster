@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use gpui::{AppContext, Context, Entity, Focusable, ParentElement, Window, px};
+use gpui::{Context, Entity, Focusable, ParentElement, Window, px};
 use gpui_component::{WindowExt, input::InputState, select::SearchableVec};
 use ui::controls::app_strong_text;
 use wallet_ops::vault::{
@@ -10,7 +10,6 @@ use wallet_ops::vault::{
 };
 use zeroize::Zeroizing;
 
-use super::dialogs::AddWalletDialogContent;
 use super::wallet_header::WalletSelectItem;
 use super::{ChainUtxoState, WalletRoot, WalletTab, secondary_dialog_content_width};
 
@@ -142,12 +141,16 @@ impl WalletRoot {
         let root = cx.entity();
         let dialog_width = (window.viewport_size().width * 0.92).min(px(520.0));
         let content_width = secondary_dialog_content_width(dialog_width);
-        let content = cx.new(|cx| AddWalletDialogContent::new(root, content_width, cx));
-        window.open_dialog(cx, move |dialog, _window, _cx| {
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            let content_root = root.clone();
             dialog
                 .w(dialog_width)
                 .title(app_strong_text("Add wallet"))
-                .child(content.clone())
+                .child(
+                    content_root
+                        .read(cx)
+                        .render_add_wallet_dialog_content(content_root.clone(), content_width),
+                )
         });
         cx.defer_in(window, move |root, window, cx| {
             root.set_wallet_name_input(&label, window, cx);

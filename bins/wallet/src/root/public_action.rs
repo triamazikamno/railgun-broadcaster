@@ -5,7 +5,8 @@ use std::sync::Arc;
 use alloy::primitives::U256;
 use gpui::{
     AppContext, Context, Entity, Focusable, InteractiveElement, IntoElement, ParentElement, Pixels,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, px, rgb,
+    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder as _, px,
+    rgb,
 };
 use gpui_component::{
     Disableable, Icon, IconName, Selectable, Sizable, WindowExt,
@@ -21,13 +22,19 @@ use ui::clipboard::clipboard_with_toast;
 use ui::controls::{app_button, app_input, app_muted_text, app_strong_text};
 use ui::theme::{self, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
-    PublicActionProgressStatus, PublicActionProgressStep, PublicActionProgressUpdate,
-    PublicAssetId, PublicBalanceEntry, PublicSendRequest, PublicShieldRequest,
-    estimate_public_native_action_gas_reserve, parse_send_amount, submit_public_send_with_progress,
-    submit_public_shield_with_progress, vault::PublicAccountStatus,
+    PublicActionCommand, PublicActionCommandKind, PublicActionCommandSender,
+    PublicActionGasFeeSelection, PublicActionProgressStatus, PublicActionProgressStep,
+    PublicActionProgressUpdate, PublicActionSessionEvent, PublicAssetId, PublicBalanceEntry,
+    PublicSendRequest, PublicShieldRequest, estimate_public_native_action_gas_reserve,
+    parse_send_amount, public_action_replacement_bumped_fee, quote_public_action_gas_fee,
+    submit_public_send_with_progress, submit_public_shield_with_progress,
+    vault::PublicAccountStatus,
 };
 
-use super::dialogs::PublicActionDialogContent;
+use super::gas_fee::{
+    Eip1559GasFeeEditTarget, Eip1559GasFeeMode, Eip1559GasFeeTarget, GasRetryInputs, format_gwei,
+    render_eip1559_gas_fee_editor,
+};
 use super::public_balances::public_asset_icon_path;
 use super::utxo::short_hash;
 use super::{
@@ -37,6 +44,8 @@ use super::{
 };
 
 use crate::assets::RailgunActionIcon;
+
+const PUBLIC_ACTION_RETRY_DEFAULT_FEE_WEI: u128 = 1_000_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PublicActionMode {
@@ -60,6 +69,122 @@ pub(super) struct PublicActionStepState {
     pub(super) message: Option<Arc<str>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublicActionGasRetryKind {
+    RetryEstimate,
+    SpeedUp,
+}
+
+struct PublicActionGasRetryDialogContent {
+    root: Entity<WalletRoot>,
+    generation: u64,
+    retry_kind: PublicActionGasRetryKind,
+    gas_inputs: GasRetryInputs,
+    error: Option<Arc<str>>,
+}
+
+impl PublicActionGasRetryDialogContent {
+    fn new(
+        root: Entity<WalletRoot>,
+        generation: u64,
+        retry_kind: PublicActionGasRetryKind,
+        initial_max_fee_per_gas: u128,
+        initial_max_priority_fee_per_gas: u128,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Self {
+        let gas_inputs = GasRetryInputs::new(
+            initial_max_fee_per_gas,
+            initial_max_priority_fee_per_gas,
+            window,
+            cx,
+        );
+        cx.observe(&root, |_this, _root, cx| cx.notify()).detach();
+        gas_inputs.subscribe_clear_error(cx, |this, cx| {
+            this.error = None;
+            cx.notify();
+        });
+        Self {
+            root,
+            generation,
+            retry_kind,
+            gas_inputs,
+            error: None,
+        }
+    }
+}
+
+impl gpui::Render for PublicActionGasRetryDialogContent {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        let title = match self.retry_kind {
+            PublicActionGasRetryKind::RetryEstimate => "Retry with custom gas",
+            PublicActionGasRetryKind::SpeedUp => "Speed up transaction",
+        };
+        let detail = match self.retry_kind {
+            PublicActionGasRetryKind::RetryEstimate => {
+                "Retry this Public action step using these EIP-1559 fee values."
+            }
+            PublicActionGasRetryKind::SpeedUp => {
+                "Uses the same nonce to replace the pending transaction. Values are prefilled +12.5%."
+            }
+        };
+        let submit_root = self.root.clone();
+        let gas_inputs = self.gas_inputs.clone();
+        let generation = self.generation;
+        let retry_kind = self.retry_kind;
+        let dialog = cx.entity();
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(app_strong_text(title))
+            .child(app_muted_text(detail).whitespace_normal())
+            .child(self.gas_inputs.render_fields())
+            .when_some(self.error.as_ref(), |this, error| {
+                this.child(app_muted_text(error.to_string()).text_color(rgb(theme::DANGER)))
+            })
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_wrap()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        app_button("public-action-gas-retry-cancel", "Cancel")
+                            .flex_none()
+                            .on_click(move |_event, window, cx| {
+                                window.close_dialog(cx);
+                            }),
+                    )
+                    .child(
+                        app_button("public-action-gas-retry-confirm", "Submit")
+                            .primary()
+                            .flex_none()
+                            .on_click(move |_event, window, cx| {
+                                let (max_fee, max_tip) = match gas_inputs.parse(cx) {
+                                    Ok(values) => values,
+                                    Err(error) => {
+                                        dialog.update(cx, |this, cx| {
+                                            this.error = Some(Arc::from(error));
+                                            cx.notify();
+                                        });
+                                        return;
+                                    }
+                                };
+                                submit_root.update(cx, |root, cx| {
+                                    root.submit_public_action_gas_retry(
+                                        generation, retry_kind, max_fee, max_tip, cx,
+                                    );
+                                });
+                                window.close_dialog(cx);
+                            }),
+                    ),
+            )
+    }
+}
+
 impl WalletRoot {
     pub(super) fn open_public_action_dialog(
         &mut self,
@@ -73,10 +198,8 @@ impl WalletRoot {
         self.public_form.action_mode = PublicActionMode::Shield;
         self.clear_public_action_dialog_inputs(window, cx);
         let root = cx.entity();
-        let content_root = root.clone();
         let dialog_width = (window.viewport_size().width * 0.92).min(PUBLIC_ACTION_DIALOG_WIDTH);
         let content_width = secondary_dialog_content_width(dialog_width);
-        let content = cx.new(|cx| PublicActionDialogContent::new(content_root, content_width, cx));
         let asset_label = public_asset_label(
             self.selected_chain,
             asset,
@@ -87,8 +210,9 @@ impl WalletRoot {
             asset,
             Some(&self.effective_token_registry),
         );
-        window.open_dialog(cx, move |dialog, _window, _cx| {
+        window.open_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
+            let content_root = root.clone();
             dialog
                 .w(dialog_width)
                 .title(public_action_title_row(
@@ -100,8 +224,13 @@ impl WalletRoot {
                         root.clear_public_action_dialog_inputs(window, cx);
                     });
                 })
-                .child(content.clone())
+                .child(
+                    content_root
+                        .read(cx)
+                        .render_public_action_dialog_content(content_root.clone(), content_width),
+                )
         });
+        self.refresh_public_action_gas_fee_quote(PublicActionMode::Shield, cx);
         cx.defer_in(window, |root, window, cx| {
             root.focus_public_action_dialog_input(window, cx);
         });
@@ -147,9 +276,10 @@ impl WalletRoot {
         let submitting = self.public_form.sending || self.public_form.shielding;
         let mode_root = root.clone();
         let submit_root = root.clone();
-        let stepper_root = root.clone();
+        let gas_fee_root = root.clone();
+        let progress_root = root.clone();
         let max_root = root;
-        let show_form_errors = self.public_form.action_progress.is_empty();
+        let show_form_errors = !self.public_action_has_active_progress();
         let max_label = balance_entry.as_ref().and_then(public_action_max_label);
         let amount_hint = format!("{asset_label} amount");
         let mut content = div()
@@ -208,6 +338,14 @@ impl WalletRoot {
                         app_input(&self.public_form.shield_password_input)
                             .disabled(disabled || self.public_form.shielding),
                     )
+                    .child(render_eip1559_gas_fee_editor(
+                        gas_fee_root,
+                        Eip1559GasFeeTarget::Public {
+                            mode: PublicActionMode::Shield,
+                        },
+                        &self.public_form.shield_gas_fee,
+                        disabled || self.public_form.shielding,
+                    ))
                     .child(
                         app_button(
                             "wallet-public-shield",
@@ -251,6 +389,14 @@ impl WalletRoot {
                         app_input(&self.public_form.send_password_input)
                             .disabled(disabled || self.public_form.sending),
                     )
+                    .child(render_eip1559_gas_fee_editor(
+                        gas_fee_root,
+                        Eip1559GasFeeTarget::Public {
+                            mode: PublicActionMode::Send,
+                        },
+                        &self.public_form.send_gas_fee,
+                        disabled || self.public_form.sending,
+                    ))
                     .child(
                         app_button(
                             "wallet-public-send",
@@ -277,24 +423,17 @@ impl WalletRoot {
             }
         }
 
-        if !self.public_form.action_progress.is_empty() {
-            let action_asset_label = selected_asset.map_or_else(
-                || asset_label.clone(),
-                |asset| {
-                    public_action_asset_label(
-                        self.selected_chain,
-                        asset,
-                        Some(&self.effective_token_registry),
-                    )
-                },
-            );
-            content = content.child(render_public_action_stepper(
-                &stepper_root,
-                &self.public_form.action_progress,
-                &self.public_form.expanded_action_error_steps,
-                &action_asset_label,
+        if !self.public_form.action_progress_dialog_open
+            && let Some(active_step) =
+                public_action_closed_active_step(&self.public_form.action_progress)
+        {
+            content = content.child(render_public_action_active_status_notice(
+                progress_root,
+                mode,
+                active_step,
             ));
         }
+
         content
     }
 
@@ -315,8 +454,7 @@ impl WalletRoot {
         self.public_form.send_error = None;
         self.public_form.shield_error = None;
         if !self.public_form.sending && !self.public_form.shielding {
-            self.public_form.action_progress.clear();
-            self.public_form.expanded_action_error_steps.clear();
+            self.clear_public_action_progress_state();
         }
     }
 
@@ -332,11 +470,125 @@ impl WalletRoot {
         self.public_form.action_mode = mode;
         self.public_form.send_error = None;
         self.public_form.shield_error = None;
-        self.public_form.action_progress.clear();
-        self.public_form.expanded_action_error_steps.clear();
+        self.clear_public_action_progress_state();
+        self.refresh_public_action_gas_fee_quote(mode, cx);
         cx.defer_in(window, |root, window, cx| {
             root.focus_public_action_dialog_input(window, cx);
         });
+        cx.notify();
+    }
+
+    const fn public_action_has_active_progress(&self) -> bool {
+        !self.public_form.action_progress.is_empty()
+    }
+
+    pub(super) fn clear_public_action_progress_state(&mut self) {
+        self.public_form.action_progress.clear();
+        self.public_form.expanded_action_error_steps.clear();
+        self.public_form.action_progress_dialog_open = false;
+        self.public_form.action_progress_asset_label = Arc::from("");
+        self.public_form.action_progress_icon_path = None;
+        self.public_form.action_command_tx = None;
+        self.public_form.action_attempts.clear();
+        self.public_form.action_current_gas_fee = None;
+        self.public_form.action_action_error = None;
+    }
+
+    pub(super) fn set_public_action_gas_fee_mode(
+        &mut self,
+        action_mode: PublicActionMode,
+        mode: Eip1559GasFeeMode,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let submitting = self.public_form.sending || self.public_form.shielding;
+        let gas_fee = match action_mode {
+            PublicActionMode::Shield => &mut self.public_form.shield_gas_fee,
+            PublicActionMode::Send => &mut self.public_form.send_gas_fee,
+        };
+        if submitting || gas_fee.mode == mode {
+            return;
+        }
+        if mode == Eip1559GasFeeMode::Custom {
+            gas_fee.seed_custom_from_auto_if_empty(window, cx);
+        }
+        gas_fee.mode = mode;
+        self.set_public_action_error(action_mode, None);
+        cx.notify();
+    }
+
+    pub(super) fn customize_public_action_gas_fee_from_auto(
+        &mut self,
+        action_mode: PublicActionMode,
+        target: Eip1559GasFeeEditTarget,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.public_form.sending || self.public_form.shielding {
+            return;
+        }
+        let gas_fee = match action_mode {
+            PublicActionMode::Shield => &mut self.public_form.shield_gas_fee,
+            PublicActionMode::Send => &mut self.public_form.send_gas_fee,
+        };
+        if !gas_fee.overwrite_custom_from_auto(window, cx) {
+            return;
+        }
+        let focus_input = match target {
+            Eip1559GasFeeEditTarget::MaxFee => gas_fee.max_fee_input.clone(),
+            Eip1559GasFeeEditTarget::MaxTip => gas_fee.max_priority_fee_input.clone(),
+        };
+        gas_fee.mode = Eip1559GasFeeMode::Custom;
+        self.set_public_action_error(action_mode, None);
+        focus_input.read(cx).focus_handle(cx).focus(window);
+        cx.notify();
+    }
+
+    pub(super) fn refresh_public_action_gas_fee_quote(
+        &mut self,
+        action_mode: PublicActionMode,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let submitting = self.public_form.sending || self.public_form.shielding;
+        let gas_fee = match action_mode {
+            PublicActionMode::Shield => &mut self.public_form.shield_gas_fee,
+            PublicActionMode::Send => &mut self.public_form.send_gas_fee,
+        };
+        if submitting || gas_fee.refreshing {
+            return;
+        }
+        gas_fee.refresh_id = gas_fee.refresh_id.wrapping_add(1);
+        gas_fee.refreshing = true;
+        gas_fee.error = None;
+        let refresh_id = gas_fee.refresh_id;
+        let chain_id = self.selected_chain;
+        let effective_chain = self.effective_chain_configs.get(&chain_id).cloned();
+        let http = self.http.clone();
+        cx.spawn(async move |this, cx| {
+            let result =
+                quote_public_action_gas_fee(chain_id, effective_chain.as_ref(), &http).await;
+            let _ = this.update(cx, |root, cx| {
+                let gas_fee = match action_mode {
+                    PublicActionMode::Shield => &mut root.public_form.shield_gas_fee,
+                    PublicActionMode::Send => &mut root.public_form.send_gas_fee,
+                };
+                if gas_fee.refresh_id != refresh_id {
+                    return;
+                }
+                gas_fee.refreshing = false;
+                match result {
+                    Ok(quote) => {
+                        gas_fee.quote = Some(quote);
+                        gas_fee.error = None;
+                    }
+                    Err(error) => {
+                        gas_fee.error = Some(Arc::from(format_report_chain(&error)));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
         cx.notify();
     }
 
@@ -344,10 +596,21 @@ impl WalletRoot {
         &mut self,
         mode: PublicActionMode,
         asset: PublicAssetId,
+        asset_label: String,
+        icon_path: Option<PathBuf>,
+        command_tx: Option<PublicActionCommandSender>,
+        initial_gas_fee: Option<(u128, u128)>,
     ) -> u64 {
         self.public_form.action_generation = self.public_form.action_generation.wrapping_add(1);
         let generation = self.public_form.action_generation;
         self.public_form.expanded_action_error_steps.clear();
+        self.public_form.action_progress_asset_label = Arc::from(asset_label);
+        self.public_form.action_progress_icon_path = icon_path;
+        self.public_form.action_progress_dialog_open = false;
+        self.public_form.action_command_tx = command_tx;
+        self.public_form.action_attempts.clear();
+        self.public_form.action_current_gas_fee = initial_gas_fee;
+        self.public_form.action_action_error = None;
         self.public_form.action_progress = public_action_progress_steps(mode, asset)
             .into_iter()
             .map(|step| PublicActionStepState {
@@ -437,6 +700,8 @@ impl WalletRoot {
             let step = &mut self.public_form.action_progress[step_index];
             step.status = PublicActionStepStatus::Error;
             step.message = Some(Arc::from(message));
+            self.public_form.action_command_tx = None;
+            self.public_form.action_action_error = None;
             cx.notify();
         }
     }
@@ -461,6 +726,219 @@ impl WalletRoot {
             }
         })
         .detach();
+    }
+
+    fn spawn_public_action_session_event_listener(
+        generation: u64,
+        chain_id: u64,
+        active_wallet_id: Option<Arc<str>>,
+        mut event_rx: mpsc::UnboundedReceiver<PublicActionSessionEvent>,
+        cx: &Context<'_, Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            while let Some(event) = event_rx.recv().await {
+                let _ = this.update(cx, |root, cx| {
+                    if root.selected_wallet_id != active_wallet_id
+                        || root.selected_chain != chain_id
+                    {
+                        return;
+                    }
+                    root.apply_public_action_session_event(generation, event, cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn apply_public_action_session_event(
+        &mut self,
+        generation: u64,
+        event: PublicActionSessionEvent,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.public_form.action_generation != generation {
+            return;
+        }
+        match event {
+            PublicActionSessionEvent::StepFailed { step, message } => {
+                self.public_form.action_action_error = None;
+                if let Some(progress_step) = self
+                    .public_form
+                    .action_progress
+                    .iter_mut()
+                    .find(|progress_step| progress_step.step == step)
+                {
+                    progress_step.status = PublicActionStepStatus::Error;
+                    progress_step.message = Some(Arc::from(message));
+                }
+            }
+            PublicActionSessionEvent::AttemptSubmitted { attempt, .. } => {
+                self.public_form.action_current_gas_fee =
+                    Some((attempt.max_fee_per_gas, attempt.max_priority_fee_per_gas));
+                self.public_form.action_action_error = None;
+                self.public_form.action_attempts.push(attempt);
+            }
+            PublicActionSessionEvent::AttemptRejected { message, .. } => {
+                self.public_form.action_action_error = Some(Arc::from(message));
+            }
+        }
+        cx.notify();
+    }
+
+    fn show_public_action_progress_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.public_form.action_progress_dialog_open {
+            return;
+        }
+        self.public_form.action_progress_dialog_open = true;
+        let generation = self.public_form.action_generation;
+        let mode = self.public_form.action_mode;
+        let asset_label = Arc::clone(&self.public_form.action_progress_asset_label);
+        let icon_path = self.public_form.action_progress_icon_path.clone();
+        let root = cx.entity();
+        let dialog_width = (window.viewport_size().width * 0.92).min(PUBLIC_ACTION_DIALOG_WIDTH);
+        let content_width = secondary_dialog_content_width(dialog_width);
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            let close_root = root.clone();
+            let content_root = root.clone();
+            dialog
+                .w(dialog_width)
+                .title(public_action_title_row(
+                    format!("{} {}", public_action_mode_verb(mode), asset_label.as_ref()),
+                    icon_path.clone(),
+                ))
+                .on_close(move |_event, _window, cx| {
+                    close_root.update(cx, |root, cx| {
+                        if root.public_form.action_generation == generation {
+                            root.public_form.action_progress_dialog_open = false;
+                            cx.notify();
+                        }
+                    });
+                })
+                .child(
+                    content_root
+                        .read(cx)
+                        .render_public_action_progress_dialog_content(&content_root, content_width),
+                )
+        });
+    }
+
+    pub(super) fn render_public_action_progress_dialog_content(
+        &self,
+        root: &Entity<Self>,
+        content_width: Pixels,
+    ) -> gpui::Div {
+        if self.public_form.action_progress.is_empty() {
+            return div()
+                .w(content_width)
+                .child(app_muted_text("No active Public action."));
+        }
+        let mut content =
+            div()
+                .w(content_width)
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(render_public_action_stepper(
+                    root,
+                    &self.public_form.action_progress,
+                    &self.public_form.expanded_action_error_steps,
+                    self.public_form.action_progress_asset_label.as_ref(),
+                    self.public_form.action_command_tx.is_some(),
+                    self.public_form.action_current_gas_fee,
+                    self.public_form.action_action_error.as_deref(),
+                    self.public_form.action_generation,
+                ));
+
+        if let Some((max_fee, max_tip)) = self.public_form.action_current_gas_fee {
+            content = content.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p(px(12.0))
+                    .rounded_md()
+                    .bg(rgb(theme::SURFACE_ELEVATED))
+                    .border_1()
+                    .border_color(rgb(theme::BORDER))
+                    .child(app_strong_text("Gas fee"))
+                    .child(public_action_context_row(
+                        "Max fee",
+                        format!("{} gwei", format_gwei(max_fee)),
+                    ))
+                    .child(public_action_context_row(
+                        "Max tip",
+                        format!("{} gwei", format_gwei(max_tip)),
+                    )),
+            );
+        }
+        content
+    }
+
+    fn open_public_action_gas_retry_dialog(
+        &self,
+        generation: u64,
+        retry_kind: PublicActionGasRetryKind,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.public_form.action_generation != generation
+            || self.public_form.action_command_tx.is_none()
+        {
+            return;
+        }
+        let (mut max_fee, mut max_tip) = self.public_form.action_current_gas_fee.unwrap_or((
+            PUBLIC_ACTION_RETRY_DEFAULT_FEE_WEI,
+            PUBLIC_ACTION_RETRY_DEFAULT_FEE_WEI,
+        ));
+        if retry_kind == PublicActionGasRetryKind::SpeedUp {
+            max_fee = public_action_replacement_bumped_fee(max_fee);
+            max_tip = public_action_replacement_bumped_fee(max_tip);
+        }
+        let root = cx.entity();
+        let content = cx.new(|cx| {
+            PublicActionGasRetryDialogContent::new(
+                root, generation, retry_kind, max_fee, max_tip, window, cx,
+            )
+        });
+        let dialog_width = (window.viewport_size().width * 0.92).min(px(460.0));
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            dialog.w(dialog_width).child(content.clone())
+        });
+    }
+
+    fn submit_public_action_gas_retry(
+        &mut self,
+        generation: u64,
+        retry_kind: PublicActionGasRetryKind,
+        max_fee_per_gas: u128,
+        max_priority_fee_per_gas: u128,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.public_form.action_generation != generation {
+            return;
+        }
+        let Some(command_tx) = self.public_form.action_command_tx.as_ref() else {
+            return;
+        };
+        let kind = match retry_kind {
+            PublicActionGasRetryKind::RetryEstimate => PublicActionCommandKind::Retry,
+            PublicActionGasRetryKind::SpeedUp => PublicActionCommandKind::Replacement,
+        };
+        let send_result = command_tx.send(PublicActionCommand {
+            kind,
+            gas_fee: PublicActionGasFeeSelection::Custom {
+                max_fee_per_gas,
+                max_priority_fee_per_gas,
+            },
+        });
+        self.public_form.action_action_error = send_result
+            .err()
+            .map(|_| Arc::from("Public action is no longer accepting retry commands."));
+        cx.notify();
     }
 
     fn set_public_action_error_details_open(
@@ -506,11 +984,20 @@ impl WalletRoot {
         let http = self.http.clone();
         let steps = public_action_progress_steps(mode, PublicAssetId::Native);
         let effective_chain = self.effective_chain_configs.get(&chain_id).cloned();
+        let gas_fee = match self.public_action_gas_fee_selection(mode, cx) {
+            Ok(selection) => selection,
+            Err(error) => {
+                self.set_public_action_error(mode, Some(Arc::from(error)));
+                cx.notify();
+                return;
+            }
+        };
         let join = self.runtime.spawn(async move {
             estimate_public_native_action_gas_reserve(
                 chain_id,
                 &steps,
                 effective_chain.as_ref(),
+                gas_fee,
                 &http,
             )
             .await
@@ -589,6 +1076,40 @@ impl WalletRoot {
         }
     }
 
+    fn public_action_gas_fee_selection(
+        &self,
+        mode: PublicActionMode,
+        cx: &Context<'_, Self>,
+    ) -> Result<PublicActionGasFeeSelection, String> {
+        match mode {
+            PublicActionMode::Shield => self.public_form.shield_gas_fee.selection(cx),
+            PublicActionMode::Send => self.public_form.send_gas_fee.selection(cx),
+        }
+    }
+
+    fn public_action_initial_gas_values(
+        &self,
+        mode: PublicActionMode,
+        selection: &PublicActionGasFeeSelection,
+    ) -> Option<(u128, u128)> {
+        match selection {
+            PublicActionGasFeeSelection::Custom {
+                max_fee_per_gas,
+                max_priority_fee_per_gas,
+            } => Some((*max_fee_per_gas, *max_priority_fee_per_gas)),
+            PublicActionGasFeeSelection::Auto => {
+                let quote = match mode {
+                    PublicActionMode::Shield => self.public_form.shield_gas_fee.quote,
+                    PublicActionMode::Send => self.public_form.send_gas_fee.quote,
+                }?;
+                Some((
+                    quote.suggested_max_fee_per_gas,
+                    quote.suggested_max_priority_fee_per_gas,
+                ))
+            }
+        }
+    }
+
     pub(super) fn submit_public_send_from_form(
         &mut self,
         window: &mut Window,
@@ -597,8 +1118,7 @@ impl WalletRoot {
         if self.public_form.sending {
             return;
         }
-        self.public_form.action_progress.clear();
-        self.public_form.expanded_action_error_steps.clear();
+        self.clear_public_action_progress_state();
         let Some(asset) = self.public_form.selected_asset else {
             self.public_form.send_error = Some(Arc::from("Select an asset to send"));
             cx.notify();
@@ -656,6 +1176,14 @@ impl WalletRoot {
             cx.notify();
             return;
         };
+        let gas_fee = match self.public_action_gas_fee_selection(PublicActionMode::Send, cx) {
+            Ok(selection) => selection,
+            Err(error) => {
+                self.public_form.send_error = Some(Arc::from(error));
+                cx.notify();
+                return;
+            }
+        };
         let vault_password =
             Self::read_and_clear_input(&self.public_form.send_password_input, window, cx);
         if vault_password.trim().is_empty() {
@@ -668,7 +1196,22 @@ impl WalletRoot {
         let chain_id = self.selected_chain;
         let http = self.http.clone();
         let active_wallet_id = self.selected_wallet_id.clone();
-        let generation = self.start_public_action_progress(PublicActionMode::Send, asset);
+        let asset_label =
+            public_action_asset_label(chain_id, asset, Some(&self.effective_token_registry));
+        let icon_path =
+            public_asset_icon_path(chain_id, asset, Some(&self.effective_token_registry));
+        let initial_gas_fee =
+            self.public_action_initial_gas_values(PublicActionMode::Send, &gas_fee);
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let generation = self.start_public_action_progress(
+            PublicActionMode::Send,
+            asset,
+            asset_label,
+            icon_path,
+            Some(command_tx),
+            initial_gas_fee,
+        );
         let (progress_tx, progress_rx) = mpsc::unbounded_channel();
         Self::spawn_public_action_progress_listener(
             generation,
@@ -677,6 +1220,14 @@ impl WalletRoot {
             progress_rx,
             cx,
         );
+        Self::spawn_public_action_session_event_listener(
+            generation,
+            chain_id,
+            active_wallet_id.clone(),
+            event_rx,
+            cx,
+        );
+        self.show_public_action_progress_dialog(window, cx);
         let request = PublicSendRequest {
             chain_id,
             effective_chain: self.effective_chain_configs.get(&chain_id).cloned(),
@@ -687,6 +1238,9 @@ impl WalletRoot {
             asset,
             amount,
             recipient,
+            gas_fee,
+            command_rx: Some(command_rx),
+            event_tx: Some(event_tx),
         };
         let submitted_public_account_uuid = Arc::clone(&public_account_uuid);
         let join = self.runtime.spawn(async move {
@@ -707,6 +1261,8 @@ impl WalletRoot {
                 root.public_form.sending = false;
                 match result {
                     Ok(Ok(_result)) => {
+                        root.public_form.action_command_tx = None;
+                        root.public_form.action_action_error = None;
                         match root
                             .public_account_for_uuid(Some(submitted_public_account_uuid.as_ref()))
                             .map(|account| account.status)
@@ -719,11 +1275,13 @@ impl WalletRoot {
                     }
                     Ok(Err(error)) => {
                         let message = error.to_string();
+                        root.public_form.action_command_tx = None;
                         root.fail_public_action_progress(generation, message.clone(), cx);
                         root.public_form.send_error = Some(Arc::from(message));
                     }
                     Err(error) => {
                         let message = format!("Public send task failed: {error}");
+                        root.public_form.action_command_tx = None;
                         root.fail_public_action_progress(generation, message.clone(), cx);
                         root.public_form.send_error = Some(Arc::from(message));
                     }
@@ -791,6 +1349,14 @@ impl WalletRoot {
                 return;
             }
         };
+        let gas_fee = match self.public_action_gas_fee_selection(PublicActionMode::Shield, cx) {
+            Ok(selection) => selection,
+            Err(error) => {
+                self.public_form.shield_error = Some(Arc::from(error));
+                cx.notify();
+                return;
+            }
+        };
         let vault_password =
             Self::read_and_clear_input(&self.public_form.shield_password_input, window, cx);
         if vault_password.trim().is_empty() {
@@ -803,7 +1369,22 @@ impl WalletRoot {
         let chain_id = self.selected_chain;
         let http = self.http.clone();
         let active_wallet_id = self.selected_wallet_id.clone();
-        let generation = self.start_public_action_progress(PublicActionMode::Shield, asset);
+        let asset_label =
+            public_action_asset_label(chain_id, asset, Some(&self.effective_token_registry));
+        let icon_path =
+            public_asset_icon_path(chain_id, asset, Some(&self.effective_token_registry));
+        let initial_gas_fee =
+            self.public_action_initial_gas_values(PublicActionMode::Shield, &gas_fee);
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let generation = self.start_public_action_progress(
+            PublicActionMode::Shield,
+            asset,
+            asset_label,
+            icon_path,
+            Some(command_tx),
+            initial_gas_fee,
+        );
         let (progress_tx, progress_rx) = mpsc::unbounded_channel();
         Self::spawn_public_action_progress_listener(
             generation,
@@ -812,6 +1393,14 @@ impl WalletRoot {
             progress_rx,
             cx,
         );
+        Self::spawn_public_action_session_event_listener(
+            generation,
+            chain_id,
+            active_wallet_id.clone(),
+            event_rx,
+            cx,
+        );
+        self.show_public_action_progress_dialog(window, cx);
         let request = PublicShieldRequest {
             chain_id,
             effective_chain: self.effective_chain_configs.get(&chain_id).cloned(),
@@ -821,6 +1410,9 @@ impl WalletRoot {
             public_account_uuid: public_account_uuid.to_string(),
             asset,
             amount,
+            gas_fee,
+            command_rx: Some(command_rx),
+            event_tx: Some(event_tx),
         };
         let submitted_public_account_uuid = Arc::clone(&public_account_uuid);
         let join = self.runtime.spawn(async move {
@@ -841,6 +1433,8 @@ impl WalletRoot {
                 root.public_form.shielding = false;
                 match result {
                     Ok(Ok(_result)) => {
+                        root.public_form.action_command_tx = None;
+                        root.public_form.action_action_error = None;
                         match root
                             .public_account_for_uuid(Some(submitted_public_account_uuid.as_ref()))
                             .map(|account| account.status)
@@ -853,11 +1447,13 @@ impl WalletRoot {
                     }
                     Ok(Err(error)) => {
                         let message = error.to_string();
+                        root.public_form.action_command_tx = None;
                         root.fail_public_action_progress(generation, message.clone(), cx);
                         root.public_form.shield_error = Some(Arc::from(message));
                     }
                     Err(error) => {
                         let message = format!("Public shield task failed: {error}");
+                        root.public_form.action_command_tx = None;
                         root.fail_public_action_progress(generation, message.clone(), cx);
                         root.public_form.shield_error = Some(Arc::from(message));
                     }
@@ -941,6 +1537,97 @@ pub(super) fn public_action_title_row(label: String, icon_path: Option<PathBuf>)
     ))
 }
 
+fn public_action_context_row(label: &'static str, value: String) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .child(app_muted_text(label))
+        .child(
+            app_strong_text(value)
+                .text_size(px(13.0))
+                .font_family(APP_MONO_FONT_FAMILY),
+        )
+}
+
+fn render_public_action_active_status_notice(
+    root: Entity<WalletRoot>,
+    mode: PublicActionMode,
+    step: &PublicActionStepState,
+) -> gpui::Div {
+    let step_kind = step.step;
+    let title = match (mode, step.status) {
+        (PublicActionMode::Shield, PublicActionStepStatus::Error) => {
+            "Public shield needs attention"
+        }
+        (PublicActionMode::Send, PublicActionStepStatus::Error) => "Public send needs attention",
+        (PublicActionMode::Shield, _) => "Public shield in progress",
+        (PublicActionMode::Send, _) => "Public send in progress",
+    };
+    let detail = format!(
+        "{}: {}",
+        public_action_step_label(step.step),
+        public_action_step_detail(step.step, step.status)
+    );
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .p(px(10.0))
+        .rounded_md()
+        .bg(rgb(theme::SURFACE_ELEVATED))
+        .border_1()
+        .border_color(rgb(theme::INFO))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(app_strong_text(title))
+                .child(app_muted_text(detail).whitespace_normal()),
+        )
+        .child(
+            app_button(
+                SharedString::from(format!(
+                    "wallet-public-action-{}-view-progress",
+                    public_action_step_id(step_kind)
+                )),
+                "View status",
+            )
+            .outline()
+            .small()
+            .on_click(move |_event, window, cx| {
+                root.update(cx, |root, cx| {
+                    root.show_public_action_progress_dialog(window, cx);
+                });
+            }),
+        )
+}
+
+pub(super) fn public_action_closed_active_step(
+    steps: &[PublicActionStepState],
+) -> Option<&PublicActionStepState> {
+    steps
+        .iter()
+        .find(|step| step.status == PublicActionStepStatus::Pending)
+        .or_else(|| {
+            steps
+                .iter()
+                .find(|step| step.status == PublicActionStepStatus::Error)
+        })
+}
+
+const fn public_action_mode_verb(mode: PublicActionMode) -> &'static str {
+    match mode {
+        PublicActionMode::Shield => "Shield",
+        PublicActionMode::Send => "Send",
+    }
+}
+
 pub(super) fn public_action_max_label(entry: &PublicBalanceEntry) -> Option<String> {
     if entry.asset.id == PublicAssetId::Native {
         return entry
@@ -977,6 +1664,10 @@ pub(super) fn render_public_action_stepper(
     steps: &[PublicActionStepState],
     expanded_error_steps: &BTreeSet<PublicActionProgressStep>,
     asset_label: &str,
+    command_available: bool,
+    current_gas_fee: Option<(u128, u128)>,
+    action_error: Option<&str>,
+    generation: u64,
 ) -> gpui::Div {
     let mut stepper = div()
         .flex()
@@ -995,6 +1686,10 @@ pub(super) fn render_public_action_stepper(
             index == last_index,
             expanded_error_steps.contains(&step.step),
             asset_label,
+            command_available,
+            current_gas_fee,
+            action_error,
+            generation,
         ));
     }
     stepper
@@ -1006,6 +1701,10 @@ fn render_public_action_step(
     is_last: bool,
     error_details_open: bool,
     asset_label: &str,
+    command_available: bool,
+    current_gas_fee: Option<(u128, u128)>,
+    action_error: Option<&str>,
+    generation: u64,
 ) -> gpui::Div {
     let color = public_action_step_color(step.status);
     let title = public_action_step_label(step.step);
@@ -1041,6 +1740,16 @@ fn render_public_action_step(
             .as_ref()
             .map(|tx_hash| render_public_action_step_hash(step.step, tx_hash.as_ref())),
     );
+    if let Some(action) = render_public_action_step_action(
+        root.clone(),
+        step,
+        command_available,
+        current_gas_fee,
+        action_error,
+        generation,
+    ) {
+        body = body.child(action);
+    }
 
     div()
         .flex()
@@ -1063,6 +1772,56 @@ fn render_public_action_step(
                 })),
         )
         .child(body)
+}
+
+fn render_public_action_step_action(
+    root: Entity<WalletRoot>,
+    step: &PublicActionStepState,
+    command_available: bool,
+    current_gas_fee: Option<(u128, u128)>,
+    action_error: Option<&str>,
+    generation: u64,
+) -> Option<gpui::AnyElement> {
+    if !command_available {
+        return None;
+    }
+    let retry_kind = match step.status {
+        PublicActionStepStatus::Error => PublicActionGasRetryKind::RetryEstimate,
+        PublicActionStepStatus::Pending if step.tx_hash.is_some() && current_gas_fee.is_some() => {
+            PublicActionGasRetryKind::SpeedUp
+        }
+        _ => return None,
+    };
+    let label = match retry_kind {
+        PublicActionGasRetryKind::RetryEstimate => "Retry with custom gas",
+        PublicActionGasRetryKind::SpeedUp => "Speed up transaction",
+    };
+    let mut action = div()
+        .pt(px(4.0))
+        .flex()
+        .flex_col()
+        .items_start()
+        .gap_1()
+        .child(
+            app_button(public_action_retry_button_id(step.step, retry_kind), label)
+                .small()
+                .outline()
+                .on_click(move |_event, window, cx| {
+                    root.update(cx, |root, cx| {
+                        root.open_public_action_gas_retry_dialog(
+                            generation, retry_kind, window, cx,
+                        );
+                    });
+                }),
+        );
+    if let Some(error) = action_error {
+        action = action.child(
+            app_muted_text(format!("Last retry failed: {error}"))
+                .text_color(rgb(theme::DANGER))
+                .whitespace_normal(),
+        );
+    }
+    Some(action.into_any_element())
 }
 
 fn render_public_action_step_error(
@@ -1320,6 +2079,20 @@ const fn public_action_step_id(step: PublicActionProgressStep) -> &'static str {
         PublicActionProgressStep::Approve => "approve",
         PublicActionProgressStep::Shield => "shield",
     }
+}
+
+fn public_action_retry_button_id(
+    step: PublicActionProgressStep,
+    retry_kind: PublicActionGasRetryKind,
+) -> SharedString {
+    let action = match retry_kind {
+        PublicActionGasRetryKind::RetryEstimate => "retry-gas",
+        PublicActionGasRetryKind::SpeedUp => "speed-up",
+    };
+    SharedString::from(format!(
+        "wallet-public-action-{}-{action}",
+        public_action_step_id(step)
+    ))
 }
 
 pub(super) fn public_action_progress_steps(
