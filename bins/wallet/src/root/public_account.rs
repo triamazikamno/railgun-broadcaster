@@ -33,7 +33,7 @@ use wallet_ops::{
     },
 };
 
-use crate::assets::{RailgunActionIcon, RailgunPublicAccountIcon};
+use crate::assets::{RailgunActionIcon, RailgunPublicAccountIcon, WalletIconSource};
 
 use super::dialogs::PublicAccountDialogKind;
 use super::gas_fee::Eip1559GasFeeEditorState;
@@ -93,7 +93,7 @@ pub(super) struct PublicAccountFormState {
     pub(super) expanded_action_error_steps: BTreeSet<PublicActionProgressStep>,
     pub(super) action_progress_dialog_open: bool,
     pub(super) action_progress_asset_label: Arc<str>,
-    pub(super) action_progress_icon_path: Option<std::path::PathBuf>,
+    pub(super) action_progress_icon_path: Option<WalletIconSource>,
     pub(super) action_task_abort_handle: Option<tokio::task::AbortHandle>,
     pub(super) action_stop_available: bool,
     pub(super) action_stopped: bool,

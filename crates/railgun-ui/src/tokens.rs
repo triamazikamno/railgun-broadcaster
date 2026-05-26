@@ -224,6 +224,15 @@ pub fn known_tokens_for_chain(chain_id: u64) -> impl Iterator<Item = KnownTokenI
 
 #[must_use]
 pub fn token_icon_path(chain_id: u64, addr: &Address) -> Option<PathBuf> {
+    token_icon_file_name(chain_id, addr).map(|file| TOKEN_ICON_DIR.join(file))
+}
+
+#[must_use]
+pub fn token_icon_asset_path(chain_id: u64, addr: &Address) -> Option<String> {
+    token_icon_file_name(chain_id, addr).map(|file| format!("railgun-ui/tokens/{file}"))
+}
+
+fn token_icon_file_name(chain_id: u64, addr: &Address) -> Option<String> {
     lookup_token(chain_id, addr)?;
     let ext = if (chain_id == 1 && *addr == address!("0x085780639CC2cACd35E474e71f4d000e2405d8f6"))
         || (chain_id == 42161 && *addr == address!("0x4D15a3A2286D883AF0AA1B3f21367843FAc63E07"))
@@ -233,7 +242,7 @@ pub fn token_icon_path(chain_id: u64, addr: &Address) -> Option<PathBuf> {
         "png"
     };
 
-    Some(TOKEN_ICON_DIR.join(format!("{chain_id}-{addr:#x}.{ext}")))
+    Some(format!("{chain_id}-{addr:#x}.{ext}"))
 }
 
 fn pow10(exp: u8) -> U256 {

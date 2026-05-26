@@ -2429,7 +2429,10 @@ fn effective_token_registry_formats_private_and_public_assets() {
     assert_eq!(rows[0].amount, "1.23");
     assert_eq!(rows[0].decimals, Some(4));
     assert_eq!(
-        rows[0].icon_path.as_deref(),
+        rows[0]
+            .icon_path
+            .as_ref()
+            .and_then(|path| path.as_file_path()),
         Some(std::path::Path::new(icon))
     );
     assert_eq!(
@@ -2441,7 +2444,9 @@ fn effective_token_registry_formats_private_and_public_assets() {
         Some(4)
     );
     assert_eq!(
-        public_asset_icon_path(1, PublicAssetId::Erc20(token), Some(&registry)).as_deref(),
+        public_asset_icon_path(1, PublicAssetId::Erc20(token), Some(&registry))
+            .as_ref()
+            .and_then(|path| path.as_file_path()),
         Some(std::path::Path::new(icon))
     );
 }

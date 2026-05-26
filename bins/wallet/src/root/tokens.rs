@@ -1,17 +1,18 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 
 use alloy::primitives::{Address, U256};
 use railgun_ui::{
-    format_scaled_amount, format_token_amount, lookup_token, short_address, token_icon_path,
+    format_scaled_amount, format_token_amount, lookup_token, short_address, token_icon_asset_path,
 };
 use wallet_ops::settings::{EffectiveChainConfig, EffectiveTokenInfo, EffectiveTokenRegistry};
+
+use crate::assets::WalletIconSource;
 
 #[derive(Clone)]
 pub(super) struct TokenDisplayMetadata {
     pub(super) symbol: String,
     pub(super) decimals: u8,
-    pub(super) icon_path: Option<PathBuf>,
+    pub(super) icon_path: Option<WalletIconSource>,
 }
 
 pub(super) fn token_display_metadata(
@@ -28,7 +29,7 @@ pub(super) fn token_display_metadata(
     lookup_token(chain_id, token).map(|info| TokenDisplayMetadata {
         symbol: info.symbol.to_owned(),
         decimals: info.decimals,
-        icon_path: token_icon_path(chain_id, token),
+        icon_path: token_icon_asset_path(chain_id, token).map(WalletIconSource::embedded),
     })
 }
 
@@ -36,11 +37,17 @@ fn token_display_metadata_from_effective(
     info: &EffectiveTokenInfo,
     token: &Address,
 ) -> TokenDisplayMetadata {
-    let icon_path = info.icon_path.as_ref().map(PathBuf::from).or_else(|| {
-        info.built_in
-            .then(|| token_icon_path(info.chain_id, token))
-            .flatten()
-    });
+    let icon_path = info
+        .icon_path
+        .as_ref()
+        .map(WalletIconSource::file)
+        .or_else(|| {
+            info.built_in
+                .then(|| {
+                    token_icon_asset_path(info.chain_id, token).map(WalletIconSource::embedded)
+                })
+                .flatten()
+        });
     TokenDisplayMetadata {
         symbol: info.symbol.clone(),
         decimals: info.decimals,

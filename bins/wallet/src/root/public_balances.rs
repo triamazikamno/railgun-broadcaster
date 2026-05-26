@@ -1,15 +1,16 @@
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::{Context, Window};
-use railgun_ui::{chain_icon_path, chain_name, format_token_amount, short_address};
+use railgun_ui::{chain_icon_asset_path, chain_name, format_token_amount, short_address};
 use wallet_ops::{
     PublicAssetId, PublicBalanceAmount, PublicBalanceEntry, PublicBalanceSnapshot,
     refresh_public_balances, settings::EffectiveTokenRegistry, vault::PublicAccountStatus,
 };
 
 use super::{WalletRoot, WalletTab, format_report_chain, token_display_metadata};
+
+use crate::assets::WalletIconSource;
 
 pub(super) fn public_asset_label(
     chain_id: u64,
@@ -47,9 +48,9 @@ pub(super) fn public_asset_icon_path(
     chain_id: u64,
     asset: PublicAssetId,
     registry: Option<&EffectiveTokenRegistry>,
-) -> Option<PathBuf> {
+) -> Option<WalletIconSource> {
     match asset {
-        PublicAssetId::Native => chain_icon_path(chain_id),
+        PublicAssetId::Native => chain_icon_asset_path(chain_id).map(WalletIconSource::embedded),
         PublicAssetId::Erc20(token) => {
             token_display_metadata(registry, chain_id, &token).and_then(|info| info.icon_path)
         }

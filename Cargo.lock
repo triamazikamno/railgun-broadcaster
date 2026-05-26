@@ -15419,6 +15419,7 @@ dependencies = [
  "railgun-ui",
  "rand 0.10.1",
  "reqwest 0.13.3",
+ "rust-embed",
  "structopt",
  "tokio",
  "tracing",

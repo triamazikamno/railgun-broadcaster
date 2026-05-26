@@ -19,6 +19,7 @@ gpui-component-assets = { workspace = true }
 qrcodegen = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
+rust-embed = "8.7"
 structopt = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 tracing = { workspace = true }

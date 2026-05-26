@@ -12,7 +12,7 @@ use gpui_component::{
     select::{Select, SelectItem},
     tooltip::Tooltip,
 };
-use railgun_ui::{chain_icon_path, chain_name};
+use railgun_ui::{chain_icon_asset_path, chain_name};
 use ui::clipboard::clipboard_with_toast;
 use ui::controls::{app_button_base, app_input, app_muted_text, app_strong_text};
 use ui::{icons, theme};
@@ -179,10 +179,10 @@ impl WalletRoot {
                 app_button_base("wallet-lock-vault")
                     .outline()
                     .xsmall()
-                    .px(px(10.0))
-                    .py(px(15.0))
+                    .px(px(5.0))
+                    .py(px(12.0))
                     .tooltip("Lock vault")
-                    .child(img(icons::lock_icon_path()).size(px(12.0)).flex_none())
+                    .child(img(icons::lock_icon_path()).size(px(18.0)).flex_none())
                     .on_click(move |_event, window, cx| {
                         lock_root.update(cx, |root, cx| {
                             root.lock_vault(window, cx);
@@ -322,7 +322,7 @@ fn chain_label_row(chain_id: u64) -> impl IntoElement {
         .gap_2()
         .text_color(rgb(theme::TEXT))
         .text_size(APP_TEXT_SIZE);
-    if let Some(path) = chain_icon_path(chain_id) {
+    if let Some(path) = chain_icon_asset_path(chain_id) {
         row = row.child(img(path).size(px(16.0)).flex_none());
     }
     row.child(SharedString::from(label))

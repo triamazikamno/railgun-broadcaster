@@ -1,7 +1,9 @@
 use std::borrow::Cow;
+use std::path::PathBuf;
 
-use gpui::{AssetSource, Result, SharedString};
+use gpui::{AssetSource, ImageSource, Result, SharedString};
 use gpui_component::IconNamed;
+use rust_embed::RustEmbed;
 
 pub(crate) const LOGO_ICON_PATH: &str = "railgun/icons/logo.svg";
 pub(crate) const SIDEBAR_WORDMARK_PATH: &str = "railgun/icons/wordmark.svg";
@@ -22,6 +24,8 @@ const KEY_ROUND_ICON_PATH: &str = "railgun/icons/key-round.svg";
 const NETWORK_ICON_PATH: &str = "railgun/icons/network.svg";
 const PIN_ICON_PATH: &str = "railgun/icons/pin.svg";
 const TOR_STATUS_ICON_PATH: &str = "railgun/icons/tor-status.svg";
+const UI_ASSET_PREFIX: &str = "ui/";
+const RAILGUN_UI_ASSET_PREFIX: &str = "railgun-ui/";
 
 const RAILGUN_ASSET_PATHS: &[&str] = &[
     LOGO_ICON_PATH,
@@ -68,10 +72,57 @@ const TOR_STATUS_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/tor-status.
 
 pub(crate) struct WalletAssets;
 
+#[derive(RustEmbed)]
+#[folder = "../../crates/ui/assets"]
+struct UiAssets;
+
+#[derive(RustEmbed)]
+#[folder = "../../crates/railgun-ui/assets"]
+struct RailgunUiAssets;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum WalletIconSource {
+    Embedded(String),
+    File(PathBuf),
+}
+
+impl WalletIconSource {
+    pub(crate) fn embedded(path: impl Into<String>) -> Self {
+        Self::Embedded(path.into())
+    }
+
+    pub(crate) fn file(path: impl Into<PathBuf>) -> Self {
+        Self::File(path.into())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn as_file_path(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::Embedded(_) => None,
+            Self::File(path) => Some(path.as_path()),
+        }
+    }
+}
+
+impl From<WalletIconSource> for ImageSource {
+    fn from(source: WalletIconSource) -> Self {
+        match source {
+            WalletIconSource::Embedded(path) => Self::from(path),
+            WalletIconSource::File(path) => Self::from(path),
+        }
+    }
+}
+
 impl AssetSource for WalletAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         if let Some(bytes) = railgun_asset(path) {
             return Ok(Some(Cow::Borrowed(bytes)));
+        }
+        if let Some(bytes) = embedded_asset::<UiAssets>(UI_ASSET_PREFIX, path) {
+            return Ok(Some(bytes));
+        }
+        if let Some(bytes) = embedded_asset::<RailgunUiAssets>(RAILGUN_UI_ASSET_PREFIX, path) {
+            return Ok(Some(bytes));
         }
 
         gpui_component_assets::Assets.load(path)
@@ -79,6 +130,8 @@ impl AssetSource for WalletAssets {
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         let mut assets = gpui_component_assets::Assets.list(path)?;
+        append_embedded_asset_list::<UiAssets>(&mut assets, UI_ASSET_PREFIX, path);
+        append_embedded_asset_list::<RailgunUiAssets>(&mut assets, RAILGUN_UI_ASSET_PREFIX, path);
         assets.extend(
             RAILGUN_ASSET_PATHS
                 .iter()
@@ -87,6 +140,22 @@ impl AssetSource for WalletAssets {
         );
         Ok(assets)
     }
+}
+
+fn embedded_asset<T: RustEmbed>(prefix: &str, path: &str) -> Option<Cow<'static, [u8]>> {
+    let path = path.strip_prefix(prefix)?;
+    T::get(path).map(|file| file.data)
+}
+
+fn append_embedded_asset_list<T: RustEmbed>(
+    assets: &mut Vec<SharedString>,
+    prefix: &str,
+    path: &str,
+) {
+    assets.extend(T::iter().filter_map(|asset| {
+        let asset = format!("{prefix}{asset}");
+        asset.starts_with(path).then(|| SharedString::from(asset))
+    }));
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -187,5 +256,34 @@ fn railgun_asset(path: &str) -> Option<&'static [u8]> {
         PIN_ICON_PATH => Some(PIN_ICON_BYTES),
         TOR_STATUS_ICON_PATH => Some(TOR_STATUS_ICON_BYTES),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wallet_assets_embed_shared_icon_sets() {
+        let assets = WalletAssets;
+
+        assert!(
+            assets
+                .load("ui/icons/refresh-ccw.svg")
+                .expect("load ui icon")
+                .is_some()
+        );
+        assert!(
+            assets
+                .load("railgun-ui/chains/ethereum.svg")
+                .expect("load chain icon")
+                .is_some()
+        );
+        assert!(
+            assets
+                .load("railgun-ui/tokens/1-0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.png")
+                .expect("load token icon")
+                .is_some()
+        );
     }
 }

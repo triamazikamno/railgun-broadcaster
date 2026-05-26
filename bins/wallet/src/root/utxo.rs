@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -19,7 +18,7 @@ use gpui_component::{
     tag::Tag,
     tooltip::Tooltip,
 };
-use railgun_ui::{format_token_amount, lookup_token, short_address, token_icon_path};
+use railgun_ui::{format_token_amount, lookup_token, short_address, token_icon_asset_path};
 use ui::clipboard::clipboard_with_toast;
 use ui::controls::{app_button, app_button_base, app_input, app_muted_text};
 use ui::icons;
@@ -35,6 +34,8 @@ use super::{
     SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_MINUTE, SECONDS_PER_MONTH, SECONDS_PER_YEAR,
     WalletRoot, centered_message, rgb_with_alpha, token_label_row,
 };
+
+use crate::assets::WalletIconSource;
 
 #[derive(Clone, Copy)]
 enum UtxoNavigation {
@@ -414,7 +415,7 @@ impl WalletRoot {
 pub(super) struct UtxoDisplayRow {
     pub(super) tree_position: String,
     pub(super) token: String,
-    pub(super) token_icon_path: Option<PathBuf>,
+    pub(super) token_icon_path: Option<WalletIconSource>,
     pub(super) amount: String,
     pub(super) poi_status: String,
     pub(super) poi_spendable: bool,
@@ -841,7 +842,7 @@ fn display_row_from_utxo(chain_id: u64, row: &UtxoOutput) -> UtxoDisplayRow {
         (
             token.symbol.to_owned(),
             amount,
-            token_icon_path(chain_id, &address),
+            token_icon_asset_path(chain_id, &address).map(WalletIconSource::embedded),
         )
     } else {
         (short_address(&address), row.value.clone(), None)

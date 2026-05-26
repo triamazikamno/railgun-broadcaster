@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -19,6 +18,8 @@ use ui::clipboard::clipboard_with_toast;
 use ui::controls::{app_button, app_input, app_muted_text, app_strong_text, app_text};
 use ui::theme::{self, APP_MONO_FONT_FAMILY};
 use zeroize::Zeroizing;
+
+use crate::assets::WalletIconSource;
 
 use super::private_action::UnshieldAssetKey;
 use super::{WalletRoot, new_masked_input, secondary_dialog_content_width, token_label_row};
@@ -118,7 +119,7 @@ impl SpendAuthorizationSummary {
 pub(super) struct SpendAuthorizationSummaryRow {
     label: Arc<str>,
     value: Arc<str>,
-    icon_path: Option<PathBuf>,
+    icon_path: Option<WalletIconSource>,
 }
 
 impl SpendAuthorizationSummaryRow {
@@ -130,7 +131,7 @@ impl SpendAuthorizationSummaryRow {
         }
     }
 
-    pub(super) fn with_icon(mut self, icon_path: Option<PathBuf>) -> Self {
+    pub(super) fn with_icon(mut self, icon_path: Option<WalletIconSource>) -> Self {
         self.icon_path = icon_path;
         self
     }

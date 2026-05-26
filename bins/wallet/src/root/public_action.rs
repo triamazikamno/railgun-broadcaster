@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use alloy::primitives::{Address, U256};
@@ -49,7 +48,7 @@ use super::{
     public_balance_amount_label, secondary_dialog_content_width, token_label_row,
 };
 
-use crate::assets::RailgunActionIcon;
+use crate::assets::{RailgunActionIcon, WalletIconSource};
 
 const PUBLIC_ACTION_RETRY_DEFAULT_FEE_WEI: u128 = 1_000_000_000;
 
@@ -57,7 +56,7 @@ struct PublicSendDraft {
     chain_id: u64,
     asset: PublicAssetId,
     asset_label: String,
-    asset_icon_path: Option<PathBuf>,
+    asset_icon_path: Option<WalletIconSource>,
     asset_decimals: Option<u8>,
     public_account_uuid: Arc<str>,
     public_account_label: String,
@@ -72,7 +71,7 @@ struct PublicShieldDraft {
     chain_id: u64,
     asset: PublicAssetId,
     asset_label: String,
-    asset_icon_path: Option<PathBuf>,
+    asset_icon_path: Option<WalletIconSource>,
     asset_decimals: Option<u8>,
     public_account_uuid: Arc<str>,
     public_account_label: String,
@@ -751,7 +750,7 @@ impl WalletRoot {
         mode: PublicActionMode,
         asset: PublicAssetId,
         asset_label: String,
-        icon_path: Option<PathBuf>,
+        icon_path: Option<WalletIconSource>,
         command_tx: Option<PublicActionCommandSender>,
         initial_gas_fee: Option<(u128, u128)>,
     ) -> u64 {
@@ -1871,7 +1870,10 @@ pub(super) fn public_action_segment_button(
     if selected { button.primary() } else { button }
 }
 
-pub(super) fn public_action_title_row(label: String, icon_path: Option<PathBuf>) -> gpui::Div {
+pub(super) fn public_action_title_row(
+    label: String,
+    icon_path: Option<WalletIconSource>,
+) -> gpui::Div {
     div().flex().items_center().gap_1().child(token_label_row(
         SharedString::from(label),
         icon_path,

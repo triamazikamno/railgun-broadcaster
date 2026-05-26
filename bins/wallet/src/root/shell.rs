@@ -49,7 +49,7 @@ impl WalletTab {
         }
     }
 
-    pub(super) fn icon_path(self) -> PathBuf {
+    pub(super) const fn icon_path(self) -> &'static str {
         match self {
             Self::Private => icons::shield_check_icon_path(),
             Self::Public => icons::globe_icon_path(),
@@ -507,7 +507,7 @@ impl WalletRoot {
                 Tab::new()
                     .min_w(px(92.0))
                     .label(tab.label())
-                    .prefix(img(tab.icon_path()).size(px(16.0)).flex_none())
+                    .prefix(img(tab.icon_path()).size(px(18.0)).flex_none())
             }))
     }
 

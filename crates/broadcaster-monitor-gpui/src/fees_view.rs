@@ -17,8 +17,8 @@ use gpui_component::{
 
 use broadcaster_monitor::FeeRow;
 use railgun_ui::{
-    chain_icon_path, chain_name, format_broadcaster_address_label, format_token_amount,
-    lookup_token, short_address, token_icon_path,
+    chain_icon_asset_path, chain_name, format_broadcaster_address_label, format_token_amount,
+    lookup_token, short_address, token_icon_asset_path,
 };
 use ui::clipboard::clipboard_with_toast;
 use ui::theme::{self, APP_MONO_FONT_FAMILY};
@@ -454,7 +454,7 @@ fn token_menu_label(chain_id: u64, addr: &Address, show_chain: bool) -> String {
 
 fn icon_label_row(chain_id: u64, label: SharedString, icon_size: Pixels) -> impl IntoElement {
     let mut row = div().flex().items_center().gap_1();
-    if let Some(path) = chain_icon_path(chain_id) {
+    if let Some(path) = chain_icon_asset_path(chain_id) {
         row = row.child(img(path).size(icon_size).flex_none());
     }
     row.child(label)
@@ -467,7 +467,7 @@ fn token_label_row(
     icon_size: Pixels,
 ) -> gpui::Div {
     let mut row = div().flex().items_center().gap_1();
-    if let Some(path) = token_icon_path(chain_id, addr) {
+    if let Some(path) = token_icon_asset_path(chain_id, addr) {
         row = row.child(img(path).size(icon_size).rounded_full().flex_none());
     }
     row.child(label)
@@ -481,12 +481,12 @@ fn token_trigger_content(
 ) -> impl IntoElement {
     let mut row = div().w_full().flex().items_center().gap_1().text_left();
     if let Some(chain_id) = chain_id
-        && let Some(path) = chain_icon_path(chain_id)
+        && let Some(path) = chain_icon_asset_path(chain_id)
     {
         row = row.child(img(path).size(icon_size).flex_none());
     }
     if let Some((chain_id, addr)) = token
-        && let Some(path) = token_icon_path(chain_id, &addr)
+        && let Some(path) = token_icon_asset_path(chain_id, &addr)
     {
         row = row.child(img(path).size(icon_size).rounded_full().flex_none());
     }
@@ -518,10 +518,16 @@ impl TableDelegate for FeesDelegate {
             1 => div()
                 .id("fees-broadcaster-filter-input")
                 .size_full()
+                .flex()
+                .items_center()
                 .on_click(|_event, _window, cx| {
                     cx.stop_propagation();
                 })
-                .child(Input::new(&self.broadcaster_input).with_size(Size::XSmall))
+                .child(
+                    Input::new(&self.broadcaster_input)
+                        .with_size(Size::XSmall)
+                        .w_full(),
+                )
                 .into_any_element(),
             2 => render_token_header(&self.token_select).into_any_element(),
             3 => render_fee_header(self.fee_sort, table).into_any_element(),

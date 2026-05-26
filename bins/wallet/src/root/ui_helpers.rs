@@ -1,8 +1,8 @@
-use std::path::PathBuf;
-
 use gpui::{IntoElement, ParentElement, Pixels, SharedString, Styled, div, img, px, rgb};
 use ui::controls::app_muted_text;
 use ui::theme;
+
+use crate::assets::WalletIconSource;
 
 const DIALOG_CONTENT_HORIZONTAL_INSET: Pixels = px(56.0);
 
@@ -41,7 +41,7 @@ pub(super) fn labeled_field(
 
 pub(super) fn token_label_row(
     label: SharedString,
-    icon_path: Option<PathBuf>,
+    icon_path: Option<WalletIconSource>,
     icon_size: Pixels,
 ) -> gpui::Div {
     let mut row = div().flex().items_center().gap_1();

@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 
 use alloy::primitives::{Address, U256};
 use gpui::{
@@ -17,7 +16,7 @@ use wallet_ops::{
     settings::EffectiveTokenRegistry,
 };
 
-use crate::assets::RailgunActionIcon;
+use crate::assets::{RailgunActionIcon, WalletIconSource};
 
 use super::chain_load::loading_summary;
 use super::{
@@ -43,7 +42,7 @@ pub(super) struct FormattedTokenTotal {
     pub(super) pending_incoming_total: Option<U256>,
     pub(super) pending_outgoing_total: Option<U256>,
     pub(super) decimals: Option<u8>,
-    pub(super) icon_path: Option<PathBuf>,
+    pub(super) icon_path: Option<WalletIconSource>,
 }
 
 pub(super) fn max_unshield_amount_from_snapshot(
@@ -486,7 +485,7 @@ impl WalletRoot {
     }
 }
 
-fn private_asset_label_row(label: SharedString, icon_path: Option<PathBuf>) -> gpui::Div {
+fn private_asset_label_row(label: SharedString, icon_path: Option<WalletIconSource>) -> gpui::Div {
     let mut row = div().flex().items_center().gap_2();
     if let Some(path) = icon_path {
         row = row.child(img(path).size(px(32.0)).rounded_full().flex_none());

@@ -34,3 +34,14 @@ pub const fn chain_name(chain_id: u64) -> Option<&'static str> {
 pub fn chain_icon_path(chain_id: u64) -> Option<PathBuf> {
     chain_icon_file(chain_id).map(|file| CHAIN_ICON_DIR.join(file))
 }
+
+#[must_use]
+pub const fn chain_icon_asset_path(chain_id: u64) -> Option<&'static str> {
+    match chain_id {
+        1 => Some("railgun-ui/chains/ethereum.svg"),
+        56 => Some("railgun-ui/chains/bsc.svg"),
+        137 => Some("railgun-ui/chains/polygon.svg"),
+        42161 => Some("railgun-ui/chains/arbitrum.svg"),
+        _ => None,
+    }
+}

@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::{
@@ -32,7 +31,7 @@ use super::{
     format_native_token_amount_for_display, secondary_dialog_content_width,
 };
 
-use crate::assets::RailgunActionIcon;
+use crate::assets::{RailgunActionIcon, WalletIconSource};
 
 const PRIVATE_BROADCASTER_PROGRESS_STAGES: [TransactionGenerationStage; 6] = [
     TransactionGenerationStage::SelectingPrivateNotes,
@@ -79,7 +78,7 @@ pub(super) struct PrivateBroadcasterProgressState {
     pub(super) key: UnshieldAssetKey,
     pub(super) generation_id: u64,
     pub(super) asset_label: Arc<str>,
-    pub(super) icon_path: Option<PathBuf>,
+    pub(super) icon_path: Option<WalletIconSource>,
     pub(super) recipient: Arc<str>,
     pub(super) gas_payer: Option<Arc<str>>,
     pub(super) steps: Vec<PrivateBroadcasterProgressStepState>,
@@ -477,7 +476,7 @@ impl WalletRoot {
         key: UnshieldAssetKey,
         generation_id: u64,
         asset_label: String,
-        icon_path: Option<PathBuf>,
+        icon_path: Option<WalletIconSource>,
         recipient: String,
         estimate: Option<PublicBroadcasterCostEstimate>,
     ) {
@@ -518,7 +517,7 @@ impl WalletRoot {
         key: UnshieldAssetKey,
         generation_id: u64,
         asset_label: String,
-        icon_path: Option<PathBuf>,
+        icon_path: Option<WalletIconSource>,
         recipient: String,
         gas_payer: String,
         command_tx: Option<SelfBroadcastCommandSender>,

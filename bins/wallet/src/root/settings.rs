@@ -26,7 +26,7 @@ use gpui_component::{
     slider::{Slider, SliderEvent, SliderState},
     switch::Switch,
 };
-use railgun_ui::{chain_icon_path, chain_name, short_address};
+use railgun_ui::{chain_icon_asset_path, chain_name, short_address};
 use tokio::runtime::Handle;
 use tokio::sync::watch;
 use ui::controls::{app_button, app_button_base, app_muted_text, app_strong_text, app_text};
@@ -3131,7 +3131,7 @@ fn settings_section_header_element(
     chain_id: Option<u64>,
 ) -> gpui::Div {
     let mut title_row = div().flex().items_center().gap_2();
-    if let Some(path) = chain_id.and_then(chain_icon_path) {
+    if let Some(path) = chain_id.and_then(chain_icon_asset_path) {
         title_row = title_row.child(img(path).size(px(16.0)).flex_none());
     }
     title_row = title_row.child(
@@ -3619,7 +3619,7 @@ fn settings_token_chain_header(chain_id: u64) -> gpui::Div {
         .text_size(px(11.0))
         .line_height(px(14.0))
         .text_color(rgb(theme::TEXT_SUBTLE));
-    if let Some(path) = chain_icon_path(chain_id) {
+    if let Some(path) = chain_icon_asset_path(chain_id) {
         row = row.child(img(path).size(px(16.0)).flex_none());
     }
     row.child(SharedString::from(

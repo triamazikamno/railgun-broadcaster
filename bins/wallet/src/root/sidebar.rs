@@ -61,7 +61,7 @@ impl WalletRoot {
                 SidebarMenu::new()
                     .child(
                         SidebarMenuItem::new("Wallets")
-                            .icon(Icon::new(RailgunSidebarIcon::Wallet).size_4())
+                            .icon(Icon::new(RailgunSidebarIcon::Wallet).size_5())
                             .active(self.active_activity == Activity::Wallet)
                             .on_click(move |_event, _window, cx| {
                                 wallet_root.update(cx, |root, cx| {
@@ -82,7 +82,7 @@ impl WalletRoot {
                         SidebarMenuItem::new("Broadcasters")
                             .icon(
                                 Icon::new(RailgunSidebarIcon::Broadcaster)
-                                    .size_4()
+                                    .size_5()
                                     .text_color(rgb(public_broadcaster_color)),
                             )
                             .active(self.active_activity == Activity::Broadcaster)
@@ -105,7 +105,7 @@ impl WalletRoot {
                     )
                     .child(
                         SidebarMenuItem::new("Settings")
-                            .icon(Icon::new(IconName::Settings).size_4())
+                            .icon(Icon::new(IconName::Settings).size_5())
                             .active(self.active_activity == Activity::Settings)
                             .on_click(move |_event, _window, cx| {
                                 settings_root.update(cx, |root, cx| {

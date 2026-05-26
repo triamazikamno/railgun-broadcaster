@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -47,7 +46,7 @@ use wallet_ops::{
 };
 use zeroize::Zeroizing;
 
-use crate::assets::RailgunActionIcon;
+use crate::assets::{RailgunActionIcon, WalletIconSource};
 
 use super::broadcaster_picker::{
     BroadcasterChoice, broadcaster_choice_supported_by_candidates,
@@ -185,7 +184,7 @@ pub(super) struct UnshieldAsset {
     pub(super) total: U256,
     pub(super) poi_verified_total: U256,
     pub(super) max_batched: U256,
-    pub(super) icon_path: Option<PathBuf>,
+    pub(super) icon_path: Option<WalletIconSource>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -348,7 +347,7 @@ pub(super) fn private_action_input(state: &Entity<InputState>) -> Input {
 pub(super) fn private_action_title_row(
     action: &'static str,
     label: &str,
-    icon_path: Option<PathBuf>,
+    icon_path: Option<WalletIconSource>,
 ) -> gpui::Div {
     div()
         .flex()
@@ -1704,7 +1703,7 @@ impl WalletRoot {
         key: UnshieldAssetKey,
         title_action: &'static str,
         asset_label: String,
-        icon_path: Option<PathBuf>,
+        icon_path: Option<WalletIconSource>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {

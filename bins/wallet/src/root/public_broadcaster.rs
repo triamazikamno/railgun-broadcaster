@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use alloy::primitives::{Address, U256, address};
@@ -12,6 +11,8 @@ use wallet_ops::{
     public_broadcaster_candidates_for_asset,
     settings::{EffectiveChainConfig, EffectiveTokenRegistry},
 };
+
+use crate::assets::WalletIconSource;
 
 use super::private_assets::format_private_asset_rows;
 use super::{
@@ -29,7 +30,7 @@ pub(super) struct PublicBroadcasterFeeTokenOption {
     pub(super) decimals: Option<u8>,
     pub(super) max_spendable: U256,
     pub(super) eligible_broadcaster_count: usize,
-    pub(super) icon_path: Option<PathBuf>,
+    pub(super) icon_path: Option<WalletIconSource>,
 }
 
 impl WalletRoot {
