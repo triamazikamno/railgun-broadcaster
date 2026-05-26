@@ -216,7 +216,7 @@ pub(super) fn public_broadcaster_fee_token_options_from_snapshot(
     registry: Option<&EffectiveTokenRegistry>,
     mut anchor_rate_for_token: impl FnMut(Address) -> Option<U256>,
 ) -> Vec<PublicBroadcasterFeeTokenOption> {
-    format_private_asset_rows(snapshot.chain_id, &snapshot.totals, registry)
+    format_private_asset_rows(snapshot.chain_id, &snapshot.totals, registry, None)
         .into_iter()
         .filter_map(|asset| {
             let token = asset.token?;

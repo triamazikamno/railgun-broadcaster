@@ -10,7 +10,10 @@ use alloy::sol;
 use alloy::sol_types::SolCall;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use eyre::{Result, WrapErr};
-use railgun_ui::{TokenAnchorInfo, TokenAnchorSource, lookup_token, token_anchor_entries};
+use railgun_ui::{
+    NativeUsdAnchorInfo, TokenAnchorInfo, TokenAnchorSource, lookup_token,
+    native_usd_anchor_entries, native_usd_micro_value, token_anchor_entries, token_usd_micro_value,
+};
 use sync_service::ChainConfigDefaults;
 use tokio::runtime::Handle;
 use tokio::sync::watch;
@@ -136,6 +139,12 @@ struct RuntimeTokenAnchorInfo {
 }
 
 #[derive(Debug, Clone)]
+struct RuntimeNativeUsdAnchorInfo {
+    chain_id: u64,
+    anchor_sources: Vec<RuntimeTokenAnchorSource>,
+}
+
+#[derive(Debug, Clone)]
 enum RuntimeTokenAnchorSource {
     Fixed {
         token_fee_per_unit_gas: U256,
@@ -159,9 +168,22 @@ impl TokenAnchorKey {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct TokenAnchorRateCache {
     rates: RwLock<BTreeMap<TokenAnchorKey, U256>>,
+    native_usd_rates: RwLock<BTreeMap<u64, U256>>,
+    refresh_tx: watch::Sender<u64>,
+}
+
+impl Default for TokenAnchorRateCache {
+    fn default() -> Self {
+        let (refresh_tx, _refresh_rx) = watch::channel(0_u64);
+        Self {
+            rates: RwLock::new(BTreeMap::new()),
+            native_usd_rates: RwLock::new(BTreeMap::new()),
+            refresh_tx,
+        }
+    }
 }
 
 impl TokenAnchorRateCache {
@@ -185,6 +207,52 @@ impl TokenAnchorRateCache {
         if let Ok(mut rates) = self.rates.write() {
             rates.insert(TokenAnchorKey::new(chain_id, token), rate);
         }
+    }
+
+    #[must_use]
+    pub fn cached_native_usd_rate(&self, chain_id: u64) -> Option<U256> {
+        self.native_usd_rates
+            .read()
+            .ok()
+            .and_then(|rates| rates.get(&chain_id).copied())
+    }
+
+    pub fn store_native_usd_rate(&self, chain_id: u64, rate: U256) {
+        if rate.is_zero() {
+            return;
+        }
+        if let Ok(mut rates) = self.native_usd_rates.write() {
+            rates.insert(chain_id, rate);
+        }
+    }
+
+    #[must_use]
+    pub fn cached_token_usd_micro_value(
+        &self,
+        chain_id: u64,
+        token: Address,
+        amount: U256,
+    ) -> Option<U256> {
+        let token_anchor_rate = self
+            .cached_rate(chain_id, token)
+            .or_else(|| fixed_token_anchor_rate(chain_id, token))?;
+        let native_usd_rate = self.cached_native_usd_rate(chain_id)?;
+        token_usd_micro_value(amount, token_anchor_rate, native_usd_rate)
+    }
+
+    #[must_use]
+    pub fn cached_native_usd_micro_value(&self, chain_id: u64, amount: U256) -> Option<U256> {
+        native_usd_micro_value(amount, self.cached_native_usd_rate(chain_id)?)
+    }
+
+    #[must_use]
+    pub fn subscribe_refreshes(&self) -> watch::Receiver<u64> {
+        self.refresh_tx.subscribe()
+    }
+
+    fn notify_refreshed(&self) {
+        let current = *self.refresh_tx.borrow();
+        let _ = self.refresh_tx.send(current.wrapping_add(1));
     }
 }
 
@@ -285,21 +353,48 @@ pub async fn refresh_token_anchor_rates(
             .or_default()
             .push(entry);
     }
-
-    for (chain_id, entries) in entries_by_chain {
-        refresh_token_anchor_rates_for_chain(cache, chain_id, &entries, effective_chains, http)
-            .await;
+    let mut native_entries_by_chain: BTreeMap<u64, Vec<RuntimeNativeUsdAnchorInfo>> =
+        BTreeMap::new();
+    for entry in native_usd_anchor_entries_for_chains(chain_ids) {
+        native_entries_by_chain
+            .entry(entry.chain_id)
+            .or_default()
+            .push(entry);
     }
+
+    let refresh_chain_ids = entries_by_chain
+        .keys()
+        .chain(native_entries_by_chain.keys())
+        .copied()
+        .collect::<BTreeSet<_>>();
+    for chain_id in refresh_chain_ids {
+        let entries = entries_by_chain.remove(&chain_id).unwrap_or_default();
+        let native_entries = native_entries_by_chain
+            .remove(&chain_id)
+            .unwrap_or_default();
+        refresh_token_anchor_rates_for_chain(
+            cache,
+            chain_id,
+            &entries,
+            &native_entries,
+            effective_chains,
+            http,
+        )
+        .await;
+    }
+    cache.notify_refreshed();
 }
 
 async fn refresh_token_anchor_rates_for_chain(
     cache: &TokenAnchorRateCache,
     chain_id: u64,
     entries: &[RuntimeTokenAnchorInfo],
+    native_entries: &[RuntimeNativeUsdAnchorInfo],
     effective_chains: &BTreeMap<u64, EffectiveChainConfig>,
     http: &HttpContext,
 ) {
-    let oracle_addresses_by_chain = oracle_addresses_for_entries(entries);
+    let oracle_addresses_by_chain =
+        oracle_addresses_for_token_and_native_entries(entries, native_entries);
     let mut oracle_answers = BTreeMap::new();
     for (oracle_chain_id, oracle_addresses) in oracle_addresses_by_chain {
         match fetch_oracle_answers_for_chain(
@@ -321,6 +416,7 @@ async fn refresh_token_anchor_rates_for_chain(
         }
     }
     store_anchor_rates_from_entries(cache, entries, &oracle_answers);
+    store_native_usd_rates_from_entries(cache, native_entries, &oracle_answers);
 }
 
 async fn fetch_oracle_answers_for_chain(
@@ -459,6 +555,25 @@ fn static_anchor_entry_to_runtime(
     )
 }
 
+fn native_usd_anchor_entries_for_chains(chain_ids: &[u64]) -> Vec<RuntimeNativeUsdAnchorInfo> {
+    let chain_ids = chain_ids.iter().copied().collect::<BTreeSet<_>>();
+    native_usd_anchor_entries()
+        .filter(|entry| chain_ids.contains(&entry.chain_id))
+        .map(static_native_usd_entry_to_runtime)
+        .collect()
+}
+
+fn static_native_usd_entry_to_runtime(entry: NativeUsdAnchorInfo) -> RuntimeNativeUsdAnchorInfo {
+    RuntimeNativeUsdAnchorInfo {
+        chain_id: entry.chain_id,
+        anchor_sources: entry
+            .anchor_sources
+            .iter()
+            .map(|source| static_anchor_source_to_runtime(entry.chain_id, source))
+            .collect(),
+    }
+}
+
 fn static_anchor_source_to_runtime(
     chain_id: u64,
     source: &TokenAnchorSource,
@@ -533,9 +648,31 @@ fn price_anchor_to_runtime_source(
     }
 }
 
+#[cfg(test)]
 fn oracle_addresses_for_entries(entries: &[RuntimeTokenAnchorInfo]) -> BTreeMap<u64, Vec<Address>> {
     let mut addresses: BTreeMap<u64, BTreeSet<Address>> = BTreeMap::new();
     for entry in entries {
+        for source in &entry.anchor_sources {
+            collect_oracle_addresses_from_source(source, &mut addresses);
+        }
+    }
+    addresses
+        .into_iter()
+        .map(|(chain_id, addresses)| (chain_id, addresses.into_iter().collect()))
+        .collect()
+}
+
+fn oracle_addresses_for_token_and_native_entries(
+    entries: &[RuntimeTokenAnchorInfo],
+    native_entries: &[RuntimeNativeUsdAnchorInfo],
+) -> BTreeMap<u64, Vec<Address>> {
+    let mut addresses: BTreeMap<u64, BTreeSet<Address>> = BTreeMap::new();
+    for entry in entries {
+        for source in &entry.anchor_sources {
+            collect_oracle_addresses_from_source(source, &mut addresses);
+        }
+    }
+    for entry in native_entries {
         for source in &entry.anchor_sources {
             collect_oracle_addresses_from_source(source, &mut addresses);
         }
@@ -572,6 +709,19 @@ fn store_anchor_rates_from_entries(
         let rates = anchor_rates_from_sources(&entry.anchor_sources, oracle_answers);
         if let Some(rate) = average_non_outlier_anchor_rates(&rates) {
             cache.store_rate(entry.chain_id, entry.token, rate);
+        }
+    }
+}
+
+fn store_native_usd_rates_from_entries(
+    cache: &TokenAnchorRateCache,
+    entries: &[RuntimeNativeUsdAnchorInfo],
+    oracle_answers: &BTreeMap<(u64, Address), U256>,
+) {
+    for entry in entries {
+        let rates = anchor_rates_from_sources(&entry.anchor_sources, oracle_answers);
+        if let Some(rate) = average_non_outlier_anchor_rates(&rates) {
+            cache.store_native_usd_rate(entry.chain_id, rate);
         }
     }
 }
@@ -860,6 +1010,56 @@ mod tests {
             cache.cached_rate(1, address!("0x0000000000000000000000000000000000000002")),
             None
         );
+    }
+
+    #[test]
+    fn cache_stores_native_usd_rates_by_chain() {
+        let cache = TokenAnchorRateCache::new();
+
+        cache.store_native_usd_rate(1, U256::ZERO);
+        assert_eq!(cache.cached_native_usd_rate(1), None);
+
+        cache.store_native_usd_rate(1, uint!(3_000_000_000_U256));
+
+        assert_eq!(
+            cache.cached_native_usd_rate(1),
+            Some(uint!(3_000_000_000_U256))
+        );
+        assert_eq!(cache.cached_native_usd_rate(56), None);
+    }
+
+    #[test]
+    fn native_usd_rates_store_from_oracle_answers() {
+        let cache = TokenAnchorRateCache::new();
+        let entry = RuntimeNativeUsdAnchorInfo {
+            chain_id: 1,
+            anchor_sources: runtime_sources(SHARED_ORACLE_SOURCE_6),
+        };
+        let mut answers = BTreeMap::new();
+        answers.insert(
+            (1, address!("0x0000000000000000000000000000000000000100")),
+            uint!(3_000_00000000_U256),
+        );
+
+        store_native_usd_rates_from_entries(&cache, &[entry], &answers);
+
+        assert_eq!(
+            cache.cached_native_usd_rate(1),
+            Some(uint!(3_000_000_000_U256))
+        );
+    }
+
+    #[test]
+    fn cache_refresh_notifications_increment_generation() {
+        let cache = TokenAnchorRateCache::new();
+        let mut refresh_rx = cache.subscribe_refreshes();
+
+        assert_eq!(*refresh_rx.borrow_and_update(), 0);
+
+        cache.notify_refreshed();
+
+        assert!(refresh_rx.has_changed().expect("watch channel open"));
+        assert_eq!(*refresh_rx.borrow_and_update(), 1);
     }
 
     #[test]

@@ -17,7 +17,7 @@ use gpui_component::{
     select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState},
     spinner::Spinner,
 };
-use railgun_ui::short_address;
+use railgun_ui::{format_token_amount, short_address};
 use rand::seq::IndexedRandom;
 use tokio::sync::{mpsc, watch};
 use ui::clipboard::clipboard_with_toast;
@@ -33,11 +33,11 @@ use wallet_ops::{
     PublicAssetId, PublicBalanceAmount, PublicBalanceEntry, PublicBalanceSnapshot,
     PublicBroadcasterCandidate, PublicBroadcasterCostEstimate, PublicBroadcasterFeeMode,
     PublicBroadcasterResultKind, PublicBroadcasterSubmissionResult, SelfBroadcastGasFeeQuote,
-    SelfBroadcastGasFeeSelection, SelfBroadcastSessionEvent, TransactionGenerationStage,
-    WalletSession, fee_policy_eligible_public_broadcasters, parse_railgun_recipient,
-    parse_send_amount, parse_unshield_amount, prepare_desktop_send_calldata,
-    prepare_desktop_unshield_calldata, quote_desktop_self_broadcast_gas_fee,
-    select_public_broadcaster_with_policy,
+    SelfBroadcastGasFeeSelection, SelfBroadcastSessionEvent, TokenAnchorRateCache,
+    TransactionGenerationStage, WalletSession, fee_policy_eligible_public_broadcasters,
+    parse_railgun_recipient, parse_send_amount, parse_unshield_amount,
+    prepare_desktop_send_calldata, prepare_desktop_unshield_calldata,
+    quote_desktop_self_broadcast_gas_fee, select_public_broadcaster_with_policy,
     settings::EffectiveTokenRegistry,
     sort_specific_public_broadcasters, submit_desktop_send_public_broadcaster,
     submit_desktop_send_self_broadcast, submit_desktop_unshield_public_broadcaster,
@@ -57,13 +57,17 @@ use super::gas_fee::{
     Eip1559GasFeeEditTarget, Eip1559GasFeeEditorState, Eip1559GasFeeMode, Eip1559GasFeeTarget,
     render_eip1559_gas_fee_editor,
 };
-use super::private_assets::refresh_form_asset_from_snapshot;
+use super::private_assets::{
+    build_send_asset, build_unshield_asset, format_private_asset_rows_from_snapshot,
+    refresh_form_asset_from_snapshot,
+};
 use super::private_broadcaster::{
     private_broadcaster_closed_active_progress, render_private_broadcaster_status_notice,
     render_private_self_broadcast_status_notice, render_private_submission_active_status_notice,
 };
 use super::public_account::public_account_display_label;
 use super::public_balances::public_balance_entry_for_chain;
+use super::public_broadcaster::resolve_selected_public_broadcaster_fee_token;
 use super::public_broadcaster_cost::{
     cost_estimate_detail_text, public_broadcaster_cost_status,
     render_public_broadcaster_cost_estimate, render_public_broadcaster_cost_status,
@@ -104,7 +108,7 @@ pub(super) enum DeliveryMode {
 impl DeliveryMode {
     const fn label(self) -> &'static str {
         match self {
-            Self::ManualCalldata => "Manual calldata",
+            Self::ManualCalldata => "External wallet",
             Self::PublicBroadcaster => "Public broadcaster",
             Self::SelfBroadcast => "Self-broadcast",
         }
@@ -163,6 +167,46 @@ impl SelectItem for SelfBroadcastGasPayerSelectItem {
     }
 }
 
+#[derive(Clone, Eq, PartialEq)]
+pub(super) struct PrivateActionAssetSelectItem {
+    token: Address,
+    label: Arc<str>,
+    icon_path: Option<WalletIconSource>,
+}
+
+impl SelectItem for PrivateActionAssetSelectItem {
+    type Value = Address;
+
+    fn title(&self) -> SharedString {
+        SharedString::from(self.label.to_string())
+    }
+
+    fn display_title(&self) -> Option<gpui::AnyElement> {
+        Some(
+            private_action_asset_select_row(&self.label, self.icon_path.clone()).into_any_element(),
+        )
+    }
+
+    fn render(&self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        private_action_asset_select_row(&self.label, self.icon_path.clone())
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.token
+    }
+
+    fn matches(&self, query: &str) -> bool {
+        let query = query.trim().to_ascii_lowercase();
+        query.is_empty()
+            || self.label.to_ascii_lowercase().contains(&query)
+            || self
+                .token
+                .to_checksum(None)
+                .to_ascii_lowercase()
+                .contains(&query)
+    }
+}
+
 pub(super) enum SendResult {
     Manual(PreparedSendCall),
     PublicBroadcaster(Box<PublicBroadcasterSubmissionResult>),
@@ -173,6 +217,22 @@ pub(super) enum UnshieldResult {
     Manual(PreparedUnshieldCall),
     PublicBroadcaster(Box<PublicBroadcasterSubmissionResult>),
     SelfBroadcast(Box<DesktopSelfBroadcastResult>),
+}
+
+fn send_form_submitted(form: &SendFormState) -> bool {
+    matches!(
+        form.result.as_ref(),
+        Some(SendResult::PublicBroadcaster(result))
+            if matches!(result.result, PublicBroadcasterResultKind::Submitted { .. })
+    ) || matches!(form.result.as_ref(), Some(SendResult::SelfBroadcast(_)))
+}
+
+fn unshield_form_submitted(form: &UnshieldFormState) -> bool {
+    matches!(
+        form.result.as_ref(),
+        Some(UnshieldResult::PublicBroadcaster(result))
+            if matches!(result.result, PublicBroadcasterResultKind::Submitted { .. })
+    ) || matches!(form.result.as_ref(), Some(UnshieldResult::SelfBroadcast(_)))
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -289,6 +349,8 @@ pub(super) struct UnshieldFormState {
     pub(super) asset: UnshieldAsset,
     pub(super) recipient_input: Entity<InputState>,
     pub(super) amount_input: Entity<InputState>,
+    pub(super) asset_select: Entity<SelectState<SearchableVec<PrivateActionAssetSelectItem>>>,
+    asset_select_items: Vec<PrivateActionAssetSelectItem>,
     pub(super) unwrap: bool,
     pub(super) delivery_mode: DeliveryMode,
     pub(super) self_broadcast_gas_payer_uuid: Option<Arc<str>>,
@@ -317,6 +379,8 @@ pub(super) struct SendFormState {
     pub(super) asset: UnshieldAsset,
     pub(super) recipient_input: Entity<InputState>,
     pub(super) amount_input: Entity<InputState>,
+    pub(super) asset_select: Entity<SelectState<SearchableVec<PrivateActionAssetSelectItem>>>,
+    asset_select_items: Vec<PrivateActionAssetSelectItem>,
     pub(super) delivery_mode: DeliveryMode,
     pub(super) self_broadcast_gas_payer_uuid: Option<Arc<str>>,
     pub(super) self_broadcast_gas_payer_select:
@@ -348,17 +412,22 @@ pub(super) fn private_action_title_row(
     action: &'static str,
     label: &str,
     icon_path: Option<WalletIconSource>,
+    asset_select: Option<Entity<SelectState<SearchableVec<PrivateActionAssetSelectItem>>>>,
+    asset_select_disabled: bool,
 ) -> gpui::Div {
-    div()
-        .flex()
-        .items_center()
-        .gap_1()
-        .child(action)
-        .child(token_label_row(
+    let row = div().flex().items_center().gap_1().child(action);
+    if let Some(asset_select) = asset_select {
+        row.child(private_action_asset_title_select(
+            &asset_select,
+            asset_select_disabled,
+        ))
+    } else {
+        row.child(token_label_row(
             SharedString::from(label.to_owned()),
             icon_path,
             px(20.0),
         ))
+    }
 }
 
 pub(super) fn send_element_id(key: UnshieldAssetKey, action: &str) -> SharedString {
@@ -572,6 +641,28 @@ pub(super) fn private_action_metrics(asset: &UnshieldAsset) -> Vec<PrivateAction
     metrics
 }
 
+pub(super) fn private_action_metric_display_amount(amount: U256, decimals: Option<u8>) -> String {
+    decimals.map_or_else(
+        || amount.to_string(),
+        |decimals| format_token_amount(amount, decimals),
+    )
+}
+
+pub(super) fn private_action_assets_from_snapshot(
+    kind: DeliveryFormKind,
+    snapshot: &ListUtxosOutput,
+    registry: Option<&EffectiveTokenRegistry>,
+    anchor_cache: Option<&TokenAnchorRateCache>,
+) -> Vec<UnshieldAsset> {
+    format_private_asset_rows_from_snapshot(snapshot, registry, anchor_cache)
+        .iter()
+        .filter_map(|asset| match kind {
+            DeliveryFormKind::Send => build_send_asset(snapshot, asset),
+            DeliveryFormKind::Unshield => build_unshield_asset(snapshot, asset),
+        })
+        .collect()
+}
+
 impl WalletRoot {
     pub(super) fn apply_public_broadcaster_error_amount_adjustments(
         &mut self,
@@ -697,6 +788,79 @@ impl WalletRoot {
             self.schedule_public_broadcaster_cost_estimate(kind, key, cx);
         }
     }
+
+    fn private_action_snapshot(&self, chain_id: u64) -> Option<&ListUtxosOutput> {
+        match self.chain_states.get(&chain_id) {
+            Some(
+                ChainUtxoState::Ready { snapshot, .. } | ChainUtxoState::Syncing { snapshot, .. },
+            ) => Some(snapshot),
+            _ => None,
+        }
+    }
+
+    fn private_action_asset_options(
+        &self,
+        kind: DeliveryFormKind,
+        chain_id: u64,
+    ) -> Vec<UnshieldAsset> {
+        self.private_action_snapshot(chain_id)
+            .map_or_else(Vec::new, |snapshot| {
+                private_action_assets_from_snapshot(
+                    kind,
+                    snapshot,
+                    Some(&self.effective_token_registry),
+                    Some(&self.public_broadcaster_anchor_cache),
+                )
+            })
+    }
+
+    fn sync_private_action_asset_select_for_dialog(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some((chain_id, selected_token, select, current_items)) = (match kind {
+            DeliveryFormKind::Send => self.send_forms.get(&key).map(|form| {
+                (
+                    form.asset.chain_id,
+                    form.asset.token,
+                    form.asset_select.clone(),
+                    form.asset_select_items.clone(),
+                )
+            }),
+            DeliveryFormKind::Unshield => self.unshield_forms.get(&key).map(|form| {
+                (
+                    form.asset.chain_id,
+                    form.asset.token,
+                    form.asset_select.clone(),
+                    form.asset_select_items.clone(),
+                )
+            }),
+        }) else {
+            return;
+        };
+        let assets = self.private_action_asset_options(kind, chain_id);
+        let items = private_action_asset_select_items(&assets);
+        let selected_matches = select.read(cx).selected_value().copied() == Some(selected_token);
+        if items == current_items && selected_matches {
+            return;
+        }
+        match kind {
+            DeliveryFormKind::Send => {
+                if let Some(form) = self.send_forms.get_mut(&key) {
+                    form.asset_select_items.clone_from(&items);
+                }
+            }
+            DeliveryFormKind::Unshield => {
+                if let Some(form) = self.unshield_forms.get_mut(&key) {
+                    form.asset_select_items.clone_from(&items);
+                }
+            }
+        }
+        sync_private_action_asset_select_entity(&select, &assets, selected_token, window, cx);
+    }
 }
 
 pub(super) fn adjusted_amount_for_max_change(
@@ -766,7 +930,7 @@ fn render_private_action_metric(
     decimals: Option<u8>,
     disabled: bool,
 ) -> impl IntoElement {
-    let value = format_unshield_amount_input(metric.amount, decimals);
+    let value = private_action_metric_display_amount(metric.amount, decimals);
     div()
         .id(id)
         .flex_1()
@@ -875,6 +1039,30 @@ impl WalletRoot {
         cx.new(|cx| {
             SelectState::new(SearchableVec::new(items), selected_index, window, cx).searchable(true)
         })
+    }
+
+    fn new_private_action_asset_select(
+        &self,
+        kind: DeliveryFormKind,
+        chain_id: u64,
+        selected_token: Address,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> (
+        Entity<SelectState<SearchableVec<PrivateActionAssetSelectItem>>>,
+        Vec<PrivateActionAssetSelectItem>,
+    ) {
+        let assets = self.private_action_asset_options(kind, chain_id);
+        let items = private_action_asset_select_items(&assets);
+        let selected_index = private_action_asset_select_index(&items, selected_token);
+        let state_items = items.clone();
+        (
+            cx.new(|cx| {
+                SelectState::new(SearchableVec::new(items), selected_index, window, cx)
+                    .searchable(true)
+            }),
+            state_items,
+        )
     }
 
     pub(super) fn sync_self_broadcast_gas_payer_selects(
@@ -1171,6 +1359,44 @@ fn sync_self_broadcast_gas_payer_select_entity(
     });
 }
 
+fn private_action_asset_select_items(
+    assets: &[UnshieldAsset],
+) -> Vec<PrivateActionAssetSelectItem> {
+    assets
+        .iter()
+        .map(|asset| PrivateActionAssetSelectItem {
+            token: asset.token,
+            label: Arc::from(asset.label.as_str()),
+            icon_path: asset.icon_path.clone(),
+        })
+        .collect()
+}
+
+fn private_action_asset_select_index(
+    items: &[PrivateActionAssetSelectItem],
+    selected_token: Address,
+) -> Option<IndexPath> {
+    items
+        .iter()
+        .position(|item| item.token == selected_token)
+        .map(|index| IndexPath::default().row(index))
+}
+
+fn sync_private_action_asset_select_entity(
+    select: &Entity<SelectState<SearchableVec<PrivateActionAssetSelectItem>>>,
+    assets: &[UnshieldAsset],
+    selected_token: Address,
+    window: &mut Window,
+    cx: &mut Context<'_, WalletRoot>,
+) {
+    let items = private_action_asset_select_items(assets);
+    let selected_index = private_action_asset_select_index(&items, selected_token);
+    select.update(cx, |select, cx| {
+        select.set_items(SearchableVec::new(items), window, cx);
+        select.set_selected_index(selected_index, window, cx);
+    });
+}
+
 pub(super) fn render_delivery_selector(
     root: Entity<WalletRoot>,
     key: UnshieldAssetKey,
@@ -1202,7 +1428,7 @@ pub(super) fn render_delivery_selector(
                 .disabled(generating || !self_broadcast_available),
                 private_action_segment_button(
                     delivery_element_id(key, kind, "manual"),
-                    "Manual calldata",
+                    "External wallet",
                     mode == DeliveryMode::ManualCalldata,
                 )
                 .disabled(generating),
@@ -1702,8 +1928,6 @@ impl WalletRoot {
         kind: DeliveryFormKind,
         key: UnshieldAssetKey,
         title_action: &'static str,
-        asset_label: String,
-        icon_path: Option<WalletIconSource>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -1714,13 +1938,32 @@ impl WalletRoot {
                 (window.viewport_size().height * 0.88).min(PRIVATE_ACTION_FORM_MAX_HEIGHT);
             let close_root = root.clone();
             let content_root = root.clone();
+            root.update(cx, |root, cx| {
+                root.sync_private_action_asset_select_for_dialog(kind, key, window, cx);
+            });
+            let content = content_root.read(cx);
+            let (asset_label, icon_path) =
+                content.private_action_dialog_asset(kind, key).map_or_else(
+                    || ("asset".to_string(), None),
+                    |asset| (asset.label.clone(), asset.icon_path.clone()),
+                );
+            let (asset_select, asset_select_disabled) =
+                content.private_action_dialog_asset_select(kind, key);
+            let child = match kind {
+                DeliveryFormKind::Send => content.render_send_form(content_root.clone(), key),
+                DeliveryFormKind::Unshield => {
+                    content.render_unshield_form(content_root.clone(), key)
+                }
+            };
             dialog
                 .w(dialog_width)
                 .h(max_height)
                 .title(private_action_title_row(
                     title_action,
                     &asset_label,
-                    icon_path.clone(),
+                    icon_path,
+                    asset_select,
+                    asset_select_disabled,
                 ))
                 .on_close(move |_event, _window, cx| {
                     close_root.update(cx, |root, cx| match kind {
@@ -1728,15 +1971,53 @@ impl WalletRoot {
                         DeliveryFormKind::Unshield => root.close_unshield_form(key, cx),
                     });
                 })
-                .child(match kind {
-                    DeliveryFormKind::Send => content_root
-                        .read(cx)
-                        .render_send_form(content_root.clone(), key),
-                    DeliveryFormKind::Unshield => content_root
-                        .read(cx)
-                        .render_unshield_form(content_root.clone(), key),
-                })
+                .child(child)
         });
+    }
+
+    fn private_action_dialog_asset(
+        &self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+    ) -> Option<&UnshieldAsset> {
+        match kind {
+            DeliveryFormKind::Send => self.send_forms.get(&key).map(|form| &form.asset),
+            DeliveryFormKind::Unshield => self.unshield_forms.get(&key).map(|form| &form.asset),
+        }
+    }
+
+    fn private_action_dialog_asset_select(
+        &self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+    ) -> (
+        Option<Entity<SelectState<SearchableVec<PrivateActionAssetSelectItem>>>>,
+        bool,
+    ) {
+        match kind {
+            DeliveryFormKind::Send => {
+                let Some(form) = self.send_forms.get(&key) else {
+                    return (None, false);
+                };
+                let show = self
+                    .private_action_asset_options(kind, form.asset.chain_id)
+                    .len()
+                    > 1;
+                let disabled = form.generating || send_form_submitted(form);
+                (show.then(|| form.asset_select.clone()), disabled)
+            }
+            DeliveryFormKind::Unshield => {
+                let Some(form) = self.unshield_forms.get(&key) else {
+                    return (None, false);
+                };
+                let show = self
+                    .private_action_asset_options(kind, form.asset.chain_id)
+                    .len()
+                    > 1;
+                let disabled = form.generating || unshield_form_submitted(form);
+                (show.then(|| form.asset_select.clone()), disabled)
+            }
+        }
     }
 
     pub(super) fn open_send_form(
@@ -1747,12 +2028,17 @@ impl WalletRoot {
     ) {
         window.close_all_dialogs(cx);
         let key = UnshieldAssetKey::from_asset(&asset);
-        let dialog_asset_label = asset.label.clone();
-        let dialog_icon_path = asset.icon_path.clone();
         let amount = format_send_amount_input(asset.max_batched, asset.decimals);
         let amount_input = new_prefilled_input(window, cx, "amount", amount);
         let recipient_input = new_text_input(window, cx, "0zk recipient");
         let focus_recipient_input = recipient_input.clone();
+        let (asset_select, asset_select_items) = self.new_private_action_asset_select(
+            DeliveryFormKind::Send,
+            key.chain_id,
+            key.token,
+            window,
+            cx,
+        );
         let self_broadcast_gas_payer_uuid = self.default_self_broadcast_gas_payer_uuid();
         let gas_payer_select = self.new_self_broadcast_gas_payer_select(
             key.chain_id,
@@ -1784,6 +2070,26 @@ impl WalletRoot {
                     }
                     this.clear_send_form_text_edit_state(key, cx);
                     this.debounce_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
+                }
+            },
+        )
+        .detach();
+        cx.subscribe_in(
+            &asset_select,
+            window,
+            move |this,
+                  _select,
+                  event: &SelectEvent<SearchableVec<PrivateActionAssetSelectItem>>,
+                  window,
+                  cx| {
+                if let SelectEvent::Confirm(Some(token)) = event {
+                    this.set_private_action_asset_token(
+                        DeliveryFormKind::Send,
+                        key,
+                        *token,
+                        window,
+                        cx,
+                    );
                 }
             },
         )
@@ -1838,6 +2144,8 @@ impl WalletRoot {
                 asset,
                 recipient_input,
                 amount_input,
+                asset_select,
+                asset_select_items,
                 delivery_mode: DeliveryMode::PublicBroadcaster,
                 self_broadcast_gas_payer_uuid,
                 self_broadcast_gas_payer_select: gas_payer_select,
@@ -1866,15 +2174,7 @@ impl WalletRoot {
         });
         self.refresh_public_broadcaster_anchor(DeliveryFormKind::Send, key, cx);
         self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
-        Self::open_private_action_dialog(
-            DeliveryFormKind::Send,
-            key,
-            "Send",
-            dialog_asset_label,
-            dialog_icon_path,
-            window,
-            cx,
-        );
+        Self::open_private_action_dialog(DeliveryFormKind::Send, key, "Send", window, cx);
         focus_recipient_input
             .read(cx)
             .focus_handle(cx)
@@ -1983,6 +2283,243 @@ impl WalletRoot {
                     .update(cx, |input, cx| input.set_value(value, window, cx));
                 true
             }),
+        }
+    }
+
+    fn set_private_action_asset(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        asset: UnshieldAsset,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        match kind {
+            DeliveryFormKind::Send => self.set_send_asset(key, asset, window, cx),
+            DeliveryFormKind::Unshield => self.set_unshield_asset(key, asset, window, cx),
+        }
+    }
+
+    fn set_private_action_asset_token(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        token: Address,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(asset) = self
+            .private_action_asset_options(kind, key.chain_id)
+            .into_iter()
+            .find(|asset| asset.token == token)
+        else {
+            return;
+        };
+        self.set_private_action_asset(kind, key, asset, window, cx);
+    }
+
+    fn set_send_asset(
+        &mut self,
+        key: UnshieldAssetKey,
+        asset: UnshieldAsset,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some((
+            current_token,
+            selected_fee_token,
+            choice,
+            fee_mode,
+            allow_suspicious,
+            delivery_mode,
+        )) = self.send_forms.get(&key).map(|form| {
+            (
+                form.asset.token,
+                form.selected_fee_token,
+                form.broadcaster_choice.clone(),
+                form.broadcaster_fee_mode,
+                form.allow_suspicious_broadcasters,
+                form.delivery_mode,
+            )
+        })
+        else {
+            return;
+        };
+        if current_token == asset.token {
+            return;
+        }
+
+        let policy = self.public_broadcaster_fee_policy(allow_suspicious);
+        let asset_options =
+            self.private_action_asset_options(DeliveryFormKind::Send, asset.chain_id);
+        let fee_token_options =
+            self.current_public_broadcaster_fee_token_options(asset.chain_id, false, policy);
+        let selected_fee_token = resolve_selected_public_broadcaster_fee_token(
+            selected_fee_token,
+            asset.token,
+            &fee_token_options,
+        );
+        let candidates = self.current_public_broadcaster_candidates(
+            asset.chain_id,
+            selected_fee_token,
+            false,
+            policy,
+        );
+        let broadcaster_choice =
+            if broadcaster_choice_supported_by_candidates(&choice, &candidates, policy) {
+                choice
+            } else {
+                BroadcasterChoice::Random
+            };
+        let broadcaster_fee_mode = if selected_fee_token == asset.token {
+            fee_mode
+        } else {
+            PublicBroadcasterFeeMode::AddToAmount
+        };
+        let amount = format_send_amount_input(asset.max_batched, asset.decimals);
+
+        let Some(form) = self.send_forms.get_mut(&key) else {
+            return;
+        };
+        if form.generating {
+            return;
+        }
+        form.asset = asset;
+        form.selected_fee_token = selected_fee_token;
+        form.broadcaster_choice = broadcaster_choice;
+        form.broadcaster_fee_mode = broadcaster_fee_mode;
+        form.pending_programmatic_amount_input = Some(amount.clone());
+        form.self_broadcast_estimated_native_gas_cost = None;
+        form.error = None;
+        form.result = None;
+        form.cost_estimate = None;
+        form.estimate_id = 0;
+        form.cost_estimate_pending = false;
+        form.estimating_cost = false;
+        form.amount_input
+            .update(cx, |input, cx| input.set_value(amount, window, cx));
+        form.asset_select_items = private_action_asset_select_items(&asset_options);
+        sync_private_action_asset_select_entity(
+            &form.asset_select,
+            &asset_options,
+            form.asset.token,
+            window,
+            cx,
+        );
+
+        self.clear_private_broadcaster_progress_state();
+        cx.notify();
+        self.refresh_public_broadcaster_anchor(DeliveryFormKind::Send, key, cx);
+        self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
+        if delivery_mode == DeliveryMode::SelfBroadcast {
+            self.refresh_self_broadcast_gas_fee_quote(DeliveryFormKind::Send, key, cx);
+        }
+    }
+
+    fn set_unshield_asset(
+        &mut self,
+        key: UnshieldAssetKey,
+        asset: UnshieldAsset,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some((
+            current_token,
+            selected_fee_token,
+            choice,
+            fee_mode,
+            allow_suspicious,
+            delivery_mode,
+            unwrap,
+        )) = self.unshield_forms.get(&key).map(|form| {
+            (
+                form.asset.token,
+                form.selected_fee_token,
+                form.broadcaster_choice.clone(),
+                form.broadcaster_fee_mode,
+                form.allow_suspicious_broadcasters,
+                form.delivery_mode,
+                form.unwrap,
+            )
+        })
+        else {
+            return;
+        };
+        if current_token == asset.token {
+            return;
+        }
+
+        let unwrap_supported = is_effective_wrapped_native_token(
+            &self.effective_chain_configs,
+            asset.chain_id,
+            asset.token,
+        );
+        let unwrap = unwrap && unwrap_supported;
+        let policy = self.public_broadcaster_fee_policy(allow_suspicious);
+        let asset_options =
+            self.private_action_asset_options(DeliveryFormKind::Unshield, asset.chain_id);
+        let fee_token_options =
+            self.current_public_broadcaster_fee_token_options(asset.chain_id, unwrap, policy);
+        let selected_fee_token = resolve_selected_public_broadcaster_fee_token(
+            selected_fee_token,
+            asset.token,
+            &fee_token_options,
+        );
+        let candidates = self.current_public_broadcaster_candidates(
+            asset.chain_id,
+            selected_fee_token,
+            unwrap,
+            policy,
+        );
+        let broadcaster_choice =
+            if broadcaster_choice_supported_by_candidates(&choice, &candidates, policy) {
+                choice
+            } else {
+                BroadcasterChoice::Random
+            };
+        let broadcaster_fee_mode = if selected_fee_token == asset.token {
+            fee_mode
+        } else {
+            PublicBroadcasterFeeMode::AddToAmount
+        };
+        let amount = format_unshield_amount_input(asset.max_batched, asset.decimals);
+
+        let Some(form) = self.unshield_forms.get_mut(&key) else {
+            return;
+        };
+        if form.generating {
+            return;
+        }
+        form.asset = asset;
+        form.unwrap = unwrap;
+        form.selected_fee_token = selected_fee_token;
+        form.broadcaster_choice = broadcaster_choice;
+        form.broadcaster_fee_mode = broadcaster_fee_mode;
+        form.pending_programmatic_amount_input = Some(amount.clone());
+        form.self_broadcast_estimated_native_gas_cost = None;
+        form.error = None;
+        form.result = None;
+        form.cost_estimate = None;
+        form.estimate_id = 0;
+        form.cost_estimate_pending = false;
+        form.estimating_cost = false;
+        form.amount_input
+            .update(cx, |input, cx| input.set_value(amount, window, cx));
+        form.asset_select_items = private_action_asset_select_items(&asset_options);
+        sync_private_action_asset_select_entity(
+            &form.asset_select,
+            &asset_options,
+            form.asset.token,
+            window,
+            cx,
+        );
+
+        self.clear_private_broadcaster_progress_state();
+        cx.notify();
+        self.refresh_public_broadcaster_anchor(DeliveryFormKind::Unshield, key, cx);
+        self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
+        if delivery_mode == DeliveryMode::SelfBroadcast {
+            self.refresh_self_broadcast_gas_fee_quote(DeliveryFormKind::Unshield, key, cx);
         }
     }
 
@@ -2524,12 +3061,17 @@ impl WalletRoot {
     ) {
         window.close_all_dialogs(cx);
         let key = UnshieldAssetKey::from_asset(&asset);
-        let dialog_asset_label = asset.label.clone();
-        let dialog_icon_path = asset.icon_path.clone();
         let amount = format_unshield_amount_input(asset.max_batched, asset.decimals);
         let amount_input = new_prefilled_input(window, cx, "amount", amount);
         let recipient_input = new_text_input(window, cx, "0x recipient");
         let focus_recipient_input = recipient_input.clone();
+        let (asset_select, asset_select_items) = self.new_private_action_asset_select(
+            DeliveryFormKind::Unshield,
+            key.chain_id,
+            key.token,
+            window,
+            cx,
+        );
         let self_broadcast_gas_payer_uuid = self.default_self_broadcast_gas_payer_uuid();
         let gas_payer_select = self.new_self_broadcast_gas_payer_select(
             key.chain_id,
@@ -2574,6 +3116,26 @@ impl WalletRoot {
         )
         .detach();
         cx.subscribe_in(
+            &asset_select,
+            window,
+            move |this,
+                  _select,
+                  event: &SelectEvent<SearchableVec<PrivateActionAssetSelectItem>>,
+                  window,
+                  cx| {
+                if let SelectEvent::Confirm(Some(token)) = event {
+                    this.set_private_action_asset_token(
+                        DeliveryFormKind::Unshield,
+                        key,
+                        *token,
+                        window,
+                        cx,
+                    );
+                }
+            },
+        )
+        .detach();
+        cx.subscribe_in(
             &gas_payer_select,
             window,
             move |this,
@@ -2605,6 +3167,8 @@ impl WalletRoot {
                 asset,
                 recipient_input,
                 amount_input,
+                asset_select,
+                asset_select_items,
                 unwrap: false,
                 delivery_mode: DeliveryMode::PublicBroadcaster,
                 self_broadcast_gas_payer_uuid,
@@ -2634,15 +3198,7 @@ impl WalletRoot {
         });
         self.refresh_public_broadcaster_anchor(DeliveryFormKind::Unshield, key, cx);
         self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
-        Self::open_private_action_dialog(
-            DeliveryFormKind::Unshield,
-            key,
-            "Unshield",
-            dialog_asset_label,
-            dialog_icon_path,
-            window,
-            cx,
-        );
+        Self::open_private_action_dialog(DeliveryFormKind::Unshield, key, "Unshield", window, cx);
         focus_recipient_input
             .read(cx)
             .focus_handle(cx)
@@ -4666,6 +5222,28 @@ impl WalletRoot {
 
         card
     }
+}
+
+fn private_action_asset_title_select(
+    asset_select: &Entity<SelectState<SearchableVec<PrivateActionAssetSelectItem>>>,
+    disabled: bool,
+) -> gpui::Div {
+    div().w(px(170.0)).h(px(32.0)).child(
+        Select::new(asset_select)
+            .w_full()
+            .h(px(32.0))
+            .placeholder("Select asset")
+            .menu_width(px(220.0))
+            .disabled(disabled),
+    )
+}
+
+fn private_action_asset_select_row(label: &str, icon_path: Option<WalletIconSource>) -> gpui::Div {
+    div().flex().items_center().gap_2().child(token_label_row(
+        SharedString::from(label.to_owned()),
+        icon_path,
+        px(16.0),
+    ))
 }
 
 fn render_fee_token_selector(

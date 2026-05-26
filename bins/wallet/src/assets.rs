@@ -20,6 +20,7 @@ const SQUARE_ICON_PATH: &str = "railgun/icons/square.svg";
 const PENCIL_ICON_PATH: &str = "railgun/icons/pencil.svg";
 const QR_CODE_ICON_PATH: &str = "railgun/icons/qr-code.svg";
 const TRASH_2_ICON_PATH: &str = "railgun/icons/trash-2.svg";
+const CLOCK_ICON_PATH: &str = "railgun/icons/clock.svg";
 const KEY_ROUND_ICON_PATH: &str = "railgun/icons/key-round.svg";
 const NETWORK_ICON_PATH: &str = "railgun/icons/network.svg";
 const PIN_ICON_PATH: &str = "railgun/icons/pin.svg";
@@ -43,6 +44,7 @@ const RAILGUN_ASSET_PATHS: &[&str] = &[
     PENCIL_ICON_PATH,
     QR_CODE_ICON_PATH,
     TRASH_2_ICON_PATH,
+    CLOCK_ICON_PATH,
     KEY_ROUND_ICON_PATH,
     NETWORK_ICON_PATH,
     PIN_ICON_PATH,
@@ -65,6 +67,7 @@ const SQUARE_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/square.svg");
 const PENCIL_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/pencil.svg");
 const QR_CODE_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/qr-code.svg");
 const TRASH_2_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/trash-2.svg");
+const CLOCK_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/clock.svg");
 const KEY_ROUND_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/key-round.svg");
 const NETWORK_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/network.svg");
 const PIN_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/pin.svg");
@@ -167,6 +170,7 @@ pub(crate) enum RailgunActionIcon {
     Pencil,
     QrCode,
     Trash2,
+    Clock,
 }
 
 impl IconNamed for RailgunActionIcon {
@@ -179,6 +183,7 @@ impl IconNamed for RailgunActionIcon {
             Self::Pencil => PENCIL_ICON_PATH,
             Self::QrCode => QR_CODE_ICON_PATH,
             Self::Trash2 => TRASH_2_ICON_PATH,
+            Self::Clock => CLOCK_ICON_PATH,
         }
         .into()
     }
@@ -251,6 +256,7 @@ fn railgun_asset(path: &str) -> Option<&'static [u8]> {
         PENCIL_ICON_PATH => Some(PENCIL_ICON_BYTES),
         QR_CODE_ICON_PATH => Some(QR_CODE_ICON_BYTES),
         TRASH_2_ICON_PATH => Some(TRASH_2_ICON_BYTES),
+        CLOCK_ICON_PATH => Some(CLOCK_ICON_BYTES),
         KEY_ROUND_ICON_PATH => Some(KEY_ROUND_ICON_BYTES),
         NETWORK_ICON_PATH => Some(NETWORK_ICON_BYTES),
         PIN_ICON_PATH => Some(PIN_ICON_BYTES),
@@ -283,6 +289,12 @@ mod tests {
             assets
                 .load("railgun-ui/tokens/1-0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.png")
                 .expect("load token icon")
+                .is_some()
+        );
+        assert!(
+            assets
+                .load("railgun/icons/clock.svg")
+                .expect("load clock icon")
                 .is_some()
         );
     }

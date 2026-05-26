@@ -123,18 +123,20 @@ use private_action::{
     PrivateActionMetric, SEND_AUTHORIZATION_FAILED_ERROR, SelfBroadcastNativeBalanceState,
     UNSHIELD_AUTHORIZATION_FAILED_ERROR, adjusted_amount_for_max_change,
     default_self_broadcast_gas_payer_uuid, form_error_clears_public_broadcaster_cost_estimate,
-    format_exact_asset_amount_for_display, format_form_error_for_asset, private_action_metrics,
-    random_self_broadcast_gas_payer_uuid, self_broadcast_gas_payer_matches_search,
-    self_broadcast_native_balance_label, self_broadcast_native_balance_state, send_element_id,
+    format_exact_asset_amount_for_display, format_form_error_for_asset,
+    private_action_assets_from_snapshot, private_action_metric_display_amount,
+    private_action_metrics, random_self_broadcast_gas_payer_uuid,
+    self_broadcast_gas_payer_matches_search, self_broadcast_native_balance_label,
+    self_broadcast_native_balance_state, send_element_id,
     send_public_broadcaster_estimate_input_error, unshield_element_id,
     unshield_public_broadcaster_estimate_input_error,
 };
 #[cfg(test)]
 use private_assets::{
     format_private_asset_rows, format_total, max_send_amount_from_snapshot,
-    max_unshield_amount_from_snapshot, refresh_form_asset_from_snapshot,
-    send_asset_key_from_formatted, send_key_matches_asset, unshield_asset_key_from_formatted,
-    unshield_key_matches_asset,
+    max_unshield_amount_from_snapshot, private_asset_display_amounts,
+    refresh_form_asset_from_snapshot, send_asset_key_from_formatted, send_key_matches_asset,
+    unshield_asset_key_from_formatted, unshield_key_matches_asset,
 };
 #[cfg(test)]
 use private_broadcaster::{
@@ -166,6 +168,7 @@ use public_action::{
 #[cfg(test)]
 use public_balances::{
     merge_public_balance_snapshot, public_asset_icon_path, public_balance_entry_for_chain,
+    public_balance_usd_label,
 };
 #[cfg(test)]
 use public_broadcaster::{
@@ -613,6 +616,7 @@ impl WalletRoot {
         let network_health = http.network_health();
         let sidebar_public_broadcaster_count =
             ethereum_weth_public_broadcaster_count(&monitor_state.read().fee_rows());
+        let mut anchor_refresh_rx = public_broadcaster_anchor_cache.subscribe_refreshes();
         let root = Self {
             selected_chain: initial_chain_id,
             options,
@@ -854,6 +858,14 @@ impl WalletRoot {
                     })
                     .is_err()
                 {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.spawn(async move |this, cx| {
+            while anchor_refresh_rx.changed().await.is_ok() {
+                if this.update(cx, |_root, cx| cx.notify()).is_err() {
                     break;
                 }
             }

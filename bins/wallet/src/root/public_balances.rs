@@ -2,10 +2,13 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use gpui::{Context, Window};
-use railgun_ui::{chain_icon_asset_path, chain_name, format_token_amount, short_address};
+use railgun_ui::{
+    chain_icon_asset_path, chain_name, format_token_amount, format_usd_micro_value, short_address,
+};
 use wallet_ops::{
     PublicAssetId, PublicBalanceAmount, PublicBalanceEntry, PublicBalanceSnapshot,
-    refresh_public_balances, settings::EffectiveTokenRegistry, vault::PublicAccountStatus,
+    TokenAnchorRateCache, refresh_public_balances, settings::EffectiveTokenRegistry,
+    vault::PublicAccountStatus,
 };
 
 use super::{WalletRoot, WalletTab, format_report_chain, token_display_metadata};
@@ -92,6 +95,23 @@ pub(super) fn public_balance_amount_label(amount: &PublicBalanceAmount, decimals
         PublicBalanceAmount::Available(amount) => format_token_amount(*amount, decimals),
         PublicBalanceAmount::Unavailable => "unavailable".to_string(),
     }
+}
+
+pub(super) fn public_balance_usd_label(
+    chain_id: u64,
+    asset: PublicAssetId,
+    amount: &PublicBalanceAmount,
+    anchor_cache: Option<&TokenAnchorRateCache>,
+) -> Option<String> {
+    let PublicBalanceAmount::Available(amount) = amount else {
+        return None;
+    };
+    let cache = anchor_cache?;
+    let usd_micro_value = match asset {
+        PublicAssetId::Native => cache.cached_native_usd_micro_value(chain_id, *amount),
+        PublicAssetId::Erc20(token) => cache.cached_token_usd_micro_value(chain_id, token, *amount),
+    }?;
+    Some(format_usd_micro_value(usd_micro_value))
 }
 
 pub(super) fn public_balance_entry_for_chain(

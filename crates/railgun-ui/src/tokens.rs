@@ -32,6 +32,12 @@ pub struct TokenAnchorInfo {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct NativeUsdAnchorInfo {
+    pub chain_id: u64,
+    pub anchor_sources: &'static [TokenAnchorSource],
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct KnownTokenInfo {
     pub chain_id: u64,
     pub token: Address,
@@ -58,6 +64,8 @@ pub enum TokenAnchorSource {
 }
 
 pub const WRAPPED_NATIVE_FEE_RATE: U256 = uint!(1_000_000_000_000_000_000_U256);
+const USD_MICRO_PER_CENT: U256 = uint!(10_000_U256);
+const CENTS_PER_DOLLAR: U256 = uint!(100_U256);
 
 const NO_ANCHORS: &[TokenAnchorSource] = &[];
 const WRAPPED_NATIVE_ANCHOR: &[TokenAnchorSource] = &[TokenAnchorSource::Fixed {
@@ -130,6 +138,32 @@ const ARB_PER_ETH_18_ANCHOR: &[TokenAnchorSource] = &[TokenAnchorSource::Product
     sources: ARB_PER_ETH_18_PRODUCT_SOURCES,
     scale_decimals: 18,
 }];
+const BNB_USD_6_ANCHOR: &[TokenAnchorSource] = &[TokenAnchorSource::ChainlinkOracle {
+    addr: address!("0x0567F2323251f0Aab15c8dFb1967E4e8A7D42aeE"),
+    token_decimals: 6,
+    oracle_decimals: 8,
+    is_inversed: false,
+}];
+const MATIC_USD_6_NATIVE_ANCHOR: &[TokenAnchorSource] = &[TokenAnchorSource::ChainlinkOracle {
+    addr: address!("0xAB594600376Ec9fD91F8e885dADF0CE036862dE0"),
+    token_decimals: 6,
+    oracle_decimals: 8,
+    is_inversed: false,
+}];
+const ARB_ETH_USD_6_NATIVE_ANCHOR: &[TokenAnchorSource] = &[TokenAnchorSource::ChainlinkOracle {
+    addr: address!("0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612"),
+    token_decimals: 6,
+    oracle_decimals: 8,
+    is_inversed: false,
+}];
+
+#[rustfmt::skip]
+const NATIVE_USD_ANCHORS: &[(u64, &[TokenAnchorSource])] = &[
+    (1, ETH_USD_6_ANCHOR),
+    (56, BNB_USD_6_ANCHOR),
+    (137, MATIC_USD_6_NATIVE_ANCHOR),
+    (42161, ARB_ETH_USD_6_NATIVE_ANCHOR),
+];
 
 #[rustfmt::skip]
 const TOKENS: &[(u64, Address, &str, u8, &[TokenAnchorSource])] = &[
@@ -203,6 +237,15 @@ pub fn token_anchor_entries() -> impl Iterator<Item = TokenAnchorInfo> {
         .map(|(chain_id, token, _, _, anchor_sources)| TokenAnchorInfo {
             chain_id: *chain_id,
             token: *token,
+            anchor_sources,
+        })
+}
+
+pub fn native_usd_anchor_entries() -> impl Iterator<Item = NativeUsdAnchorInfo> {
+    NATIVE_USD_ANCHORS
+        .iter()
+        .map(|(chain_id, anchor_sources)| NativeUsdAnchorInfo {
+            chain_id: *chain_id,
             anchor_sources,
         })
 }
@@ -314,6 +357,51 @@ fn format_token_amount_with_precision(amount: U256, decimals: u8, precision: u8)
 #[must_use]
 pub fn format_token_amount(amount: U256, decimals: u8) -> String {
     format_token_amount_with_precision(amount, decimals, display_precision(amount, decimals))
+}
+
+#[must_use]
+pub fn token_usd_micro_value(
+    amount: U256,
+    token_anchor_rate: U256,
+    native_usd_micro_rate: U256,
+) -> Option<U256> {
+    if token_anchor_rate.is_zero() || native_usd_micro_rate.is_zero() {
+        return None;
+    }
+    amount
+        .checked_mul(native_usd_micro_rate)?
+        .checked_div(token_anchor_rate)
+}
+
+#[must_use]
+pub fn native_usd_micro_value(amount: U256, native_usd_micro_rate: U256) -> Option<U256> {
+    token_usd_micro_value(amount, WRAPPED_NATIVE_FEE_RATE, native_usd_micro_rate)
+}
+
+#[must_use]
+pub fn format_usd_micro_value(value: U256) -> String {
+    let mut rounded_cents = value / USD_MICRO_PER_CENT;
+    if value % USD_MICRO_PER_CENT >= USD_MICRO_PER_CENT / uint!(2_U256) {
+        rounded_cents = rounded_cents.saturating_add(U256::ONE);
+    }
+    let dollars = format_usd_dollars(rounded_cents / CENTS_PER_DOLLAR);
+    let cents = (rounded_cents % CENTS_PER_DOLLAR).to_string();
+    format!("${dollars}.{cents:0>2}")
+}
+
+fn format_usd_dollars(dollars: U256) -> String {
+    let digits = dollars.to_string();
+    if digits.len() <= 3 {
+        return digits;
+    }
+    let mut formatted = String::with_capacity(digits.len() + (digits.len() - 1) / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            formatted.push(',');
+        }
+        formatted.push(digit);
+    }
+    formatted
 }
 
 /// Shorten an address for the fallback display on unknown tokens.
@@ -434,6 +522,84 @@ mod tests {
                 oracle_decimals: 8,
                 is_inversed: false,
             }]
+        );
+    }
+
+    #[test]
+    fn native_usd_anchor_entries_cover_supported_wallet_chains() {
+        let entries = native_usd_anchor_entries().collect::<Vec<_>>();
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.chain_id)
+                .collect::<Vec<_>>(),
+            [1, 56, 137, 42161]
+        );
+        assert!(entries.iter().all(|entry| !entry.anchor_sources.is_empty()));
+        assert_eq!(
+            entries[0].anchor_sources,
+            &[TokenAnchorSource::ChainlinkOracle {
+                addr: address!("0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419"),
+                token_decimals: 6,
+                oracle_decimals: 8,
+                is_inversed: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn usd_value_helpers_price_tokens_and_native_assets() {
+        let native_usd = uint!(3_000_000_000_U256);
+
+        assert_eq!(
+            token_usd_micro_value(uint!(1_500_000_U256), uint!(3_000_000_000_U256), native_usd),
+            Some(uint!(1_500_000_U256))
+        );
+        assert_eq!(
+            token_usd_micro_value(
+                uint!(500_000_000_000_000_000_U256),
+                WRAPPED_NATIVE_FEE_RATE,
+                native_usd,
+            ),
+            Some(uint!(1_500_000_000_U256))
+        );
+        assert_eq!(
+            native_usd_micro_value(uint!(2_000_000_000_000_000_000_U256), native_usd),
+            Some(uint!(6_000_000_000_U256))
+        );
+    }
+
+    #[test]
+    fn usd_value_helpers_skip_missing_or_invalid_rates() {
+        assert_eq!(
+            token_usd_micro_value(uint!(1_U256), U256::ZERO, uint!(1_U256)),
+            None
+        );
+        assert_eq!(
+            token_usd_micro_value(uint!(1_U256), uint!(1_U256), U256::ZERO),
+            None
+        );
+        assert_eq!(
+            token_usd_micro_value(U256::MAX, uint!(1_U256), uint!(2_U256)),
+            None
+        );
+    }
+
+    #[test]
+    fn usd_value_formatter_rounds_to_cents() {
+        assert_eq!(format_usd_micro_value(U256::ZERO), "$0.00");
+        assert_eq!(format_usd_micro_value(uint!(12_344_U256)), "$0.01");
+        assert_eq!(format_usd_micro_value(uint!(12_345_U256)), "$0.01");
+        assert_eq!(format_usd_micro_value(uint!(123_454_999_U256)), "$123.45");
+        assert_eq!(format_usd_micro_value(uint!(123_455_000_U256)), "$123.46");
+        assert_eq!(
+            format_usd_micro_value(uint!(1_234_560_000_U256)),
+            "$1,234.56"
+        );
+        assert_eq!(
+            format_usd_micro_value(uint!(12_345_678_900_000_U256)),
+            "$12,345,678.90"
         );
     }
 

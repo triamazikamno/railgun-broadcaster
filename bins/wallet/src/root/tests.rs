@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, U256, address};
 use alloy::uint;
 use broadcaster_monitor::FeeRow;
 use broadcaster_monitor_waku::{DEFAULT_DOH_ENDPOINT, DEFAULT_TOR_DOH_ENDPOINT};
@@ -14,8 +14,8 @@ use wallet_ops::{
     PublicAssetId, PublicBalanceAmount, PublicBalanceAsset, PublicBalanceEntry,
     PublicBalanceSnapshot, PublicBroadcasterCandidate, PublicBroadcasterCostEstimate,
     PublicBroadcasterFeeMargin, PublicBroadcasterFeeMode, PublicBroadcasterResultKind,
-    PublicBroadcasterSelection, SyncProgressStage, SyncProgressUpdate, TransactionGenerationStage,
-    UtxoOutput,
+    PublicBroadcasterSelection, SyncProgressStage, SyncProgressUpdate, TokenAnchorRateCache,
+    TransactionGenerationStage, UtxoOutput,
     settings::{
         BuiltInTokenOverride, CustomTokenSettings, NetworkModeSetting, PoiReadSourceSetting,
         PriceAnchorSettings, TokenKey, TokenPriceAnchorOverride, WALLET_SETTINGS_KEY,
@@ -32,7 +32,7 @@ use wallet_ops::{
 
 use super::private_assets::{
     build_send_asset, build_unshield_asset, format_private_asset_rows_from_snapshot,
-    should_show_pending_amount, should_show_pending_poi_amount,
+    should_show_pending_amount, should_show_pending_poi_amount, total_private_balance_usd_amount,
 };
 use super::private_broadcaster::{
     PrivateSubmissionProgressFlow, private_broadcaster_closed_active_stage,
@@ -76,9 +76,11 @@ use super::{
     native_wrapped_output_labels, next_public_account_label_number, parse_gwei_to_wei,
     parse_repair_cache_block, price_anchor_dialog_values_from_entry,
     price_anchor_override_from_dialog_values, price_anchor_token_primary_label,
-    private_action_metrics, private_broadcaster_progress_footer_action,
-    private_broadcaster_progress_steps, private_progress_stage_disables_stop, progress_detail,
-    progress_footer_action, public_account_identicon_color, public_account_identicon_pattern,
+    private_action_assets_from_snapshot, private_action_metric_display_amount,
+    private_action_metrics, private_asset_display_amounts,
+    private_broadcaster_progress_footer_action, private_broadcaster_progress_steps,
+    private_progress_stage_disables_stop, progress_detail, progress_footer_action,
+    public_account_identicon_color, public_account_identicon_pattern,
     public_account_matches_search, public_account_visible_balances_for_chain,
     public_action_accepts_update, public_action_closed_active_step, public_action_error_copy_value,
     public_action_error_details, public_action_error_summary,
@@ -87,19 +89,19 @@ use super::{
     public_action_step_is_final_handoff, public_action_step_uses_stop_marker,
     public_address_qr_module_range, public_address_qr_payload, public_asset_decimals,
     public_asset_icon_path, public_asset_label, public_balance_amount_label,
-    public_balance_entry_for_chain, public_broadcaster_candidates_for_asset,
-    public_broadcaster_cost_status_text, public_broadcaster_fee_token_options_from_snapshot,
-    public_broadcaster_fee_token_warning, public_broadcaster_submit_disabled_for_fee_token_options,
-    random_self_broadcast_gas_payer_uuid, refresh_form_asset_from_snapshot,
-    remembered_spend_authorization_valid_for_test, remove_chain_rpc_endpoint,
-    remove_poi_gateway_url, remove_waku_direct_peer, remove_waku_dns_enr_tree,
-    remove_waku_doh_fallback_endpoint, repair_cache_help_text, required_relay_adapt_for_unwrap,
-    resolve_selected_public_broadcaster_fee_token, selected_wallet_after_metadata_refresh,
-    self_broadcast_gas_payer_matches_search, self_broadcast_native_balance_label,
-    self_broadcast_native_balance_state, self_broadcast_progress_steps,
-    send_asset_key_from_formatted, send_element_id, send_key_matches_asset,
-    send_public_broadcaster_estimate_input_error, set_chain_rpc_endpoint, set_poi_gateway_url,
-    set_price_anchor_override, set_waku_direct_peer, set_waku_dns_enr_tree,
+    public_balance_entry_for_chain, public_balance_usd_label,
+    public_broadcaster_candidates_for_asset, public_broadcaster_cost_status_text,
+    public_broadcaster_fee_token_options_from_snapshot, public_broadcaster_fee_token_warning,
+    public_broadcaster_submit_disabled_for_fee_token_options, random_self_broadcast_gas_payer_uuid,
+    refresh_form_asset_from_snapshot, remembered_spend_authorization_valid_for_test,
+    remove_chain_rpc_endpoint, remove_poi_gateway_url, remove_waku_direct_peer,
+    remove_waku_dns_enr_tree, remove_waku_doh_fallback_endpoint, repair_cache_help_text,
+    required_relay_adapt_for_unwrap, resolve_selected_public_broadcaster_fee_token,
+    selected_wallet_after_metadata_refresh, self_broadcast_gas_payer_matches_search,
+    self_broadcast_native_balance_label, self_broadcast_native_balance_state,
+    self_broadcast_progress_steps, send_asset_key_from_formatted, send_element_id,
+    send_key_matches_asset, send_public_broadcaster_estimate_input_error, set_chain_rpc_endpoint,
+    set_poi_gateway_url, set_price_anchor_override, set_waku_direct_peer, set_waku_dns_enr_tree,
     set_waku_doh_fallback_endpoint, settings_draft_after_discard, settings_restart_action_enabled,
     settings_restart_reuses_active_network, settings_save_action_enabled, should_focus_utxo_table,
     should_preserve_estimate_after_broadcaster_policy_change,
@@ -2423,7 +2425,7 @@ fn effective_token_registry_formats_private_and_public_assets() {
         poi_verified_total: "12345".to_string(),
     }];
 
-    let rows = format_private_asset_rows(1, &totals, Some(&registry));
+    let rows = format_private_asset_rows(1, &totals, Some(&registry), None);
 
     assert_eq!(rows[0].label, "TST");
     assert_eq!(rows[0].amount, "1.23");
@@ -2459,7 +2461,7 @@ fn private_asset_rows_use_totals_formatting() {
         poi_verified_total: "1000000".to_string(),
     }];
 
-    let rows = format_private_asset_rows(1, &totals, None);
+    let rows = format_private_asset_rows(1, &totals, None, None);
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].label, "USDC");
     assert_eq!(rows[0].amount, "1.23");
@@ -2470,6 +2472,264 @@ fn private_asset_rows_use_totals_formatting() {
 }
 
 #[test]
+fn private_asset_rows_include_usd_when_cache_has_rates() {
+    let usdc = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+    let weth = address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+    let cache = TokenAnchorRateCache::new();
+    cache.store_native_usd_rate(1, uint!(3_000_000_000_U256));
+    cache.store_rate(1, usdc, uint!(3_000_000_000_U256));
+    let totals = [
+        wallet_ops::TokenTotal {
+            token: usdc.to_checksum(None),
+            total: "1234567".to_string(),
+            poi_verified_total: "1234567".to_string(),
+        },
+        wallet_ops::TokenTotal {
+            token: weth.to_checksum(None),
+            total: "500000000000000000".to_string(),
+            poi_verified_total: "500000000000000000".to_string(),
+        },
+    ];
+
+    let rows = format_private_asset_rows(1, &totals, None, Some(&cache));
+
+    assert_eq!(rows[0].usd_amount.as_deref(), Some("$1.23"));
+    assert_eq!(rows[1].usd_amount.as_deref(), Some("$1,500.00"));
+}
+
+#[test]
+fn private_asset_rows_from_snapshot_sort_by_usd_descending() {
+    let rail = address!("0xe76C6c83af64e4C60245D8C7dE953DF673a7A33D");
+    let usdc = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+    let weth = address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+    let cache = TokenAnchorRateCache::new();
+    cache.store_native_usd_rate(1, uint!(3_000_000_000_U256));
+    cache.store_rate(1, usdc, uint!(3_000_000_000_U256));
+    let snapshot = ListUtxosOutput {
+        chain_id: 1,
+        cache_key: "cache".to_string(),
+        utxo_count: 0,
+        unspent_count: 0,
+        spent_count: 0,
+        local_pending_spent_count: 0,
+        utxos: Vec::new(),
+        totals: vec![
+            wallet_ops::TokenTotal {
+                token: rail.to_checksum(None),
+                total: "1000000000000000000".to_string(),
+                poi_verified_total: "1000000000000000000".to_string(),
+            },
+            wallet_ops::TokenTotal {
+                token: usdc.to_checksum(None),
+                total: "1234567".to_string(),
+                poi_verified_total: "1234567".to_string(),
+            },
+            wallet_ops::TokenTotal {
+                token: weth.to_checksum(None),
+                total: "500000000000000000".to_string(),
+                poi_verified_total: "500000000000000000".to_string(),
+            },
+        ],
+    };
+
+    let rows = format_private_asset_rows_from_snapshot(&snapshot, None, Some(&cache));
+
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.label.as_str())
+            .collect::<Vec<_>>(),
+        ["WETH", "USDC", "RAIL"]
+    );
+    assert_eq!(rows[0].usd_amount.as_deref(), Some("$1,500.00"));
+    assert_eq!(rows[1].usd_amount.as_deref(), Some("$1.23"));
+    assert_eq!(rows[2].usd_amount, None);
+}
+
+#[test]
+fn private_asset_rows_from_snapshot_preserve_equal_and_unpriced_order() {
+    let usdc = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+    let weth = address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+    let rail = address!("0xe76C6c83af64e4C60245D8C7dE953DF673a7A33D");
+    let unknown = Address::from([0x99; 20]);
+    let cache = TokenAnchorRateCache::new();
+    cache.store_native_usd_rate(1, uint!(3_000_000_000_U256));
+    cache.store_rate(1, usdc, uint!(3_000_000_000_U256));
+    let snapshot = ListUtxosOutput {
+        chain_id: 1,
+        cache_key: "cache".to_string(),
+        utxo_count: 0,
+        unspent_count: 0,
+        spent_count: 0,
+        local_pending_spent_count: 0,
+        utxos: Vec::new(),
+        totals: vec![
+            wallet_ops::TokenTotal {
+                token: usdc.to_checksum(None),
+                total: "1500000000".to_string(),
+                poi_verified_total: "1500000000".to_string(),
+            },
+            wallet_ops::TokenTotal {
+                token: weth.to_checksum(None),
+                total: "500000000000000000".to_string(),
+                poi_verified_total: "500000000000000000".to_string(),
+            },
+            wallet_ops::TokenTotal {
+                token: rail.to_checksum(None),
+                total: "1000000000000000000".to_string(),
+                poi_verified_total: "1000000000000000000".to_string(),
+            },
+            wallet_ops::TokenTotal {
+                token: unknown.to_checksum(None),
+                total: "1".to_string(),
+                poi_verified_total: "1".to_string(),
+            },
+        ],
+    };
+
+    let rows = format_private_asset_rows_from_snapshot(&snapshot, None, Some(&cache));
+
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.label.as_str())
+            .collect::<Vec<_>>(),
+        ["USDC", "WETH", "RAIL", "0x9999…9999"]
+    );
+    assert_eq!(rows[0].usd_amount.as_deref(), Some("$1,500.00"));
+    assert_eq!(rows[1].usd_amount.as_deref(), Some("$1,500.00"));
+    assert_eq!(rows[2].usd_amount, None);
+    assert_eq!(rows[3].usd_amount, None);
+}
+
+#[test]
+fn private_total_balance_sums_priced_assets() {
+    let rail = address!("0xe76C6c83af64e4C60245D8C7dE953DF673a7A33D");
+    let usdc = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+    let weth = address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+    let cache = TokenAnchorRateCache::new();
+    cache.store_native_usd_rate(1, uint!(3_000_000_000_U256));
+    cache.store_rate(1, usdc, uint!(3_000_000_000_U256));
+    let snapshot = ListUtxosOutput {
+        chain_id: 1,
+        cache_key: "cache".to_string(),
+        utxo_count: 0,
+        unspent_count: 0,
+        spent_count: 0,
+        local_pending_spent_count: 0,
+        utxos: Vec::new(),
+        totals: vec![
+            wallet_ops::TokenTotal {
+                token: usdc.to_checksum(None),
+                total: "1234567".to_string(),
+                poi_verified_total: "1234567".to_string(),
+            },
+            wallet_ops::TokenTotal {
+                token: weth.to_checksum(None),
+                total: "500000000000000000".to_string(),
+                poi_verified_total: "500000000000000000".to_string(),
+            },
+            wallet_ops::TokenTotal {
+                token: rail.to_checksum(None),
+                total: "1000000000000000000".to_string(),
+                poi_verified_total: "1000000000000000000".to_string(),
+            },
+        ],
+    };
+
+    let rows = format_private_asset_rows_from_snapshot(&snapshot, None, Some(&cache));
+
+    assert_eq!(
+        total_private_balance_usd_amount(&rows).as_deref(),
+        Some("$1,501.23")
+    );
+}
+
+#[test]
+fn private_total_balance_absent_without_priced_assets() {
+    let rail = address!("0xe76C6c83af64e4C60245D8C7dE953DF673a7A33D");
+    let rows = format_private_asset_rows(
+        1,
+        &[wallet_ops::TokenTotal {
+            token: rail.to_checksum(None),
+            total: "1000000000000000000".to_string(),
+            poi_verified_total: "1000000000000000000".to_string(),
+        }],
+        None,
+        None,
+    );
+
+    assert_eq!(total_private_balance_usd_amount(&rows), None);
+}
+
+#[test]
+fn private_asset_display_amounts_prioritize_usd_when_available() {
+    let usdc = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+    let cache = TokenAnchorRateCache::new();
+    cache.store_native_usd_rate(1, uint!(3_000_000_000_U256));
+    cache.store_rate(1, usdc, uint!(3_000_000_000_U256));
+    let totals = [wallet_ops::TokenTotal {
+        token: usdc.to_checksum(None),
+        total: "1234567".to_string(),
+        poi_verified_total: "1234567".to_string(),
+    }];
+    let rows = format_private_asset_rows(1, &totals, None, Some(&cache));
+
+    assert_eq!(
+        private_asset_display_amounts(&rows[0]),
+        ("$1.23".to_string(), Some("1.23 USDC".to_string()))
+    );
+}
+
+#[test]
+fn private_asset_display_amounts_keep_token_primary_when_unpriced() {
+    let totals = [wallet_ops::TokenTotal {
+        token: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string(),
+        total: "1234567".to_string(),
+        poi_verified_total: "1234567".to_string(),
+    }];
+    let rows = format_private_asset_rows(1, &totals, None, None);
+
+    assert_eq!(
+        private_asset_display_amounts(&rows[0]),
+        ("1.23".to_string(), None)
+    );
+}
+
+#[test]
+fn private_asset_rows_omit_usd_without_required_pricing() {
+    let rail = address!("0xe76C6c83af64e4C60245D8C7dE953DF673a7A33D");
+    let usdc = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+    let unknown = Address::from([0x99; 20]);
+    let cache = TokenAnchorRateCache::new();
+    cache.store_native_usd_rate(1, uint!(3_000_000_000_U256));
+    let totals = [
+        wallet_ops::TokenTotal {
+            token: rail.to_checksum(None),
+            total: "1000000000000000000".to_string(),
+            poi_verified_total: "1000000000000000000".to_string(),
+        },
+        wallet_ops::TokenTotal {
+            token: usdc.to_checksum(None),
+            total: "1234567".to_string(),
+            poi_verified_total: "1234567".to_string(),
+        },
+        wallet_ops::TokenTotal {
+            token: unknown.to_checksum(None),
+            total: "1234567".to_string(),
+            poi_verified_total: "1234567".to_string(),
+        },
+    ];
+
+    let rows = format_private_asset_rows(1, &totals, None, Some(&cache));
+
+    assert_eq!(rows[0].label, "RAIL");
+    assert_eq!(rows[0].usd_amount, None);
+    assert_eq!(rows[1].label, "USDC");
+    assert_eq!(rows[1].usd_amount, None);
+    assert_eq!(rows[2].token, Some(unknown));
+    assert_eq!(rows[2].usd_amount, None);
+}
+
+#[test]
 fn private_asset_rows_hide_zero_pending_poi() {
     let totals = [wallet_ops::TokenTotal {
         token: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string(),
@@ -2477,7 +2737,7 @@ fn private_asset_rows_hide_zero_pending_poi() {
         poi_verified_total: "1234567".to_string(),
     }];
 
-    let rows = format_private_asset_rows(1, &totals, None);
+    let rows = format_private_asset_rows(1, &totals, None, None);
 
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].pending_poi_amount, "0");
@@ -2509,7 +2769,7 @@ fn private_asset_rows_show_separate_pending_amounts() {
         }],
     };
 
-    let rows = format_private_asset_rows_from_snapshot(&snapshot, None);
+    let rows = format_private_asset_rows_from_snapshot(&snapshot, None, None);
 
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].total, Some(uint!(5_U256)));
@@ -2540,7 +2800,7 @@ fn private_asset_rows_include_local_pending_outgoing_amount() {
         }],
     };
 
-    let rows = format_private_asset_rows_from_snapshot(&snapshot, None);
+    let rows = format_private_asset_rows_from_snapshot(&snapshot, None, None);
 
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].pending_outgoing_total, Some(uint!(5_U256)));
@@ -3176,6 +3436,22 @@ fn private_action_metrics_hide_values_matching_total() {
 }
 
 #[test]
+fn private_action_metric_display_amount_uses_compact_precision() {
+    assert_eq!(
+        private_action_metric_display_amount(uint!(10_447_680_100_412_055_662_U256), Some(18)),
+        "10.45"
+    );
+    assert_eq!(
+        private_action_metric_display_amount(uint!(10_437_705_100_412_055_662_U256), Some(18)),
+        "10.44"
+    );
+    assert_eq!(
+        private_action_metric_display_amount(uint!(42_U256), None),
+        "42"
+    );
+}
+
+#[test]
 fn native_wrapped_output_labels_are_chain_specific() {
     assert_eq!(native_wrapped_output_labels(1), Some(("ETH", "WETH")));
     assert_eq!(native_wrapped_output_labels(56), Some(("BNB", "WBNB")));
@@ -3278,7 +3554,7 @@ fn refreshed_form_asset_tracks_new_utxos() {
             poi_verified_total: "5".to_string(),
         }],
     };
-    let original_row = format_private_asset_rows(1, &original_snapshot.totals, None)
+    let original_row = format_private_asset_rows(1, &original_snapshot.totals, None, None)
         .pop()
         .expect("formatted row");
     let original_asset =
@@ -3397,7 +3673,7 @@ fn build_unshield_asset_includes_max_batched_transaction() {
             poi_verified_total: "12".to_string(),
         }],
     };
-    let row = format_private_asset_rows(1, &snapshot.totals, None)
+    let row = format_private_asset_rows(1, &snapshot.totals, None, None)
         .into_iter()
         .next()
         .expect("asset row");
@@ -3428,7 +3704,7 @@ fn build_send_asset_includes_max_batched_transaction() {
             poi_verified_total: "12".to_string(),
         }],
     };
-    let row = format_private_asset_rows(1, &snapshot.totals, None)
+    let row = format_private_asset_rows(1, &snapshot.totals, None, None)
         .into_iter()
         .next()
         .expect("asset row");
@@ -3437,6 +3713,62 @@ fn build_send_asset_includes_max_batched_transaction() {
 
     assert_eq!(asset.total, uint!(12_U256));
     assert_eq!(asset.max_batched, uint!(12_U256));
+}
+
+#[test]
+fn private_action_assets_from_snapshot_include_only_switchable_assets() {
+    let weth = Address::from([0x35; 20]);
+    let dai = Address::from([0x36; 20]);
+    let stale = Address::from([0x37; 20]);
+    let snapshot = ListUtxosOutput {
+        chain_id: 1,
+        cache_key: "cache".to_string(),
+        utxo_count: 2,
+        unspent_count: 2,
+        spent_count: 0,
+        local_pending_spent_count: 0,
+        utxos: vec![
+            unshield_utxo_output(weth, 5, 0, 1),
+            unshield_utxo_output(dai, 7, 0, 2),
+        ],
+        totals: vec![
+            wallet_ops::TokenTotal {
+                token: weth.to_checksum(None),
+                total: "5".to_string(),
+                poi_verified_total: "5".to_string(),
+            },
+            wallet_ops::TokenTotal {
+                token: stale.to_checksum(None),
+                total: "3".to_string(),
+                poi_verified_total: "3".to_string(),
+            },
+            wallet_ops::TokenTotal {
+                token: dai.to_checksum(None),
+                total: "7".to_string(),
+                poi_verified_total: "7".to_string(),
+            },
+        ],
+    };
+
+    let send_assets =
+        private_action_assets_from_snapshot(DeliveryFormKind::Send, &snapshot, None, None);
+    let unshield_assets =
+        private_action_assets_from_snapshot(DeliveryFormKind::Unshield, &snapshot, None, None);
+
+    assert_eq!(
+        send_assets
+            .iter()
+            .map(|asset| asset.token)
+            .collect::<Vec<_>>(),
+        [weth, dai]
+    );
+    assert_eq!(
+        unshield_assets
+            .iter()
+            .map(|asset| asset.token)
+            .collect::<Vec<_>>(),
+        [weth, dai]
+    );
 }
 
 #[test]
@@ -3457,6 +3789,7 @@ fn unshield_key_matches_only_selected_asset() {
                 poi_verified_total: "7".to_string(),
             },
         ],
+        None,
         None,
     );
     let key = UnshieldAssetKey::new(1, token);
@@ -3484,6 +3817,7 @@ fn send_key_matches_only_selected_asset() {
                 poi_verified_total: "7".to_string(),
             },
         ],
+        None,
         None,
     );
     let key = UnshieldAssetKey::new(1, token);
@@ -3924,6 +4258,80 @@ fn public_balance_helpers_ignore_stale_chain_snapshot() {
             PublicAccountStatus::Inactive,
         )
         .is_empty(),
+    );
+}
+
+#[test]
+fn public_balance_usd_label_prices_native_and_erc20_balances() {
+    let usdc = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+    let cache = TokenAnchorRateCache::new();
+    cache.store_native_usd_rate(1, uint!(3_000_000_000_U256));
+    cache.store_rate(1, usdc, uint!(3_000_000_000_U256));
+
+    assert_eq!(
+        public_balance_usd_label(
+            1,
+            PublicAssetId::Native,
+            &PublicBalanceAmount::Available(uint!(2_000_000_000_000_000_000_U256)),
+            Some(&cache),
+        )
+        .as_deref(),
+        Some("$6,000.00")
+    );
+    assert_eq!(
+        public_balance_usd_label(
+            1,
+            PublicAssetId::Erc20(usdc),
+            &PublicBalanceAmount::Available(uint!(1_234_567_U256)),
+            Some(&cache),
+        )
+        .as_deref(),
+        Some("$1.23")
+    );
+}
+
+#[test]
+fn public_balance_usd_label_omits_unpriced_and_unavailable_balances() {
+    let usdc = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+    let unknown = Address::from([0x77; 20]);
+    let cache = TokenAnchorRateCache::new();
+    cache.store_native_usd_rate(1, uint!(3_000_000_000_U256));
+
+    assert_eq!(
+        public_balance_usd_label(
+            1,
+            PublicAssetId::Erc20(usdc),
+            &PublicBalanceAmount::Available(uint!(1_234_567_U256)),
+            Some(&cache),
+        ),
+        None
+    );
+    assert_eq!(
+        public_balance_usd_label(
+            1,
+            PublicAssetId::Erc20(unknown),
+            &PublicBalanceAmount::Available(uint!(1_234_567_U256)),
+            Some(&cache),
+        ),
+        None
+    );
+    assert_eq!(
+        public_balance_usd_label(
+            1,
+            PublicAssetId::Native,
+            &PublicBalanceAmount::Unavailable,
+            Some(&cache),
+        ),
+        None
+    );
+    assert_eq!(
+        public_balance_usd_label(
+            56,
+            PublicAssetId::Native,
+            &PublicBalanceAmount::Available(uint!(1_000_000_000_000_000_000_U256)),
+            Some(&cache),
+        ),
+        None
     );
 }
 

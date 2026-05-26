@@ -585,6 +585,8 @@ impl WalletRoot {
                     private_submission_dialog_title_action(flow, kind),
                     asset_label.as_ref(),
                     icon_path.clone(),
+                    None,
+                    false,
                 ))
                 .on_close(move |_event, _window, cx| {
                     close_root.update(cx, |root, cx| {

@@ -38,7 +38,9 @@ use crate::assets::{RailgunActionIcon, RailgunPublicAccountIcon, WalletIconSourc
 use super::dialogs::PublicAccountDialogKind;
 use super::gas_fee::Eip1559GasFeeEditorState;
 use super::public_action::{PublicActionMode, PublicActionStepState};
-use super::public_balances::{public_asset_icon_path, public_balance_amount_label};
+use super::public_balances::{
+    public_asset_icon_path, public_balance_amount_label, public_balance_usd_label,
+};
 use super::{
     PUBLIC_ACCOUNT_DIALOG_WIDTH, PUBLIC_ADDRESS_QR_DIALOG_WIDTH, WalletRoot,
     public_account_visible_balances_for_chain, rgb_with_alpha, secondary_dialog_content_width,
@@ -210,6 +212,9 @@ impl WalletRoot {
         let copy_id = SharedString::from(format!(
             "wallet-public-address-qr-copy-{public_account_uuid}"
         ));
+        let receive_warning = SharedString::from(format!(
+            "Send only public {chain_label} assets to this address."
+        ));
         window.open_dialog(cx, move |dialog, _window, _cx| {
             dialog
                 .w(dialog_width)
@@ -217,7 +222,7 @@ impl WalletRoot {
                 .child(render_public_address_qr_dialog_content(
                     account_label.clone(),
                     address_text.clone(),
-                    &chain_label,
+                    Some(receive_warning.clone()),
                     copy_id.clone(),
                     content_width,
                 ))
@@ -1518,6 +1523,12 @@ impl WalletRoot {
             Some(&self.effective_token_registry),
         );
         let amount_label = public_balance_amount_label(&entry.amount, entry.asset.decimals);
+        let usd_label = public_balance_usd_label(
+            self.selected_chain,
+            entry.asset.id,
+            &entry.amount,
+            Some(&self.public_broadcaster_anchor_cache),
+        );
         let symbol = entry.asset.symbol.clone();
         let tooltip = SharedString::from(format!("Shield/send {symbol}"));
         let balance_id = SharedString::from(format!(
@@ -1583,9 +1594,19 @@ impl WalletRoot {
             .child(
                 div()
                     .flex_none()
+                    .flex()
+                    .flex_col()
+                    .items_end()
                     .text_color(rgb(theme::WARNING))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child(SharedString::from(amount_label)),
+                    .child(SharedString::from(amount_label))
+                    .when_some(usd_label, |column, usd_label| {
+                        column.child(
+                            app_muted_text(usd_label)
+                                .whitespace_nowrap()
+                                .text_align(gpui::TextAlign::Right),
+                        )
+                    }),
             )
             .child(div().flex_1())
             .child(
@@ -1712,13 +1733,10 @@ pub(super) fn public_account_identicon_color(address: &Address) -> u32 {
 pub(super) fn render_public_address_qr_dialog_content(
     label: Option<SharedString>,
     address: SharedString,
-    chain_label: &str,
+    warning: Option<SharedString>,
     copy_id: SharedString,
     content_width: Pixels,
 ) -> gpui::Div {
-    let receive_warning = SharedString::from(format!(
-        "Send only public {chain_label} assets to this address."
-    ));
     let address_copy_value = address.clone();
     let copy_row_id = SharedString::from(format!("{}-row", copy_id.as_ref()));
     div()
@@ -1727,7 +1745,7 @@ pub(super) fn render_public_address_qr_dialog_content(
         .flex_col()
         .items_center()
         .gap_4()
-        .child(
+        .children(warning.map(|warning| {
             div()
                 .w_full()
                 .rounded_md()
@@ -1738,8 +1756,8 @@ pub(super) fn render_public_address_qr_dialog_content(
                 .text_color(rgb(theme::TEXT_MUTED))
                 .text_size(APP_TEXT_SIZE)
                 .line_height(px(18.0))
-                .child(receive_warning),
-        )
+                .child(warning)
+        }))
         .children(label.map(|label| {
             div()
                 .text_color(rgb(theme::TEXT))
