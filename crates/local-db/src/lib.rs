@@ -1364,7 +1364,7 @@ impl DbStore {
         Ok(())
     }
 
-    fn run_migrations(&self, from: u32, to: u32) -> Result<(), DbError> {
+    const fn run_migrations(&self, from: u32, to: u32) -> Result<(), DbError> {
         if from < to {
             return Err(DbError::UnsupportedSchemaVersion { version: from });
         }

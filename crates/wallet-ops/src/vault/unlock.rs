@@ -1,0 +1,355 @@
+use super::{
+    DecodedWalletMetadata, EncryptedRecord, HmacKeyInit, HmacSha256, KEY_LEN, Mac,
+    PublicAccountMetadata, PublicAccountSecret, RecordKind, SecretKey, VaultError,
+    WalletChainMetadataBundle, WalletMetadataBundle, WalletMetadataWire, WalletSpendBundle,
+    WalletViewBundle, Zeroizing, decrypt_payload, decrypt_serialized, derive_context_key,
+    encrypt_payload, encrypt_serialized,
+};
+
+pub struct ViewUnlock {
+    pub(super) view_dek: SecretKey,
+}
+
+impl ViewUnlock {
+    #[must_use]
+    pub const fn view_dek(&self) -> &SecretKey {
+        &self.view_dek
+    }
+
+    pub(super) fn clone_unlock(&self) -> Self {
+        Self {
+            view_dek: self.view_dek.clone_secret(),
+        }
+    }
+
+    pub fn encrypt_record(
+        &self,
+        kind: RecordKind,
+        record_id: &str,
+        plaintext: &[u8],
+    ) -> Result<EncryptedRecord, VaultError> {
+        encrypt_payload(&self.view_dek, kind, record_id, plaintext)
+    }
+
+    pub fn decrypt_record(
+        &self,
+        kind: RecordKind,
+        record_id: &str,
+        record: &EncryptedRecord,
+    ) -> Result<Zeroizing<Vec<u8>>, VaultError> {
+        decrypt_payload(&self.view_dek, kind, record_id, record)
+    }
+
+    pub fn encrypt_view_bundle(
+        &self,
+        wallet_id: &str,
+        bundle: &WalletViewBundle,
+    ) -> Result<EncryptedRecord, VaultError> {
+        encrypt_serialized(
+            &self.view_dek,
+            RecordKind::WalletViewBundle,
+            wallet_id,
+            bundle,
+        )
+    }
+
+    pub fn decrypt_view_bundle(
+        &self,
+        wallet_id: &str,
+        record: &EncryptedRecord,
+    ) -> Result<WalletViewBundle, VaultError> {
+        decrypt_serialized(
+            &self.view_dek,
+            RecordKind::WalletViewBundle,
+            wallet_id,
+            record,
+        )
+    }
+
+    pub fn encrypt_wallet_metadata(
+        &self,
+        wallet_uuid: &str,
+        metadata: &WalletMetadataBundle,
+    ) -> Result<EncryptedRecord, VaultError> {
+        encrypt_serialized(
+            &self.view_dek,
+            RecordKind::WalletMetadata,
+            wallet_uuid,
+            metadata,
+        )
+    }
+
+    pub fn decrypt_wallet_metadata(
+        &self,
+        wallet_uuid: &str,
+        record: &EncryptedRecord,
+    ) -> Result<WalletMetadataBundle, VaultError> {
+        Ok(self
+            .decrypt_wallet_metadata_record(wallet_uuid, record)?
+            .metadata)
+    }
+
+    pub(super) fn decrypt_wallet_metadata_record(
+        &self,
+        wallet_uuid: &str,
+        record: &EncryptedRecord,
+    ) -> Result<DecodedWalletMetadata, VaultError> {
+        let wire: WalletMetadataWire = decrypt_serialized(
+            &self.view_dek,
+            RecordKind::WalletMetadata,
+            wallet_uuid,
+            record,
+        )?;
+        let missing_display_order = wire.display_order.is_none();
+        let missing_lifecycle_fields =
+            wire.source.is_none() || wire.status.is_none() || missing_display_order;
+        Ok(DecodedWalletMetadata {
+            metadata: WalletMetadataBundle {
+                wallet_uuid: wire.wallet_uuid,
+                label: wire.label,
+                derivation_index: wire.derivation_index,
+                source: wire.source.unwrap_or_default(),
+                status: wire.status.unwrap_or_default(),
+                display_order: wire.display_order.unwrap_or_default(),
+            },
+            missing_lifecycle_fields,
+            missing_display_order,
+        })
+    }
+
+    pub fn encrypt_wallet_chain_metadata(
+        &self,
+        wallet_chain_uuid: &str,
+        metadata: &WalletChainMetadataBundle,
+    ) -> Result<EncryptedRecord, VaultError> {
+        encrypt_serialized(
+            &self.view_dek,
+            RecordKind::WalletChainMetadata,
+            wallet_chain_uuid,
+            metadata,
+        )
+    }
+
+    pub fn decrypt_wallet_chain_metadata(
+        &self,
+        wallet_chain_uuid: &str,
+        record: &EncryptedRecord,
+    ) -> Result<WalletChainMetadataBundle, VaultError> {
+        decrypt_serialized(
+            &self.view_dek,
+            RecordKind::WalletChainMetadata,
+            wallet_chain_uuid,
+            record,
+        )
+    }
+
+    pub fn encrypt_public_account_metadata(
+        &self,
+        public_account_uuid: &str,
+        metadata: &PublicAccountMetadata,
+    ) -> Result<EncryptedRecord, VaultError> {
+        encrypt_serialized(
+            &self.view_dek,
+            RecordKind::PublicAccountMetadata,
+            public_account_uuid,
+            metadata,
+        )
+    }
+
+    pub fn decrypt_public_account_metadata(
+        &self,
+        public_account_uuid: &str,
+        record: &EncryptedRecord,
+    ) -> Result<PublicAccountMetadata, VaultError> {
+        decrypt_serialized(
+            &self.view_dek,
+            RecordKind::PublicAccountMetadata,
+            public_account_uuid,
+            record,
+        )
+    }
+
+    pub fn derive_cache_keys(&self, wallet_chain_uuid: &str) -> Result<CacheKeys, VaultError> {
+        Ok(CacheKeys {
+            index: derive_context_key(
+                &self.view_dek,
+                b"cache-index",
+                wallet_chain_uuid.as_bytes(),
+            )?,
+            data: derive_context_key(&self.view_dek, b"cache-data", wallet_chain_uuid.as_bytes())?,
+        })
+    }
+}
+
+pub struct SpendUnlock {
+    pub(super) spend_dek: SecretKey,
+}
+
+impl SpendUnlock {
+    #[must_use]
+    pub const fn spend_dek(&self) -> &SecretKey {
+        &self.spend_dek
+    }
+
+    pub fn encrypt_record(
+        &self,
+        kind: RecordKind,
+        record_id: &str,
+        plaintext: &[u8],
+    ) -> Result<EncryptedRecord, VaultError> {
+        encrypt_payload(&self.spend_dek, kind, record_id, plaintext)
+    }
+
+    pub fn decrypt_record(
+        &self,
+        kind: RecordKind,
+        record_id: &str,
+        record: &EncryptedRecord,
+    ) -> Result<Zeroizing<Vec<u8>>, VaultError> {
+        decrypt_payload(&self.spend_dek, kind, record_id, record)
+    }
+
+    pub fn encrypt_spend_bundle(
+        &self,
+        wallet_id: &str,
+        bundle: &WalletSpendBundle,
+    ) -> Result<EncryptedRecord, VaultError> {
+        encrypt_serialized(
+            &self.spend_dek,
+            RecordKind::WalletSpendBundle,
+            wallet_id,
+            bundle,
+        )
+    }
+
+    pub fn decrypt_spend_bundle(
+        &self,
+        wallet_id: &str,
+        record: &EncryptedRecord,
+    ) -> Result<WalletSpendBundle, VaultError> {
+        decrypt_serialized(
+            &self.spend_dek,
+            RecordKind::WalletSpendBundle,
+            wallet_id,
+            record,
+        )
+    }
+
+    pub fn encrypt_public_account_secret(
+        &self,
+        public_account_uuid: &str,
+        secret: &PublicAccountSecret,
+    ) -> Result<EncryptedRecord, VaultError> {
+        encrypt_serialized(
+            &self.spend_dek,
+            RecordKind::PublicAccountSecret,
+            public_account_uuid,
+            secret,
+        )
+    }
+
+    pub fn decrypt_public_account_secret(
+        &self,
+        public_account_uuid: &str,
+        record: &EncryptedRecord,
+    ) -> Result<PublicAccountSecret, VaultError> {
+        decrypt_serialized(
+            &self.spend_dek,
+            RecordKind::PublicAccountSecret,
+            public_account_uuid,
+            record,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpendGrantPolicy {
+    OneUse,
+}
+
+pub struct SpendGrant {
+    pub(super) policy: SpendGrantPolicy,
+    pub(super) spend: Option<SpendUnlock>,
+}
+
+pub struct CacheKeys {
+    pub(super) index: SecretKey,
+    pub(super) data: SecretKey,
+}
+
+impl CacheKeys {
+    /// # Panics
+    ///
+    /// Panics only if HMAC rejects a fixed-size SHA-256 key, which should be
+    /// unreachable for the selected MAC implementation.
+    #[must_use]
+    pub fn row_id(&self, tree: u32, position: u64, stable_utxo_identity: &[u8]) -> [u8; KEY_LEN] {
+        let mut mac = HmacSha256::new_from_slice(self.index.expose_secret())
+            .expect("HMAC accepts any key length");
+        mac.update(b"wallet-cache-row:v1");
+        mac.update(&tree.to_be_bytes());
+        mac.update(&position.to_be_bytes());
+        mac.update(stable_utxo_identity);
+        mac.finalize().into_bytes().into()
+    }
+
+    #[must_use]
+    pub fn row_record_id(row_id: &[u8; KEY_LEN]) -> String {
+        alloy::hex::encode(row_id)
+    }
+
+    pub fn encrypt_row(
+        &self,
+        row_id: &[u8; KEY_LEN],
+        plaintext: &[u8],
+    ) -> Result<EncryptedRecord, VaultError> {
+        let record_id = Self::row_record_id(row_id);
+        encrypt_payload(
+            &self.data,
+            RecordKind::WalletCacheRow,
+            &record_id,
+            plaintext,
+        )
+    }
+
+    pub fn decrypt_row(
+        &self,
+        row_id: &[u8; KEY_LEN],
+        record: &EncryptedRecord,
+    ) -> Result<Zeroizing<Vec<u8>>, VaultError> {
+        let record_id = Self::row_record_id(row_id);
+        decrypt_payload(&self.data, RecordKind::WalletCacheRow, &record_id, record)
+    }
+}
+
+impl SpendGrant {
+    #[must_use]
+    pub const fn one_use(spend: SpendUnlock) -> Self {
+        Self {
+            policy: SpendGrantPolicy::OneUse,
+            spend: Some(spend),
+        }
+    }
+
+    #[must_use]
+    pub const fn policy(&self) -> SpendGrantPolicy {
+        self.policy
+    }
+
+    #[must_use]
+    pub const fn is_valid(&self) -> bool {
+        self.spend.is_some()
+    }
+
+    pub fn spend_unlock(&self) -> Result<&SpendUnlock, VaultError> {
+        self.spend.as_ref().ok_or(VaultError::InvalidSpendGrant)
+    }
+
+    pub fn take_spend_unlock(&mut self) -> Result<SpendUnlock, VaultError> {
+        self.spend.take().ok_or(VaultError::InvalidSpendGrant)
+    }
+
+    pub fn invalidate(&mut self) {
+        self.spend.take();
+    }
+}

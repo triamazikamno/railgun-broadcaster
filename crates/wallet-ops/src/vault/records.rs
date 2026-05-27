@@ -1,0 +1,380 @@
+use super::{
+    ADDITIONAL_WALLET_LABEL_PREFIX, Address, BTreeSet, CacheKeys, KEY_LEN, MnemonicBuilder,
+    PRIMARY_WALLET_LABEL, PUBLIC_ACCOUNT_METADATA_PREFIX, PUBLIC_ACCOUNT_SECRET_PREFIX,
+    PrivateKeySigner, PublicAccountMetadata, PublicAccountScope, PublicAccountSecret,
+    PublicAccountSource, PublicAccountStatus, SigningKey, SpendUnlock, VaultError, ViewUnlock,
+    WALLET_CACHE_ROW_PREFIX, WALLET_CHAIN_METADATA_PREFIX, WALLET_METADATA_PREFIX,
+    WALLET_SPEND_PREFIX, WALLET_VIEW_PREFIX, WalletCacheError, WalletMetadataBundle, WalletUtxo,
+    Zeroizing, bip39_mnemonic_from_entropy, generate_opaque_id,
+};
+
+pub(super) fn wallet_view_record_key(wallet_id: &str) -> String {
+    format!("{WALLET_VIEW_PREFIX}{wallet_id}")
+}
+
+pub(super) fn wallet_spend_record_key(wallet_id: &str) -> String {
+    format!("{WALLET_SPEND_PREFIX}{wallet_id}")
+}
+
+pub(super) fn wallet_metadata_record_key(wallet_uuid: &str) -> String {
+    format!("{WALLET_METADATA_PREFIX}{wallet_uuid}")
+}
+
+pub(super) fn wallet_chain_metadata_record_key(wallet_chain_uuid: &str) -> String {
+    format!("{WALLET_CHAIN_METADATA_PREFIX}{wallet_chain_uuid}")
+}
+
+pub(super) fn wallet_cache_row_prefix(wallet_chain_uuid: &str) -> String {
+    format!("{WALLET_CACHE_ROW_PREFIX}{wallet_chain_uuid}|")
+}
+
+pub(super) fn wallet_cache_row_record_key(
+    wallet_chain_uuid: &str,
+    row_id: &[u8; KEY_LEN],
+) -> String {
+    format!(
+        "{}{row_id}",
+        wallet_cache_row_prefix(wallet_chain_uuid),
+        row_id = CacheKeys::row_record_id(row_id)
+    )
+}
+
+pub(super) fn public_account_metadata_record_key(public_account_uuid: &str) -> String {
+    format!("{PUBLIC_ACCOUNT_METADATA_PREFIX}{public_account_uuid}")
+}
+
+pub(super) fn public_account_secret_record_key(public_account_uuid: &str) -> String {
+    format!("{PUBLIC_ACCOUNT_SECRET_PREFIX}{public_account_uuid}")
+}
+
+pub(super) fn wallet_cache_counts(utxos: &[WalletUtxo]) -> (usize, usize) {
+    let spent = utxos.iter().filter(|utxo| utxo.is_spent()).count();
+    (utxos.len().saturating_sub(spent), spent)
+}
+
+pub(super) fn vault_error_from_wallet_cache(error: WalletCacheError) -> VaultError {
+    match error {
+        WalletCacheError::Encode(error) => VaultError::Encode(error),
+        WalletCacheError::Decode(error) => VaultError::Decode(error),
+        WalletCacheError::Db(error) => VaultError::Db(error),
+        WalletCacheError::Io(error) => VaultError::Io(error),
+        WalletCacheError::Crypto => VaultError::Decrypt,
+    }
+}
+
+pub(super) struct LoadedWalletMetadata {
+    pub(super) metadata: WalletMetadataBundle,
+    pub(super) needs_persist: bool,
+    pub(super) missing_display_order: bool,
+}
+
+pub(super) fn wallet_metadata_record_entry(
+    view: &ViewUnlock,
+    metadata: &WalletMetadataBundle,
+) -> Result<(String, Vec<u8>), VaultError> {
+    let key = wallet_metadata_record_key(&metadata.wallet_uuid);
+    let record = view.encrypt_wallet_metadata(&metadata.wallet_uuid, metadata)?;
+    record.to_record_entry(key)
+}
+
+pub(super) fn public_account_metadata_record_entry(
+    view: &ViewUnlock,
+    metadata: &PublicAccountMetadata,
+) -> Result<(String, Vec<u8>), VaultError> {
+    let key = public_account_metadata_record_key(&metadata.public_account_uuid);
+    let record = view.encrypt_public_account_metadata(&metadata.public_account_uuid, metadata)?;
+    record.to_record_entry(key)
+}
+
+pub(super) fn public_account_secret_record_entry(
+    spend: &SpendUnlock,
+    metadata: &PublicAccountMetadata,
+    secret: &PublicAccountSecret,
+) -> Result<(String, Vec<u8>), VaultError> {
+    let key = public_account_secret_record_key(&metadata.public_account_uuid);
+    let record = spend.encrypt_public_account_secret(&metadata.public_account_uuid, secret)?;
+    record.to_record_entry(key)
+}
+
+#[must_use]
+pub fn normalize_wallet_label(label: &str) -> String {
+    label.trim().to_owned()
+}
+
+pub(super) fn wallet_label_duplicate_key(label: &str) -> String {
+    normalize_wallet_label(label).to_lowercase()
+}
+
+pub fn validate_wallet_label(
+    label: &str,
+    existing: &[WalletMetadataBundle],
+    current_wallet_uuid: Option<&str>,
+) -> Result<String, VaultError> {
+    let label = normalize_wallet_label(label);
+    if label.is_empty() {
+        return Err(VaultError::InvalidWalletLabel);
+    }
+    let label_key = wallet_label_duplicate_key(&label);
+    if existing.iter().any(|metadata| {
+        current_wallet_uuid != Some(metadata.wallet_uuid.as_str())
+            && wallet_label_duplicate_key(&metadata.label) == label_key
+    }) {
+        return Err(VaultError::DuplicateWalletLabel);
+    }
+    Ok(label)
+}
+
+#[must_use]
+pub fn default_wallet_label_for_metadata(metadata: &[WalletMetadataBundle]) -> String {
+    if metadata.is_empty() {
+        return PRIMARY_WALLET_LABEL.to_owned();
+    }
+
+    let used = metadata
+        .iter()
+        .map(|metadata| wallet_label_duplicate_key(&metadata.label))
+        .collect::<BTreeSet<_>>();
+    let mut label_index = 2u32;
+    loop {
+        let label = format!("{ADDITIONAL_WALLET_LABEL_PREFIX}{label_index}");
+        if !used.contains(&wallet_label_duplicate_key(&label)) {
+            return label;
+        }
+        label_index = label_index.saturating_add(1);
+    }
+}
+
+pub(super) fn next_wallet_display_order(
+    metadata: &[WalletMetadataBundle],
+) -> Result<u32, VaultError> {
+    metadata
+        .iter()
+        .map(|metadata| metadata.display_order)
+        .max()
+        .map_or(Ok(0), |max_display_order| {
+            max_display_order
+                .checked_add(1)
+                .ok_or(VaultError::WalletDisplayOrderOverflow)
+        })
+}
+
+pub(super) fn assign_missing_display_orders(
+    metadata: &mut [LoadedWalletMetadata],
+) -> Result<(), VaultError> {
+    let mut next_order = metadata
+        .iter()
+        .filter(|metadata| !metadata.missing_display_order)
+        .map(|metadata| metadata.metadata.display_order)
+        .max()
+        .map_or(Ok(0), |display_order| {
+            display_order
+                .checked_add(1)
+                .ok_or(VaultError::WalletDisplayOrderOverflow)
+        })?;
+    let mut missing_indices = metadata
+        .iter()
+        .enumerate()
+        .filter_map(|(index, metadata)| metadata.missing_display_order.then_some(index))
+        .collect::<Vec<_>>();
+    missing_indices.sort_by(|left, right| {
+        metadata[*left]
+            .metadata
+            .label
+            .cmp(&metadata[*right].metadata.label)
+            .then_with(|| {
+                metadata[*left]
+                    .metadata
+                    .wallet_uuid
+                    .cmp(&metadata[*right].metadata.wallet_uuid)
+            })
+    });
+
+    for index in missing_indices {
+        metadata[index].metadata.display_order = next_order;
+        metadata[index].needs_persist = true;
+        next_order = next_order
+            .checked_add(1)
+            .ok_or(VaultError::WalletDisplayOrderOverflow)?;
+    }
+    Ok(())
+}
+
+pub fn sort_wallet_metadata(metadata: &mut [WalletMetadataBundle]) {
+    metadata.sort_by(|left, right| {
+        left.display_order
+            .cmp(&right.display_order)
+            .then_with(|| left.label.cmp(&right.label))
+            .then_with(|| left.wallet_uuid.cmp(&right.wallet_uuid))
+    });
+}
+
+#[must_use]
+pub fn normalize_public_account_label(label: Option<&str>) -> Option<String> {
+    label
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+#[must_use]
+pub fn public_account_default_label(label_number: u32) -> String {
+    format!("Account #{label_number}")
+}
+
+pub fn sort_public_account_metadata(metadata: &mut [PublicAccountMetadata]) {
+    metadata.sort_by(|left, right| {
+        left.display_order
+            .cmp(&right.display_order)
+            .then_with(|| left.address.cmp(&right.address))
+            .then_with(|| left.public_account_uuid.cmp(&right.public_account_uuid))
+    });
+}
+
+pub(super) fn next_public_account_display_order(
+    metadata: &[PublicAccountMetadata],
+) -> Result<u32, VaultError> {
+    metadata
+        .iter()
+        .map(|metadata| metadata.display_order)
+        .max()
+        .map_or(Ok(0), |max_display_order| {
+            max_display_order
+                .checked_add(1)
+                .ok_or(VaultError::PublicAccountDisplayOrderOverflow)
+        })
+}
+
+pub(super) fn next_derived_public_account_index(
+    metadata: &[PublicAccountMetadata],
+    wallet_uuid: &str,
+) -> Result<u32, VaultError> {
+    metadata
+        .iter()
+        .filter(|account| account.source == PublicAccountSource::Derived)
+        .filter(|account| {
+            matches!(
+                &account.scope,
+                PublicAccountScope::PrivateWallet { wallet_uuid: scoped } if scoped == wallet_uuid
+            )
+        })
+        .filter_map(|account| account.derivation_index)
+        .max()
+        .map_or(Ok(0), |max_index| {
+            max_index
+                .checked_add(1)
+                .ok_or(VaultError::PublicAccountDisplayOrderOverflow)
+        })
+}
+
+pub(super) fn ensure_public_account_address_available(
+    metadata: &[PublicAccountMetadata],
+    address: Address,
+    scope: &PublicAccountScope,
+    selected_wallet_uuid: &str,
+) -> Result<(), VaultError> {
+    let duplicates = match scope {
+        PublicAccountScope::Global => metadata.iter().any(|account| {
+            account.status == PublicAccountStatus::Active && account.address == address
+        }),
+        PublicAccountScope::PrivateWallet { .. } => metadata.iter().any(|account| {
+            account.address == address && account.is_active_for_wallet(selected_wallet_uuid)
+        }),
+    };
+    if duplicates {
+        Err(VaultError::DuplicatePublicAccountAddress)
+    } else {
+        Ok(())
+    }
+}
+
+pub(super) fn initial_derived_public_account(
+    wallet_uuid: &str,
+    entropy: &[u8],
+    existing_accounts: &[PublicAccountMetadata],
+) -> Result<PublicAccountMetadata, VaultError> {
+    let address = derive_public_evm_address_from_entropy(entropy, 0)?;
+    let scope = PublicAccountScope::PrivateWallet {
+        wallet_uuid: wallet_uuid.to_owned(),
+    };
+    ensure_public_account_address_available(existing_accounts, address, &scope, wallet_uuid)?;
+    Ok(PublicAccountMetadata {
+        public_account_uuid: generate_opaque_id()?,
+        address,
+        label: Some(public_account_default_label(
+            next_public_account_label_number(existing_accounts, wallet_uuid),
+        )),
+        source: PublicAccountSource::Derived,
+        scope,
+        derivation_index: Some(0),
+        status: PublicAccountStatus::Active,
+        display_order: next_public_account_display_order(existing_accounts)?,
+    })
+}
+
+pub(super) fn next_public_account_label_number(
+    metadata: &[PublicAccountMetadata],
+    wallet_uuid: &str,
+) -> u32 {
+    u32::try_from(
+        metadata
+            .iter()
+            .filter(|account| account.is_scoped_to_wallet(wallet_uuid))
+            .count(),
+    )
+    .ok()
+    .and_then(|count| count.checked_add(1))
+    .unwrap_or(u32::MAX)
+}
+
+pub fn derive_public_evm_private_key_from_entropy(
+    entropy: &[u8],
+    derivation_index: u32,
+) -> Result<Zeroizing<[u8; KEY_LEN]>, VaultError> {
+    let mnemonic = Zeroizing::new(bip39_mnemonic_from_entropy(entropy)?);
+    derive_public_evm_private_key_from_mnemonic(&mnemonic, derivation_index)
+}
+
+pub fn derive_public_evm_private_key_from_mnemonic(
+    mnemonic: &str,
+    derivation_index: u32,
+) -> Result<Zeroizing<[u8; KEY_LEN]>, VaultError> {
+    let signer = MnemonicBuilder::from_phrase(mnemonic)
+        .index(derivation_index)
+        .map_err(|_| VaultError::PublicEvmKeyDerivation)?
+        .build()
+        .map_err(|_| VaultError::PublicEvmKeyDerivation)?;
+    let bytes = signer.to_bytes();
+    let mut private_key = [0u8; KEY_LEN];
+    private_key.copy_from_slice(bytes.as_slice());
+    Ok(Zeroizing::new(private_key))
+}
+
+pub fn derive_public_evm_address_from_entropy(
+    entropy: &[u8],
+    derivation_index: u32,
+) -> Result<Address, VaultError> {
+    let private_key = derive_public_evm_private_key_from_entropy(entropy, derivation_index)?;
+    public_evm_address_from_private_key(&private_key)
+}
+
+pub fn parse_public_evm_private_key(
+    private_key: &str,
+) -> Result<Zeroizing<[u8; KEY_LEN]>, VaultError> {
+    let pk_hex = private_key
+        .trim()
+        .strip_prefix("0x")
+        .unwrap_or_else(|| private_key.trim());
+    let bytes =
+        alloy::hex::decode_to_array(pk_hex).map_err(|_| VaultError::InvalidPublicEvmPrivateKey)?;
+    let private_key = Zeroizing::new(bytes);
+    public_evm_address_from_private_key(&private_key)?;
+    Ok(private_key)
+}
+
+pub fn public_evm_address_from_private_key(
+    private_key: &[u8; KEY_LEN],
+) -> Result<Address, VaultError> {
+    let signing_key = SigningKey::from_bytes(private_key.into())
+        .map_err(|_| VaultError::InvalidPublicEvmPrivateKey)?;
+    Ok(PrivateKeySigner::from(signing_key).address())
+}
