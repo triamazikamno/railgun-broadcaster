@@ -17,9 +17,9 @@ use tokio::sync::{OnceCell, watch};
 use ui::logs::LogsPane;
 use ui::theme::APP_TEXT_SIZE;
 use wallet_ops::{
-    BroadcasterFeePolicy, HttpContext, PoiCacheService, PoiReadSource, ProverCacheBuildProgress,
-    PublicBalanceSnapshot, PublicBroadcasterWakuClient, TokenAnchorRateCache,
-    TokenAnchorRefreshHandle, WalletNetworkHealth, WalletSessionStore,
+    BlockedShieldRescueUtxoId, BroadcasterFeePolicy, HttpContext, PoiCacheService, PoiReadSource,
+    ProverCacheBuildProgress, PublicBalanceSnapshot, PublicBroadcasterWakuClient,
+    TokenAnchorRateCache, TokenAnchorRefreshHandle, WalletNetworkHealth, WalletSessionStore,
     settings::{EffectiveChainConfig, EffectiveTokenRegistry, load_wallet_settings},
     subscribe_prover_cache_build,
     vault::{
@@ -100,7 +100,7 @@ use ui_helpers::{
     centered_message, labeled_field, rgb_with_alpha, secondary_dialog_content_width,
     token_label_row,
 };
-use utxo::{UtxoDelegate, should_focus_utxo_table};
+use utxo::{BlockedShieldRescueRowState, UtxoDelegate, should_focus_utxo_table};
 use vault::{VaultState, WalletOption, WalletSetupMode, vault_error_kind};
 use wallet_header::{ChainSelectItem, WalletSelectItem};
 
@@ -208,7 +208,10 @@ use spend_authorization::{
 #[cfg(test)]
 use startup::load_validated_startup_settings;
 #[cfg(test)]
-use utxo::{display_rows_from_output, format_compact_age};
+use utxo::{
+    activity_classification_icon_style, apply_blocked_shield_rescue_rows, display_rows_from_output,
+    format_compact_age, should_show_blocked_shield_refund_action,
+};
 #[cfg(test)]
 use vault::wallet_options_from_metadata;
 #[cfg(test)]
@@ -336,6 +339,9 @@ pub(crate) struct WalletRoot {
     tx_search_query: Arc<str>,
     show_spent_utxos: bool,
     local_pending_spent_clear_confirming: bool,
+    blocked_shield_rescue_lookup_generation: u64,
+    blocked_shield_rescue_rows: BTreeMap<BlockedShieldRescueUtxoId, BlockedShieldRescueRowState>,
+    blocked_shield_refunds_in_flight: BTreeSet<BlockedShieldRescueUtxoId>,
     utxo_table: Entity<TableState<UtxoDelegate>>,
     focus_vault_input_on_render: bool,
     focus_utxo_table_on_render: bool,
@@ -611,8 +617,14 @@ impl WalletRoot {
         let wallet_select = cx.new(|cx| {
             SelectState::new(SearchableVec::new(Vec::new()), None, window, cx).searchable(true)
         });
-        let utxo_table =
-            cx.new(|cx| TableState::new(UtxoDelegate::new(tx_search_input.clone()), window, cx));
+        let root_weak = cx.weak_entity();
+        let utxo_table = cx.new(|cx| {
+            TableState::new(
+                UtxoDelegate::new(root_weak.clone(), tx_search_input.clone()),
+                window,
+                cx,
+            )
+        });
         let network_health = http.network_health();
         let sidebar_public_broadcaster_count =
             ethereum_weth_public_broadcaster_count(&monitor_state.read().fee_rows());
@@ -705,6 +717,9 @@ impl WalletRoot {
             tx_search_query: Arc::from(""),
             show_spent_utxos: false,
             local_pending_spent_clear_confirming: false,
+            blocked_shield_rescue_lookup_generation: 0,
+            blocked_shield_rescue_rows: BTreeMap::new(),
+            blocked_shield_refunds_in_flight: BTreeSet::new(),
             utxo_table,
             focus_vault_input_on_render,
             focus_utxo_table_on_render: false,

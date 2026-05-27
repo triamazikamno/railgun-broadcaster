@@ -420,6 +420,7 @@ impl WalletRoot {
             self.public_accounts.clear();
             self.public_form.selected_account_uuid = None;
             self.sync_self_broadcast_gas_payer_selects(window, cx);
+            self.invalidate_blocked_shield_rescue_rows(cx);
             return;
         };
         match store.list_public_accounts_for_session(view_session.as_ref(), true) {
@@ -449,6 +450,7 @@ impl WalletRoot {
                     .ok();
                 self.sync_self_broadcast_gas_payer_selects(window, cx);
                 self.sync_public_edit_label_input(window, cx);
+                self.invalidate_blocked_shield_rescue_rows(cx);
             }
             Err(error) => {
                 tracing::warn!(

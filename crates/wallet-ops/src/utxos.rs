@@ -2,12 +2,41 @@ use super::*;
 use std::collections::HashSet;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BlockedShieldRescueInfo {
+    pub eligible: bool,
+    pub disabled_reason: Option<String>,
+    pub origin_address: Option<String>,
+    pub public_account_uuid: Option<String>,
+    pub public_account_label: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityUtxoClassification {
+    Shield,
+    BlockedShield,
+    PrivateOutput,
+}
+
+impl ActivityUtxoClassification {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Shield => "Shield",
+            Self::BlockedShield => "Blocked Shield",
+            Self::PrivateOutput => "Private Output",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct UtxoOutput {
     pub tree: u32,
     pub position: u64,
     pub token: String,
     pub value: String,
     pub commitment_kind: String,
+    pub activity_classification: String,
+    pub blocked_shield_rescue: Option<BlockedShieldRescueInfo>,
     pub commitment: String,
     pub npk: String,
     pub blinded_commitment: String,
@@ -127,6 +156,8 @@ pub(crate) fn utxo_outputs_from_utxos(
             }
             let source = &utxo.source;
             let spent = wallet_utxo.spent.as_ref();
+            let activity_classification =
+                activity_utxo_classification(&utxo.poi, &active_poi_list_keys);
             let poi_statuses = poi_statuses_for_output(&utxo, &active_poi_list_keys);
 
             UtxoOutput {
@@ -135,6 +166,14 @@ pub(crate) fn utxo_outputs_from_utxos(
                 token: token_addr.to_checksum(None),
                 value: utxo.note.value.to_string(),
                 commitment_kind: commitment_kind_label(utxo.poi.commitment_kind).to_string(),
+                activity_classification: activity_classification.label().to_string(),
+                blocked_shield_rescue: blocked_shield_rescue_info(
+                    activity_classification,
+                    wallet_utxo.spent.is_some(),
+                    false,
+                    false,
+                    false,
+                ),
                 commitment: hex::encode_prefixed(utxo.poi.commitment),
                 npk: hex::encode_prefixed(utxo.poi.npk),
                 blinded_commitment: hex::encode_prefixed(utxo.poi.blinded_commitment),
@@ -213,6 +252,15 @@ pub(crate) fn apply_pending_overlay_to_outputs(
 fn mark_output_pending_spent(output: &mut UtxoOutput, spent: &WalletPendingSpent) {
     output.pending_spent = true;
     output.poi_spendable = false;
+    if output.blocked_shield_rescue.is_some() {
+        output.blocked_shield_rescue = blocked_shield_rescue_info(
+            ActivityUtxoClassification::BlockedShield,
+            output.is_spent,
+            output.pending_new,
+            true,
+            output.local_pending_spent,
+        );
+    }
     if output.spent_tx_hash.is_none() {
         output.spent_tx_hash = spent.tx_hash.map(hex::encode_prefixed);
     }
@@ -224,6 +272,15 @@ fn mark_output_pending_spent(output: &mut UtxoOutput, spent: &WalletPendingSpent
 fn mark_output_local_pending_spent(output: &mut UtxoOutput, spent: &WalletPendingSpent) {
     output.local_pending_spent = true;
     output.poi_spendable = false;
+    if output.blocked_shield_rescue.is_some() {
+        output.blocked_shield_rescue = blocked_shield_rescue_info(
+            ActivityUtxoClassification::BlockedShield,
+            output.is_spent,
+            output.pending_new,
+            output.pending_spent,
+            true,
+        );
+    }
     if output.spent_tx_hash.is_none() {
         output.spent_tx_hash = spent.tx_hash.map(hex::encode_prefixed);
     }
@@ -234,12 +291,22 @@ fn pending_utxo_output(wallet_utxo: WalletUtxo) -> UtxoOutput {
     let token_addr = utxo.token_address();
     let spent = wallet_utxo.spent.as_ref();
     let source = &utxo.source;
+    let activity_classification =
+        activity_utxo_classification(&utxo.poi, &default_active_poi_list_keys());
     UtxoOutput {
         tree: utxo.tree,
         position: utxo.position,
         token: token_addr.to_checksum(None),
         value: utxo.note.value.to_string(),
         commitment_kind: commitment_kind_label(utxo.poi.commitment_kind).to_string(),
+        activity_classification: activity_classification.label().to_string(),
+        blocked_shield_rescue: blocked_shield_rescue_info(
+            activity_classification,
+            false,
+            true,
+            spent.is_some(),
+            false,
+        ),
         commitment: hex::encode_prefixed(utxo.poi.commitment),
         npk: hex::encode_prefixed(utxo.poi.npk),
         blinded_commitment: hex::encode_prefixed(utxo.poi.blinded_commitment),
@@ -262,6 +329,55 @@ const fn commitment_kind_label(kind: UtxoCommitmentKind) -> &'static str {
         UtxoCommitmentKind::Shield => "Shield",
         UtxoCommitmentKind::Transact => "Transact",
     }
+}
+
+#[must_use]
+pub(crate) fn activity_utxo_classification(
+    poi: &UtxoPoiMetadata,
+    active_poi_list_keys: &[FixedBytes<32>],
+) -> ActivityUtxoClassification {
+    match poi.commitment_kind {
+        UtxoCommitmentKind::Shield => {
+            if active_poi_list_keys
+                .iter()
+                .any(|list_key| poi.statuses.get(list_key) == Some(&PoiStatus::ShieldBlocked))
+            {
+                ActivityUtxoClassification::BlockedShield
+            } else {
+                ActivityUtxoClassification::Shield
+            }
+        }
+        UtxoCommitmentKind::Transact => ActivityUtxoClassification::PrivateOutput,
+    }
+}
+
+fn blocked_shield_rescue_info(
+    classification: ActivityUtxoClassification,
+    is_spent: bool,
+    pending_new: bool,
+    pending_spent: bool,
+    local_pending_spent: bool,
+) -> Option<BlockedShieldRescueInfo> {
+    if classification != ActivityUtxoClassification::BlockedShield {
+        return None;
+    }
+    let disabled_reason = if is_spent {
+        Some("Spent blocked Shield UTXOs cannot be refunded.".to_string())
+    } else if pending_spent || local_pending_spent {
+        Some("This blocked Shield UTXO is already pending spend.".to_string())
+    } else if pending_new {
+        Some("Pending received blocked Shield UTXOs cannot be refunded yet.".to_string())
+    } else {
+        Some("Source transaction origin has not been resolved yet.".to_string())
+    };
+
+    Some(BlockedShieldRescueInfo {
+        eligible: false,
+        disabled_reason,
+        origin_address: None,
+        public_account_uuid: None,
+        public_account_label: None,
+    })
 }
 
 const fn poi_status_label(status: PoiStatus) -> &'static str {

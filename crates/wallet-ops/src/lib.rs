@@ -8,7 +8,9 @@ use std::time::{Duration, Instant, SystemTime};
 use alloy::eips::BlockNumberOrTag;
 use alloy::eips::Encodable2718;
 use alloy::hex;
-use alloy::network::{EthereumWallet, NetworkTransactionBuilder, TransactionBuilder as _};
+use alloy::network::{
+    EthereumWallet, NetworkTransactionBuilder, TransactionBuilder as _, TransactionResponse,
+};
 use alloy::primitives::{Address, Bytes, FixedBytes, U256, address, keccak256};
 use alloy::providers::Provider;
 use alloy::rpc::types::{FeeHistory, TransactionReceipt, TransactionRequest};
@@ -44,8 +46,8 @@ use railgun_wallet::tx::{
     unshield_selection_info_with_separate_broadcaster_fee_seed,
 };
 use railgun_wallet::{
-    Note, PoiStatus, ProverService, TransactionBuilder, Utxo, UtxoCommitmentKind, UtxoSource,
-    WalletUtxo,
+    Note, PoiStatus, ProverService, TransactionBuilder, Utxo, UtxoCommitmentKind, UtxoPoiMetadata,
+    UtxoSource, WalletUtxo,
 };
 use rand::seq::IndexedRandom;
 use reqwest::Url;
@@ -117,8 +119,9 @@ pub use public_wallet::{
 use signer::EvmTransactionSigner;
 use utxos::apply_pending_overlay_to_outputs;
 pub use utxos::{
-    ListUtxosOutput, TokenTotal, UtxoOutput, max_broadcaster_fee_token_amount_from_outputs,
-    max_send_amount_from_outputs, max_unshield_amount_from_outputs,
+    ActivityUtxoClassification, BlockedShieldRescueInfo, ListUtxosOutput, TokenTotal, UtxoOutput,
+    max_broadcaster_fee_token_amount_from_outputs, max_send_amount_from_outputs,
+    max_unshield_amount_from_outputs,
 };
 
 #[derive(Debug, Clone)]
@@ -515,6 +518,69 @@ pub struct DesktopSendSelfBroadcastRequest {
     pub event_tx: Option<SelfBroadcastSessionEventSender>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BlockedShieldRescueUtxoId {
+    pub tree: u32,
+    pub position: u64,
+    pub commitment: FixedBytes<32>,
+    pub blinded_commitment: FixedBytes<32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockedShieldRescueEligibility {
+    pub eligible: bool,
+    pub disabled_reason: Option<String>,
+    pub origin_address: Option<Address>,
+    pub public_account_uuid: Option<String>,
+    pub public_account_label: Option<String>,
+}
+
+pub struct BlockedShieldRescueEligibilityRequest {
+    pub chain_id: u64,
+    pub effective_chain: Option<settings::EffectiveChainConfig>,
+    pub view_session: Arc<vault::DesktopViewSession>,
+    pub session: Arc<WalletSession>,
+    pub vault_store: Arc<vault::DesktopVaultStore>,
+    pub utxo_id: BlockedShieldRescueUtxoId,
+}
+
+pub struct BlockedShieldRescuePreviewRequest {
+    pub chain_id: u64,
+    pub effective_chain: Option<settings::EffectiveChainConfig>,
+    pub view_session: Arc<vault::DesktopViewSession>,
+    pub session: Arc<WalletSession>,
+    pub vault_store: Arc<vault::DesktopVaultStore>,
+    pub utxo_id: BlockedShieldRescueUtxoId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockedShieldRescuePreview {
+    pub chain_id: u64,
+    pub utxo_id: BlockedShieldRescueUtxoId,
+    pub token: Address,
+    pub amount: U256,
+    pub source_tx_hash: FixedBytes<32>,
+    pub origin_address: Address,
+    pub public_account_uuid: String,
+    pub public_account_label: Option<String>,
+}
+
+pub struct BlockedShieldRescueSelfBroadcastRequest {
+    pub chain_id: u64,
+    pub effective_chain: Option<settings::EffectiveChainConfig>,
+    pub view_session: Arc<vault::DesktopViewSession>,
+    pub session: Arc<WalletSession>,
+    pub vault_store: Arc<vault::DesktopVaultStore>,
+    pub vault_password: Zeroizing<String>,
+    pub utxo_id: BlockedShieldRescueUtxoId,
+    pub requested_public_account_uuid: Option<String>,
+    pub verify_proof: bool,
+    pub gas_fee: SelfBroadcastGasFeeSelection,
+    pub progress_tx: Option<TransactionGenerationProgressSender>,
+    pub command_rx: Option<SelfBroadcastCommandReceiver>,
+    pub event_tx: Option<SelfBroadcastSessionEventSender>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PublicBroadcasterCandidate {
     pub chain_id: u64,
@@ -876,6 +942,11 @@ struct PreparedPrivatePlan<P> {
     prover: ProverService,
 }
 
+struct PreparedBlockedShieldRescuePlan {
+    plan: UnshieldPlan,
+    public_account_uuid: String,
+}
+
 struct DesktopUnshieldPlanRequest<'a> {
     chain_id: u64,
     effective_chain: Option<&'a settings::EffectiveChainConfig>,
@@ -1009,6 +1080,158 @@ fn pending_spent_keys(pending_overlay: &WalletPendingOverlay) -> HashSet<(u32, u
         .chain(pending_overlay.local_pending_spent.iter())
         .map(WalletPendingSpent::key)
         .collect()
+}
+
+pub async fn resolve_blocked_shield_rescue_eligibility(
+    request: BlockedShieldRescueEligibilityRequest,
+    http: &HttpContext,
+) -> Result<BlockedShieldRescueEligibility> {
+    let utxos = request.session.handle.utxos.read().await.clone();
+    let pending_overlay = request.session.handle.pending_overlay().await;
+    let Some(utxo) =
+        blocked_shield_rescue_candidate_from_records(&utxos, &pending_overlay, &request.utxo_id)
+    else {
+        return Ok(blocked_shield_rescue_disabled(
+            "Selected UTXO is not an unspent blocked Shield that can be refunded.",
+            None,
+        ));
+    };
+
+    let origin = match resolve_source_tx_origin(
+        request.chain_id,
+        request.effective_chain.as_ref(),
+        utxo.source.tx_hash,
+        http,
+    )
+    .await
+    {
+        Ok(origin) => origin,
+        Err(error) => {
+            tracing::warn!(%error, tx_hash = %hex::encode_prefixed(utxo.source.tx_hash), "resolve blocked Shield source origin failed");
+            return Ok(blocked_shield_rescue_disabled(
+                "Source transaction origin could not be resolved. Retry after checking RPC connectivity.",
+                None,
+            ));
+        }
+    };
+
+    let accounts = request
+        .vault_store
+        .list_active_public_accounts_for_session(&request.view_session)
+        .wrap_err("load active public accounts")?;
+    Ok(blocked_shield_rescue_eligibility_for_origin(
+        Some(origin),
+        &accounts,
+    ))
+}
+
+pub async fn resolve_source_tx_origin(
+    chain_id: u64,
+    effective_chain: Option<&settings::EffectiveChainConfig>,
+    source_tx_hash: FixedBytes<32>,
+    http: &HttpContext,
+) -> Result<Address> {
+    let chain = effective_desktop_chain_config(chain_id, effective_chain)?;
+    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
+    let provider_handles = query_rpc_pool.available_providers();
+    if provider_handles.is_empty() {
+        return Err(eyre!("no healthy query RPC available"));
+    }
+    let mut last_error = None;
+
+    for provider_handle in provider_handles {
+        match provider_handle
+            .provider
+            .get_transaction_by_hash(source_tx_hash)
+            .await
+        {
+            Ok(Some(tx)) => return Ok(tx.from()),
+            Ok(None) => {
+                last_error = Some(eyre!(
+                    "source transaction {} not found",
+                    hex::encode_prefixed(source_tx_hash)
+                ));
+            }
+            Err(error) => {
+                tracing::warn!(%error, rpc = %provider_handle.url, "fetch source transaction failed");
+                query_rpc_pool.mark_bad_provider(&provider_handle);
+                last_error = Some(Report::new(error));
+            }
+        }
+    }
+
+    if let Some(error) = last_error {
+        Err(error).wrap_err("all source transaction origin lookup attempts failed")
+    } else {
+        Err(eyre!("no healthy query RPC available"))
+    }
+}
+
+fn blocked_shield_rescue_candidate_from_records(
+    utxos: &[WalletUtxo],
+    pending_overlay: &WalletPendingOverlay,
+    utxo_id: &BlockedShieldRescueUtxoId,
+) -> Option<Utxo> {
+    let pending_spent_keys = pending_spent_keys(pending_overlay);
+    let active_poi_list_keys = default_active_poi_list_keys();
+    utxos
+        .iter()
+        .filter(|entry| !entry.is_spent())
+        .filter(|entry| !pending_spent_keys.contains(&(entry.utxo.tree, entry.utxo.position)))
+        .find(|entry| blocked_shield_rescue_utxo_matches(&entry.utxo, utxo_id))
+        .filter(|entry| {
+            utxos::activity_utxo_classification(&entry.utxo.poi, &active_poi_list_keys)
+                == ActivityUtxoClassification::BlockedShield
+        })
+        .map(|entry| entry.utxo.clone())
+}
+
+fn blocked_shield_rescue_utxo_matches(utxo: &Utxo, utxo_id: &BlockedShieldRescueUtxoId) -> bool {
+    utxo.tree == utxo_id.tree
+        && utxo.position == utxo_id.position
+        && utxo.poi.commitment == utxo_id.commitment
+        && utxo.poi.blinded_commitment == utxo_id.blinded_commitment
+}
+
+fn blocked_shield_rescue_eligibility_for_origin(
+    origin: Option<Address>,
+    active_public_accounts: &[vault::PublicAccountMetadata],
+) -> BlockedShieldRescueEligibility {
+    let Some(origin) = origin else {
+        return blocked_shield_rescue_disabled(
+            "Source transaction origin could not be resolved. Retry after checking RPC connectivity.",
+            None,
+        );
+    };
+    let Some(account) = active_public_accounts.iter().find(|account| {
+        account.address == origin && account.status == vault::PublicAccountStatus::Active
+    }) else {
+        return blocked_shield_rescue_disabled(
+            "The Shield origin Public account must be added or activated before refund.",
+            Some(origin),
+        );
+    };
+
+    BlockedShieldRescueEligibility {
+        eligible: true,
+        disabled_reason: None,
+        origin_address: Some(origin),
+        public_account_uuid: Some(account.public_account_uuid.clone()),
+        public_account_label: account.label.clone(),
+    }
+}
+
+fn blocked_shield_rescue_disabled(
+    reason: &str,
+    origin_address: Option<Address>,
+) -> BlockedShieldRescueEligibility {
+    BlockedShieldRescueEligibility {
+        eligible: false,
+        disabled_reason: Some(reason.to_string()),
+        origin_address,
+        public_account_uuid: None,
+        public_account_label: None,
+    }
 }
 
 pub fn eligible_public_broadcasters_for_asset(
@@ -2075,6 +2298,243 @@ async fn prepare_desktop_unshield_plan_without_broadcaster_fee(
     })
 }
 
+pub async fn prepare_blocked_shield_rescue_preview(
+    request: BlockedShieldRescuePreviewRequest,
+    http: &HttpContext,
+) -> Result<BlockedShieldRescuePreview> {
+    let utxo = selected_blocked_shield_rescue_utxo(&request.session, &request.utxo_id).await?;
+    let eligibility = resolve_blocked_shield_rescue_eligibility(
+        BlockedShieldRescueEligibilityRequest {
+            chain_id: request.chain_id,
+            effective_chain: request.effective_chain,
+            view_session: request.view_session,
+            session: request.session,
+            vault_store: request.vault_store,
+            utxo_id: request.utxo_id,
+        },
+        http,
+    )
+    .await?;
+    let origin_address = eligibility
+        .origin_address
+        .ok_or_else(|| eyre!("blocked Shield refund origin is unresolved"))?;
+    let public_account_uuid = eligibility
+        .public_account_uuid
+        .ok_or_else(|| eyre!("blocked Shield refund origin Public account is unavailable"))?;
+    if !eligibility.eligible {
+        return Err(eyre!(
+            "blocked Shield refund is unavailable: {}",
+            eligibility
+                .disabled_reason
+                .as_deref()
+                .unwrap_or("eligibility check failed")
+        ));
+    }
+
+    Ok(BlockedShieldRescuePreview {
+        chain_id: request.chain_id,
+        utxo_id: request.utxo_id,
+        token: utxo.token_address(),
+        amount: utxo.note.value,
+        source_tx_hash: utxo.source.tx_hash,
+        origin_address,
+        public_account_uuid,
+        public_account_label: eligibility.public_account_label,
+    })
+}
+
+async fn prepare_blocked_shield_rescue_plan(
+    request: &BlockedShieldRescueSelfBroadcastRequest,
+    http: &HttpContext,
+) -> Result<PreparedBlockedShieldRescuePlan> {
+    if request.session.chain_id != request.chain_id {
+        return Err(eyre!(
+            "selected wallet session is for chain {}, not {}",
+            request.session.chain_id,
+            request.chain_id
+        ));
+    }
+    let chain = effective_desktop_chain_config(request.chain_id, request.effective_chain.as_ref())?;
+    let utxo = selected_blocked_shield_rescue_utxo(&request.session, &request.utxo_id).await?;
+    let token = utxo.token_address();
+    let amount = utxo.note.value;
+    let eligibility = resolve_blocked_shield_rescue_eligibility(
+        BlockedShieldRescueEligibilityRequest {
+            chain_id: request.chain_id,
+            effective_chain: request.effective_chain.clone(),
+            view_session: Arc::clone(&request.view_session),
+            session: Arc::clone(&request.session),
+            vault_store: Arc::clone(&request.vault_store),
+            utxo_id: request.utxo_id,
+        },
+        http,
+    )
+    .await?;
+    if !eligibility.eligible {
+        return Err(eyre!(
+            "blocked Shield refund is unavailable: {}",
+            eligibility
+                .disabled_reason
+                .as_deref()
+                .unwrap_or("eligibility check failed")
+        ));
+    }
+    let origin_address = eligibility
+        .origin_address
+        .ok_or_else(|| eyre!("blocked Shield refund origin is unresolved"))?;
+    let public_account_uuid = matched_blocked_shield_rescue_public_account_uuid(
+        eligibility.public_account_uuid.as_deref(),
+        request.requested_public_account_uuid.as_deref(),
+    )?;
+
+    let artifact_source = artifact_source(http);
+    let prover = ProverService::new_with_db(artifact_source, Arc::clone(&request.session.db));
+    let chain_handle = request
+        .session
+        .sync_manager
+        .chain_handle(&request.session.chain_key)
+        .await
+        .ok_or_else(|| eyre!("chain handle not found for chain {}", request.chain_id))?;
+    let mut forest = chain_handle.forest.read().await.clone();
+    forest.compute_roots();
+
+    let rescue_utxos = vec![utxo.clone()];
+    update_transaction_generation_stage(
+        request.progress_tx.as_ref(),
+        TransactionGenerationStage::SelectingPrivateNotes,
+    );
+    let selection_info = unshield_selection_info(&rescue_utxos, token, amount, false)
+        .wrap_err("select blocked Shield refund note")?;
+    if selection_info.input_count != 1 || selection_info.max_spendable != amount {
+        return Err(eyre!(
+            "blocked Shield refund must select exactly the chosen UTXO"
+        ));
+    }
+
+    let mut grant = request
+        .vault_store
+        .create_spend_grant(request.vault_password.as_str())
+        .wrap_err("authorize blocked Shield refund spend")?;
+    let signer = request
+        .vault_store
+        .railgun_spend_signer(&mut grant, request.view_session.wallet_id())
+        .wrap_err("load blocked Shield refund spend signer")?;
+    let tx_builder = TransactionBuilder {
+        chain_type: 0,
+        chain_id: request.chain_id,
+        railgun_contract: chain.railgun_contract,
+        relay_adapt_contract: chain.relay_adapt_contract,
+    };
+    let unshield_request = RailgunUnshieldRequest {
+        token_address: token,
+        amount,
+        recipient: origin_address,
+        mode: UnshieldMode::Token,
+        verify_proof: request.verify_proof,
+        spend_up_to: false,
+        broadcaster_fee: None,
+        min_gas_price: 0,
+    };
+
+    update_transaction_generation_stage(
+        request.progress_tx.as_ref(),
+        TransactionGenerationStage::ProvingTransaction,
+    );
+    let plan = tx_builder
+        .build_unshield_plan_with_signer(
+            &request.view_session.scan_keys(),
+            &signer,
+            &forest,
+            &rescue_utxos,
+            unshield_request,
+            &prover,
+        )
+        .await
+        .wrap_err("build blocked Shield refund calldata")?;
+    validate_blocked_shield_rescue_plan(&plan, &request.utxo_id, token, amount, origin_address)?;
+
+    Ok(PreparedBlockedShieldRescuePlan {
+        plan,
+        public_account_uuid,
+    })
+}
+
+async fn selected_blocked_shield_rescue_utxo(
+    session: &WalletSession,
+    utxo_id: &BlockedShieldRescueUtxoId,
+) -> Result<Utxo> {
+    let utxos = session.handle.utxos.read().await.clone();
+    let pending_overlay = session.handle.pending_overlay().await;
+    blocked_shield_rescue_candidate_from_records(&utxos, &pending_overlay, utxo_id)
+        .ok_or_else(|| eyre!("selected UTXO is not an unspent blocked Shield that can be refunded"))
+}
+
+fn matched_blocked_shield_rescue_public_account_uuid(
+    matched: Option<&str>,
+    requested: Option<&str>,
+) -> Result<String> {
+    let matched =
+        matched.ok_or_else(|| eyre!("blocked Shield refund origin account is unavailable"))?;
+    if let Some(requested) = requested
+        && requested != matched
+    {
+        return Err(eyre!(
+            "blocked Shield refund gas payer must be the matched origin Public account"
+        ));
+    }
+    Ok(matched.to_string())
+}
+
+fn validate_blocked_shield_rescue_plan(
+    plan: &UnshieldPlan,
+    utxo_id: &BlockedShieldRescueUtxoId,
+    token: Address,
+    amount: U256,
+    origin_address: Address,
+) -> Result<()> {
+    if plan.inputs.len() != 1 {
+        return Err(eyre!(
+            "blocked Shield refund must spend exactly one private input"
+        ));
+    }
+    let input = &plan.inputs[0].utxo;
+    if !blocked_shield_rescue_utxo_matches(input, utxo_id) {
+        return Err(eyre!("blocked Shield refund selected an unexpected UTXO"));
+    }
+    if input.note.value != amount || plan.unshield_note.value != amount {
+        return Err(eyre!(
+            "blocked Shield refund must spend the full UTXO value"
+        ));
+    }
+    let expected_unshield = Note::new_unshield(origin_address, token, amount);
+    if plan.unshield_note.token_hash != expected_unshield.token_hash
+        || plan.unshield_note.npk != expected_unshield.npk
+    {
+        return Err(eyre!(
+            "blocked Shield refund must unshield the exact token to the origin address"
+        ));
+    }
+    if plan.unshield_notes.len() != 1 {
+        return Err(eyre!(
+            "blocked Shield refund must have exactly one public output"
+        ));
+    }
+    if plan.broadcaster_fee_note.is_some() {
+        return Err(eyre!(
+            "blocked Shield refund cannot include a broadcaster fee note"
+        ));
+    }
+    if plan.change_note.is_some() {
+        return Err(eyre!("blocked Shield refund cannot create private change"));
+    }
+    for chunk in &plan.chunks {
+        if chunk.private_output_count() != Some(0) {
+            return Err(eyre!("blocked Shield refund cannot create private outputs"));
+        }
+    }
+    Ok(())
+}
+
 async fn prepare_desktop_send_plan_without_broadcaster_fee(
     request: DesktopSendPlanRequest<'_>,
     http: &HttpContext,
@@ -2709,6 +3169,50 @@ pub async fn submit_desktop_unshield_self_broadcast(
         request.vault_store.as_ref(),
         request.vault_password.as_str(),
         request.public_account_uuid,
+        Arc::clone(&request.session),
+        prepared.plan.call.to,
+        prepared.plan.call.data,
+        pending_spent_inputs,
+        request.gas_fee,
+        request.progress_tx,
+        request.command_rx,
+        request.event_tx,
+        http,
+    )
+    .await
+}
+
+pub async fn submit_blocked_shield_rescue_self_broadcast(
+    request: BlockedShieldRescueSelfBroadcastRequest,
+    http: &HttpContext,
+) -> Result<DesktopSelfBroadcastResult> {
+    let prepared = prepare_blocked_shield_rescue_plan(&request, http).await?;
+    let pending_output_pois_required =
+        unshield_chunks_require_pending_output_pois(&prepared.plan.chunks);
+    emit_self_broadcast_event(
+        request.event_tx.as_ref(),
+        SelfBroadcastSessionEvent::PendingOutputPoiProofsRequired {
+            required: pending_output_pois_required,
+        },
+    );
+    if pending_output_pois_required {
+        return Err(eyre!(
+            "blocked Shield refund plan unexpectedly requires private output POI proofs"
+        ));
+    }
+    let pending_spent_inputs = prepared
+        .plan
+        .inputs
+        .iter()
+        .map(|input| input.utxo.clone())
+        .collect::<Vec<_>>();
+    submit_self_broadcast_plan(
+        request.chain_id,
+        request.effective_chain.as_ref(),
+        request.view_session.as_ref(),
+        request.vault_store.as_ref(),
+        request.vault_password.as_str(),
+        prepared.public_account_uuid,
         Arc::clone(&request.session),
         prepared.plan.call.to,
         prepared.plan.call.data,
@@ -5298,11 +5802,14 @@ mod tests {
         try_decrypt_transact_request,
     };
     use broadcaster_core::transact_response::DecryptedTransactResponse;
+    use broadcaster_core::tree::TREE_DEPTH;
     use broadcaster_monitor::FeeRow;
     use local_db::{DbConfig, DbStore, PendingOutputPoiRole};
+    use merkletree::tree::MerkleProof;
     use poi::poi::default_active_poi_list_keys;
     use railgun_wallet::tx::{
-        BuildError, PrivateInputs, PublicInputs, TransactionPlanChunk, UnshieldSelectionInfo,
+        BuildError, InputWitness, PrivateInputs, PublicInputs, TransactionCall,
+        TransactionPlanChunk, UnshieldPlan, UnshieldSelectionInfo,
     };
     use railgun_wallet::{PoiStatus, Utxo, UtxoCommitmentKind, UtxoSource, WalletKeys, WalletUtxo};
     use serde_json::json;
@@ -5310,17 +5817,18 @@ mod tests {
 
     use super::signer::{EvmMessageSigner, EvmTransactionSigner, SoftwareEvmSigner};
     use super::{
-        ApproximateTransactionShape, BroadcasterFeePolicy, BroadcasterFeePolicyStatus,
-        DesktopWalletChainStart, DesktopWalletSyncStartPolicy, ListUtxosOutput,
-        PublicBroadcasterCandidate, PublicBroadcasterFeeMargin, PublicBroadcasterFeeMode,
-        PublicBroadcasterResultKind, PublicBroadcasterSelection, RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
-        SelfBroadcastFeeSample, SelfBroadcastGasFeeQuote, SelfBroadcastGasFeeSelection,
-        SelfBroadcastTipFallback, TokenTotal, UtxoOutput, WalletPendingOverlay, WalletPendingSpent,
-        apply_pending_overlay_to_outputs, approximate_public_broadcaster_cost,
-        approximate_public_broadcaster_gas, broadcaster_fee_amount, broadcaster_fee_covers,
-        buffered_public_broadcaster_fee, decode_public_broadcaster_response,
-        eligible_public_broadcasters, fee_policy_eligible_public_broadcasters,
-        fixed_token_anchor_rate, initial_separate_token_public_broadcaster_fee,
+        ApproximateTransactionShape, BlockedShieldRescueUtxoId, BroadcasterFeePolicy,
+        BroadcasterFeePolicyStatus, DesktopWalletChainStart, DesktopWalletSyncStartPolicy,
+        ListUtxosOutput, PublicBroadcasterCandidate, PublicBroadcasterFeeMargin,
+        PublicBroadcasterFeeMode, PublicBroadcasterResultKind, PublicBroadcasterSelection,
+        RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS, SelfBroadcastFeeSample, SelfBroadcastGasFeeQuote,
+        SelfBroadcastGasFeeSelection, SelfBroadcastTipFallback, TokenTotal, UtxoOutput,
+        WalletPendingOverlay, WalletPendingSpent, apply_pending_overlay_to_outputs,
+        approximate_public_broadcaster_cost, approximate_public_broadcaster_gas,
+        broadcaster_fee_amount, broadcaster_fee_covers, buffered_public_broadcaster_fee,
+        decode_public_broadcaster_response, eligible_public_broadcasters,
+        fee_policy_eligible_public_broadcasters, fixed_token_anchor_rate,
+        initial_separate_token_public_broadcaster_fee,
         is_self_broadcast_insufficient_native_gas_error,
         is_self_broadcast_tx_already_known_message, is_wrapped_native_token,
         max_broadcaster_fee_token_amount_from_outputs, max_send_amount_from_outputs,
@@ -5754,13 +6262,19 @@ mod tests {
         }
     }
 
-    fn utxo(token: Address, value: u64, tree: u32, position: u64) -> WalletUtxo {
+    fn utxo_with_kind(
+        token: Address,
+        value: u64,
+        tree: u32,
+        position: u64,
+        commitment_kind: UtxoCommitmentKind,
+    ) -> WalletUtxo {
         let mut wallet_utxo = WalletUtxo::new(Utxo::new(
             Note::new_unshield(Address::ZERO, token, U256::from(value)),
             tree,
             position,
             source(position as u8 + 1),
-            UtxoCommitmentKind::Transact,
+            commitment_kind,
         ));
         for list_key in default_active_poi_list_keys() {
             wallet_utxo
@@ -5770,6 +6284,133 @@ mod tests {
                 .insert(list_key, PoiStatus::Valid);
         }
         wallet_utxo
+    }
+
+    fn utxo(token: Address, value: u64, tree: u32, position: u64) -> WalletUtxo {
+        utxo_with_kind(token, value, tree, position, UtxoCommitmentKind::Transact)
+    }
+
+    fn blocked_shield_utxo(token: Address, value: u64, tree: u32, position: u64) -> WalletUtxo {
+        let mut wallet_utxo =
+            utxo_with_kind(token, value, tree, position, UtxoCommitmentKind::Shield);
+        wallet_utxo
+            .utxo
+            .poi
+            .statuses
+            .insert(default_active_poi_list_keys()[0], PoiStatus::ShieldBlocked);
+        wallet_utxo
+    }
+
+    fn rescue_utxo_id(wallet_utxo: &WalletUtxo) -> BlockedShieldRescueUtxoId {
+        BlockedShieldRescueUtxoId {
+            tree: wallet_utxo.utxo.tree,
+            position: wallet_utxo.utxo.position,
+            commitment: wallet_utxo.utxo.poi.commitment,
+            blinded_commitment: wallet_utxo.utxo.poi.blinded_commitment,
+        }
+    }
+
+    fn public_account(
+        uuid: &str,
+        address: Address,
+        status: super::vault::PublicAccountStatus,
+    ) -> super::vault::PublicAccountMetadata {
+        super::vault::PublicAccountMetadata {
+            public_account_uuid: uuid.to_string(),
+            address,
+            label: Some(format!("Account {uuid}")),
+            source: super::vault::PublicAccountSource::Imported,
+            scope: super::vault::PublicAccountScope::Global,
+            derivation_index: None,
+            status,
+            display_order: 0,
+        }
+    }
+
+    fn rescue_plan_for_test(
+        utxo: &Utxo,
+        token: Address,
+        amount: U256,
+        origin: Address,
+        extra_input: Option<Utxo>,
+        change_value: Option<U256>,
+    ) -> UnshieldPlan {
+        let mut inputs = vec![InputWitness {
+            utxo: utxo.clone(),
+            merkle_proof: MerkleProof {
+                root: U256::ZERO,
+                leaf: U256::ZERO,
+                leaf_index: utxo.position,
+                path_elements: [U256::ZERO; TREE_DEPTH],
+                path_indices: [0; TREE_DEPTH],
+            },
+        }];
+        if let Some(extra) = extra_input {
+            inputs.push(InputWitness {
+                utxo: extra,
+                merkle_proof: MerkleProof {
+                    root: U256::ZERO,
+                    leaf: U256::ZERO,
+                    leaf_index: 0,
+                    path_elements: [U256::ZERO; TREE_DEPTH],
+                    path_indices: [0; TREE_DEPTH],
+                },
+            });
+        }
+
+        let unshield_note = Note::new_unshield(origin, token, amount);
+        let change_note =
+            change_value.map(|value| Note::new_change(U256::ZERO, token, value, [1; 16]));
+        let mut outputs = Vec::new();
+        if let Some(change) = change_note.clone() {
+            outputs.push(change);
+        }
+        outputs.push(unshield_note.clone());
+        let public_inputs = PublicInputs {
+            merkle_root: U256::ZERO,
+            bound_params_hash: U256::ZERO,
+            nullifiers: Vec::new(),
+            commitments_out: outputs.iter().map(Note::commitment).collect(),
+        };
+        let private_inputs = PrivateInputs {
+            token_address: U256::from_be_slice(token.as_slice()),
+            random_in: Vec::new(),
+            value_in: Vec::new(),
+            path_elements: Vec::new(),
+            leaves_indices: Vec::new(),
+            value_out: outputs.iter().map(|note| note.value).collect(),
+            public_key: [U256::ZERO; 2],
+            npk_out: outputs.iter().map(|note| note.npk).collect(),
+            nullifying_key: U256::ZERO,
+        };
+        let chunk = TransactionPlanChunk {
+            tree_number: utxo.tree,
+            merkle_root: U256::ZERO,
+            inputs: inputs.clone(),
+            outputs: outputs.clone(),
+            has_unshield: true,
+            public_inputs: public_inputs.clone(),
+            private_inputs: private_inputs.clone(),
+            signature: [U256::ZERO; 3],
+        };
+        UnshieldPlan {
+            call: TransactionCall {
+                to: Address::ZERO,
+                data: Bytes::new(),
+            },
+            tree_number: utxo.tree,
+            merkle_root: U256::ZERO,
+            inputs,
+            outputs,
+            chunks: vec![chunk],
+            broadcaster_fee_note: None,
+            unshield_note,
+            unshield_notes: vec![Note::new_unshield(origin, token, amount)],
+            change_note,
+            public_inputs,
+            private_inputs,
+            signature: [U256::ZERO; 3],
+        }
     }
 
     fn spent_utxo(token: Address, value: u64, tree: u32, position: u64) -> WalletUtxo {
@@ -5819,6 +6460,243 @@ mod tests {
         let selected = super::poi_verified_unspent_utxos_from_records(&[valid], &pending);
 
         assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn blocked_shield_rescue_eligibility_accepts_matched_origin_account() {
+        let token = address(0x11);
+        let origin = address(0xaa);
+        let blocked = blocked_shield_utxo(token, 5, 0, 1);
+        let id = rescue_utxo_id(&blocked);
+        let candidate = super::blocked_shield_rescue_candidate_from_records(
+            &[blocked],
+            &WalletPendingOverlay::default(),
+            &id,
+        );
+        let eligibility = super::blocked_shield_rescue_eligibility_for_origin(
+            Some(origin),
+            &[public_account(
+                "pub-1",
+                origin,
+                super::vault::PublicAccountStatus::Active,
+            )],
+        );
+
+        assert!(candidate.is_some());
+        assert!(eligibility.eligible);
+        assert_eq!(eligibility.origin_address, Some(origin));
+        assert_eq!(eligibility.public_account_uuid.as_deref(), Some("pub-1"));
+        assert!(eligibility.disabled_reason.is_none());
+    }
+
+    #[test]
+    fn blocked_shield_rescue_eligibility_requires_origin_account() {
+        let origin = address(0xaa);
+
+        let missing = super::blocked_shield_rescue_eligibility_for_origin(Some(origin), &[]);
+        let inactive = super::blocked_shield_rescue_eligibility_for_origin(
+            Some(origin),
+            &[public_account(
+                "pub-1",
+                origin,
+                super::vault::PublicAccountStatus::Inactive,
+            )],
+        );
+
+        assert!(!missing.eligible);
+        assert_eq!(missing.origin_address, Some(origin));
+        assert_eq!(
+            missing.disabled_reason.as_deref(),
+            Some("The Shield origin Public account must be added or activated before refund.")
+        );
+        assert!(!inactive.eligible);
+    }
+
+    #[test]
+    fn blocked_shield_rescue_eligibility_reports_unresolved_origin() {
+        let eligibility = super::blocked_shield_rescue_eligibility_for_origin(None, &[]);
+
+        assert!(!eligibility.eligible);
+        assert_eq!(eligibility.origin_address, None);
+        assert_eq!(
+            eligibility.disabled_reason.as_deref(),
+            Some(
+                "Source transaction origin could not be resolved. Retry after checking RPC connectivity."
+            )
+        );
+    }
+
+    #[test]
+    fn blocked_shield_rescue_candidate_rejects_ineligible_utxos() {
+        let token = address(0x11);
+        let blocked = blocked_shield_utxo(token, 5, 0, 1);
+        let blocked_id = rescue_utxo_id(&blocked);
+        let transact = utxo(token, 5, 0, 2);
+        let transact_id = rescue_utxo_id(&transact);
+        let shield = utxo_with_kind(token, 5, 0, 3, UtxoCommitmentKind::Shield);
+        let shield_id = rescue_utxo_id(&shield);
+        let mut spent = blocked_shield_utxo(token, 5, 0, 4);
+        let spent_id = rescue_utxo_id(&spent);
+        spent.spent = Some(source(9));
+        let pending_overlay = WalletPendingOverlay {
+            pending_spent: vec![WalletPendingSpent {
+                tree: blocked.utxo.tree,
+                position: blocked.utxo.position,
+                tx_hash: Some(FixedBytes::from([0x99; 32])),
+                block_number: Some(20),
+                block_timestamp: Some(1_700_000_020),
+            }],
+            ..WalletPendingOverlay::default()
+        };
+
+        assert!(
+            super::blocked_shield_rescue_candidate_from_records(
+                std::slice::from_ref(&blocked),
+                &WalletPendingOverlay::default(),
+                &blocked_id,
+            )
+            .is_some()
+        );
+        assert!(
+            super::blocked_shield_rescue_candidate_from_records(
+                &[blocked],
+                &pending_overlay,
+                &blocked_id,
+            )
+            .is_none()
+        );
+        assert!(
+            super::blocked_shield_rescue_candidate_from_records(
+                &[transact],
+                &WalletPendingOverlay::default(),
+                &transact_id,
+            )
+            .is_none()
+        );
+        assert!(
+            super::blocked_shield_rescue_candidate_from_records(
+                &[shield],
+                &WalletPendingOverlay::default(),
+                &shield_id,
+            )
+            .is_none()
+        );
+        assert!(
+            super::blocked_shield_rescue_candidate_from_records(
+                &[spent],
+                &WalletPendingOverlay::default(),
+                &spent_id,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn blocked_shield_rescue_plan_accepts_exact_single_utxo_unshield() {
+        let token = address(0x11);
+        let origin = address(0xaa);
+        let blocked = blocked_shield_utxo(token, 5, 0, 1);
+        let id = rescue_utxo_id(&blocked);
+        let plan = rescue_plan_for_test(&blocked.utxo, token, uint!(5_U256), origin, None, None);
+
+        super::validate_blocked_shield_rescue_plan(&plan, &id, token, uint!(5_U256), origin)
+            .expect("valid rescue plan");
+    }
+
+    #[test]
+    fn blocked_shield_rescue_plan_rejects_additional_private_inputs() {
+        let token = address(0x11);
+        let origin = address(0xaa);
+        let blocked = blocked_shield_utxo(token, 5, 0, 1);
+        let extra = blocked_shield_utxo(token, 1, 0, 2);
+        let id = rescue_utxo_id(&blocked);
+        let plan = rescue_plan_for_test(
+            &blocked.utxo,
+            token,
+            uint!(5_U256),
+            origin,
+            Some(extra.utxo),
+            None,
+        );
+
+        assert!(
+            super::validate_blocked_shield_rescue_plan(&plan, &id, token, uint!(5_U256), origin)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn blocked_shield_rescue_plan_rejects_partial_amount() {
+        let token = address(0x11);
+        let origin = address(0xaa);
+        let blocked = blocked_shield_utxo(token, 5, 0, 1);
+        let id = rescue_utxo_id(&blocked);
+        let plan = rescue_plan_for_test(&blocked.utxo, token, uint!(4_U256), origin, None, None);
+
+        assert!(
+            super::validate_blocked_shield_rescue_plan(&plan, &id, token, uint!(5_U256), origin)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn blocked_shield_rescue_plan_rejects_private_change_outputs() {
+        let token = address(0x11);
+        let origin = address(0xaa);
+        let blocked = blocked_shield_utxo(token, 5, 0, 1);
+        let id = rescue_utxo_id(&blocked);
+        let plan = rescue_plan_for_test(
+            &blocked.utxo,
+            token,
+            uint!(5_U256),
+            origin,
+            None,
+            Some(uint!(1_U256)),
+        );
+
+        assert!(
+            super::validate_blocked_shield_rescue_plan(&plan, &id, token, uint!(5_U256), origin)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn blocked_shield_rescue_rejects_mismatched_gas_payer() {
+        assert_eq!(
+            super::matched_blocked_shield_rescue_public_account_uuid(Some("origin"), None)
+                .expect("matched account"),
+            "origin"
+        );
+        assert_eq!(
+            super::matched_blocked_shield_rescue_public_account_uuid(
+                Some("origin"),
+                Some("origin")
+            )
+            .expect("matched account"),
+            "origin"
+        );
+        assert!(
+            super::matched_blocked_shield_rescue_public_account_uuid(Some("origin"), Some("other"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn normal_spend_selection_excludes_shield_blocked_utxos() {
+        let token = address(0x11);
+        let blocked = blocked_shield_utxo(token, 5, 0, 1);
+        let selected = super::poi_verified_unspent_utxos_from_records(
+            std::slice::from_ref(&blocked),
+            &WalletPendingOverlay::default(),
+        );
+        let (outputs, _) = utxo_outputs_from_utxos(vec![blocked]);
+
+        assert!(selected.is_empty());
+        assert_eq!(max_send_amount_from_outputs(&outputs, token), U256::ZERO);
+        assert_eq!(
+            max_unshield_amount_from_outputs(&outputs, token),
+            U256::ZERO
+        );
     }
 
     #[test]
@@ -6576,6 +7454,36 @@ mod tests {
     }
 
     #[test]
+    fn utxo_outputs_classify_activity_rows() {
+        let token = address(0x11);
+        let active_list_key = default_active_poi_list_keys()[0];
+        let shield = utxo_with_kind(token, 5, 0, 1, UtxoCommitmentKind::Shield);
+        let mut blocked_shield = utxo_with_kind(token, 7, 0, 2, UtxoCommitmentKind::Shield);
+        blocked_shield
+            .utxo
+            .poi
+            .statuses
+            .insert(active_list_key, PoiStatus::ShieldBlocked);
+        let transact = utxo(token, 9, 0, 3);
+
+        let (outputs, _) = utxo_outputs_from_utxos(vec![shield, blocked_shield, transact]);
+
+        assert_eq!(outputs[0].activity_classification, "Shield");
+        assert!(outputs[0].blocked_shield_rescue.is_none());
+        assert_eq!(outputs[1].activity_classification, "Blocked Shield");
+        assert!(!outputs[1].poi_spendable);
+        assert_eq!(
+            outputs[1]
+                .blocked_shield_rescue
+                .as_ref()
+                .and_then(|rescue| rescue.disabled_reason.as_deref()),
+            Some("Source transaction origin has not been resolved yet.")
+        );
+        assert_eq!(outputs[2].activity_classification, "Private Output");
+        assert!(outputs[2].blocked_shield_rescue.is_none());
+    }
+
+    #[test]
     fn max_amount_from_outputs_uses_planner_batched_selection() {
         let token = address(0x11);
         let other = address(0x22);
@@ -6643,6 +7551,8 @@ mod tests {
                 token: "0x0000000000000000000000000000000000000001".to_string(),
                 value: "4".to_string(),
                 commitment_kind: "Transact".to_string(),
+                activity_classification: "Private Output".to_string(),
+                blocked_shield_rescue: None,
                 commitment: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     .to_string(),
                 npk: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -6690,6 +7600,8 @@ mod tests {
                     "token": "0x0000000000000000000000000000000000000001",
                     "value": "4",
                     "commitment_kind": "Transact",
+                    "activity_classification": "Private Output",
+                    "blocked_shield_rescue": null,
                     "commitment": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "npk": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                     "blinded_commitment": "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",

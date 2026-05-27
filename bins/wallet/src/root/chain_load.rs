@@ -248,6 +248,10 @@ impl WalletRoot {
         self.private_action_form = None;
         self.clear_private_broadcaster_progress_state();
         self.broadcaster_picker = None;
+        self.blocked_shield_rescue_rows.clear();
+        self.blocked_shield_refunds_in_flight.clear();
+        self.blocked_shield_rescue_lookup_generation =
+            self.blocked_shield_rescue_lookup_generation.wrapping_add(1);
         self.active_wallet_tab = WalletTab::default();
         for state in self.chain_states.values_mut() {
             *state = ChainUtxoState::Idle;

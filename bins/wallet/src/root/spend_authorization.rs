@@ -17,6 +17,7 @@ use gpui_component::{
 use ui::clipboard::clipboard_with_toast;
 use ui::controls::{app_button, app_input, app_muted_text, app_strong_text, app_text};
 use ui::theme::{self, APP_MONO_FONT_FAMILY};
+use wallet_ops::BlockedShieldRescueUtxoId;
 use zeroize::Zeroizing;
 
 use crate::assets::WalletIconSource;
@@ -90,6 +91,7 @@ impl SpendAuthorizationCache {
 pub(super) enum SpendAuthorizationIntent {
     PrivateSend(UnshieldAssetKey),
     PrivateUnshield(UnshieldAssetKey),
+    BlockedShieldRefund(BlockedShieldRescueUtxoId),
     PublicSend,
     PublicShield,
 }
@@ -496,6 +498,9 @@ impl WalletRoot {
             }
             SpendAuthorizationIntent::PrivateUnshield(key) => {
                 self.generate_unshield_calldata_authorized(key, password, window, cx);
+            }
+            SpendAuthorizationIntent::BlockedShieldRefund(utxo_id) => {
+                self.submit_blocked_shield_refund_authorized(utxo_id, password, window, cx);
             }
             SpendAuthorizationIntent::PublicSend => {
                 self.submit_public_send_authorized(password, window, cx);

@@ -623,14 +623,14 @@ impl WalletRoot {
         let send_tooltip = if can_send {
             "Prepare private send calldata"
         } else if chain_ready {
-            "Token cannot be sent from this row"
+            "No spendable private balance for this token"
         } else {
             "Available after wallet sync finishes"
         };
         let unshield_tooltip = if can_unshield {
             "Prepare unshield calldata"
         } else if chain_ready {
-            "Token cannot be unshielded from this row"
+            "No unshieldable private balance for this token"
         } else {
             "Available after wallet sync finishes"
         };

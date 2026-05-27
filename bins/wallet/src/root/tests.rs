@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,12 +10,12 @@ use broadcaster_monitor::FeeRow;
 use broadcaster_monitor_waku::{DEFAULT_DOH_ENDPOINT, DEFAULT_TOR_DOH_ENDPOINT};
 use gpui_component::select::SelectItem;
 use wallet_ops::{
-    BroadcasterFeePolicy, ListUtxosOutput, PublicAccountBalance, PublicActionProgressStep,
-    PublicAssetId, PublicBalanceAmount, PublicBalanceAsset, PublicBalanceEntry,
-    PublicBalanceSnapshot, PublicBroadcasterCandidate, PublicBroadcasterCostEstimate,
-    PublicBroadcasterFeeMargin, PublicBroadcasterFeeMode, PublicBroadcasterResultKind,
-    PublicBroadcasterSelection, SyncProgressStage, SyncProgressUpdate, TokenAnchorRateCache,
-    TransactionGenerationStage, UtxoOutput,
+    BlockedShieldRescueInfo, BroadcasterFeePolicy, ListUtxosOutput, PublicAccountBalance,
+    PublicActionProgressStep, PublicAssetId, PublicBalanceAmount, PublicBalanceAsset,
+    PublicBalanceEntry, PublicBalanceSnapshot, PublicBroadcasterCandidate,
+    PublicBroadcasterCostEstimate, PublicBroadcasterFeeMargin, PublicBroadcasterFeeMode,
+    PublicBroadcasterResultKind, PublicBroadcasterSelection, SyncProgressStage, SyncProgressUpdate,
+    TokenAnchorRateCache, TransactionGenerationStage, UtxoOutput,
     settings::{
         BuiltInTokenOverride, CustomTokenSettings, NetworkModeSetting, PoiReadSourceSetting,
         PriceAnchorSettings, TokenKey, TokenPriceAnchorOverride, WALLET_SETTINGS_KEY,
@@ -40,19 +40,20 @@ use super::private_broadcaster::{
 use super::public_action::{public_action_asset_label, public_action_max_label};
 use super::public_broadcaster_cost::public_broadcaster_cost_status;
 use super::{
-    Activity, BroadcasterChoice, ChainUtxoState, CostEstimateStatus, DeliveryFormKind,
-    DeliveryMode, PUBLIC_ACCOUNT_IDENTICON_CELL_COUNT, PUBLIC_ACCOUNT_IDENTICON_GRID_SIZE,
-    PUBLIC_ADDRESS_QR_QUIET_ZONE_MODULES, PriceAnchorComponentDialogValues,
-    PriceAnchorDialogValues, PrivateActionMetric, PrivateBroadcasterProgressState,
-    ProgressFooterAction, PublicActionMode, PublicActionStepState, PublicActionStepStatus,
-    PublicBroadcasterFeeTokenOption, SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_MINUTE,
-    SECONDS_PER_MONTH, SECONDS_PER_YEAR, SEND_AUTHORIZATION_FAILED_ERROR,
+    Activity, BlockedShieldRescueRowState, BroadcasterChoice, ChainUtxoState, CostEstimateStatus,
+    DeliveryFormKind, DeliveryMode, PUBLIC_ACCOUNT_IDENTICON_CELL_COUNT,
+    PUBLIC_ACCOUNT_IDENTICON_GRID_SIZE, PUBLIC_ADDRESS_QR_QUIET_ZONE_MODULES,
+    PriceAnchorComponentDialogValues, PriceAnchorDialogValues, PrivateActionMetric,
+    PrivateBroadcasterProgressState, ProgressFooterAction, PublicActionMode, PublicActionStepState,
+    PublicActionStepStatus, PublicBroadcasterFeeTokenOption, SECONDS_PER_DAY, SECONDS_PER_HOUR,
+    SECONDS_PER_MINUTE, SECONDS_PER_MONTH, SECONDS_PER_YEAR, SEND_AUTHORIZATION_FAILED_ERROR,
     SelfBroadcastNativeBalanceState, SettingsApplyMode, SpendAuthorizationLifetime,
     UNSHIELD_AUTHORIZATION_FAILED_ERROR, UnshieldAsset, UnshieldAssetKey, VaultState,
     WalletAppOptions, WalletManagementSelection, WalletRoot, WalletSelectItem, WalletTab,
-    active_wallet_management_rows, add_chain_rpc_endpoint, add_poi_gateway_url,
-    add_waku_direct_peer, add_waku_dns_enr_tree, add_waku_doh_fallback_endpoint,
-    adjusted_amount_for_max_change, apply_private_broadcaster_progress_stage,
+    active_wallet_management_rows, activity_classification_icon_style, add_chain_rpc_endpoint,
+    add_poi_gateway_url, add_waku_direct_peer, add_waku_dns_enr_tree,
+    add_waku_doh_fallback_endpoint, adjusted_amount_for_max_change,
+    apply_blocked_shield_rescue_rows, apply_private_broadcaster_progress_stage,
     broadcaster_choice_supported_by_candidates, classify_settings_apply_mode,
     default_self_broadcast_gas_payer_uuid, display_chain_contract_settings,
     display_chain_quick_sync_endpoint, display_chain_rpc_endpoints, display_price_anchor_entries,
@@ -105,13 +106,14 @@ use super::{
     set_waku_doh_fallback_endpoint, settings_draft_after_discard, settings_restart_action_enabled,
     settings_restart_reuses_active_network, settings_save_action_enabled, should_focus_utxo_table,
     should_preserve_estimate_after_broadcaster_policy_change,
-    should_render_public_broadcaster_cost_preview, should_show_broadcaster_fee_mode_toggle,
-    should_show_distinct_amount, should_show_pre_unlock_settings_action,
-    should_show_proxy_url_setting, should_show_proxy_waku_disclaimer,
-    sidebar_primary_activity_order, startup_settings_action_state,
-    unshield_asset_key_from_formatted, unshield_element_id, unshield_key_matches_asset,
-    unshield_public_broadcaster_estimate_input_error, validate_custom_gas_fee,
-    wallet_generation_matches, wallet_ids_after_drop, wallet_options_from_metadata,
+    should_render_public_broadcaster_cost_preview, should_show_blocked_shield_refund_action,
+    should_show_broadcaster_fee_mode_toggle, should_show_distinct_amount,
+    should_show_pre_unlock_settings_action, should_show_proxy_url_setting,
+    should_show_proxy_waku_disclaimer, sidebar_primary_activity_order,
+    startup_settings_action_state, unshield_asset_key_from_formatted, unshield_element_id,
+    unshield_key_matches_asset, unshield_public_broadcaster_estimate_input_error,
+    validate_custom_gas_fee, wallet_generation_matches, wallet_ids_after_drop,
+    wallet_options_from_metadata,
 };
 
 fn utxo_output(token: &str, value: &str, is_spent: bool) -> UtxoOutput {
@@ -142,6 +144,8 @@ fn utxo_output_with_hashes(
         token: token.to_string(),
         value: value.to_string(),
         commitment_kind: "Transact".to_string(),
+        activity_classification: "Private Output".to_string(),
+        blocked_shield_rescue: None,
         commitment: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             .to_string(),
         npk: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
@@ -171,6 +175,8 @@ fn unshield_utxo_output(token: Address, value: u64, tree: u32, position: u64) ->
         token: token.to_checksum(None),
         value: value.to_string(),
         commitment_kind: "Transact".to_string(),
+        activity_classification: "Private Output".to_string(),
+        blocked_shield_rescue: None,
         commitment: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             .to_string(),
         npk: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
@@ -4666,6 +4672,235 @@ fn display_rows_keep_pending_spent_visible_when_spent_toggle_off() {
     assert_eq!(rows[0].amount, "42");
     assert!(rows[0].pending_spent);
     assert_eq!(rows[0].poi_status, "Pending spend");
+}
+
+#[test]
+fn display_rows_include_activity_classification() {
+    let mut blocked_shield = utxo_output("0x1111111111111111111111111111111111111111", "42", false);
+    blocked_shield.commitment_kind = "Shield".to_string();
+    blocked_shield.activity_classification = "Blocked Shield".to_string();
+    blocked_shield.poi_statuses = BTreeMap::from([(
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string(),
+        "ShieldBlocked".to_string(),
+    )]);
+    blocked_shield.poi_spendable = false;
+    let output = ListUtxosOutput {
+        chain_id: 1,
+        cache_key: "cache".to_string(),
+        utxo_count: 1,
+        unspent_count: 1,
+        spent_count: 0,
+        local_pending_spent_count: 0,
+        utxos: vec![blocked_shield],
+        totals: Vec::new(),
+    };
+
+    let rows = display_rows_from_output(&output, "", false);
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].activity_classification, "Blocked Shield");
+    assert_eq!(rows[0].poi_status, "ShieldBlocked");
+}
+
+#[test]
+fn activity_classification_icon_styles_match_kinds() {
+    assert_eq!(
+        activity_classification_icon_style("Shield"),
+        (
+            ui::icons::shield_plus_icon_path(),
+            ui::theme::SUCCESS,
+            "Shield"
+        )
+    );
+    assert_eq!(
+        activity_classification_icon_style("Private Output"),
+        (
+            ui::icons::shield_check_icon_path(),
+            ui::theme::TEXT,
+            "Private Output",
+        )
+    );
+    assert_eq!(
+        activity_classification_icon_style("Blocked Shield"),
+        (
+            ui::icons::shield_alert_icon_path(),
+            ui::theme::DANGER,
+            "Blocked Shield",
+        )
+    );
+}
+
+#[test]
+fn display_rows_include_blocked_shield_rescue_metadata() {
+    let mut blocked_shield = utxo_output("0x1111111111111111111111111111111111111111", "42", false);
+    blocked_shield.commitment_kind = "Shield".to_string();
+    blocked_shield.activity_classification = "Blocked Shield".to_string();
+    blocked_shield.poi_statuses = BTreeMap::from([(
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string(),
+        "ShieldBlocked".to_string(),
+    )]);
+    blocked_shield.poi_spendable = false;
+    blocked_shield.blocked_shield_rescue = Some(BlockedShieldRescueInfo {
+        eligible: true,
+        disabled_reason: None,
+        origin_address: Some("0xaAaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa".to_string()),
+        public_account_uuid: Some("pub-1".to_string()),
+        public_account_label: Some("Origin".to_string()),
+    });
+    let output = ListUtxosOutput {
+        chain_id: 1,
+        cache_key: "cache".to_string(),
+        utxo_count: 1,
+        unspent_count: 1,
+        spent_count: 0,
+        local_pending_spent_count: 0,
+        utxos: vec![blocked_shield],
+        totals: Vec::new(),
+    };
+
+    let rows = display_rows_from_output(&output, "", false);
+
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].utxo_id.is_some());
+    let rescue = rows[0]
+        .blocked_shield_rescue
+        .as_ref()
+        .expect("rescue metadata");
+    assert!(rescue.eligible);
+    assert_eq!(rescue.public_account_uuid.as_deref(), Some("pub-1"));
+    assert!(should_show_blocked_shield_refund_action(&rows[0]));
+
+    let mut non_blocked = rows[0].clone();
+    non_blocked.poi_status = "Valid".to_string();
+    assert!(!should_show_blocked_shield_refund_action(&non_blocked));
+}
+
+#[test]
+fn blocked_shield_rescue_row_state_tracks_resolution_generation() {
+    let disabled = BlockedShieldRescueInfo {
+        eligible: false,
+        disabled_reason: Some("retry later".to_string()),
+        origin_address: None,
+        public_account_uuid: None,
+        public_account_label: None,
+    };
+    let disabled_state = BlockedShieldRescueRowState::from_info(disabled);
+
+    assert!(!disabled_state.is_resolving());
+    assert!(!disabled_state.accepts_lookup_result(7));
+
+    let eligible = BlockedShieldRescueInfo {
+        eligible: true,
+        disabled_reason: None,
+        origin_address: Some("0xaAaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa".to_string()),
+        public_account_uuid: Some("pub-1".to_string()),
+        public_account_label: None,
+    };
+    let eligible_state = BlockedShieldRescueRowState::from_info(eligible);
+
+    assert!(!eligible_state.is_resolving());
+
+    let resolving = BlockedShieldRescueRowState::resolving(7);
+
+    assert!(resolving.is_resolving());
+    assert!(resolving.accepts_lookup_result(7));
+    assert!(!resolving.accepts_lookup_result(8));
+}
+
+#[test]
+fn cached_blocked_shield_rescue_does_not_reenable_spent_row() {
+    let mut blocked_shield = utxo_output("0x1111111111111111111111111111111111111111", "42", true);
+    blocked_shield.commitment_kind = "Shield".to_string();
+    blocked_shield.activity_classification = "Blocked Shield".to_string();
+    blocked_shield.poi_statuses = BTreeMap::from([(
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string(),
+        "ShieldBlocked".to_string(),
+    )]);
+    blocked_shield.poi_spendable = false;
+    blocked_shield.blocked_shield_rescue = Some(BlockedShieldRescueInfo {
+        eligible: false,
+        disabled_reason: Some("Spent blocked Shield UTXOs cannot be refunded.".to_string()),
+        origin_address: None,
+        public_account_uuid: None,
+        public_account_label: None,
+    });
+    let output = ListUtxosOutput {
+        chain_id: 1,
+        cache_key: "cache".to_string(),
+        utxo_count: 1,
+        unspent_count: 0,
+        spent_count: 1,
+        local_pending_spent_count: 0,
+        utxos: vec![blocked_shield],
+        totals: Vec::new(),
+    };
+
+    let mut rows = display_rows_from_output(&output, "", true);
+    let utxo_id = rows[0].utxo_id.expect("blocked Shield id");
+    let eligible = BlockedShieldRescueInfo {
+        eligible: true,
+        disabled_reason: None,
+        origin_address: Some("0xaAaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa".to_string()),
+        public_account_uuid: Some("pub-1".to_string()),
+        public_account_label: Some("Origin".to_string()),
+    };
+    let rescue_rows = BTreeMap::from([(utxo_id, BlockedShieldRescueRowState::from_info(eligible))]);
+
+    apply_blocked_shield_rescue_rows(&mut rows, &rescue_rows, &BTreeSet::new());
+
+    let rescue = rows[0]
+        .blocked_shield_rescue
+        .as_ref()
+        .expect("rescue metadata");
+    assert!(!rescue.eligible);
+    assert_eq!(
+        rescue.disabled_reason.as_deref(),
+        Some("Spent blocked Shield UTXOs cannot be refunded.")
+    );
+}
+
+#[test]
+fn in_flight_blocked_shield_refund_disables_cached_action() {
+    let mut blocked_shield = utxo_output("0x1111111111111111111111111111111111111111", "42", false);
+    blocked_shield.commitment_kind = "Shield".to_string();
+    blocked_shield.activity_classification = "Blocked Shield".to_string();
+    blocked_shield.poi_statuses = BTreeMap::from([(
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string(),
+        "ShieldBlocked".to_string(),
+    )]);
+    blocked_shield.poi_spendable = false;
+    blocked_shield.blocked_shield_rescue = Some(BlockedShieldRescueInfo {
+        eligible: true,
+        disabled_reason: None,
+        origin_address: Some("0xaAaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa".to_string()),
+        public_account_uuid: Some("pub-1".to_string()),
+        public_account_label: Some("Origin".to_string()),
+    });
+    let output = ListUtxosOutput {
+        chain_id: 1,
+        cache_key: "cache".to_string(),
+        utxo_count: 1,
+        unspent_count: 1,
+        spent_count: 0,
+        local_pending_spent_count: 0,
+        utxos: vec![blocked_shield],
+        totals: Vec::new(),
+    };
+
+    let mut rows = display_rows_from_output(&output, "", false);
+    let utxo_id = rows[0].utxo_id.expect("blocked Shield id");
+
+    apply_blocked_shield_rescue_rows(&mut rows, &BTreeMap::new(), &BTreeSet::from([utxo_id]));
+
+    let rescue = rows[0]
+        .blocked_shield_rescue
+        .as_ref()
+        .expect("rescue metadata");
+    assert!(!rescue.eligible);
+    assert_eq!(
+        rescue.disabled_reason.as_deref(),
+        Some("Blocked Shield refund submission is already in progress.")
+    );
 }
 
 #[test]

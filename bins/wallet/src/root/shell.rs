@@ -8,7 +8,7 @@ use gpui::{
     prelude::FluentBuilder as _, px, rgb, size,
 };
 use gpui_component::{
-    IconName, Root, Sizable, TitleBar,
+    Icon, IconName, Root, Sizable, TitleBar,
     button::ButtonVariants,
     resizable::{resizable_panel, v_resizable},
     tab::{Tab, TabBar},
@@ -504,10 +504,12 @@ impl WalletRoot {
                 });
             })
             .children(WalletTab::ALL.into_iter().map(|tab| {
-                Tab::new()
-                    .min_w(px(92.0))
-                    .label(tab.label())
-                    .prefix(img(tab.icon_path()).size(px(18.0)).flex_none())
+                Tab::new().min_w(px(92.0)).label(tab.label()).prefix(
+                    Icon::empty()
+                        .path(tab.icon_path())
+                        .with_size(px(18.0))
+                        .text_color(rgb(theme::TEXT)),
+                )
             }))
     }
 

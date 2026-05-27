@@ -1,9 +1,12 @@
 const LOGS_ICON_PATH: &str = "ui/icons/logs.svg";
 const ACTIVITY_ICON_PATH: &str = "ui/icons/activity.svg";
+const BAN_ICON_PATH: &str = "ui/icons/ban.svg";
 const CLOSE_ICON_PATH: &str = "ui/icons/close.svg";
 const SEARCH_ICON_PATH: &str = "ui/icons/search.svg";
 const WALLET_ICON_PATH: &str = "ui/icons/wallet.svg";
+const SHIELD_PLUS_ICON_PATH: &str = "ui/icons/shield-plus.svg";
 const SHIELD_CHECK_ICON_PATH: &str = "ui/icons/shield-check.svg";
+const SHIELD_ALERT_ICON_PATH: &str = "ui/icons/shield-alert.svg";
 const GLOBE_ICON_PATH: &str = "ui/icons/globe.svg";
 const WRENCH_ICON_PATH: &str = "ui/icons/wrench.svg";
 const LOCK_ICON_PATH: &str = "ui/icons/lock.svg";
@@ -18,6 +21,11 @@ pub const fn logs_icon_path() -> &'static str {
 #[must_use]
 pub const fn activity_icon_path() -> &'static str {
     ACTIVITY_ICON_PATH
+}
+
+#[must_use]
+pub const fn ban_icon_path() -> &'static str {
+    BAN_ICON_PATH
 }
 
 #[must_use]
@@ -36,8 +44,18 @@ pub const fn wallet_icon_path() -> &'static str {
 }
 
 #[must_use]
+pub const fn shield_plus_icon_path() -> &'static str {
+    SHIELD_PLUS_ICON_PATH
+}
+
+#[must_use]
 pub const fn shield_check_icon_path() -> &'static str {
     SHIELD_CHECK_ICON_PATH
+}
+
+#[must_use]
+pub const fn shield_alert_icon_path() -> &'static str {
+    SHIELD_ALERT_ICON_PATH
 }
 
 #[must_use]
