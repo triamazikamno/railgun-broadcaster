@@ -1,11 +1,9 @@
-use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::time::Instant;
 
 use alloy::hex;
 use alloy::primitives::{Address, Bytes, FixedBytes, U256, Uint};
 use alloy::sol_types::SolCall;
-use alloy::uint;
 use async_trait::async_trait;
 use rand::Rng;
 use rayon::iter::IntoParallelRefIterator;
