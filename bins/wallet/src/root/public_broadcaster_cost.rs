@@ -15,8 +15,8 @@ use ui::icons;
 use ui::theme::{self, APP_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
     DesktopSendPublicBroadcasterEstimateRequest, DesktopUnshieldPublicBroadcasterEstimateRequest,
-    PublicBroadcasterCandidate, PublicBroadcasterCostEstimate, PublicBroadcasterFeeBreakdown,
-    PublicBroadcasterFeeMargin, PublicBroadcasterFeeMode, PublicBroadcasterSubmissionResult,
+    FeeHandlingMode, PublicBroadcasterCandidate, PublicBroadcasterCostEstimate,
+    PublicBroadcasterFeeBreakdown, PublicBroadcasterFeeMargin, PublicBroadcasterSubmissionResult,
     estimate_desktop_send_public_broadcaster_cost,
     estimate_desktop_unshield_public_broadcaster_cost, fixed_token_anchor_rate, parse_send_amount,
     parse_unshield_amount, public_broadcaster_fee_breakdown, public_broadcaster_service_gas_price,
@@ -31,10 +31,9 @@ use super::private_action::{
 use super::private_broadcaster::PrivateBroadcasterProgressState;
 use super::{
     COST_ESTIMATE_DEBOUNCE, ChainUtxoState, DeliveryFormKind, DeliveryMode, UnshieldAsset,
-    UnshieldAssetKey, WalletRoot, broadcaster_candidate_anchor_rate,
-    effective_public_broadcaster_fee_mode, format_exact_token_amount_for_display,
-    format_native_token_amount_for_display, format_report_chain, format_send_amount_input,
-    should_show_distinct_amount,
+    UnshieldAssetKey, WalletRoot, broadcaster_candidate_anchor_rate, effective_fee_handling_mode,
+    format_exact_token_amount_for_display, format_native_token_amount_for_display,
+    format_report_chain, format_send_amount_input, should_show_distinct_amount,
 };
 
 const COST_ESTIMATE_DETAIL_TEXT_SIZE: gpui::Pixels = px(12.0);
@@ -57,7 +56,7 @@ pub(super) struct PublicBroadcasterCostDisplay<'a> {
     fee_amount: U256,
     protocol_fee_amount: U256,
     pub(super) protocol_fee_bps: U256,
-    fee_mode: PublicBroadcasterFeeMode,
+    fee_mode: FeeHandlingMode,
     gas_limit: u64,
     min_gas_price: u128,
     fee_anchor_rate: Option<U256>,
@@ -102,11 +101,11 @@ fn format_gwei(wei: u128) -> String {
     format_token_amount(U256::from(wei), 9)
 }
 
-fn public_broadcaster_fee_mode_summary(
+fn fee_handling_mode_summary(
     chain_id: u64,
     action_token: Address,
     fee_token: Address,
-    fee_mode: PublicBroadcasterFeeMode,
+    fee_mode: FeeHandlingMode,
     entered_amount: U256,
     receiver_amount: U256,
     protocol_fee_amount: U256,
@@ -122,29 +121,32 @@ fn public_broadcaster_fee_mode_summary(
                 "Recipient receives the full entered amount; transaction fee is paid separately as {fee_text}."
             );
         }
-        return format!(
-            "Recipient receives the entered amount minus {} RAILGUN protocol fee; transaction fee is paid separately as {fee_text}.",
-            format_exact_token_amount_for_display(
-                chain_id,
-                action_token,
-                protocol_fee_amount,
-                registry
-            )
+        let protocol_text = format_exact_token_amount_for_display(
+            chain_id,
+            action_token,
+            protocol_fee_amount,
+            registry,
         );
+        return match fee_mode {
+            FeeHandlingMode::AddToAmount => format!(
+                "Recipient receives the entered amount; {protocol_text} RAILGUN protocol fee is added to spend. Transaction fee is paid separately as {fee_text}."
+            ),
+            FeeHandlingMode::DeductFromAmount => format!(
+                "Recipient receives the entered amount minus {protocol_text} RAILGUN protocol fee; transaction fee is paid separately as {fee_text}."
+            ),
+        };
     }
     match fee_mode {
-        PublicBroadcasterFeeMode::AddToAmount => {
+        FeeHandlingMode::AddToAmount => {
             if protocol_fee_amount.is_zero() {
                 "Recipient receives the full entered amount; transaction fee is added to spend."
                     .to_string()
             } else {
-                format!(
-                    "Recipient receives the entered amount minus {} RAILGUN protocol fee; transaction fee is added to spend.",
-                    format_exact_candidate_token_amount(broadcaster, protocol_fee_amount)
-                )
+                "Recipient receives the entered amount; transaction fee and RAILGUN protocol fee are added to spend."
+                    .to_string()
             }
         }
-        PublicBroadcasterFeeMode::DeductFromAmount => {
+        FeeHandlingMode::DeductFromAmount => {
             let reduction = entered_amount.saturating_sub(receiver_amount);
             if reduction.is_zero() && protocol_fee_amount.is_zero() {
                 "Recipient receives the entered amount because the transaction fee is zero."
@@ -329,7 +331,7 @@ impl<'a> PublicBroadcasterCostDisplay<'a> {
     }
 
     pub(super) fn fee_mode_summary(&self) -> String {
-        public_broadcaster_fee_mode_summary(
+        fee_handling_mode_summary(
             self.chain_id,
             self.action_token,
             self.fee_token,
@@ -509,10 +511,11 @@ impl WalletRoot {
         let amount_raw = form.amount_input.read(cx).value().to_string();
         let broadcaster_choice = form.broadcaster_choice.clone();
         let fee_token = form.selected_fee_token;
-        let fee_mode = effective_public_broadcaster_fee_mode(
+        let fee_mode = effective_fee_handling_mode(
+            DeliveryFormKind::Send,
             asset.token,
             fee_token,
-            form.broadcaster_fee_mode,
+            form.fee_mode,
         );
         let allow_suspicious_broadcasters = form.allow_suspicious_broadcasters;
         if self.recipient_combobox_search_active(DeliveryFormKind::Send, key) {
@@ -629,10 +632,11 @@ impl WalletRoot {
         let amount_raw = form.amount_input.read(cx).value().to_string();
         let broadcaster_choice = form.broadcaster_choice.clone();
         let fee_token = form.selected_fee_token;
-        let fee_mode = effective_public_broadcaster_fee_mode(
+        let fee_mode = effective_fee_handling_mode(
+            DeliveryFormKind::Unshield,
             asset.token,
             fee_token,
-            form.broadcaster_fee_mode,
+            form.fee_mode,
         );
         let allow_suspicious_broadcasters = form.allow_suspicious_broadcasters;
         if self.recipient_combobox_search_active(DeliveryFormKind::Unshield, key) {

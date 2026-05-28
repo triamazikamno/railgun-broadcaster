@@ -300,7 +300,7 @@ impl WalletRoot {
                 self_broadcast_estimated_native_gas_cost: None,
                 selected_fee_token,
                 broadcaster_choice: BroadcasterChoice::Random,
-                broadcaster_fee_mode: PublicBroadcasterFeeMode::DeductFromAmount,
+                fee_mode: FeeHandlingMode::DeductFromAmount,
                 allow_suspicious_broadcasters: self.default_allow_suspicious_broadcasters,
                 transaction_fee_breakdown_open: true,
                 pending_programmatic_amount_input: None,
@@ -484,7 +484,7 @@ impl WalletRoot {
                 form.asset.token,
                 form.selected_fee_token,
                 form.broadcaster_choice.clone(),
-                form.broadcaster_fee_mode,
+                form.fee_mode,
                 form.allow_suspicious_broadcasters,
                 form.delivery_mode,
             )
@@ -518,10 +518,10 @@ impl WalletRoot {
             } else {
                 BroadcasterChoice::Random
             };
-        let broadcaster_fee_mode = if selected_fee_token == asset.token {
+        let fee_mode = if selected_fee_token == asset.token {
             fee_mode
         } else {
-            PublicBroadcasterFeeMode::AddToAmount
+            FeeHandlingMode::AddToAmount
         };
         let amount = format_send_amount_input(asset.max_batched, asset.decimals);
 
@@ -534,7 +534,7 @@ impl WalletRoot {
         form.asset = asset;
         form.selected_fee_token = selected_fee_token;
         form.broadcaster_choice = broadcaster_choice;
-        form.broadcaster_fee_mode = broadcaster_fee_mode;
+        form.fee_mode = fee_mode;
         form.pending_programmatic_amount_input = Some(amount.clone());
         form.self_broadcast_estimated_native_gas_cost = None;
         form.error = None;
@@ -583,7 +583,7 @@ impl WalletRoot {
                 form.asset.token,
                 form.selected_fee_token,
                 form.broadcaster_choice.clone(),
-                form.broadcaster_fee_mode,
+                form.fee_mode,
                 form.allow_suspicious_broadcasters,
                 form.delivery_mode,
                 form.unwrap,
@@ -624,12 +624,8 @@ impl WalletRoot {
             } else {
                 BroadcasterChoice::Random
             };
-        let broadcaster_fee_mode = if selected_fee_token == asset.token {
-            fee_mode
-        } else {
-            PublicBroadcasterFeeMode::AddToAmount
-        };
-        let amount = format_unshield_amount_input(asset.max_batched, asset.decimals);
+        let max_entered_amount = unshield_max_entered_amount_for_mode(asset.max_batched, fee_mode);
+        let amount = format_unshield_amount_input(max_entered_amount, asset.decimals);
 
         let Some(form) = self.unshield_forms.get_mut(&key) else {
             return;
@@ -641,7 +637,7 @@ impl WalletRoot {
         form.unwrap = unwrap;
         form.selected_fee_token = selected_fee_token;
         form.broadcaster_choice = broadcaster_choice;
-        form.broadcaster_fee_mode = broadcaster_fee_mode;
+        form.fee_mode = fee_mode;
         form.pending_programmatic_amount_input = Some(amount.clone());
         form.self_broadcast_estimated_native_gas_cost = None;
         form.error = None;
@@ -692,9 +688,8 @@ impl WalletRoot {
         if form.generating || form.delivery_mode == mode {
             return;
         }
-        let old_max =
-            send_form_max_entered_amount(form, form.delivery_mode, form.broadcaster_fee_mode);
-        let new_max = send_form_max_entered_amount(form, mode, form.broadcaster_fee_mode);
+        let old_max = send_form_max_entered_amount(form, form.delivery_mode, form.fee_mode);
+        let new_max = send_form_max_entered_amount(form, mode, form.fee_mode);
         let adjusted =
             amount_adjustment_for_max_change(&form.amount_input, &form.asset, old_max, new_max, cx);
         form.delivery_mode = mode;
@@ -782,7 +777,7 @@ impl WalletRoot {
         }
         form.selected_fee_token = fee_token;
         if fee_token != action_token {
-            form.broadcaster_fee_mode = PublicBroadcasterFeeMode::AddToAmount;
+            form.fee_mode = FeeHandlingMode::AddToAmount;
         }
         if reset_specific {
             form.broadcaster_choice = BroadcasterChoice::Random;
@@ -849,10 +844,10 @@ impl WalletRoot {
         }
     }
 
-    pub(in crate::root) fn set_send_broadcaster_fee_mode(
+    pub(in crate::root) fn set_send_fee_mode(
         &mut self,
         key: UnshieldAssetKey,
-        fee_mode: PublicBroadcasterFeeMode,
+        fee_mode: FeeHandlingMode,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -861,16 +856,15 @@ impl WalletRoot {
         };
         if form.generating
             || form.selected_fee_token != form.asset.token
-            || form.broadcaster_fee_mode == fee_mode
+            || form.fee_mode == fee_mode
         {
             return;
         }
-        let old_max =
-            send_form_max_entered_amount(form, form.delivery_mode, form.broadcaster_fee_mode);
+        let old_max = send_form_max_entered_amount(form, form.delivery_mode, form.fee_mode);
         let new_max = send_form_max_entered_amount(form, form.delivery_mode, fee_mode);
         let adjusted =
             amount_adjustment_for_max_change(&form.amount_input, &form.asset, old_max, new_max, cx);
-        form.broadcaster_fee_mode = fee_mode;
+        form.fee_mode = fee_mode;
         form.error = None;
         form.result = None;
         form.estimate_id = 0;
@@ -1344,7 +1338,7 @@ impl WalletRoot {
                 self_broadcast_estimated_native_gas_cost: None,
                 selected_fee_token,
                 broadcaster_choice: BroadcasterChoice::Random,
-                broadcaster_fee_mode: PublicBroadcasterFeeMode::DeductFromAmount,
+                fee_mode: FeeHandlingMode::DeductFromAmount,
                 allow_suspicious_broadcasters: self.default_allow_suspicious_broadcasters,
                 transaction_fee_breakdown_open: true,
                 pending_programmatic_amount_input: None,
@@ -1405,28 +1399,24 @@ impl WalletRoot {
         self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
     }
 
-    pub(in crate::root) fn set_unshield_broadcaster_fee_mode(
+    pub(in crate::root) fn set_unshield_fee_mode(
         &mut self,
         key: UnshieldAssetKey,
-        fee_mode: PublicBroadcasterFeeMode,
+        fee_mode: FeeHandlingMode,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
         let Some(form) = self.unshield_forms.get_mut(&key) else {
             return;
         };
-        if form.generating
-            || form.selected_fee_token != form.asset.token
-            || form.broadcaster_fee_mode == fee_mode
-        {
+        if form.generating || form.fee_mode == fee_mode {
             return;
         }
-        let old_max =
-            unshield_form_max_entered_amount(form, form.delivery_mode, form.broadcaster_fee_mode);
+        let old_max = unshield_form_max_entered_amount(form, form.delivery_mode, form.fee_mode);
         let new_max = unshield_form_max_entered_amount(form, form.delivery_mode, fee_mode);
         let adjusted =
             amount_adjustment_for_max_change(&form.amount_input, &form.asset, old_max, new_max, cx);
-        form.broadcaster_fee_mode = fee_mode;
+        form.fee_mode = fee_mode;
         form.error = None;
         form.result = None;
         form.estimate_id = 0;
@@ -1492,9 +1482,8 @@ impl WalletRoot {
         if form.generating || form.delivery_mode == mode {
             return;
         }
-        let old_max =
-            unshield_form_max_entered_amount(form, form.delivery_mode, form.broadcaster_fee_mode);
-        let new_max = unshield_form_max_entered_amount(form, mode, form.broadcaster_fee_mode);
+        let old_max = unshield_form_max_entered_amount(form, form.delivery_mode, form.fee_mode);
+        let new_max = unshield_form_max_entered_amount(form, mode, form.fee_mode);
         let adjusted =
             amount_adjustment_for_max_change(&form.amount_input, &form.asset, old_max, new_max, cx);
         form.delivery_mode = mode;
@@ -1553,11 +1542,10 @@ impl WalletRoot {
         fee_token: Address,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some((chain_id, action_token, unwrap, current_choice, generating, allow_suspicious)) =
+        let Some((chain_id, unwrap, current_choice, generating, allow_suspicious)) =
             self.unshield_forms.get(&key).map(|form| {
                 (
                     form.asset.chain_id,
-                    form.asset.token,
                     form.unwrap,
                     form.broadcaster_choice.clone(),
                     form.generating,
@@ -1582,9 +1570,6 @@ impl WalletRoot {
             return;
         }
         form.selected_fee_token = fee_token;
-        if fee_token != action_token {
-            form.broadcaster_fee_mode = PublicBroadcasterFeeMode::AddToAmount;
-        }
         if reset_specific {
             form.broadcaster_choice = BroadcasterChoice::Random;
         }

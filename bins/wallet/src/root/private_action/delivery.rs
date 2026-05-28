@@ -64,7 +64,7 @@ pub(in crate::root) fn render_public_broadcaster_settings(
     kind: DeliveryFormKind,
     allow_suspicious_broadcasters: bool,
     action_token: Address,
-    broadcaster_fee_mode: PublicBroadcasterFeeMode,
+    fee_mode: FeeHandlingMode,
     choice: &BroadcasterChoice,
     candidates: Vec<PublicBroadcasterCandidate>,
     fee_token_options: &[PublicBroadcasterFeeTokenOption],
@@ -200,13 +200,15 @@ pub(in crate::root) fn render_public_broadcaster_settings(
                 }),
         )
         .when(
-            should_show_broadcaster_fee_mode_toggle(action_token, selected_fee_token),
+            matches!(kind, DeliveryFormKind::Send)
+                && should_show_fee_mode_toggle(kind, action_token, selected_fee_token),
             |settings| {
-                settings.child(render_broadcaster_fee_mode_toggle(
+                settings.child(render_fee_mode_toggle(
                     fee_mode_root,
                     key,
                     kind,
-                    broadcaster_fee_mode,
+                    DeliveryMode::PublicBroadcaster,
+                    fee_mode,
                     generating,
                 ))
             },
@@ -317,7 +319,7 @@ pub(in crate::root) fn render_self_broadcast_settings(
                                     })
                                     .menu_width(px(380.0))
                                     .when(missing_selection || selected_zero_balance, |this| {
-                                        this.border_color(rgb(theme::WARNING))
+                                        this.border_color(rgb(theme::DANGER))
                                     })
                                     .disabled(generating || accounts.is_empty()),
                             ),

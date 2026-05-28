@@ -35,9 +35,10 @@ pub(super) async fn prepare_desktop_unshield_plan_without_broadcaster_fee(
     } else {
         UnshieldMode::Token
     };
+    let receiver_amount = unshield_receiver_amount_for_fee_mode(request.amount, request.fee_mode)?;
     let unshield_request = RailgunUnshieldRequest {
         token_address: request.token,
-        amount: request.amount,
+        amount: receiver_amount,
         recipient: request.recipient,
         mode,
         verify_proof: request.verify_proof,
@@ -49,7 +50,7 @@ pub(super) async fn prepare_desktop_unshield_plan_without_broadcaster_fee(
         request.progress_tx,
         TransactionGenerationStage::SelectingPrivateNotes,
     );
-    let selection_info = unshield_selection_info(&utxos, request.token, request.amount, false)
+    let selection_info = unshield_selection_info(&utxos, request.token, receiver_amount, false)
         .wrap_err("select POI-verified unshield notes")?;
 
     let mut grant = request
@@ -544,6 +545,7 @@ pub async fn prepare_desktop_unshield_calldata(
             vault_password: request.vault_password.as_str(),
             token: request.token,
             amount: request.amount,
+            fee_mode: request.fee_mode,
             recipient: request.recipient,
             unwrap: request.unwrap,
             verify_proof: request.verify_proof,
@@ -673,19 +675,27 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
     let same_token_fee = request.fee_token == request.token;
     let initial_fee_amount =
         initial_public_broadcaster_fee_amount(&broadcaster, min_gas_price, same_token_fee, || {
+            let seed_split = public_broadcaster_amount_split_for_tokens_and_protocol(
+                request.amount,
+                U256::ZERO,
+                request.fee_mode,
+                same_token_fee,
+                RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+            )?;
             let selection = unshield_selection_info_with_separate_broadcaster_fee_seed(
                 &utxos,
                 request.token,
                 request.fee_token,
-                request.amount,
+                seed_split.receiver_amount,
                 false,
             )
             .map_err(|error| {
                 public_broadcaster_build_error(
                     error,
                     U256::ZERO,
-                    PublicBroadcasterFeeMode::AddToAmount,
+                    seed_split.fee_mode,
                     same_token_fee,
+                    RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
                 )
             })?;
             Ok(unshield_approximate_shape(
@@ -719,6 +729,7 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
                     split.fee_amount,
                     split.fee_mode,
                     same_token_fee,
+                    RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
                 )
             })?;
             Ok(unshield_approximate_shape(
@@ -778,8 +789,9 @@ pub async fn estimate_desktop_send_public_broadcaster_cost(
                 public_broadcaster_build_error(
                     error,
                     U256::ZERO,
-                    PublicBroadcasterFeeMode::AddToAmount,
+                    FeeHandlingMode::AddToAmount,
                     same_token_fee,
+                    U256::ZERO,
                 )
             })?;
             Ok(send_approximate_shape(&selection, selection.max_spendable))
@@ -809,6 +821,7 @@ pub async fn estimate_desktop_send_public_broadcaster_cost(
                     split.fee_amount,
                     split.fee_mode,
                     same_token_fee,
+                    U256::ZERO,
                 )
             })?;
             Ok(send_approximate_shape(&selection, selection.max_spendable))
@@ -916,6 +929,7 @@ pub async fn submit_desktop_unshield_self_broadcast(
             vault_password: request.vault_password.as_str(),
             token: request.token,
             amount: request.amount,
+            fee_mode: request.fee_mode,
             recipient: request.recipient,
             unwrap: request.unwrap,
             verify_proof: request.verify_proof,

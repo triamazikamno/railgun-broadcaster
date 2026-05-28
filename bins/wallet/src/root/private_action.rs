@@ -32,9 +32,9 @@ use wallet_ops::{
     BroadcasterFeePolicy, DesktopSelfBroadcastResult, DesktopSendCalldataRequest,
     DesktopSendPublicBroadcasterRequest, DesktopSendSelfBroadcastRequest,
     DesktopUnshieldCalldataRequest, DesktopUnshieldPublicBroadcasterRequest,
-    DesktopUnshieldSelfBroadcastRequest, ListUtxosOutput, PreparedSendCall, PreparedUnshieldCall,
-    PublicAssetId, PublicBalanceAmount, PublicBalanceEntry, PublicBalanceSnapshot,
-    PublicBroadcasterCandidate, PublicBroadcasterCostEstimate, PublicBroadcasterFeeMode,
+    DesktopUnshieldSelfBroadcastRequest, FeeHandlingMode, ListUtxosOutput, PreparedSendCall,
+    PreparedUnshieldCall, PublicAssetId, PublicBalanceAmount, PublicBalanceEntry,
+    PublicBalanceSnapshot, PublicBroadcasterCandidate, PublicBroadcasterCostEstimate,
     PublicBroadcasterResultKind, PublicBroadcasterSubmissionResult, SelfBroadcastGasFeeQuote,
     SelfBroadcastGasFeeSelection, SelfBroadcastSessionEvent, TokenAnchorRateCache,
     TransactionGenerationStage, WalletSession, fee_policy_eligible_public_broadcasters,
@@ -86,14 +86,14 @@ use super::spend_authorization::{
 use super::utxo::short_hash;
 use super::{
     ChainUtxoState, PRIVATE_ACTION_FORM_MAX_HEIGHT, PRIVATE_ASSET_LIST_WIDTH,
-    PublicBroadcasterFeeTokenOption, WalletRoot, effective_public_broadcaster_fee_mode,
+    PublicBroadcasterFeeTokenOption, WalletRoot, effective_fee_handling_mode,
     format_exact_token_amount_for_display, format_report_chain, format_send_amount_input,
     format_unshield_amount_input, is_effective_wrapped_native_token, labeled_field,
     native_token_display_label, native_wrapped_output_labels, new_prefilled_input, new_text_input,
     parse_address, public_balance_amount_label, public_broadcaster_fee_token_warning,
     public_broadcaster_submit_disabled_for_fee_token_options, secondary_dialog_content_width,
-    send_form_max_entered_amount, should_show_broadcaster_fee_mode_toggle, token_label_row,
-    unshield_form_max_entered_amount, vault_error_kind,
+    send_form_max_entered_amount, should_show_fee_mode_toggle, token_label_row,
+    unshield_form_max_entered_amount, unshield_max_entered_amount_for_mode, vault_error_kind,
 };
 
 mod delivery;

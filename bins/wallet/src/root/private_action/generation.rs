@@ -54,10 +54,11 @@ impl WalletRoot {
         } else {
             None
         };
-        let broadcaster_fee_mode = effective_public_broadcaster_fee_mode(
+        let fee_mode = effective_fee_handling_mode(
+            DeliveryFormKind::Send,
             asset.token,
             fee_token,
-            form.broadcaster_fee_mode,
+            form.fee_mode,
         );
         let allow_suspicious_broadcasters = form.allow_suspicious_broadcasters;
 
@@ -170,7 +171,7 @@ impl WalletRoot {
             fee_token,
             self_broadcast_gas_fee,
             self_broadcast_initial_gas_fee,
-            broadcaster_fee_mode,
+            fee_mode,
             view_session,
             vault_store,
             session,
@@ -201,7 +202,7 @@ impl WalletRoot {
             fee_token,
             self_broadcast_gas_fee,
             self_broadcast_initial_gas_fee,
-            broadcaster_fee_mode,
+            fee_mode,
             view_session,
             vault_store,
             session,
@@ -316,7 +317,7 @@ impl WalletRoot {
                         &broadcaster_choice,
                         cost_estimate.as_ref(),
                     ),
-                    fee_mode: broadcaster_fee_mode,
+                    fee_mode,
                     fee_policy,
                     anchor_cache: Some(Arc::clone(&self.public_broadcaster_anchor_cache)),
                     waku,
@@ -578,10 +579,11 @@ impl WalletRoot {
         } else {
             None
         };
-        let broadcaster_fee_mode = effective_public_broadcaster_fee_mode(
+        let fee_mode = effective_fee_handling_mode(
+            DeliveryFormKind::Unshield,
             asset.token,
             fee_token,
-            form.broadcaster_fee_mode,
+            form.fee_mode,
         );
         let allow_suspicious_broadcasters = form.allow_suspicious_broadcasters;
 
@@ -629,12 +631,14 @@ impl WalletRoot {
                 return None;
             }
         };
-        if amount > asset.max_batched {
+        let max_entered_amount = unshield_form_max_entered_amount(form, delivery_mode, fee_mode)
+            .unwrap_or(asset.max_batched);
+        if amount > max_entered_amount {
             self.set_unshield_form_error(
                 key,
                 format!(
                     "Amount exceeds max POI-verified batched transaction: {}",
-                    format_unshield_amount_input(asset.max_batched, asset.decimals)
+                    format_unshield_amount_input(max_entered_amount, asset.decimals)
                 ),
                 cx,
             );
@@ -702,7 +706,7 @@ impl WalletRoot {
             fee_token,
             self_broadcast_gas_fee,
             self_broadcast_initial_gas_fee,
-            broadcaster_fee_mode,
+            fee_mode,
             view_session,
             vault_store,
             session,
@@ -734,7 +738,7 @@ impl WalletRoot {
             fee_token,
             self_broadcast_gas_fee,
             self_broadcast_initial_gas_fee,
-            broadcaster_fee_mode,
+            fee_mode,
             view_session,
             vault_store,
             session,
@@ -821,6 +825,7 @@ impl WalletRoot {
                     token,
                     fee_token,
                     amount,
+                    fee_mode,
                     recipient,
                     unwrap,
                     verify_proof: true,
@@ -851,7 +856,7 @@ impl WalletRoot {
                         &broadcaster_choice,
                         cost_estimate.as_ref(),
                     ),
-                    fee_mode: broadcaster_fee_mode,
+                    fee_mode,
                     fee_policy,
                     anchor_cache: Some(Arc::clone(&self.public_broadcaster_anchor_cache)),
                     waku,
@@ -878,6 +883,7 @@ impl WalletRoot {
                     token,
                     fee_token,
                     amount,
+                    fee_mode,
                     recipient,
                     unwrap,
                     verify_proof: true,

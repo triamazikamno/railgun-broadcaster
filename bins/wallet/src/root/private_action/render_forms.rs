@@ -6,12 +6,13 @@ use super::{
     private_action_input, private_broadcaster_closed_active_progress,
     public_broadcaster_cost_status, public_broadcaster_fee_token_warning,
     public_broadcaster_submit_disabled_for_fee_token_options, px, render_delivery_selector,
-    render_private_action_metrics, render_private_broadcaster_status_notice,
-    render_private_self_broadcast_status_notice, render_private_submission_active_status_notice,
-    render_public_broadcaster_cost_estimate, render_public_broadcaster_cost_status,
-    render_public_broadcaster_settings, render_recipient_picker, render_self_broadcast_settings,
-    render_send_result, render_unshield_generating_status, render_unshield_output_toggle,
-    render_unshield_result, selected_broadcaster_fee_warning, send_element_id,
+    render_fee_mode_toggle, render_private_action_metrics,
+    render_private_broadcaster_status_notice, render_private_self_broadcast_status_notice,
+    render_private_submission_active_status_notice, render_public_broadcaster_cost_estimate,
+    render_public_broadcaster_cost_status, render_public_broadcaster_settings,
+    render_recipient_picker, render_self_broadcast_settings, render_send_result,
+    render_unshield_generating_status, render_unshield_output_toggle, render_unshield_result,
+    selected_broadcaster_fee_warning, send_element_id,
     should_render_public_broadcaster_cost_preview, unshield_element_id,
 };
 
@@ -116,7 +117,7 @@ impl WalletRoot {
                 DeliveryFormKind::Send,
                 form.allow_suspicious_broadcasters,
                 asset.token,
-                form.broadcaster_fee_mode,
+                form.fee_mode,
                 &form.broadcaster_choice,
                 visible_candidates,
                 &fee_token_options,
@@ -342,6 +343,7 @@ impl WalletRoot {
             "Raw base units for this unknown token".to_string()
         };
         let delivery_root = root.clone();
+        let fee_mode_root = root.clone();
         let metrics_root = root.clone();
         let chooser_root = root.clone();
         let output_root = root.clone();
@@ -431,7 +433,7 @@ impl WalletRoot {
                 DeliveryFormKind::Unshield,
                 form.allow_suspicious_broadcasters,
                 asset.token,
-                form.broadcaster_fee_mode,
+                form.fee_mode,
                 &form.broadcaster_choice,
                 visible_candidates,
                 &fee_token_options,
@@ -469,6 +471,15 @@ impl WalletRoot {
                 form.generating,
             ));
         }
+
+        card = card.child(render_fee_mode_toggle(
+            fee_mode_root,
+            key,
+            DeliveryFormKind::Unshield,
+            form.delivery_mode,
+            form.fee_mode,
+            form.generating,
+        ));
 
         card = card
             .child(

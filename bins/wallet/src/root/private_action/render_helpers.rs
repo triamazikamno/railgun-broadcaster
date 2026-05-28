@@ -181,20 +181,35 @@ pub(in crate::root) fn broadcaster_count_label(count: usize) -> String {
     }
 }
 
-pub(in crate::root) fn render_broadcaster_fee_mode_toggle(
+pub(in crate::root) fn render_fee_mode_toggle(
     root: Entity<WalletRoot>,
     key: UnshieldAssetKey,
     kind: DeliveryFormKind,
-    mode: PublicBroadcasterFeeMode,
+    delivery_mode: DeliveryMode,
+    mode: FeeHandlingMode,
     generating: bool,
 ) -> gpui::Div {
     let selector_root = root;
+    let (deduct_tooltip, add_tooltip) = match (kind, delivery_mode) {
+        (DeliveryFormKind::Send, _) => (
+            "Use the entered amount as the token spend. Recipient receives less after the broadcaster fee.",
+            "Recipient receives the entered amount. The wallet adds the broadcaster fee on top.",
+        ),
+        (DeliveryFormKind::Unshield, DeliveryMode::PublicBroadcaster) => (
+            "Use the entered amount as the token spend. Recipient receives less after the RAILGUN fee, and after broadcaster fee if paid in this token.",
+            "Recipient receives the entered amount. The wallet adds the RAILGUN fee, and broadcaster fee if paid in this token.",
+        ),
+        (DeliveryFormKind::Unshield, _) => (
+            "Use the entered amount as the token spend. Recipient receives less after the RAILGUN fee.",
+            "Recipient receives the entered amount. The wallet adds the RAILGUN fee on top.",
+        ),
+    };
     div()
         .flex()
         .items_center()
         .justify_between()
         .gap_3()
-        .child(div().min_w(px(0.0)).child(app_muted_text("Transaction fee")))
+        .child(div().min_w(px(0.0)).child(app_muted_text("Fees")))
         .child(
             div().flex_none().child(
                 ButtonGroup::new(delivery_element_id(key, kind, "fee-mode-toggle"))
@@ -204,32 +219,32 @@ pub(in crate::root) fn render_broadcaster_fee_mode_toggle(
                     .child(fee_mode_segment_button(
                         delivery_element_id(key, kind, "fee-mode-deduct"),
                         delivery_element_id(key, kind, "fee-mode-deduct-info"),
-                        "Deduct fee from amount",
-                        "Recipient receives the entered amount minus the transaction fee.",
-                        mode == PublicBroadcasterFeeMode::DeductFromAmount,
+                        "Deduct",
+                        deduct_tooltip,
+                        mode == FeeHandlingMode::DeductFromAmount,
                     ))
                     .child(fee_mode_segment_button(
                         delivery_element_id(key, kind, "fee-mode-add"),
                         delivery_element_id(key, kind, "fee-mode-add-info"),
-                        "Add fee on top",
-                        "Recipient receives the full entered amount; transaction fee is added to spend.",
-                        mode == PublicBroadcasterFeeMode::AddToAmount,
+                        "Add on top",
+                        add_tooltip,
+                        mode == FeeHandlingMode::AddToAmount,
                     ))
                     .on_click(move |selected, window, cx| {
                         let Some(index) = selected.first() else {
                             return;
                         };
                         let mode = if *index == 0 {
-                            PublicBroadcasterFeeMode::DeductFromAmount
+                            FeeHandlingMode::DeductFromAmount
                         } else {
-                            PublicBroadcasterFeeMode::AddToAmount
+                            FeeHandlingMode::AddToAmount
                         };
                         selector_root.update(cx, |root, cx| match kind {
                             DeliveryFormKind::Send => {
-                                root.set_send_broadcaster_fee_mode(key, mode, window, cx);
+                                root.set_send_fee_mode(key, mode, window, cx);
                             }
                             DeliveryFormKind::Unshield => {
-                                root.set_unshield_broadcaster_fee_mode(key, mode, window, cx);
+                                root.set_unshield_fee_mode(key, mode, window, cx);
                             }
                         });
                     }),

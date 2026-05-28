@@ -51,19 +51,27 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
     );
     let seeded_fee_amount =
         initial_public_broadcaster_fee_amount(&broadcaster, min_gas_price, same_token_fee, || {
+            let seed_split = public_broadcaster_amount_split_for_tokens_and_protocol(
+                request.amount,
+                U256::ZERO,
+                request.fee_mode,
+                same_token_fee,
+                RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+            )?;
             let selection = unshield_selection_info_with_separate_broadcaster_fee_seed(
                 &utxos,
                 request.token,
                 request.fee_token,
-                request.amount,
+                seed_split.receiver_amount,
                 false,
             )
             .map_err(|error| {
                 public_broadcaster_build_error(
                     error,
                     U256::ZERO,
-                    PublicBroadcasterFeeMode::AddToAmount,
+                    seed_split.fee_mode,
                     same_token_fee,
+                    RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
                 )
             })?;
             Ok(unshield_approximate_shape(
@@ -96,6 +104,7 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
                     split.fee_amount,
                     split.fee_mode,
                     same_token_fee,
+                    RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
                 )
             })?;
             Ok(unshield_approximate_shape(
@@ -156,11 +165,12 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
 
     let mut fee_amount = initial_fee_amount;
     for attempt in 1..=PUBLIC_BROADCASTER_FEE_ATTEMPTS {
-        let split = public_broadcaster_amount_split_for_tokens(
+        let split = public_broadcaster_amount_split_for_tokens_and_protocol(
             request.amount,
             fee_amount,
             request.fee_mode,
             same_token_fee,
+            RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
         )?;
         let unshield_request = RailgunUnshieldRequest {
             token_address: request.token,
@@ -192,7 +202,13 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
             )
             .await
             .map_err(|error| {
-                public_broadcaster_build_error(error, fee_amount, split.fee_mode, same_token_fee)
+                public_broadcaster_build_error(
+                    error,
+                    fee_amount,
+                    split.fee_mode,
+                    same_token_fee,
+                    RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+                )
             })
             .wrap_err("build public broadcaster unshield proof")?;
         tracing::info!(
@@ -386,8 +402,9 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
                 public_broadcaster_build_error(
                     error,
                     U256::ZERO,
-                    PublicBroadcasterFeeMode::AddToAmount,
+                    FeeHandlingMode::AddToAmount,
                     same_token_fee,
+                    U256::ZERO,
                 )
             })?;
             Ok(send_approximate_shape(&selection, selection.max_spendable))
@@ -416,6 +433,7 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
                     split.fee_amount,
                     split.fee_mode,
                     same_token_fee,
+                    U256::ZERO,
                 )
             })?;
             Ok(send_approximate_shape(&selection, selection.max_spendable))
@@ -502,7 +520,13 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
             )
             .await
             .map_err(|error| {
-                public_broadcaster_build_error(error, fee_amount, split.fee_mode, same_token_fee)
+                public_broadcaster_build_error(
+                    error,
+                    fee_amount,
+                    split.fee_mode,
+                    same_token_fee,
+                    U256::ZERO,
+                )
             })
             .wrap_err("build public broadcaster send proof")?;
         let chunk_input_counts = plan
@@ -813,7 +837,7 @@ pub(super) async fn submit_public_broadcaster_plan(
     fee_amount: U256,
     protocol_fee_amount: U256,
     protocol_fee_bps: U256,
-    fee_mode: PublicBroadcasterFeeMode,
+    fee_mode: FeeHandlingMode,
     gas_limit: u64,
     min_gas_price: u128,
     progress_tx: Option<TransactionGenerationProgressSender>,

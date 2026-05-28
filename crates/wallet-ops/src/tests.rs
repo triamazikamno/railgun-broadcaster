@@ -32,24 +32,26 @@ use super::signer::{EvmMessageSigner, EvmTransactionSigner, SoftwareEvmSigner};
 use super::{
     ApproximateTransactionShape, BlockedShieldRescueUtxoId, BroadcasterFeePolicy,
     BroadcasterFeePolicyStatus, DesktopWalletChainStart, DesktopWalletSyncStartPolicy,
-    ListUtxosOutput, PublicBroadcasterCandidate, PublicBroadcasterFeeMargin,
-    PublicBroadcasterFeeMode, PublicBroadcasterResultKind, PublicBroadcasterSelection,
-    RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS, SelfBroadcastFeeSample, SelfBroadcastGasFeeQuote,
-    SelfBroadcastGasFeeSelection, SelfBroadcastTipFallback, TokenTotal, UtxoOutput,
-    WalletPendingOverlay, WalletPendingSpent, apply_pending_overlay_to_outputs,
-    approximate_public_broadcaster_cost, approximate_public_broadcaster_gas,
-    broadcaster_fee_amount, broadcaster_fee_covers, buffered_public_broadcaster_fee,
-    decode_public_broadcaster_response, eligible_public_broadcasters,
-    fee_policy_eligible_public_broadcasters, fixed_token_anchor_rate,
+    FeeHandlingMode, ListUtxosOutput, PublicBroadcasterCandidate, PublicBroadcasterFeeMargin,
+    PublicBroadcasterResultKind, PublicBroadcasterSelection, RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+    SelfBroadcastFeeSample, SelfBroadcastGasFeeQuote, SelfBroadcastGasFeeSelection,
+    SelfBroadcastTipFallback, TokenTotal, UtxoOutput, WalletPendingOverlay, WalletPendingSpent,
+    apply_pending_overlay_to_outputs, approximate_public_broadcaster_cost,
+    approximate_public_broadcaster_gas, broadcaster_fee_amount, broadcaster_fee_covers,
+    buffered_public_broadcaster_fee, decode_public_broadcaster_response,
+    eligible_public_broadcasters, fee_policy_eligible_public_broadcasters, fixed_token_anchor_rate,
     initial_separate_token_public_broadcaster_fee, is_self_broadcast_insufficient_native_gas_error,
     is_self_broadcast_tx_already_known_message, is_wrapped_native_token,
     max_broadcaster_fee_token_amount_from_outputs, max_send_amount_from_outputs,
     max_unshield_amount_from_outputs, parse_railgun_recipient, parse_send_amount,
     parse_submitted_tx_hash, parse_unshield_amount, public_broadcaster_amount_split,
-    public_broadcaster_amount_split_for_tokens, public_broadcaster_anchor_rate_for_policy,
-    public_broadcaster_build_error, public_broadcaster_candidates,
-    public_broadcaster_fee_breakdown, public_broadcaster_gas_limit_with_buffer,
-    public_broadcaster_max_entered_amount, public_broadcaster_max_entered_amount_for_tokens,
+    public_broadcaster_amount_split_for_tokens,
+    public_broadcaster_amount_split_for_tokens_and_protocol,
+    public_broadcaster_anchor_rate_for_policy, public_broadcaster_build_error,
+    public_broadcaster_candidates, public_broadcaster_fee_breakdown,
+    public_broadcaster_gas_limit_with_buffer, public_broadcaster_max_entered_amount,
+    public_broadcaster_max_entered_amount_for_tokens,
+    public_broadcaster_max_entered_amount_for_tokens_and_protocol,
     public_broadcaster_republish_loop, public_broadcaster_transact_params,
     resolve_desktop_wallet_chain_start, resolve_self_broadcast_gas_fee, select_public_broadcaster,
     select_public_broadcaster_with_policy, self_broadcast_gas_limit_with_buffer,
@@ -2329,6 +2331,117 @@ fn railgun_protocol_fee_uses_hardcoded_unshield_bps() {
 }
 
 #[test]
+fn unshield_fee_handling_handles_protocol_fee_for_same_and_different_fee_tokens() {
+    let entered = uint!(1_000_000_U256);
+    let broadcaster_fee = uint!(400_U256);
+    let gross = super::railgun_protocol_gross_amount_for_recipient(
+        entered,
+        RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+    )
+    .expect("gross protocol amount");
+    let protocol_fee = super::railgun_protocol_fee_amount(gross, RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS);
+
+    assert_eq!(gross, uint!(1_002_506_U256));
+    assert_eq!(gross - protocol_fee, entered);
+    assert_eq!(
+        super::unshield_receiver_amount_for_fee_mode(entered, FeeHandlingMode::DeductFromAmount)
+            .expect("deduct unshield receiver amount"),
+        entered
+    );
+    assert_eq!(
+        super::unshield_receiver_amount_for_fee_mode(entered, FeeHandlingMode::AddToAmount)
+            .expect("add unshield receiver amount"),
+        gross
+    );
+
+    let same_token_add = public_broadcaster_amount_split_for_tokens_and_protocol(
+        entered,
+        broadcaster_fee,
+        FeeHandlingMode::AddToAmount,
+        true,
+        RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+    )
+    .expect("same-token add split");
+    assert_eq!(same_token_add.receiver_amount, gross);
+    assert_eq!(same_token_add.total_private_spend, gross + broadcaster_fee);
+    assert_eq!(same_token_add.fee_mode, FeeHandlingMode::AddToAmount);
+
+    let same_token_deduct = public_broadcaster_amount_split_for_tokens_and_protocol(
+        entered,
+        broadcaster_fee,
+        FeeHandlingMode::DeductFromAmount,
+        true,
+        RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+    )
+    .expect("same-token deduct split");
+    assert_eq!(same_token_deduct.receiver_amount, entered - broadcaster_fee);
+    assert_eq!(same_token_deduct.total_private_spend, entered);
+    assert_eq!(
+        same_token_deduct.fee_mode,
+        FeeHandlingMode::DeductFromAmount
+    );
+
+    let different_token_add = public_broadcaster_amount_split_for_tokens_and_protocol(
+        entered,
+        broadcaster_fee,
+        FeeHandlingMode::AddToAmount,
+        false,
+        RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+    )
+    .expect("different-token add split");
+    assert_eq!(different_token_add.receiver_amount, gross);
+    assert_eq!(different_token_add.total_private_spend, gross);
+    assert_eq!(different_token_add.fee_mode, FeeHandlingMode::AddToAmount);
+
+    let different_token_deduct = public_broadcaster_amount_split_for_tokens_and_protocol(
+        entered,
+        broadcaster_fee,
+        FeeHandlingMode::DeductFromAmount,
+        false,
+        RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+    )
+    .expect("different-token deduct split");
+    assert_eq!(different_token_deduct.receiver_amount, entered);
+    assert_eq!(different_token_deduct.total_private_spend, entered);
+    assert_eq!(
+        different_token_deduct.fee_mode,
+        FeeHandlingMode::DeductFromAmount
+    );
+
+    let max_receiver = uint!(2_000_000_U256);
+    assert_eq!(
+        public_broadcaster_max_entered_amount_for_tokens_and_protocol(
+            max_receiver,
+            broadcaster_fee,
+            FeeHandlingMode::AddToAmount,
+            true,
+            RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+        ),
+        uint!(1_995_000_U256)
+    );
+    assert_eq!(
+        public_broadcaster_max_entered_amount_for_tokens_and_protocol(
+            max_receiver,
+            broadcaster_fee,
+            FeeHandlingMode::DeductFromAmount,
+            true,
+            RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+        ),
+        max_receiver + broadcaster_fee
+    );
+    assert_eq!(
+        public_broadcaster_max_entered_amount_for_tokens_and_protocol(
+            max_receiver,
+            broadcaster_fee,
+            FeeHandlingMode::DeductFromAmount,
+            false,
+            RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+        ),
+        max_receiver
+    );
+}
+
+#[test]
 fn public_broadcaster_fee_stabilization_accepts_covering_fee() {
     let required = uint!(1_000_U256);
 
@@ -2350,46 +2463,58 @@ fn public_broadcaster_fee_stabilization_buffers_retries() {
 }
 
 #[test]
-fn public_broadcaster_fee_mode_deducts_or_adds_fee() {
+fn fee_handling_mode_deducts_or_adds_fee() {
     let entered = uint!(100_U256);
     let fee = uint!(7_U256);
 
-    let deducted =
-        public_broadcaster_amount_split(entered, fee, PublicBroadcasterFeeMode::DeductFromAmount)
-            .expect("deduct split");
+    let deducted = public_broadcaster_amount_split(entered, fee, FeeHandlingMode::DeductFromAmount)
+        .expect("deduct split");
     assert_eq!(deducted.receiver_amount, uint!(93_U256));
     assert_eq!(deducted.total_private_spend, entered);
 
-    let added =
-        public_broadcaster_amount_split(entered, fee, PublicBroadcasterFeeMode::AddToAmount)
-            .expect("add split");
+    let added = public_broadcaster_amount_split(entered, fee, FeeHandlingMode::AddToAmount)
+        .expect("add split");
     assert_eq!(added.receiver_amount, entered);
     assert_eq!(added.total_private_spend, uint!(107_U256));
 }
 
 #[test]
-fn different_token_public_broadcaster_fee_mode_is_separate_add_on() {
+fn different_token_fee_handling_preserves_selected_mode() {
     let entered = uint!(100_U256);
     let fee = uint!(7_U256);
 
-    let split = public_broadcaster_amount_split_for_tokens(
+    let deducted = public_broadcaster_amount_split_for_tokens(
         entered,
         fee,
-        PublicBroadcasterFeeMode::DeductFromAmount,
+        FeeHandlingMode::DeductFromAmount,
         false,
     )
     .expect("different-token split");
 
-    assert_eq!(split.entered_amount, entered);
-    assert_eq!(split.receiver_amount, entered);
-    assert_eq!(split.total_private_spend, entered);
-    assert_eq!(split.fee_amount, fee);
-    assert_eq!(split.fee_mode, PublicBroadcasterFeeMode::AddToAmount);
+    assert_eq!(deducted.entered_amount, entered);
+    assert_eq!(deducted.receiver_amount, entered);
+    assert_eq!(deducted.total_private_spend, entered);
+    assert_eq!(deducted.fee_amount, fee);
+    assert_eq!(deducted.fee_mode, FeeHandlingMode::DeductFromAmount);
+
+    let added = public_broadcaster_amount_split_for_tokens(
+        entered,
+        fee,
+        FeeHandlingMode::AddToAmount,
+        false,
+    )
+    .expect("different-token add split");
+
+    assert_eq!(added.entered_amount, entered);
+    assert_eq!(added.receiver_amount, entered);
+    assert_eq!(added.total_private_spend, entered);
+    assert_eq!(added.fee_amount, fee);
+    assert_eq!(added.fee_mode, FeeHandlingMode::AddToAmount);
     assert_eq!(
         public_broadcaster_max_entered_amount_for_tokens(
             uint!(123_U256),
             fee,
-            PublicBroadcasterFeeMode::DeductFromAmount,
+            FeeHandlingMode::DeductFromAmount,
             false,
         ),
         uint!(123_U256)
@@ -2401,8 +2526,9 @@ fn public_broadcaster_build_error_distinguishes_fee_token_balance() {
     let report = public_broadcaster_build_error(
         BuildError::InsufficientFeeTokenBalance(uint!(123_U256)),
         uint!(7_U256),
-        PublicBroadcasterFeeMode::AddToAmount,
+        FeeHandlingMode::AddToAmount,
         false,
+        U256::ZERO,
     );
 
     assert_eq!(
@@ -2412,19 +2538,19 @@ fn public_broadcaster_build_error_distinguishes_fee_token_balance() {
 }
 
 #[test]
-fn public_broadcaster_fee_mode_rejects_deducting_full_amount() {
+fn fee_handling_mode_rejects_deducting_full_amount() {
     assert!(
         public_broadcaster_amount_split(
             uint!(7_U256),
             uint!(7_U256),
-            PublicBroadcasterFeeMode::DeductFromAmount,
+            FeeHandlingMode::DeductFromAmount,
         )
         .is_err()
     );
 }
 
 #[test]
-fn public_broadcaster_max_entered_amount_depends_on_fee_mode() {
+fn public_broadcaster_max_entered_amount_depends_on_fee_handling() {
     let max_receiver_amount = uint!(100_U256);
     let fee = uint!(7_U256);
 
@@ -2432,7 +2558,7 @@ fn public_broadcaster_max_entered_amount_depends_on_fee_mode() {
         public_broadcaster_max_entered_amount(
             max_receiver_amount,
             fee,
-            PublicBroadcasterFeeMode::DeductFromAmount,
+            FeeHandlingMode::DeductFromAmount,
         ),
         uint!(107_U256)
     );
@@ -2440,14 +2566,14 @@ fn public_broadcaster_max_entered_amount_depends_on_fee_mode() {
         public_broadcaster_max_entered_amount(
             max_receiver_amount,
             fee,
-            PublicBroadcasterFeeMode::AddToAmount,
+            FeeHandlingMode::AddToAmount,
         ),
         max_receiver_amount
     );
 }
 
 #[test]
-fn public_broadcaster_estimate_preserves_fee_mode_amount_split() {
+fn public_broadcaster_estimate_preserves_fee_handling_amount_split() {
     let token = address(0x25);
     let broadcaster = eligible_public_broadcasters(
         &[fee_row(
@@ -2473,7 +2599,7 @@ fn public_broadcaster_estimate_preserves_fee_mode_amount_split() {
         token,
         token,
         entered,
-        PublicBroadcasterFeeMode::DeductFromAmount,
+        FeeHandlingMode::DeductFromAmount,
         U256::ZERO,
         100,
         U256::ZERO,
@@ -2488,17 +2614,14 @@ fn public_broadcaster_estimate_preserves_fee_mode_amount_split() {
     assert_eq!(deducted.receiver_amount + deducted.fee_amount, entered);
     assert_eq!(deducted.protocol_fee_amount, U256::ZERO);
     assert_eq!(deducted.recipient_amount, deducted.receiver_amount);
-    assert_eq!(
-        deducted.fee_mode,
-        PublicBroadcasterFeeMode::DeductFromAmount
-    );
+    assert_eq!(deducted.fee_mode, FeeHandlingMode::DeductFromAmount);
 
     let added = approximate_public_broadcaster_cost(
         broadcaster,
         token,
         token,
         entered,
-        PublicBroadcasterFeeMode::AddToAmount,
+        FeeHandlingMode::AddToAmount,
         U256::ZERO,
         100,
         U256::ZERO,
@@ -2513,7 +2636,7 @@ fn public_broadcaster_estimate_preserves_fee_mode_amount_split() {
     assert_eq!(added.total_private_spend, entered + added.fee_amount);
     assert_eq!(added.protocol_fee_amount, U256::ZERO);
     assert_eq!(added.recipient_amount, added.receiver_amount);
-    assert_eq!(added.fee_mode, PublicBroadcasterFeeMode::AddToAmount);
+    assert_eq!(added.fee_mode, FeeHandlingMode::AddToAmount);
 }
 
 #[test]
@@ -2556,7 +2679,7 @@ fn public_broadcaster_estimate_reports_separate_fee_token_amounts() {
         action_token,
         fee_token,
         entered,
-        PublicBroadcasterFeeMode::DeductFromAmount,
+        FeeHandlingMode::DeductFromAmount,
         U256::ZERO,
         100,
         initial_fee_amount,
@@ -2574,7 +2697,7 @@ fn public_broadcaster_estimate_reports_separate_fee_token_amounts() {
     assert_eq!(estimate.receiver_amount, entered);
     assert_eq!(estimate.total_private_spend, entered);
     assert_eq!(estimate.recipient_amount, entered);
-    assert_eq!(estimate.fee_mode, PublicBroadcasterFeeMode::AddToAmount);
+    assert_eq!(estimate.fee_mode, FeeHandlingMode::DeductFromAmount);
     assert_eq!(estimate.max_receiver_amount, max_receiver);
     assert_eq!(estimate.max_entered_amount, max_receiver);
     assert_eq!(estimate.transaction_count, 2);
@@ -2610,7 +2733,7 @@ fn public_broadcaster_unshield_estimate_includes_protocol_fee() {
         token,
         token,
         entered,
-        PublicBroadcasterFeeMode::AddToAmount,
+        FeeHandlingMode::AddToAmount,
         RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
         100,
         U256::ZERO,
@@ -2627,10 +2750,12 @@ fn public_broadcaster_unshield_estimate_includes_protocol_fee() {
 
     let expected_fee = estimate.receiver_amount * uint!(25_U256) / uint!(10_000_U256);
     assert_eq!(estimate.protocol_fee_bps, RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS);
+    assert_eq!(estimate.receiver_amount, uint!(1_002_506_U256));
     assert_eq!(estimate.protocol_fee_amount, expected_fee);
+    assert_eq!(estimate.recipient_amount, entered);
     assert_eq!(
-        estimate.recipient_amount,
-        estimate.receiver_amount - expected_fee
+        estimate.total_private_spend,
+        estimate.receiver_amount + estimate.fee_amount
     );
 }
 

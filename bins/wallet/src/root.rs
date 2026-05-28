@@ -80,10 +80,10 @@ use public_balances::{
 };
 use public_broadcaster::{
     PublicBroadcasterFeeTokenOption, broadcaster_candidate_anchor_rate,
-    effective_public_broadcaster_fee_mode, ethereum_weth_public_broadcaster_count,
+    effective_fee_handling_mode, ethereum_weth_public_broadcaster_count,
     public_broadcaster_fee_token_warning, public_broadcaster_submit_disabled_for_fee_token_options,
-    send_form_max_entered_amount, should_show_broadcaster_fee_mode_toggle,
-    should_show_distinct_amount, unshield_form_max_entered_amount,
+    send_form_max_entered_amount, should_show_distinct_amount, should_show_fee_mode_toggle,
+    unshield_form_max_entered_amount, unshield_max_entered_amount_for_mode,
 };
 use settings::WalletSettingsEditor;
 use shell::WalletTab;

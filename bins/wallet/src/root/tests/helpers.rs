@@ -10,10 +10,10 @@ pub(super) use broadcaster_monitor::FeeRow;
 pub(super) use broadcaster_monitor_waku::{DEFAULT_DOH_ENDPOINT, DEFAULT_TOR_DOH_ENDPOINT};
 pub(super) use gpui_component::select::SelectItem;
 pub(super) use wallet_ops::{
-    BlockedShieldRescueInfo, ListUtxosOutput, PublicAccountBalance, PublicActionProgressStep,
-    PublicAssetId, PublicBalanceAmount, PublicBalanceAsset, PublicBalanceEntry,
-    PublicBroadcasterCandidate, PublicBroadcasterCostEstimate, PublicBroadcasterFeeMargin,
-    PublicBroadcasterFeeMode, PublicBroadcasterResultKind, PublicBroadcasterSelection,
+    BlockedShieldRescueInfo, FeeHandlingMode, ListUtxosOutput, PublicAccountBalance,
+    PublicActionProgressStep, PublicAssetId, PublicBalanceAmount, PublicBalanceAsset,
+    PublicBalanceEntry, PublicBroadcasterCandidate, PublicBroadcasterCostEstimate,
+    PublicBroadcasterFeeMargin, PublicBroadcasterResultKind, PublicBroadcasterSelection,
     SyncProgressStage, SyncProgressUpdate, TransactionGenerationStage, UtxoOutput,
     settings::{
         BuiltInTokenOverride, CustomTokenSettings, NetworkModeSetting, PoiReadSourceSetting,
@@ -171,7 +171,7 @@ pub(super) fn public_broadcaster_cost_estimate(
         fee_amount: U256::from(1),
         protocol_fee_amount: U256::ZERO,
         protocol_fee_bps: U256::ZERO,
-        fee_mode: PublicBroadcasterFeeMode::AddToAmount,
+        fee_mode: FeeHandlingMode::AddToAmount,
         max_receiver_amount: U256::from(1),
         max_entered_amount: U256::from(1),
         gas_limit: 1,

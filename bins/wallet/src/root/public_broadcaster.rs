@@ -4,8 +4,8 @@ use std::time::Duration;
 use alloy::primitives::{Address, U256, address};
 use gpui::Context;
 use wallet_ops::{
-    BroadcasterFeePolicy, BroadcasterFeePolicyStatus, ListUtxosOutput, PublicBroadcasterCandidate,
-    PublicBroadcasterCostEstimate, PublicBroadcasterFeeMode,
+    BroadcasterFeePolicy, BroadcasterFeePolicyStatus, FeeHandlingMode, ListUtxosOutput,
+    PublicBroadcasterCandidate, PublicBroadcasterCostEstimate, RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
     eligible_public_broadcasters_for_asset, fee_policy_eligible_public_broadcasters,
     max_broadcaster_fee_token_amount_from_outputs as planner_max_broadcaster_fee_token_amount_from_outputs,
     public_broadcaster_candidates_for_asset,
@@ -149,26 +149,48 @@ pub(super) fn should_show_distinct_amount(entered_amount: U256, amount: U256) ->
     amount != entered_amount
 }
 
-fn public_broadcaster_max_entered_amount_for_mode(
+fn max_entered_amount_for_fee_handling_mode(
     max_receiver_amount: U256,
     fee_amount: U256,
-    fee_mode: PublicBroadcasterFeeMode,
+    same_token_fee: bool,
+    protocol_fee_bps: U256,
+    fee_mode: FeeHandlingMode,
 ) -> U256 {
     match fee_mode {
-        PublicBroadcasterFeeMode::DeductFromAmount => max_receiver_amount + fee_amount,
-        PublicBroadcasterFeeMode::AddToAmount => max_receiver_amount,
+        FeeHandlingMode::DeductFromAmount => {
+            if same_token_fee {
+                max_receiver_amount + fee_amount
+            } else {
+                max_receiver_amount
+            }
+        }
+        FeeHandlingMode::AddToAmount => max_receiver_amount
+            .saturating_sub(max_receiver_amount * protocol_fee_bps / U256::from(10_000)),
     }
+}
+
+pub(super) fn unshield_max_entered_amount_for_mode(
+    max_receiver_amount: U256,
+    fee_mode: FeeHandlingMode,
+) -> U256 {
+    max_entered_amount_for_fee_handling_mode(
+        max_receiver_amount,
+        U256::ZERO,
+        false,
+        RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+        fee_mode,
+    )
 }
 
 fn cost_estimate_max_entered_amount_for_mode(
     estimate: &PublicBroadcasterCostEstimate,
-    fee_mode: PublicBroadcasterFeeMode,
+    fee_mode: FeeHandlingMode,
 ) -> U256 {
-    let fee_mode =
-        effective_public_broadcaster_fee_mode(estimate.action_token, estimate.fee_token, fee_mode);
-    public_broadcaster_max_entered_amount_for_mode(
+    max_entered_amount_for_fee_handling_mode(
         estimate.max_receiver_amount,
         estimate.fee_amount,
+        estimate.action_token == estimate.fee_token,
+        estimate.protocol_fee_bps,
         fee_mode,
     )
 }
@@ -176,7 +198,7 @@ fn cost_estimate_max_entered_amount_for_mode(
 pub(super) fn send_form_max_entered_amount(
     form: &SendFormState,
     delivery_mode: DeliveryMode,
-    fee_mode: PublicBroadcasterFeeMode,
+    fee_mode: FeeHandlingMode,
 ) -> Option<U256> {
     match delivery_mode {
         DeliveryMode::ManualCalldata | DeliveryMode::SelfBroadcast => Some(form.asset.max_batched),
@@ -190,10 +212,12 @@ pub(super) fn send_form_max_entered_amount(
 pub(super) fn unshield_form_max_entered_amount(
     form: &UnshieldFormState,
     delivery_mode: DeliveryMode,
-    fee_mode: PublicBroadcasterFeeMode,
+    fee_mode: FeeHandlingMode,
 ) -> Option<U256> {
     match delivery_mode {
-        DeliveryMode::ManualCalldata | DeliveryMode::SelfBroadcast => Some(form.asset.max_batched),
+        DeliveryMode::ManualCalldata | DeliveryMode::SelfBroadcast => Some(
+            unshield_max_entered_amount_for_mode(form.asset.max_batched, fee_mode),
+        ),
         DeliveryMode::PublicBroadcaster => form
             .cost_estimate
             .as_ref()
@@ -328,23 +352,25 @@ pub(super) fn resolve_selected_public_broadcaster_fee_token(
         .map_or(current_fee_token, |option| option.token)
 }
 
-pub(super) fn effective_public_broadcaster_fee_mode(
+pub(super) fn effective_fee_handling_mode(
+    kind: DeliveryFormKind,
     action_token: Address,
     fee_token: Address,
-    fee_mode: PublicBroadcasterFeeMode,
-) -> PublicBroadcasterFeeMode {
-    if action_token == fee_token {
-        fee_mode
+    fee_mode: FeeHandlingMode,
+) -> FeeHandlingMode {
+    if matches!(kind, DeliveryFormKind::Send) && action_token != fee_token {
+        FeeHandlingMode::AddToAmount
     } else {
-        PublicBroadcasterFeeMode::AddToAmount
+        fee_mode
     }
 }
 
-pub(super) fn should_show_broadcaster_fee_mode_toggle(
+pub(super) fn should_show_fee_mode_toggle(
+    kind: DeliveryFormKind,
     action_token: Address,
     fee_token: Address,
 ) -> bool {
-    action_token == fee_token
+    matches!(kind, DeliveryFormKind::Unshield) || action_token == fee_token
 }
 
 pub(super) fn required_relay_adapt_for_unwrap(

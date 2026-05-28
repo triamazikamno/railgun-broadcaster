@@ -480,28 +480,79 @@ fn specific_submission_selection_ignores_estimate() {
 }
 
 #[test]
-fn different_fee_token_forces_add_mode_and_hides_toggle() {
+fn different_fee_token_fee_handling_depends_on_action_kind() {
     let action = Address::from([0x71; 20]);
     let fee = Address::from([0x72; 20]);
 
     assert_eq!(
-        effective_public_broadcaster_fee_mode(
+        effective_fee_handling_mode(
+            DeliveryFormKind::Send,
             action,
             fee,
-            PublicBroadcasterFeeMode::DeductFromAmount,
+            FeeHandlingMode::DeductFromAmount,
         ),
-        PublicBroadcasterFeeMode::AddToAmount
+        FeeHandlingMode::AddToAmount
     );
     assert_eq!(
-        effective_public_broadcaster_fee_mode(
+        effective_fee_handling_mode(
+            DeliveryFormKind::Unshield,
             action,
-            action,
-            PublicBroadcasterFeeMode::DeductFromAmount,
+            fee,
+            FeeHandlingMode::DeductFromAmount,
         ),
-        PublicBroadcasterFeeMode::DeductFromAmount
+        FeeHandlingMode::DeductFromAmount
     );
-    assert!(!should_show_broadcaster_fee_mode_toggle(action, fee));
-    assert!(should_show_broadcaster_fee_mode_toggle(action, action));
+    assert_eq!(
+        effective_fee_handling_mode(
+            DeliveryFormKind::Send,
+            action,
+            action,
+            FeeHandlingMode::DeductFromAmount,
+        ),
+        FeeHandlingMode::DeductFromAmount
+    );
+    assert!(!should_show_fee_mode_toggle(
+        DeliveryFormKind::Send,
+        action,
+        fee
+    ));
+    assert!(should_show_fee_mode_toggle(
+        DeliveryFormKind::Send,
+        action,
+        action
+    ));
+    assert!(should_show_fee_mode_toggle(
+        DeliveryFormKind::Unshield,
+        action,
+        fee
+    ));
+    assert!(should_show_fee_mode_toggle(
+        DeliveryFormKind::Unshield,
+        action,
+        action
+    ));
+}
+
+#[test]
+fn unshield_max_entered_amount_depends_on_fee_handling() {
+    let max_receiver = uint!(2_000_000_U256);
+    let add_on_top_max = super::super::public_broadcaster::unshield_max_entered_amount_for_mode(
+        max_receiver,
+        FeeHandlingMode::AddToAmount,
+    );
+
+    assert_eq!(
+        super::super::public_broadcaster::unshield_max_entered_amount_for_mode(
+            max_receiver,
+            FeeHandlingMode::DeductFromAmount,
+        ),
+        max_receiver
+    );
+    assert_eq!(add_on_top_max, uint!(1_995_000_U256),);
+    assert_eq!(
+        format_unshield_amount_input(add_on_top_max, Some(6)),
+        "1.995"
+    );
 }
 
 #[test]

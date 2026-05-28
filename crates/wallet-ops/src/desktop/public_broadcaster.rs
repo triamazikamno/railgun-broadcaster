@@ -93,7 +93,7 @@ pub enum PublicBroadcasterSelection {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum PublicBroadcasterFeeMode {
+pub enum FeeHandlingMode {
     #[default]
     DeductFromAmount,
     AddToAmount,
@@ -181,7 +181,7 @@ pub struct DesktopUnshieldPublicBroadcasterRequest {
     pub verify_proof: bool,
     pub fee_rows: Vec<FeeRow>,
     pub selection: PublicBroadcasterSelection,
-    pub fee_mode: PublicBroadcasterFeeMode,
+    pub fee_mode: FeeHandlingMode,
     pub fee_policy: BroadcasterFeePolicy,
     pub anchor_cache: Option<Arc<TokenAnchorRateCache>>,
     pub waku: Arc<WakuClient>,
@@ -204,7 +204,7 @@ pub struct DesktopSendPublicBroadcasterRequest {
     pub verify_proof: bool,
     pub fee_rows: Vec<FeeRow>,
     pub selection: PublicBroadcasterSelection,
-    pub fee_mode: PublicBroadcasterFeeMode,
+    pub fee_mode: FeeHandlingMode,
     pub fee_policy: BroadcasterFeePolicy,
     pub anchor_cache: Option<Arc<TokenAnchorRateCache>>,
     pub waku: Arc<WakuClient>,
@@ -224,7 +224,7 @@ pub struct DesktopUnshieldPublicBroadcasterEstimateRequest {
     pub unwrap: bool,
     pub fee_rows: Vec<FeeRow>,
     pub selection: PublicBroadcasterSelection,
-    pub fee_mode: PublicBroadcasterFeeMode,
+    pub fee_mode: FeeHandlingMode,
     pub fee_policy: BroadcasterFeePolicy,
     pub anchor_cache: Option<Arc<TokenAnchorRateCache>>,
 }
@@ -239,7 +239,7 @@ pub struct DesktopSendPublicBroadcasterEstimateRequest {
     pub recipient: String,
     pub fee_rows: Vec<FeeRow>,
     pub selection: PublicBroadcasterSelection,
-    pub fee_mode: PublicBroadcasterFeeMode,
+    pub fee_mode: FeeHandlingMode,
     pub fee_policy: BroadcasterFeePolicy,
     pub anchor_cache: Option<Arc<TokenAnchorRateCache>>,
 }
@@ -256,7 +256,7 @@ pub struct PublicBroadcasterCostEstimate {
     pub fee_amount: U256,
     pub protocol_fee_amount: U256,
     pub protocol_fee_bps: U256,
-    pub fee_mode: PublicBroadcasterFeeMode,
+    pub fee_mode: FeeHandlingMode,
     pub max_receiver_amount: U256,
     pub max_entered_amount: U256,
     pub gas_limit: u64,
@@ -287,7 +287,7 @@ pub struct PublicBroadcasterSubmissionResult {
     pub fee_amount: U256,
     pub protocol_fee_amount: U256,
     pub protocol_fee_bps: U256,
-    pub fee_mode: PublicBroadcasterFeeMode,
+    pub fee_mode: FeeHandlingMode,
     pub gas_limit: u64,
     pub min_gas_price: u128,
     pub result: PublicBroadcasterResultKind,
@@ -307,7 +307,7 @@ pub(super) struct PreparedPublicBroadcasterPlan<P> {
     pub(super) fee_amount: U256,
     pub(super) protocol_fee_amount: U256,
     pub(super) protocol_fee_bps: U256,
-    pub(super) fee_mode: PublicBroadcasterFeeMode,
+    pub(super) fee_mode: FeeHandlingMode,
     pub(super) gas_limit: u64,
     pub(super) min_gas_price: u128,
 }
@@ -378,6 +378,7 @@ pub(super) struct DesktopUnshieldPlanRequest<'a> {
     pub(super) vault_password: &'a str,
     pub(super) token: Address,
     pub(super) amount: U256,
+    pub(super) fee_mode: FeeHandlingMode,
     pub(super) recipient: Address,
     pub(super) unwrap: bool,
     pub(super) verify_proof: bool,
@@ -930,16 +931,16 @@ pub(crate) struct PublicBroadcasterAmountSplit {
     pub(crate) receiver_amount: U256,
     pub(crate) total_private_spend: U256,
     pub(crate) fee_amount: U256,
-    pub(crate) fee_mode: PublicBroadcasterFeeMode,
+    pub(crate) fee_mode: FeeHandlingMode,
 }
 
 pub(crate) fn public_broadcaster_amount_split(
     entered_amount: U256,
     fee_amount: U256,
-    fee_mode: PublicBroadcasterFeeMode,
+    fee_mode: FeeHandlingMode,
 ) -> Result<PublicBroadcasterAmountSplit> {
     let (receiver_amount, total_private_spend) = match fee_mode {
-        PublicBroadcasterFeeMode::DeductFromAmount => {
+        FeeHandlingMode::DeductFromAmount => {
             if entered_amount <= fee_amount {
                 return Err(eyre!(
                     "entered amount must be greater than the broadcaster fee"
@@ -947,7 +948,7 @@ pub(crate) fn public_broadcaster_amount_split(
             }
             (entered_amount - fee_amount, entered_amount)
         }
-        PublicBroadcasterFeeMode::AddToAmount => (entered_amount, entered_amount + fee_amount),
+        FeeHandlingMode::AddToAmount => (entered_amount, entered_amount + fee_amount),
     };
     Ok(PublicBroadcasterAmountSplit {
         entered_amount,
@@ -961,48 +962,143 @@ pub(crate) fn public_broadcaster_amount_split(
 pub(crate) fn public_broadcaster_amount_split_for_tokens(
     entered_amount: U256,
     fee_amount: U256,
-    fee_mode: PublicBroadcasterFeeMode,
+    fee_mode: FeeHandlingMode,
     same_token_fee: bool,
 ) -> Result<PublicBroadcasterAmountSplit> {
-    if same_token_fee {
+    public_broadcaster_amount_split_for_tokens_and_protocol(
+        entered_amount,
+        fee_amount,
+        fee_mode,
+        same_token_fee,
+        U256::ZERO,
+    )
+}
+
+pub(crate) fn public_broadcaster_amount_split_for_tokens_and_protocol(
+    entered_amount: U256,
+    fee_amount: U256,
+    fee_mode: FeeHandlingMode,
+    same_token_fee: bool,
+    protocol_fee_bps: U256,
+) -> Result<PublicBroadcasterAmountSplit> {
+    if same_token_fee && protocol_fee_bps.is_zero() {
         return public_broadcaster_amount_split(entered_amount, fee_amount, fee_mode);
     }
 
+    let receiver_amount = match fee_mode {
+        FeeHandlingMode::DeductFromAmount => {
+            if same_token_fee {
+                if entered_amount <= fee_amount {
+                    return Err(eyre!(
+                        "entered amount must be greater than the broadcaster fee"
+                    ));
+                }
+                entered_amount - fee_amount
+            } else {
+                entered_amount
+            }
+        }
+        FeeHandlingMode::AddToAmount => {
+            railgun_protocol_gross_amount_for_recipient(entered_amount, protocol_fee_bps)?
+        }
+    };
+    let total_private_spend = if same_token_fee {
+        receiver_amount + fee_amount
+    } else {
+        receiver_amount
+    };
+
     Ok(PublicBroadcasterAmountSplit {
         entered_amount,
-        receiver_amount: entered_amount,
-        total_private_spend: entered_amount,
+        receiver_amount,
+        total_private_spend,
         fee_amount,
-        fee_mode: PublicBroadcasterFeeMode::AddToAmount,
+        fee_mode,
     })
 }
 
 pub(crate) fn public_broadcaster_max_entered_amount(
     max_receiver_amount: U256,
     fee_amount: U256,
-    fee_mode: PublicBroadcasterFeeMode,
+    fee_mode: FeeHandlingMode,
 ) -> U256 {
     match fee_mode {
-        PublicBroadcasterFeeMode::DeductFromAmount => max_receiver_amount + fee_amount,
-        PublicBroadcasterFeeMode::AddToAmount => max_receiver_amount,
+        FeeHandlingMode::DeductFromAmount => max_receiver_amount + fee_amount,
+        FeeHandlingMode::AddToAmount => max_receiver_amount,
     }
 }
 
+#[cfg(test)]
 pub(crate) fn public_broadcaster_max_entered_amount_for_tokens(
     max_receiver_amount: U256,
     fee_amount: U256,
-    fee_mode: PublicBroadcasterFeeMode,
+    fee_mode: FeeHandlingMode,
     same_token_fee: bool,
 ) -> U256 {
-    if same_token_fee {
-        public_broadcaster_max_entered_amount(max_receiver_amount, fee_amount, fee_mode)
-    } else {
-        max_receiver_amount
+    public_broadcaster_max_entered_amount_for_tokens_and_protocol(
+        max_receiver_amount,
+        fee_amount,
+        fee_mode,
+        same_token_fee,
+        U256::ZERO,
+    )
+}
+
+pub(crate) fn public_broadcaster_max_entered_amount_for_tokens_and_protocol(
+    max_receiver_amount: U256,
+    fee_amount: U256,
+    fee_mode: FeeHandlingMode,
+    same_token_fee: bool,
+    protocol_fee_bps: U256,
+) -> U256 {
+    match fee_mode {
+        FeeHandlingMode::DeductFromAmount => {
+            if same_token_fee {
+                public_broadcaster_max_entered_amount(max_receiver_amount, fee_amount, fee_mode)
+            } else {
+                max_receiver_amount
+            }
+        }
+        FeeHandlingMode::AddToAmount => recipient_amount_after_protocol_fee(
+            max_receiver_amount,
+            railgun_protocol_fee_amount(max_receiver_amount, protocol_fee_bps),
+        ),
     }
 }
 
 pub(crate) fn railgun_protocol_fee_amount(amount: U256, fee_bps: U256) -> U256 {
     amount * fee_bps / FEE_BASIS_POINTS_DENOMINATOR
+}
+
+pub(crate) fn railgun_protocol_gross_amount_for_recipient(
+    recipient_amount: U256,
+    fee_bps: U256,
+) -> Result<U256> {
+    if recipient_amount.is_zero() || fee_bps.is_zero() {
+        return Ok(recipient_amount);
+    }
+    if fee_bps >= FEE_BASIS_POINTS_DENOMINATOR {
+        return Err(eyre!("RAILGUN protocol fee must be below 100%"));
+    }
+
+    let net_bps = FEE_BASIS_POINTS_DENOMINATOR - fee_bps;
+    Ok(
+        ((recipient_amount - U256::from(1)) * FEE_BASIS_POINTS_DENOMINATOR / net_bps)
+            + U256::from(1),
+    )
+}
+
+pub(crate) fn unshield_receiver_amount_for_fee_mode(
+    entered_amount: U256,
+    fee_mode: FeeHandlingMode,
+) -> Result<U256> {
+    match fee_mode {
+        FeeHandlingMode::DeductFromAmount => Ok(entered_amount),
+        FeeHandlingMode::AddToAmount => railgun_protocol_gross_amount_for_recipient(
+            entered_amount,
+            RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
+        ),
+    }
 }
 
 pub(super) const fn recipient_amount_after_protocol_fee(
@@ -1015,17 +1111,19 @@ pub(super) const fn recipient_amount_after_protocol_fee(
 pub(crate) fn public_broadcaster_build_error(
     error: BuildError,
     fee_amount: U256,
-    fee_mode: PublicBroadcasterFeeMode,
+    fee_mode: FeeHandlingMode,
     same_token_fee: bool,
+    protocol_fee_bps: U256,
 ) -> Report {
     match error {
         BuildError::InsufficientBalance(max_receiver_amount) => eyre!(
             "{PUBLIC_BROADCASTER_MAX_ENTERED_AMOUNT_ERROR}{}",
-            public_broadcaster_max_entered_amount_for_tokens(
+            public_broadcaster_max_entered_amount_for_tokens_and_protocol(
                 max_receiver_amount,
                 fee_amount,
                 fee_mode,
-                same_token_fee
+                same_token_fee,
+                protocol_fee_bps,
             )
         ),
         BuildError::InsufficientFeeTokenBalance(max_spendable) => {
@@ -1318,7 +1416,7 @@ pub(crate) fn approximate_public_broadcaster_cost(
     action_token: Address,
     fee_token: Address,
     entered_amount: U256,
-    fee_mode: PublicBroadcasterFeeMode,
+    fee_mode: FeeHandlingMode,
     protocol_fee_bps: U256,
     min_gas_price: u128,
     initial_fee_amount: U256,
@@ -1332,11 +1430,12 @@ pub(crate) fn approximate_public_broadcaster_cost(
     let same_token_fee = action_token == fee_token;
 
     for _ in 0..PUBLIC_BROADCASTER_FEE_ATTEMPTS {
-        let split = public_broadcaster_amount_split_for_tokens(
+        let split = public_broadcaster_amount_split_for_tokens_and_protocol(
             entered_amount,
             fee_amount,
             fee_mode,
             same_token_fee,
+            protocol_fee_bps,
         )?;
         let shape = select_shape(split)?;
         let gas_limit = approximate_public_broadcaster_gas(shape);
@@ -1363,11 +1462,12 @@ pub(crate) fn approximate_public_broadcaster_cost(
                 protocol_fee_bps,
                 fee_mode: split.fee_mode,
                 max_receiver_amount: shape.max_receiver_amount,
-                max_entered_amount: public_broadcaster_max_entered_amount_for_tokens(
+                max_entered_amount: public_broadcaster_max_entered_amount_for_tokens_and_protocol(
                     shape.max_receiver_amount,
                     fee_amount,
                     split.fee_mode,
                     same_token_fee,
+                    protocol_fee_bps,
                 ),
                 gas_limit,
                 min_gas_price,
@@ -1400,11 +1500,12 @@ pub(crate) fn approximate_public_broadcaster_cost(
         protocol_fee_bps,
         fee_mode: split.fee_mode,
         max_receiver_amount: shape.max_receiver_amount,
-        max_entered_amount: public_broadcaster_max_entered_amount_for_tokens(
+        max_entered_amount: public_broadcaster_max_entered_amount_for_tokens_and_protocol(
             shape.max_receiver_amount,
             split.fee_amount,
             split.fee_mode,
             same_token_fee,
+            protocol_fee_bps,
         ),
         gas_limit: latest_gas_limit,
         min_gas_price,
