@@ -1,4 +1,8 @@
 use super::*;
+use crate::root::private_action::{
+    RecipientSuggestionDirection, filtered_recipient_options, recipient_option_display_address,
+    recipient_query_is_valid, recipient_suggestion_index_after_move,
+};
 
 #[test]
 fn display_rows_use_known_token_metadata() {
@@ -387,6 +391,236 @@ fn public_broadcaster_estimate_validation_allows_empty_recipient_prompt_state() 
 }
 
 #[test]
+fn recipient_options_filter_inactive_app_accounts_and_include_address_books() {
+    let private_wallets = vec![
+        PrivateWalletRecipientSource {
+            label: Arc::from("Active private"),
+            address: Arc::from("0zk1active"),
+            active: true,
+        },
+        PrivateWalletRecipientSource {
+            label: Arc::from("Inactive private"),
+            address: Arc::from("0zk1inactive"),
+            active: false,
+        },
+    ];
+    let private_address_book = vec![PrivateAddressBookEntry {
+        entry_uuid: "private-book".to_string(),
+        label: "Saved private".to_string(),
+        address: "0zk1saved".to_string(),
+        display_order: 0,
+    }];
+
+    let private_options = private_send_recipient_options(&private_wallets, &private_address_book);
+
+    assert_eq!(private_options.len(), 2);
+    assert!(private_options.iter().any(|option| {
+        option.label.as_ref() == "Active private"
+            && option.source == RecipientOptionSource::PrivateWallet
+    }));
+    assert!(private_options.iter().any(|option| {
+        option.label.as_ref() == "Saved private"
+            && option.source == RecipientOptionSource::PrivateAddressBook
+    }));
+    assert!(
+        private_options
+            .iter()
+            .all(|option| option.label.as_ref() != "Inactive private")
+    );
+
+    let public_accounts = vec![
+        public_account_metadata(
+            "active-public",
+            "0x1111111111111111111111111111111111111111",
+            Some("Active public"),
+            wallet_ops::vault::PublicAccountStatus::Active,
+        ),
+        public_account_metadata(
+            "inactive-public",
+            "0x2222222222222222222222222222222222222222",
+            Some("Inactive public"),
+            wallet_ops::vault::PublicAccountStatus::Inactive,
+        ),
+    ];
+    let public_address_book = vec![PublicAddressBookEntry {
+        entry_uuid: "public-book".to_string(),
+        label: "Saved public".to_string(),
+        address: "0x3333333333333333333333333333333333333333"
+            .parse()
+            .expect("address"),
+        display_order: 0,
+    }];
+
+    let public_options = private_unshield_recipient_options(&public_accounts, &public_address_book);
+
+    assert_eq!(public_options.len(), 2);
+    assert!(public_options.iter().any(|option| {
+        option.label.as_ref() == "Active public"
+            && option.source == RecipientOptionSource::PublicAccount
+    }));
+    assert!(public_options.iter().any(|option| {
+        option.label.as_ref() == "Saved public"
+            && option.source == RecipientOptionSource::PublicAddressBook
+    }));
+    assert!(
+        public_options
+            .iter()
+            .all(|option| option.label.as_ref() != "Inactive public")
+    );
+}
+
+#[test]
+fn recipient_option_search_matches_label_and_address_case_insensitively() {
+    let option = RecipientOption {
+        label: Arc::from("Alice Cold Wallet"),
+        address: Arc::from("0xAbCdEf0000000000000000000000000000000000"),
+        source: RecipientOptionSource::PublicAddressBook,
+    };
+
+    assert!(recipient_option_matches_search(&option, "cold"));
+    assert!(recipient_option_matches_search(&option, "COLD"));
+    assert!(recipient_option_matches_search(&option, "abcdef"));
+    assert!(!recipient_option_matches_search(&option, "bob"));
+}
+
+#[test]
+fn recipient_combobox_helpers_filter_validate_and_move_selection() {
+    let options = vec![
+        RecipientOption {
+            label: Arc::from("Alice Cold Wallet"),
+            address: Arc::from("0x1111111111111111111111111111111111111111"),
+            source: RecipientOptionSource::PublicAddressBook,
+        },
+        RecipientOption {
+            label: Arc::from("Alice Hot Wallet"),
+            address: Arc::from("0x2222222222222222222222222222222222222222"),
+            source: RecipientOptionSource::PublicAccount,
+        },
+        RecipientOption {
+            label: Arc::from("Bob"),
+            address: Arc::from("0x3333333333333333333333333333333333333333"),
+            source: RecipientOptionSource::PublicAddressBook,
+        },
+    ];
+
+    assert_eq!(
+        filtered_recipient_options(&options, "alice")
+            .iter()
+            .map(|option| option.address.as_ref())
+            .collect::<Vec<_>>(),
+        vec![
+            "0x1111111111111111111111111111111111111111",
+            "0x2222222222222222222222222222222222222222"
+        ]
+    );
+    assert!(filtered_recipient_options(&options, "carol").is_empty());
+    assert!(recipient_query_is_valid(
+        DeliveryFormKind::Unshield,
+        "0x1111111111111111111111111111111111111111"
+    ));
+    assert!(!recipient_query_is_valid(
+        DeliveryFormKind::Unshield,
+        "alice"
+    ));
+    assert_eq!(
+        recipient_suggestion_index_after_move(None, 3, RecipientSuggestionDirection::Next),
+        Some(0)
+    );
+    assert_eq!(
+        recipient_suggestion_index_after_move(Some(2), 3, RecipientSuggestionDirection::Next),
+        Some(0)
+    );
+    assert_eq!(
+        recipient_suggestion_index_after_move(None, 3, RecipientSuggestionDirection::Previous),
+        Some(2)
+    );
+    assert_eq!(
+        recipient_suggestion_index_after_move(Some(0), 3, RecipientSuggestionDirection::Previous),
+        Some(2)
+    );
+}
+
+#[test]
+fn recipient_option_display_shortens_private_addresses_but_searches_full_address() {
+    const RAILGUN_ADDRESS: &str = "0zk1qy4v02p5zkq0zfpaxhz79j5tslrv8c44d80d8jr2fuecrtxlp8lemrv7j6fe3z53ll0jm7u592n0hr8elesd0xzv6y9jpdvsyln80m95jcxhvnmagfqg5p6e9mp";
+    let private_option = RecipientOption {
+        label: Arc::from("Alice Private"),
+        address: Arc::from(RAILGUN_ADDRESS),
+        source: RecipientOptionSource::PrivateAddressBook,
+    };
+    let public_option = RecipientOption {
+        label: Arc::from("Alice Public"),
+        address: Arc::from("0x1111111111111111111111111111111111111111"),
+        source: RecipientOptionSource::PublicAddressBook,
+    };
+
+    assert_eq!(
+        recipient_option_display_address(&private_option),
+        "0zk1qy4v...p6e9mp"
+    );
+    assert_eq!(
+        recipient_option_display_address(&public_option),
+        "0x1111111111111111111111111111111111111111"
+    );
+    assert!(recipient_option_matches_search(
+        &private_option,
+        "rv7j6fe3z53"
+    ));
+}
+
+#[test]
+fn recipient_save_visibility_requires_valid_unmatched_addresses() {
+    const RAILGUN_ADDRESS: &str = "0zk1qy4v02p5zkq0zfpaxhz79j5tslrv8c44d80d8jr2fuecrtxlp8lemrv7j6fe3z53ll0jm7u592n0hr8elesd0xzv6y9jpdvsyln80m95jcxhvnmagfqg5p6e9mp";
+    let private_options = vec![RecipientOption {
+        label: Arc::from("Existing private"),
+        address: Arc::from(RAILGUN_ADDRESS),
+        source: RecipientOptionSource::PrivateAddressBook,
+    }];
+
+    assert!(can_save_private_recipient(RAILGUN_ADDRESS, &[]));
+    assert!(!can_save_private_recipient("not-0zk", &[]));
+    assert!(!can_save_private_recipient(
+        RAILGUN_ADDRESS,
+        &private_options
+    ));
+
+    let public_options = vec![RecipientOption {
+        label: Arc::from("Existing public"),
+        address: Arc::from("0xaAaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa"),
+        source: RecipientOptionSource::PublicAddressBook,
+    }];
+
+    assert!(can_save_public_recipient(
+        "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        &public_options,
+    ));
+    assert!(!can_save_public_recipient("not-0x", &public_options));
+    assert!(!can_save_public_recipient(
+        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        &public_options,
+    ));
+}
+
+#[test]
+fn recipient_selection_and_save_label_helpers_preserve_expected_values() {
+    let option = RecipientOption {
+        label: Arc::from("Saved recipient"),
+        address: Arc::from("0x4444444444444444444444444444444444444444"),
+        source: RecipientOptionSource::PublicAddressBook,
+    };
+
+    assert_eq!(
+        selected_recipient_address(&option),
+        "0x4444444444444444444444444444444444444444"
+    );
+    assert_eq!(
+        normalized_address_book_save_label("  Alice  ").as_deref(),
+        Some("Alice")
+    );
+    assert_eq!(normalized_address_book_save_label("   "), None);
+}
+
+#[test]
 fn public_broadcaster_cost_status_separates_pending_from_estimating() {
     assert_eq!(public_broadcaster_cost_status(true, false), None);
     assert_eq!(
@@ -399,4 +633,22 @@ fn public_broadcaster_cost_status_separates_pending_from_estimating() {
         public_broadcaster_cost_status_text(CostEstimateStatus::Estimating).0,
         "Estimating public broadcaster cost..."
     );
+}
+
+fn public_account_metadata(
+    public_account_uuid: &str,
+    address: &str,
+    label: Option<&str>,
+    status: wallet_ops::vault::PublicAccountStatus,
+) -> PublicAccountMetadata {
+    PublicAccountMetadata {
+        public_account_uuid: public_account_uuid.to_string(),
+        address: address.parse().expect("public account address"),
+        label: label.map(str::to_owned),
+        source: wallet_ops::vault::PublicAccountSource::Imported,
+        scope: wallet_ops::vault::PublicAccountScope::Global,
+        derivation_index: None,
+        status,
+        display_order: 0,
+    }
 }

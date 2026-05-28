@@ -137,6 +137,22 @@ pub struct PublicAccountSecret {
     pub private_key: [u8; KEY_LEN],
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrivateAddressBookEntry {
+    pub entry_uuid: String,
+    pub label: String,
+    pub address: String,
+    pub display_order: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PublicAddressBookEntry {
+    pub entry_uuid: String,
+    pub label: String,
+    pub address: Address,
+    pub display_order: u32,
+}
+
 #[derive(Deserialize)]
 pub(super) struct WalletMetadataWire {
     pub(super) wallet_uuid: String,

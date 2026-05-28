@@ -3,10 +3,10 @@ use super::{
     DesktopVaultStore, DesktopViewSession, Eip1559GasFeeEditorState, Entity, FeeRow, InputState,
     IntoElement, PreparedSendCall, PreparedUnshieldCall, PublicBroadcasterCostEstimate,
     PublicBroadcasterFeeMode, PublicBroadcasterResultKind, PublicBroadcasterSubmissionResult,
-    SearchableVec, SelectItem, SelectState, SelfBroadcastGasFeeSelection, SharedString,
-    SpendAuthorizationSummary, SpendAuthorizationSummaryRow, TransactionGenerationStage, U256,
-    WalletIconSource, WalletSession, Window, format_send_amount_input,
-    format_unshield_amount_input, private_action_asset_select_row,
+    ScrollHandle, SearchableVec, SelectItem, SelectState, SelfBroadcastGasFeeSelection,
+    SharedString, SpendAuthorizationSummary, SpendAuthorizationSummaryRow,
+    TransactionGenerationStage, U256, WalletIconSource, WalletSession, Window,
+    format_send_amount_input, format_unshield_amount_input, private_action_asset_select_row,
     self_broadcast_gas_payer_fields_match, self_broadcast_gas_payer_select_menu_row,
     self_broadcast_gas_payer_select_trigger_row, short_address,
 };
@@ -279,6 +279,10 @@ pub(in crate::root) fn private_amount_label(
 pub(in crate::root) struct UnshieldFormState {
     pub(in crate::root) asset: UnshieldAsset,
     pub(in crate::root) recipient_input: Entity<InputState>,
+    pub(in crate::root) recipient_value: Arc<str>,
+    pub(in crate::root) recipient_suggestions_open: bool,
+    pub(in crate::root) recipient_suggestion_index: Option<usize>,
+    pub(in crate::root) recipient_suggestions_scroll: ScrollHandle,
     pub(in crate::root) amount_input: Entity<InputState>,
     pub(in crate::root) asset_select:
         Entity<SelectState<SearchableVec<PrivateActionAssetSelectItem>>>,
@@ -310,6 +314,10 @@ pub(in crate::root) struct UnshieldFormState {
 pub(in crate::root) struct SendFormState {
     pub(in crate::root) asset: UnshieldAsset,
     pub(in crate::root) recipient_input: Entity<InputState>,
+    pub(in crate::root) recipient_value: Arc<str>,
+    pub(in crate::root) recipient_suggestions_open: bool,
+    pub(in crate::root) recipient_suggestion_index: Option<usize>,
+    pub(in crate::root) recipient_suggestions_scroll: ScrollHandle,
     pub(in crate::root) amount_input: Entity<InputState>,
     pub(in crate::root) asset_select:
         Entity<SelectState<SearchableVec<PrivateActionAssetSelectItem>>>,

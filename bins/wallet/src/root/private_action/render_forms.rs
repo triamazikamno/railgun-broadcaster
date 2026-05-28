@@ -9,9 +9,9 @@ use super::{
     render_private_action_metrics, render_private_broadcaster_status_notice,
     render_private_self_broadcast_status_notice, render_private_submission_active_status_notice,
     render_public_broadcaster_cost_estimate, render_public_broadcaster_cost_status,
-    render_public_broadcaster_settings, render_self_broadcast_settings, render_send_result,
-    render_unshield_generating_status, render_unshield_output_toggle, render_unshield_result,
-    selected_broadcaster_fee_warning, send_element_id,
+    render_public_broadcaster_settings, render_recipient_picker, render_self_broadcast_settings,
+    render_send_result, render_unshield_generating_status, render_unshield_output_toggle,
+    render_unshield_result, selected_broadcaster_fee_warning, send_element_id,
     should_render_public_broadcaster_cost_preview, unshield_element_id,
 };
 
@@ -35,6 +35,7 @@ impl WalletRoot {
         let chooser_root = root.clone();
         let estimate_root = root.clone();
         let progress_root = root.clone();
+        let recipient_root = root.clone();
         let submit_root = root;
         let self_broadcast_accounts = self.active_self_broadcast_gas_payer_accounts();
         let mut public_broadcaster_submit_disabled = false;
@@ -47,6 +48,7 @@ impl WalletRoot {
         let self_broadcast_submitted =
             matches!(form.result.as_ref(), Some(SendResult::SelfBroadcast(_)));
         let submitted = public_broadcaster_submitted || self_broadcast_submitted;
+        let recipient_options = self.private_send_recipient_options();
 
         let mut card =
             div()
@@ -162,7 +164,18 @@ impl WalletRoot {
                     .child(
                         labeled_field(
                             "Recipient 0zk address",
-                            private_action_input(&form.recipient_input).disabled(form.generating),
+                            render_recipient_picker(
+                                recipient_root,
+                                key,
+                                DeliveryFormKind::Send,
+                                &form.recipient_input,
+                                &form.recipient_value,
+                                form.recipient_suggestions_open,
+                                form.recipient_suggestion_index,
+                                &form.recipient_suggestions_scroll,
+                                &recipient_options,
+                                form.generating,
+                            ),
                         )
                         .flex_1()
                         .min_w(px(0.0)),
@@ -334,6 +347,7 @@ impl WalletRoot {
         let output_root = root.clone();
         let estimate_root = root.clone();
         let progress_root = root.clone();
+        let recipient_root = root.clone();
         let submit_root = root;
         let self_broadcast_accounts = self.active_self_broadcast_gas_payer_accounts();
         let mut public_broadcaster_submit_disabled = false;
@@ -346,6 +360,7 @@ impl WalletRoot {
         let self_broadcast_submitted =
             matches!(form.result.as_ref(), Some(UnshieldResult::SelfBroadcast(_)));
         let submitted = public_broadcaster_submitted || self_broadcast_submitted;
+        let recipient_options = self.private_unshield_recipient_options();
 
         let mut card =
             div()
@@ -464,7 +479,18 @@ impl WalletRoot {
                     .child(
                         labeled_field(
                             "Recipient",
-                            private_action_input(&form.recipient_input).disabled(form.generating),
+                            render_recipient_picker(
+                                recipient_root,
+                                key,
+                                DeliveryFormKind::Unshield,
+                                &form.recipient_input,
+                                &form.recipient_value,
+                                form.recipient_suggestions_open,
+                                form.recipient_suggestion_index,
+                                &form.recipient_suggestions_scroll,
+                                &recipient_options,
+                                form.generating,
+                            ),
                         )
                         .flex_1()
                         .min_w(px(0.0)),

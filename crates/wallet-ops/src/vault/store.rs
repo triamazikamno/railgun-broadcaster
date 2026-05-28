@@ -1,25 +1,32 @@
 use super::{
     Arc, BTreeSet, CreatedVault, DbConfig, DbStore, DesktopVaultStore, DesktopViewSession,
     EncryptedRecord, GeneratedSeedMaterial, KEY_LEN, KdfParams, LoadedWalletMetadata,
-    PUBLIC_ACCOUNT_METADATA_PREFIX, PathBuf, PublicAccountMetadata, PublicAccountScope,
-    PublicAccountSecret, PublicAccountSource, PublicAccountStatus, SoftwareRailgunSpendSigner,
-    SpendGrant, StoredWalletRecord, VAULT_METADATA_KEY, VaultError, VaultMetadata,
-    VaultRecordEntries, ViewUnlock, WALLET_CHAIN_METADATA_PREFIX, WALLET_VIEW_PREFIX,
-    WalletChainMetadataBundle, WalletKeys, WalletMetadataBundle, WalletSource, WalletSpendBundle,
-    WalletStatus, WalletViewBundle, Zeroizing, assign_missing_display_orders,
+    PRIVATE_ADDRESS_BOOK_PREFIX, PUBLIC_ACCOUNT_METADATA_PREFIX, PUBLIC_ADDRESS_BOOK_PREFIX,
+    PathBuf, PrivateAddressBookEntry, PublicAccountMetadata, PublicAccountScope,
+    PublicAccountSecret, PublicAccountSource, PublicAccountStatus, PublicAddressBookEntry,
+    SoftwareRailgunSpendSigner, SpendGrant, StoredWalletRecord, VAULT_METADATA_KEY, VaultError,
+    VaultMetadata, VaultRecordEntries, ViewUnlock, WALLET_CHAIN_METADATA_PREFIX,
+    WALLET_VIEW_PREFIX, WalletChainMetadataBundle, WalletKeys, WalletMetadataBundle, WalletSource,
+    WalletSpendBundle, WalletStatus, WalletViewBundle, Zeroizing, assign_missing_display_orders,
     bip39_entropy_from_mnemonic, create_spend_grant, create_with_params,
     default_wallet_label_for_metadata, derive_public_evm_address_from_entropy,
     derive_public_evm_private_key_from_entropy, deserialize_wallet_utxo,
-    ensure_public_account_address_available, generate_opaque_id, initial_derived_public_account,
-    next_derived_public_account_index, next_public_account_display_order,
-    next_wallet_display_order, normalize_public_account_label, parse_public_evm_private_key,
-    public_account_metadata_record_entry, public_account_metadata_record_key,
-    public_account_secret_record_entry, public_account_secret_record_key,
-    public_evm_address_from_private_key, serialize_wallet_utxo, sort_public_account_metadata,
-    sort_wallet_metadata, unlock_spend, unlock_view, validate_wallet_label,
-    vault_error_from_wallet_cache, wallet_cache_row_prefix, wallet_cache_row_record_key,
-    wallet_chain_metadata_record_key, wallet_metadata_record_entry, wallet_metadata_record_key,
-    wallet_spend_record_key, wallet_utxo_stable_identity, wallet_view_record_key,
+    ensure_private_address_book_address_available, ensure_public_account_address_available,
+    ensure_public_address_book_address_available, generate_opaque_id,
+    initial_derived_public_account, next_derived_public_account_index,
+    next_private_address_book_display_order, next_public_account_display_order,
+    next_public_address_book_display_order, next_wallet_display_order,
+    normalize_public_account_label, parse_public_evm_private_key,
+    private_address_book_record_entry, public_account_metadata_record_entry,
+    public_account_metadata_record_key, public_account_secret_record_entry,
+    public_account_secret_record_key, public_address_book_record_entry,
+    public_evm_address_from_private_key, serialize_wallet_utxo, sort_private_address_book_entries,
+    sort_public_account_metadata, sort_public_address_book_entries, sort_wallet_metadata,
+    unlock_spend, unlock_view, validate_address_book_label, validate_private_address_book_address,
+    validate_public_address_book_address, validate_wallet_label, vault_error_from_wallet_cache,
+    wallet_cache_row_prefix, wallet_cache_row_record_key, wallet_chain_metadata_record_key,
+    wallet_metadata_record_entry, wallet_metadata_record_key, wallet_spend_record_key,
+    wallet_utxo_stable_identity, wallet_view_record_key,
 };
 
 impl DesktopVaultStore {
@@ -324,6 +331,89 @@ impl DesktopVaultStore {
     ) -> Result<u32, VaultError> {
         let accounts = self.list_public_account_metadata_with_view(&view_session.view)?;
         next_derived_public_account_index(&accounts, view_session.wallet_id())
+    }
+
+    pub fn list_private_address_book_entries_for_session(
+        &self,
+        view_session: &DesktopViewSession,
+    ) -> Result<Vec<PrivateAddressBookEntry>, VaultError> {
+        self.list_private_address_book_entries_with_view(&view_session.view)
+    }
+
+    pub fn list_public_address_book_entries_for_session(
+        &self,
+        view_session: &DesktopViewSession,
+    ) -> Result<Vec<PublicAddressBookEntry>, VaultError> {
+        self.list_public_address_book_entries_with_view(&view_session.view)
+    }
+
+    pub fn add_private_address_book_entry_for_session(
+        &self,
+        view_session: &DesktopViewSession,
+        label: &str,
+        address: &str,
+    ) -> Result<PrivateAddressBookEntry, VaultError> {
+        let label = validate_address_book_label(label)?;
+        let address = validate_private_address_book_address(address)?;
+        let entries = self.list_private_address_book_entries_with_view(&view_session.view)?;
+        let active_private_recipients = self.active_private_receive_addresses(view_session)?;
+        ensure_private_address_book_address_available(
+            &entries,
+            &active_private_recipients,
+            &address,
+        )?;
+
+        let entry = PrivateAddressBookEntry {
+            entry_uuid: generate_opaque_id()?,
+            label,
+            address,
+            display_order: next_private_address_book_display_order(&entries)?,
+        };
+        let (key, data) = private_address_book_record_entry(&view_session.view, &entry)?;
+        self.db.put_desktop_wallet_vault_record(&key, &data)?;
+        Ok(entry)
+    }
+
+    pub fn add_public_address_book_entry_for_session(
+        &self,
+        view_session: &DesktopViewSession,
+        label: &str,
+        address: &str,
+    ) -> Result<PublicAddressBookEntry, VaultError> {
+        let label = validate_address_book_label(label)?;
+        let address = validate_public_address_book_address(address)?;
+        let entries = self.list_public_address_book_entries_with_view(&view_session.view)?;
+        let accounts = self.list_public_accounts_for_session(view_session, false)?;
+        ensure_public_address_book_address_available(&entries, &accounts, address)?;
+
+        let entry = PublicAddressBookEntry {
+            entry_uuid: generate_opaque_id()?,
+            label,
+            address,
+            display_order: next_public_address_book_display_order(&entries)?,
+        };
+        let (key, data) = public_address_book_record_entry(&view_session.view, &entry)?;
+        self.db.put_desktop_wallet_vault_record(&key, &data)?;
+        Ok(entry)
+    }
+
+    fn active_private_receive_addresses(
+        &self,
+        view_session: &DesktopViewSession,
+    ) -> Result<Vec<String>, VaultError> {
+        let mut metadata = self.list_wallet_metadata_with_view(&view_session.view)?;
+        metadata.retain(|metadata| metadata.status == WalletStatus::Active);
+        let mut addresses = Vec::with_capacity(metadata.len());
+        for metadata in metadata {
+            let session =
+                self.load_view_session_with_view_session(view_session, &metadata.wallet_uuid)?;
+            addresses.push(
+                session
+                    .receive_address()
+                    .map_err(|_| VaultError::InvalidPrivateAddressBookAddress)?,
+            );
+        }
+        Ok(addresses)
     }
 
     pub fn add_derived_public_account(
@@ -1230,6 +1320,52 @@ impl DesktopVaultStore {
         }
         sort_public_account_metadata(&mut accounts);
         Ok(accounts)
+    }
+
+    fn list_private_address_book_entries_with_view(
+        &self,
+        view: &ViewUnlock,
+    ) -> Result<Vec<PrivateAddressBookEntry>, VaultError> {
+        let records = self
+            .db
+            .list_desktop_wallet_vault_records(PRIVATE_ADDRESS_BOOK_PREFIX)?;
+        let mut entries = Vec::with_capacity(records.len());
+        for stored in records {
+            let Some(entry_uuid) = stored.key.strip_prefix(PRIVATE_ADDRESS_BOOK_PREFIX) else {
+                continue;
+            };
+            let record: EncryptedRecord = rmp_serde::from_slice(&stored.payload)?;
+            let mut entry = view.decrypt_private_address_book_entry(entry_uuid, &record)?;
+            if entry.entry_uuid != entry_uuid {
+                entry_uuid.clone_into(&mut entry.entry_uuid);
+            }
+            entries.push(entry);
+        }
+        sort_private_address_book_entries(&mut entries);
+        Ok(entries)
+    }
+
+    fn list_public_address_book_entries_with_view(
+        &self,
+        view: &ViewUnlock,
+    ) -> Result<Vec<PublicAddressBookEntry>, VaultError> {
+        let records = self
+            .db
+            .list_desktop_wallet_vault_records(PUBLIC_ADDRESS_BOOK_PREFIX)?;
+        let mut entries = Vec::with_capacity(records.len());
+        for stored in records {
+            let Some(entry_uuid) = stored.key.strip_prefix(PUBLIC_ADDRESS_BOOK_PREFIX) else {
+                continue;
+            };
+            let record: EncryptedRecord = rmp_serde::from_slice(&stored.payload)?;
+            let mut entry = view.decrypt_public_address_book_entry(entry_uuid, &record)?;
+            if entry.entry_uuid != entry_uuid {
+                entry_uuid.clone_into(&mut entry.entry_uuid);
+            }
+            entries.push(entry);
+        }
+        sort_public_address_book_entries(&mut entries);
+        Ok(entries)
     }
 
     fn encrypted_wallet_records_from_entropy(

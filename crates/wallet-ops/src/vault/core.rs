@@ -20,6 +20,8 @@ pub(super) const WALLET_CHAIN_METADATA_PREFIX: &str = "wallet-chain-meta|";
 pub(super) const WALLET_CACHE_ROW_PREFIX: &str = "wallet-cache-row|";
 pub(super) const PUBLIC_ACCOUNT_METADATA_PREFIX: &str = "public-account-meta|";
 pub(super) const PUBLIC_ACCOUNT_SECRET_PREFIX: &str = "public-account-secret|";
+pub(super) const PRIVATE_ADDRESS_BOOK_PREFIX: &str = "private-address-book|";
+pub(super) const PUBLIC_ADDRESS_BOOK_PREFIX: &str = "public-address-book|";
 pub const PRIMARY_WALLET_LABEL: &str = "Primary wallet";
 pub(super) const ADDITIONAL_WALLET_LABEL_PREFIX: &str = "Wallet ";
 pub(super) type HmacSha256 = Hmac<Sha256>;
@@ -83,6 +85,20 @@ pub enum VaultError {
     InvalidPublicEvmPrivateKey,
     #[error("public EVM key derivation failed")]
     PublicEvmKeyDerivation,
+    #[error("address book label cannot be empty")]
+    InvalidAddressBookLabel,
+    #[error("invalid private address book recipient")]
+    InvalidPrivateAddressBookAddress,
+    #[error("private address book recipient already exists")]
+    DuplicatePrivateAddressBookAddress,
+    #[error("private address book display order overflow")]
+    PrivateAddressBookDisplayOrderOverflow,
+    #[error("invalid public address book recipient")]
+    InvalidPublicAddressBookAddress,
+    #[error("public address book recipient already exists")]
+    DuplicatePublicAddressBookAddress,
+    #[error("public address book display order overflow")]
+    PublicAddressBookDisplayOrderOverflow,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -145,6 +161,8 @@ pub enum RecordKind {
     WalletCacheRow,
     PublicAccountMetadata,
     PublicAccountSecret,
+    PrivateAddressBookEntry,
+    PublicAddressBookEntry,
 }
 
 impl RecordKind {
@@ -160,6 +178,8 @@ impl RecordKind {
             Self::WalletCacheRow => "wallet-cache-row",
             Self::PublicAccountMetadata => "public-account-metadata",
             Self::PublicAccountSecret => "public-account-secret",
+            Self::PrivateAddressBookEntry => "private-address-book-entry",
+            Self::PublicAddressBookEntry => "public-address-book-entry",
         }
     }
 

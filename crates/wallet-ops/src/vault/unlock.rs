@@ -1,9 +1,9 @@
 use super::{
     DecodedWalletMetadata, EncryptedRecord, HmacKeyInit, HmacSha256, KEY_LEN, Mac,
-    PublicAccountMetadata, PublicAccountSecret, RecordKind, SecretKey, VaultError,
-    WalletChainMetadataBundle, WalletMetadataBundle, WalletMetadataWire, WalletSpendBundle,
-    WalletViewBundle, Zeroizing, decrypt_payload, decrypt_serialized, derive_context_key,
-    encrypt_payload, encrypt_serialized,
+    PrivateAddressBookEntry, PublicAccountMetadata, PublicAccountSecret, PublicAddressBookEntry,
+    RecordKind, SecretKey, VaultError, WalletChainMetadataBundle, WalletMetadataBundle,
+    WalletMetadataWire, WalletSpendBundle, WalletViewBundle, Zeroizing, decrypt_payload,
+    decrypt_serialized, derive_context_key, encrypt_payload, encrypt_serialized,
 };
 
 pub struct ViewUnlock {
@@ -165,6 +165,58 @@ impl ViewUnlock {
             &self.view_dek,
             RecordKind::PublicAccountMetadata,
             public_account_uuid,
+            record,
+        )
+    }
+
+    pub fn encrypt_private_address_book_entry(
+        &self,
+        entry_uuid: &str,
+        entry: &PrivateAddressBookEntry,
+    ) -> Result<EncryptedRecord, VaultError> {
+        encrypt_serialized(
+            &self.view_dek,
+            RecordKind::PrivateAddressBookEntry,
+            entry_uuid,
+            entry,
+        )
+    }
+
+    pub fn decrypt_private_address_book_entry(
+        &self,
+        entry_uuid: &str,
+        record: &EncryptedRecord,
+    ) -> Result<PrivateAddressBookEntry, VaultError> {
+        decrypt_serialized(
+            &self.view_dek,
+            RecordKind::PrivateAddressBookEntry,
+            entry_uuid,
+            record,
+        )
+    }
+
+    pub fn encrypt_public_address_book_entry(
+        &self,
+        entry_uuid: &str,
+        entry: &PublicAddressBookEntry,
+    ) -> Result<EncryptedRecord, VaultError> {
+        encrypt_serialized(
+            &self.view_dek,
+            RecordKind::PublicAddressBookEntry,
+            entry_uuid,
+            entry,
+        )
+    }
+
+    pub fn decrypt_public_address_book_entry(
+        &self,
+        entry_uuid: &str,
+        record: &EncryptedRecord,
+    ) -> Result<PublicAddressBookEntry, VaultError> {
+        decrypt_serialized(
+            &self.view_dek,
+            RecordKind::PublicAddressBookEntry,
+            entry_uuid,
             record,
         )
     }

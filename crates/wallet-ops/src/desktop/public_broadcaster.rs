@@ -1218,7 +1218,7 @@ pub(super) async fn public_broadcaster_setup(
     let broadcaster = select_public_broadcaster_with_policy(&candidates, selection, policy)?;
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls.clone(), http);
     let min_gas_price = buffered_gas_price_from_rpc_pool(&query_rpc_pool, &chain.gas).await?;
-    let artifact_source = artifact_source(http);
+    let artifact_source = artifact_source(http, session.db.as_ref());
     let prover = ProverService::new_with_db(artifact_source, Arc::clone(&session.db));
     let chain_handle = session
         .sync_manager

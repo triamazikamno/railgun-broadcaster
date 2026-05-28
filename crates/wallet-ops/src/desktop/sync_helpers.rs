@@ -216,7 +216,8 @@ pub(super) async fn setup_synced_view_wallet_with_store(
         .wrap_err("create encrypted wallet cache")?,
     );
     let scan_keys = view_session.scan_keys();
-    let poi_recovery_prover = ProverService::new_with_db(artifact_source(http), Arc::clone(&db));
+    let poi_recovery_prover =
+        ProverService::new_with_db(artifact_source(http, db.as_ref()), Arc::clone(&db));
     let wallet_cfg = WalletConfig {
         chain: chain_key,
         cache_key,
@@ -367,10 +368,15 @@ pub(super) const fn poi_read_source_label(poi_read_source: &PoiReadSource) -> &'
     }
 }
 
-pub(super) fn artifact_source(http: &HttpContext) -> ArtifactSource {
-    match http.proxy_url.as_ref() {
-        Some(url) => ArtifactSource::default().with_proxy(url.clone()),
-        None => ArtifactSource::default(),
+pub(super) fn artifact_source(http: &HttpContext, db: &DbStore) -> ArtifactSource {
+    artifact_source_with_proxy(http.proxy_url.as_ref(), db)
+}
+
+fn artifact_source_with_proxy(proxy_url: Option<&Url>, db: &DbStore) -> ArtifactSource {
+    let source = ArtifactSource::default().with_cache_dir(db.blob_dir().join("artifacts"));
+    match proxy_url {
+        Some(url) => source.with_proxy(url.clone()),
+        None => source,
     }
 }
 
@@ -386,4 +392,40 @@ pub(super) async fn buffered_gas_price_with_policy(
     }
     let gas_price = provider.get_gas_price().await.wrap_err("fetch gas price")?;
     Ok(gas_price * numerator / denominator)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::SystemTime;
+
+    use super::*;
+
+    static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_db_root() -> PathBuf {
+        let dir = std::env::temp_dir().join("railgun-broadcaster-wallet-sync-helper-tests");
+        fs::create_dir_all(&dir).expect("create temp db dir");
+        let pid = std::process::id();
+        let nanos = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let counter = TEMP_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
+        dir.join(format!("db-{pid}-{nanos}-{counter}"))
+    }
+
+    #[test]
+    fn artifact_source_uses_db_blob_artifacts_dir() {
+        let root_dir = temp_db_root();
+        let db = DbStore::open(DbConfig {
+            root_dir: root_dir.clone(),
+        })
+        .expect("open test db");
+
+        let source = artifact_source_with_proxy(None, &db);
+
+        assert_eq!(source.out_dir, db.blob_dir().join("artifacts"));
+        fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
 }

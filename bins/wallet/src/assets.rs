@@ -21,6 +21,8 @@ const PENCIL_ICON_PATH: &str = "railgun/icons/pencil.svg";
 const QR_CODE_ICON_PATH: &str = "railgun/icons/qr-code.svg";
 const TRASH_2_ICON_PATH: &str = "railgun/icons/trash-2.svg";
 const CLOCK_ICON_PATH: &str = "railgun/icons/clock.svg";
+const BOOK_USER_ICON_PATH: &str = "railgun/icons/book-user.svg";
+const SAVE_ICON_PATH: &str = "railgun/icons/save.svg";
 const KEY_ROUND_ICON_PATH: &str = "railgun/icons/key-round.svg";
 const NETWORK_ICON_PATH: &str = "railgun/icons/network.svg";
 const PIN_ICON_PATH: &str = "railgun/icons/pin.svg";
@@ -45,6 +47,8 @@ const RAILGUN_ASSET_PATHS: &[&str] = &[
     QR_CODE_ICON_PATH,
     TRASH_2_ICON_PATH,
     CLOCK_ICON_PATH,
+    BOOK_USER_ICON_PATH,
+    SAVE_ICON_PATH,
     KEY_ROUND_ICON_PATH,
     NETWORK_ICON_PATH,
     PIN_ICON_PATH,
@@ -68,6 +72,8 @@ const PENCIL_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/pencil.svg");
 const QR_CODE_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/qr-code.svg");
 const TRASH_2_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/trash-2.svg");
 const CLOCK_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/clock.svg");
+const BOOK_USER_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/book-user.svg");
+const SAVE_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/save.svg");
 const KEY_ROUND_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/key-round.svg");
 const NETWORK_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/network.svg");
 const PIN_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/pin.svg");
@@ -163,6 +169,7 @@ fn append_embedded_asset_list<T: RustEmbed>(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RailgunActionIcon {
+    Wallet,
     Send,
     Shield,
     Dices,
@@ -171,11 +178,14 @@ pub(crate) enum RailgunActionIcon {
     QrCode,
     Trash2,
     Clock,
+    BookUser,
+    Save,
 }
 
 impl IconNamed for RailgunActionIcon {
     fn path(self) -> SharedString {
         match self {
+            Self::Wallet => WALLET_ICON_PATH,
             Self::Send => ARROW_BIG_RIGHT_DASH_ICON_PATH,
             Self::Shield => SHIELD_ICON_PATH,
             Self::Dices => DICES_ICON_PATH,
@@ -184,6 +194,8 @@ impl IconNamed for RailgunActionIcon {
             Self::QrCode => QR_CODE_ICON_PATH,
             Self::Trash2 => TRASH_2_ICON_PATH,
             Self::Clock => CLOCK_ICON_PATH,
+            Self::BookUser => BOOK_USER_ICON_PATH,
+            Self::Save => SAVE_ICON_PATH,
         }
         .into()
     }
@@ -257,6 +269,8 @@ fn railgun_asset(path: &str) -> Option<&'static [u8]> {
         QR_CODE_ICON_PATH => Some(QR_CODE_ICON_BYTES),
         TRASH_2_ICON_PATH => Some(TRASH_2_ICON_BYTES),
         CLOCK_ICON_PATH => Some(CLOCK_ICON_BYTES),
+        BOOK_USER_ICON_PATH => Some(BOOK_USER_ICON_BYTES),
+        SAVE_ICON_PATH => Some(SAVE_ICON_BYTES),
         KEY_ROUND_ICON_PATH => Some(KEY_ROUND_ICON_BYTES),
         NETWORK_ICON_PATH => Some(NETWORK_ICON_BYTES),
         PIN_ICON_PATH => Some(PIN_ICON_BYTES),
@@ -295,6 +309,18 @@ mod tests {
             assets
                 .load("railgun/icons/clock.svg")
                 .expect("load clock icon")
+                .is_some()
+        );
+        assert!(
+            assets
+                .load("railgun/icons/book-user.svg")
+                .expect("load book user icon")
+                .is_some()
+        );
+        assert!(
+            assets
+                .load("railgun/icons/save.svg")
+                .expect("load save icon")
                 .is_some()
         );
     }

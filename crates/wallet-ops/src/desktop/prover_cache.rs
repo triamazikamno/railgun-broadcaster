@@ -113,7 +113,7 @@ pub async fn build_cache_with_context_and_progress_with_session(
     session: ProverCacheBuildSession,
     mut on_progress: impl FnMut(ProverCacheBuildProgress) + Send + 'static,
 ) -> Result<ProverCacheBuildReport> {
-    let source = artifact_source(http);
+    let source = artifact_source(http, db.as_ref());
     let db_path = db.root_dir().to_path_buf();
     tracing::info!(
         db_path = %db_path.display(),

@@ -116,7 +116,8 @@ async fn main() -> Result<()> {
         });
     }
 
-    let mut artifact_source = ArtifactSource::default();
+    let mut artifact_source =
+        ArtifactSource::default().with_cache_dir(db.blob_dir().join("artifacts"));
     if let Some(path) = cfg.artifacts_metadata_dir.clone() {
         artifact_source = artifact_source
             .with_metadata_dir(path)

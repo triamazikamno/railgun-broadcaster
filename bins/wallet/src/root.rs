@@ -23,8 +23,8 @@ use wallet_ops::{
     settings::{EffectiveChainConfig, EffectiveTokenRegistry, load_wallet_settings},
     subscribe_prover_cache_build,
     vault::{
-        DesktopVaultStore, DesktopViewSession, GeneratedSeedMaterial, PublicAccountMetadata,
-        WalletMetadataBundle,
+        DesktopVaultStore, DesktopViewSession, GeneratedSeedMaterial, PrivateAddressBookEntry,
+        PublicAccountMetadata, PublicAddressBookEntry, WalletMetadataBundle,
     },
 };
 use zeroize::Zeroizing;
@@ -120,14 +120,17 @@ use manage_wallets::{
 };
 #[cfg(test)]
 use private_action::{
-    PrivateActionMetric, SEND_AUTHORIZATION_FAILED_ERROR, SelfBroadcastNativeBalanceState,
+    PrivateActionMetric, PrivateWalletRecipientSource, RecipientOption, RecipientOptionSource,
+    SEND_AUTHORIZATION_FAILED_ERROR, SelfBroadcastNativeBalanceState,
     UNSHIELD_AUTHORIZATION_FAILED_ERROR, adjusted_amount_for_max_change,
-    default_self_broadcast_gas_payer_uuid, form_error_clears_public_broadcaster_cost_estimate,
-    format_exact_asset_amount_for_display, format_form_error_for_asset,
+    can_save_private_recipient, can_save_public_recipient, default_self_broadcast_gas_payer_uuid,
+    form_error_clears_public_broadcaster_cost_estimate, format_exact_asset_amount_for_display,
+    format_form_error_for_asset, normalized_address_book_save_label,
     private_action_assets_from_snapshot, private_action_metric_display_amount,
-    private_action_metrics, random_self_broadcast_gas_payer_uuid,
-    self_broadcast_gas_payer_matches_search, self_broadcast_native_balance_label,
-    self_broadcast_native_balance_state, send_element_id,
+    private_action_metrics, private_send_recipient_options, private_unshield_recipient_options,
+    random_self_broadcast_gas_payer_uuid, recipient_option_matches_search,
+    selected_recipient_address, self_broadcast_gas_payer_matches_search,
+    self_broadcast_native_balance_label, self_broadcast_native_balance_state, send_element_id,
     send_public_broadcaster_estimate_input_error, unshield_element_id,
     unshield_public_broadcaster_estimate_input_error,
 };
@@ -317,6 +320,10 @@ pub(crate) struct WalletRoot {
     add_wallet_password_input: Entity<InputState>,
     import_mnemonic_input: Entity<InputState>,
     public_accounts: Vec<PublicAccountMetadata>,
+    private_address_book: Vec<PrivateAddressBookEntry>,
+    public_address_book: Vec<PublicAddressBookEntry>,
+    address_book_label_input: Entity<InputState>,
+    address_book_save_error: Option<Arc<str>>,
     public_form: PublicAccountFormState,
     public_balance_snapshot: Option<Arc<PublicBalanceSnapshot>>,
     public_balance_error: Option<Arc<str>>,
@@ -565,6 +572,7 @@ impl WalletRoot {
                 .placeholder("paste recovery phrase")
         });
         let public_account_search_input = new_text_input(window, cx, "search accounts");
+        let address_book_label_input = new_text_input(window, cx, "recipient label");
         let public_form = PublicAccountFormState {
             add_label_input: new_text_input(window, cx, "account label"),
             add_password_input: new_masked_input(window, cx, "vault password"),
@@ -695,6 +703,10 @@ impl WalletRoot {
             add_wallet_password_input,
             import_mnemonic_input,
             public_accounts: Vec::new(),
+            private_address_book: Vec::new(),
+            public_address_book: Vec::new(),
+            address_book_label_input,
+            address_book_save_error: None,
             public_form,
             public_balance_snapshot: None,
             public_balance_error: None,

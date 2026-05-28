@@ -80,6 +80,17 @@ pub(super) const fn vault_error_kind(error: &VaultError) -> &'static str {
         VaultError::PublicAccountDisplayOrderOverflow => "public_account_display_order_overflow",
         VaultError::InvalidPublicEvmPrivateKey => "invalid_public_evm_private_key",
         VaultError::PublicEvmKeyDerivation => "public_evm_key_derivation",
+        VaultError::InvalidAddressBookLabel => "invalid_address_book_label",
+        VaultError::InvalidPrivateAddressBookAddress => "invalid_private_address_book_address",
+        VaultError::DuplicatePrivateAddressBookAddress => "duplicate_private_address_book_address",
+        VaultError::PrivateAddressBookDisplayOrderOverflow => {
+            "private_address_book_display_order_overflow"
+        }
+        VaultError::InvalidPublicAddressBookAddress => "invalid_public_address_book_address",
+        VaultError::DuplicatePublicAddressBookAddress => "duplicate_public_address_book_address",
+        VaultError::PublicAddressBookDisplayOrderOverflow => {
+            "public_address_book_display_order_overflow"
+        }
     }
 }
 
@@ -618,6 +629,7 @@ impl WalletRoot {
         self.selected_wallet_id = Some(wallet_id);
         self.sync_wallet_select(window, cx);
         self.reset_wallet_scoped_state(cx);
+        self.reload_address_books(cx);
         self.reload_public_accounts(window, cx);
         self.setup_password = None;
         self.generated_seed = None;
@@ -674,6 +686,9 @@ impl WalletRoot {
         self.view_session = None;
         self.wallet_metadata.clear();
         self.wallet_options.clear();
+        self.private_address_book.clear();
+        self.public_address_book.clear();
+        self.address_book_save_error = None;
         self.selected_wallet_id = None;
         self.active_wallet_generation = self.active_wallet_generation.wrapping_add(1);
         self.sync_wallet_select(window, cx);

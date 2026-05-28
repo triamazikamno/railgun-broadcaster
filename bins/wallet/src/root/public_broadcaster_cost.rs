@@ -515,6 +515,10 @@ impl WalletRoot {
             form.broadcaster_fee_mode,
         );
         let allow_suspicious_broadcasters = form.allow_suspicious_broadcasters;
+        if self.recipient_combobox_search_active(DeliveryFormKind::Send, key) {
+            self.clear_pending_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
+            return;
+        }
         if let Some(error) = send_public_broadcaster_estimate_input_error(
             recipient.as_str(),
             amount_raw.as_str(),
@@ -631,6 +635,14 @@ impl WalletRoot {
             form.broadcaster_fee_mode,
         );
         let allow_suspicious_broadcasters = form.allow_suspicious_broadcasters;
+        if self.recipient_combobox_search_active(DeliveryFormKind::Unshield, key) {
+            self.clear_pending_public_broadcaster_cost_estimate(
+                DeliveryFormKind::Unshield,
+                key,
+                cx,
+            );
+            return;
+        }
         if let Some(error) = unshield_public_broadcaster_estimate_input_error(
             recipient_raw.as_str(),
             amount_raw.as_str(),

@@ -5,15 +5,18 @@ use alloy::primitives::{Address, U256};
 use broadcaster_monitor::FeeRow;
 use gpui::{
     Animation, AnimationExt as _, App, AppContext, Context, ElementId, Entity, Focusable,
-    InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder as _, px, rgb,
+    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement, Pixels,
+    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Window, deferred, div,
+    prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
     Disableable, Icon, IconName, IndexPath, Selectable, Sizable, WindowExt,
     alert::Alert,
     button::{Button, ButtonGroup, ButtonVariants},
-    input::{Input, InputEvent, InputState},
+    dialog::DialogButtonProps,
+    input::{Escape as InputEscape, Input, InputEvent, InputState},
     popover::Popover,
+    scroll::ScrollableElement,
     select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState},
     spinner::Spinner,
 };
@@ -22,7 +25,7 @@ use rand::seq::IndexedRandom;
 use tokio::sync::{mpsc, watch};
 use ui::clipboard::clipboard_with_toast;
 use ui::controls::{
-    app_button, app_button_base, app_button_label, app_muted_text, app_strong_text,
+    app_button, app_button_base, app_button_label, app_input, app_muted_text, app_strong_text,
 };
 use ui::theme::{self, APP_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
@@ -42,7 +45,10 @@ use wallet_ops::{
     sort_specific_public_broadcasters, submit_desktop_send_public_broadcaster,
     submit_desktop_send_self_broadcast, submit_desktop_unshield_public_broadcaster,
     submit_desktop_unshield_self_broadcast,
-    vault::{DesktopVaultStore, DesktopViewSession, PublicAccountMetadata, PublicAccountStatus},
+    vault::{
+        DesktopVaultStore, DesktopViewSession, PrivateAddressBookEntry, PublicAccountMetadata,
+        PublicAccountStatus, PublicAddressBookEntry, WalletStatus,
+    },
 };
 use zeroize::Zeroizing;
 
@@ -77,6 +83,7 @@ use super::spend_authorization::{
     SpendAuthorizationIntent, SpendAuthorizationSummary, SpendAuthorizationSummaryRow,
     is_spend_authorization_failure_error,
 };
+use super::utxo::short_hash;
 use super::{
     ChainUtxoState, PRIVATE_ACTION_FORM_MAX_HEIGHT, PRIVATE_ASSET_LIST_WIDTH,
     PublicBroadcasterFeeTokenOption, WalletRoot, effective_public_broadcaster_fee_mode,
@@ -84,14 +91,16 @@ use super::{
     format_unshield_amount_input, is_effective_wrapped_native_token, labeled_field,
     native_token_display_label, native_wrapped_output_labels, new_prefilled_input, new_text_input,
     parse_address, public_balance_amount_label, public_broadcaster_fee_token_warning,
-    public_broadcaster_submit_disabled_for_fee_token_options, send_form_max_entered_amount,
-    should_show_broadcaster_fee_mode_toggle, token_label_row, unshield_form_max_entered_amount,
+    public_broadcaster_submit_disabled_for_fee_token_options, secondary_dialog_content_width,
+    send_form_max_entered_amount, should_show_broadcaster_fee_mode_toggle, token_label_row,
+    unshield_form_max_entered_amount, vault_error_kind,
 };
 
 mod delivery;
 mod form_lifecycle;
 mod generation;
 mod helpers;
+mod recipient_picker;
 mod render_forms;
 mod render_helpers;
 mod self_broadcast;
@@ -99,6 +108,7 @@ mod types;
 
 pub(super) use delivery::*;
 pub(super) use helpers::*;
+pub(super) use recipient_picker::*;
 pub(super) use render_helpers::*;
 pub(super) use self_broadcast::*;
 pub(super) use types::*;

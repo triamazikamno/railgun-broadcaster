@@ -174,12 +174,28 @@ impl WalletRoot {
             cx,
         );
         let gas_fee_editor = Eip1559GasFeeEditorState::new(window, cx);
-        cx.subscribe(
+        cx.subscribe_in(
             &recipient_input,
-            move |this, _input, event: &InputEvent, cx| {
+            window,
+            move |this, input, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::Change) {
+                    if let Some(form) = this.send_forms.get_mut(&key) {
+                        form.recipient_value = Arc::from(input.read(cx).value().as_ref());
+                    }
+                    this.update_recipient_suggestions_for_input_change(
+                        DeliveryFormKind::Send,
+                        key,
+                        cx,
+                    );
                     this.clear_send_form_text_edit_state(key, cx);
                     this.debounce_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
+                } else if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.confirm_selected_recipient_suggestion(
+                        DeliveryFormKind::Send,
+                        key,
+                        window,
+                        cx,
+                    );
                 }
             },
         )
@@ -270,6 +286,10 @@ impl WalletRoot {
             SendFormState {
                 asset,
                 recipient_input,
+                recipient_value: Arc::from(""),
+                recipient_suggestions_open: false,
+                recipient_suggestion_index: None,
+                recipient_suggestions_scroll: ScrollHandle::new(),
                 amount_input,
                 asset_select,
                 asset_select_items,
@@ -1207,14 +1227,30 @@ impl WalletRoot {
             cx,
         );
         let gas_fee_editor = Eip1559GasFeeEditorState::new(window, cx);
-        cx.subscribe(
+        cx.subscribe_in(
             &recipient_input,
-            move |this, _input, event: &InputEvent, cx| {
+            window,
+            move |this, input, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::Change) {
+                    if let Some(form) = this.unshield_forms.get_mut(&key) {
+                        form.recipient_value = Arc::from(input.read(cx).value().as_ref());
+                    }
                     this.clear_unshield_form_text_edit_state(key, cx);
+                    this.update_recipient_suggestions_for_input_change(
+                        DeliveryFormKind::Unshield,
+                        key,
+                        cx,
+                    );
                     this.debounce_public_broadcaster_cost_estimate(
                         DeliveryFormKind::Unshield,
                         key,
+                        cx,
+                    );
+                } else if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.confirm_selected_recipient_suggestion(
+                        DeliveryFormKind::Unshield,
+                        key,
+                        window,
                         cx,
                     );
                 }
@@ -1293,6 +1329,10 @@ impl WalletRoot {
             UnshieldFormState {
                 asset,
                 recipient_input,
+                recipient_value: Arc::from(""),
+                recipient_suggestions_open: false,
+                recipient_suggestion_index: None,
+                recipient_suggestions_scroll: ScrollHandle::new(),
                 amount_input,
                 asset_select,
                 asset_select_items,

@@ -1,12 +1,14 @@
 use super::{
     ADDITIONAL_WALLET_LABEL_PREFIX, Address, BTreeSet, CacheKeys, KEY_LEN, MnemonicBuilder,
-    PRIMARY_WALLET_LABEL, PUBLIC_ACCOUNT_METADATA_PREFIX, PUBLIC_ACCOUNT_SECRET_PREFIX,
+    PRIMARY_WALLET_LABEL, PRIVATE_ADDRESS_BOOK_PREFIX, PUBLIC_ACCOUNT_METADATA_PREFIX,
+    PUBLIC_ACCOUNT_SECRET_PREFIX, PUBLIC_ADDRESS_BOOK_PREFIX, PrivateAddressBookEntry,
     PrivateKeySigner, PublicAccountMetadata, PublicAccountScope, PublicAccountSecret,
-    PublicAccountSource, PublicAccountStatus, SigningKey, SpendUnlock, VaultError, ViewUnlock,
-    WALLET_CACHE_ROW_PREFIX, WALLET_CHAIN_METADATA_PREFIX, WALLET_METADATA_PREFIX,
-    WALLET_SPEND_PREFIX, WALLET_VIEW_PREFIX, WalletCacheError, WalletMetadataBundle, WalletUtxo,
-    Zeroizing, bip39_mnemonic_from_entropy, generate_opaque_id,
+    PublicAccountSource, PublicAccountStatus, PublicAddressBookEntry, SigningKey, SpendUnlock,
+    VaultError, ViewUnlock, WALLET_CACHE_ROW_PREFIX, WALLET_CHAIN_METADATA_PREFIX,
+    WALLET_METADATA_PREFIX, WALLET_SPEND_PREFIX, WALLET_VIEW_PREFIX, WalletCacheError,
+    WalletMetadataBundle, WalletUtxo, Zeroizing, bip39_mnemonic_from_entropy, generate_opaque_id,
 };
+use crate::parse_railgun_recipient;
 
 pub(super) fn wallet_view_record_key(wallet_id: &str) -> String {
     format!("{WALLET_VIEW_PREFIX}{wallet_id}")
@@ -45,6 +47,14 @@ pub(super) fn public_account_metadata_record_key(public_account_uuid: &str) -> S
 
 pub(super) fn public_account_secret_record_key(public_account_uuid: &str) -> String {
     format!("{PUBLIC_ACCOUNT_SECRET_PREFIX}{public_account_uuid}")
+}
+
+pub(super) fn private_address_book_record_key(entry_uuid: &str) -> String {
+    format!("{PRIVATE_ADDRESS_BOOK_PREFIX}{entry_uuid}")
+}
+
+pub(super) fn public_address_book_record_key(entry_uuid: &str) -> String {
+    format!("{PUBLIC_ADDRESS_BOOK_PREFIX}{entry_uuid}")
 }
 
 pub(super) fn wallet_cache_counts(utxos: &[WalletUtxo]) -> (usize, usize) {
@@ -93,6 +103,24 @@ pub(super) fn public_account_secret_record_entry(
 ) -> Result<(String, Vec<u8>), VaultError> {
     let key = public_account_secret_record_key(&metadata.public_account_uuid);
     let record = spend.encrypt_public_account_secret(&metadata.public_account_uuid, secret)?;
+    record.to_record_entry(key)
+}
+
+pub(super) fn private_address_book_record_entry(
+    view: &ViewUnlock,
+    entry: &PrivateAddressBookEntry,
+) -> Result<(String, Vec<u8>), VaultError> {
+    let key = private_address_book_record_key(&entry.entry_uuid);
+    let record = view.encrypt_private_address_book_entry(&entry.entry_uuid, entry)?;
+    record.to_record_entry(key)
+}
+
+pub(super) fn public_address_book_record_entry(
+    view: &ViewUnlock,
+    entry: &PublicAddressBookEntry,
+) -> Result<(String, Vec<u8>), VaultError> {
+    let key = public_address_book_record_key(&entry.entry_uuid);
+    let record = view.encrypt_public_address_book_entry(&entry.entry_uuid, entry)?;
     record.to_record_entry(key)
 }
 
@@ -242,6 +270,121 @@ pub(super) fn next_public_account_display_order(
                 .checked_add(1)
                 .ok_or(VaultError::PublicAccountDisplayOrderOverflow)
         })
+}
+
+#[must_use]
+pub fn normalize_address_book_label(label: &str) -> String {
+    label.trim().to_owned()
+}
+
+pub fn validate_address_book_label(label: &str) -> Result<String, VaultError> {
+    let label = normalize_address_book_label(label);
+    if label.is_empty() {
+        Err(VaultError::InvalidAddressBookLabel)
+    } else {
+        Ok(label)
+    }
+}
+
+pub fn sort_private_address_book_entries(entries: &mut [PrivateAddressBookEntry]) {
+    entries.sort_by(|left, right| {
+        left.display_order
+            .cmp(&right.display_order)
+            .then_with(|| left.label.cmp(&right.label))
+            .then_with(|| left.entry_uuid.cmp(&right.entry_uuid))
+    });
+}
+
+pub fn sort_public_address_book_entries(entries: &mut [PublicAddressBookEntry]) {
+    entries.sort_by(|left, right| {
+        left.display_order
+            .cmp(&right.display_order)
+            .then_with(|| left.label.cmp(&right.label))
+            .then_with(|| left.entry_uuid.cmp(&right.entry_uuid))
+    });
+}
+
+pub(super) fn next_private_address_book_display_order(
+    entries: &[PrivateAddressBookEntry],
+) -> Result<u32, VaultError> {
+    entries
+        .iter()
+        .map(|entry| entry.display_order)
+        .max()
+        .map_or(Ok(0), |max_display_order| {
+            max_display_order
+                .checked_add(1)
+                .ok_or(VaultError::PrivateAddressBookDisplayOrderOverflow)
+        })
+}
+
+pub(super) fn next_public_address_book_display_order(
+    entries: &[PublicAddressBookEntry],
+) -> Result<u32, VaultError> {
+    entries
+        .iter()
+        .map(|entry| entry.display_order)
+        .max()
+        .map_or(Ok(0), |max_display_order| {
+            max_display_order
+                .checked_add(1)
+                .ok_or(VaultError::PublicAddressBookDisplayOrderOverflow)
+        })
+}
+
+pub(super) fn validate_private_address_book_address(address: &str) -> Result<String, VaultError> {
+    let address = address.trim();
+    parse_railgun_recipient(address).map_err(|_| VaultError::InvalidPrivateAddressBookAddress)?;
+    Ok(address.to_owned())
+}
+
+pub(super) fn validate_public_address_book_address(address: &str) -> Result<Address, VaultError> {
+    address
+        .trim()
+        .parse()
+        .map_err(|_| VaultError::InvalidPublicAddressBookAddress)
+}
+
+pub(super) fn ensure_private_address_book_address_available(
+    entries: &[PrivateAddressBookEntry],
+    existing_recipients: &[String],
+    address: &str,
+) -> Result<(), VaultError> {
+    let address_data = parse_railgun_recipient(address)
+        .map_err(|_| VaultError::InvalidPrivateAddressBookAddress)?;
+    let duplicate_entry = entries.iter().any(|entry| {
+        parse_railgun_recipient(&entry.address).is_ok_and(|entry_data| {
+            entry_data.master_public_key == address_data.master_public_key
+                && entry_data.viewing_public_key == address_data.viewing_public_key
+        })
+    });
+    let duplicate_existing = existing_recipients.iter().any(|recipient| {
+        parse_railgun_recipient(recipient).is_ok_and(|recipient_data| {
+            recipient_data.master_public_key == address_data.master_public_key
+                && recipient_data.viewing_public_key == address_data.viewing_public_key
+        })
+    });
+    if duplicate_entry || duplicate_existing {
+        Err(VaultError::DuplicatePrivateAddressBookAddress)
+    } else {
+        Ok(())
+    }
+}
+
+pub(super) fn ensure_public_address_book_address_available(
+    entries: &[PublicAddressBookEntry],
+    existing_accounts: &[PublicAccountMetadata],
+    address: Address,
+) -> Result<(), VaultError> {
+    if entries.iter().any(|entry| entry.address == address)
+        || existing_accounts.iter().any(|account| {
+            account.status == PublicAccountStatus::Active && account.address == address
+        })
+    {
+        Err(VaultError::DuplicatePublicAddressBookAddress)
+    } else {
+        Ok(())
+    }
 }
 
 pub(super) fn next_derived_public_account_index(

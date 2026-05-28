@@ -18,7 +18,7 @@ pub(super) async fn prepare_desktop_unshield_plan_without_broadcaster_fee(
         return Err(eyre!("selected token does not support unwrap-to-native"));
     }
 
-    let artifact_source = artifact_source(http);
+    let artifact_source = artifact_source(http, request.session.db.as_ref());
     let prover = ProverService::new_with_db(artifact_source, Arc::clone(&request.session.db));
     let chain_handle = request
         .session
@@ -180,7 +180,7 @@ pub(super) async fn prepare_blocked_shield_rescue_plan(
         request.requested_public_account_uuid.as_deref(),
     )?;
 
-    let artifact_source = artifact_source(http);
+    let artifact_source = artifact_source(http, request.session.db.as_ref());
     let prover = ProverService::new_with_db(artifact_source, Arc::clone(&request.session.db));
     let chain_handle = request
         .session
@@ -343,7 +343,7 @@ pub(super) async fn prepare_desktop_send_plan_without_broadcaster_fee(
     let recipient = request.recipient.trim();
     let recipient_data = parse_railgun_recipient(recipient)?;
     let chain = effective_desktop_chain_config(request.chain_id, request.effective_chain)?;
-    let artifact_source = artifact_source(http);
+    let artifact_source = artifact_source(http, request.session.db.as_ref());
     let prover = ProverService::new_with_db(artifact_source, Arc::clone(&request.session.db));
     let chain_handle = request
         .session

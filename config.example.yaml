@@ -259,6 +259,10 @@ trusted_signers:
 # Optional override for local db root.
 #db_dir: ./db
 
+# Optional override for prover artifact cache root.
+# Defaults to <db_dir>/railgun/blobs/artifacts.
+#artifacts_cache_dir: ./db/railgun/blobs/artifacts
+
 # Optional admin API for online wallet resets.
 #admin:
 #  listen_addr: 127.0.0.1:3001
