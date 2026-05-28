@@ -83,11 +83,13 @@ pub(super) const fn vault_error_kind(error: &VaultError) -> &'static str {
         VaultError::InvalidAddressBookLabel => "invalid_address_book_label",
         VaultError::InvalidPrivateAddressBookAddress => "invalid_private_address_book_address",
         VaultError::DuplicatePrivateAddressBookAddress => "duplicate_private_address_book_address",
+        VaultError::PrivateAddressBookEntryNotFound => "private_address_book_entry_not_found",
         VaultError::PrivateAddressBookDisplayOrderOverflow => {
             "private_address_book_display_order_overflow"
         }
         VaultError::InvalidPublicAddressBookAddress => "invalid_public_address_book_address",
         VaultError::DuplicatePublicAddressBookAddress => "duplicate_public_address_book_address",
+        VaultError::PublicAddressBookEntryNotFound => "public_address_book_entry_not_found",
         VaultError::PublicAddressBookDisplayOrderOverflow => {
             "public_address_book_display_order_overflow"
         }
@@ -688,6 +690,11 @@ impl WalletRoot {
         self.wallet_options.clear();
         self.private_address_book.clear();
         self.public_address_book.clear();
+        self.address_book.search_query = Arc::from("");
+        self.address_book
+            .search_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.address_book.clear_dialog_state(window, cx);
         self.address_book_save_error = None;
         self.selected_wallet_id = None;
         self.active_wallet_generation = self.active_wallet_generation.wrapping_add(1);

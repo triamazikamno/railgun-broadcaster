@@ -11,15 +11,18 @@ use super::{
     bip39_entropy_from_mnemonic, create_spend_grant, create_with_params,
     default_wallet_label_for_metadata, derive_public_evm_address_from_entropy,
     derive_public_evm_private_key_from_entropy, deserialize_wallet_utxo,
-    ensure_private_address_book_address_available, ensure_public_account_address_available,
-    ensure_public_address_book_address_available, generate_opaque_id,
+    ensure_private_address_book_address_available,
+    ensure_private_address_book_address_available_for_update,
+    ensure_public_account_address_available, ensure_public_address_book_address_available,
+    ensure_public_address_book_address_available_for_update, generate_opaque_id,
     initial_derived_public_account, next_derived_public_account_index,
     next_private_address_book_display_order, next_public_account_display_order,
     next_public_address_book_display_order, next_wallet_display_order,
     normalize_public_account_label, parse_public_evm_private_key,
-    private_address_book_record_entry, public_account_metadata_record_entry,
-    public_account_metadata_record_key, public_account_secret_record_entry,
-    public_account_secret_record_key, public_address_book_record_entry,
+    private_address_book_record_entry, private_address_book_record_key,
+    public_account_metadata_record_entry, public_account_metadata_record_key,
+    public_account_secret_record_entry, public_account_secret_record_key,
+    public_address_book_record_entry, public_address_book_record_key,
     public_evm_address_from_private_key, serialize_wallet_utxo, sort_private_address_book_entries,
     sort_public_account_metadata, sort_public_address_book_entries, sort_wallet_metadata,
     unlock_spend, unlock_view, validate_address_book_label, validate_private_address_book_address,
@@ -394,6 +397,101 @@ impl DesktopVaultStore {
         };
         let (key, data) = public_address_book_record_entry(&view_session.view, &entry)?;
         self.db.put_desktop_wallet_vault_record(&key, &data)?;
+        Ok(entry)
+    }
+
+    pub fn update_private_address_book_entry_for_session(
+        &self,
+        view_session: &DesktopViewSession,
+        entry_uuid: &str,
+        label: &str,
+        address: &str,
+    ) -> Result<PrivateAddressBookEntry, VaultError> {
+        let label = validate_address_book_label(label)?;
+        let address = validate_private_address_book_address(address)?;
+        let mut entries = self.list_private_address_book_entries_with_view(&view_session.view)?;
+        let Some(entry_index) = entries
+            .iter()
+            .position(|entry| entry.entry_uuid == entry_uuid)
+        else {
+            return Err(VaultError::PrivateAddressBookEntryNotFound);
+        };
+        let active_private_recipients = self.active_private_receive_addresses(view_session)?;
+        ensure_private_address_book_address_available_for_update(
+            &entries,
+            &active_private_recipients,
+            entry_uuid,
+            &address,
+        )?;
+
+        entries[entry_index].label = label;
+        entries[entry_index].address = address;
+        let updated = entries[entry_index].clone();
+        let (key, data) = private_address_book_record_entry(&view_session.view, &updated)?;
+        self.db.put_desktop_wallet_vault_record(&key, &data)?;
+        Ok(updated)
+    }
+
+    pub fn update_public_address_book_entry_for_session(
+        &self,
+        view_session: &DesktopViewSession,
+        entry_uuid: &str,
+        label: &str,
+        address: &str,
+    ) -> Result<PublicAddressBookEntry, VaultError> {
+        let label = validate_address_book_label(label)?;
+        let address = validate_public_address_book_address(address)?;
+        let mut entries = self.list_public_address_book_entries_with_view(&view_session.view)?;
+        let Some(entry_index) = entries
+            .iter()
+            .position(|entry| entry.entry_uuid == entry_uuid)
+        else {
+            return Err(VaultError::PublicAddressBookEntryNotFound);
+        };
+        let accounts = self.list_public_accounts_for_session(view_session, false)?;
+        ensure_public_address_book_address_available_for_update(
+            &entries, &accounts, entry_uuid, address,
+        )?;
+
+        entries[entry_index].label = label;
+        entries[entry_index].address = address;
+        let updated = entries[entry_index].clone();
+        let (key, data) = public_address_book_record_entry(&view_session.view, &updated)?;
+        self.db.put_desktop_wallet_vault_record(&key, &data)?;
+        Ok(updated)
+    }
+
+    pub fn delete_private_address_book_entry_for_session(
+        &self,
+        view_session: &DesktopViewSession,
+        entry_uuid: &str,
+    ) -> Result<PrivateAddressBookEntry, VaultError> {
+        let entries = self.list_private_address_book_entries_with_view(&view_session.view)?;
+        let Some(entry) = entries
+            .into_iter()
+            .find(|entry| entry.entry_uuid == entry_uuid)
+        else {
+            return Err(VaultError::PrivateAddressBookEntryNotFound);
+        };
+        self.db
+            .delete_desktop_wallet_vault_record(&private_address_book_record_key(entry_uuid))?;
+        Ok(entry)
+    }
+
+    pub fn delete_public_address_book_entry_for_session(
+        &self,
+        view_session: &DesktopViewSession,
+        entry_uuid: &str,
+    ) -> Result<PublicAddressBookEntry, VaultError> {
+        let entries = self.list_public_address_book_entries_with_view(&view_session.view)?;
+        let Some(entry) = entries
+            .into_iter()
+            .find(|entry| entry.entry_uuid == entry_uuid)
+        else {
+            return Err(VaultError::PublicAddressBookEntryNotFound);
+        };
+        self.db
+            .delete_desktop_wallet_vault_record(&public_address_book_record_key(entry_uuid))?;
         Ok(entry)
     }
 

@@ -223,6 +223,7 @@ impl IconNamed for RailgunPublicAccountIcon {
 pub(crate) enum RailgunSidebarIcon {
     Wallet,
     Broadcaster,
+    BookUser,
     Logs,
 }
 
@@ -231,6 +232,7 @@ impl IconNamed for RailgunSidebarIcon {
         match self {
             Self::Wallet => WALLET_ICON_PATH,
             Self::Broadcaster => BROADCASTER_ICON_PATH,
+            Self::BookUser => BOOK_USER_ICON_PATH,
             Self::Logs => LOGS_ICON_PATH,
         }
         .into()

@@ -350,9 +350,40 @@ pub(super) fn ensure_private_address_book_address_available(
     existing_recipients: &[String],
     address: &str,
 ) -> Result<(), VaultError> {
+    ensure_private_address_book_address_available_except(
+        entries,
+        existing_recipients,
+        None,
+        address,
+    )
+}
+
+pub(super) fn ensure_private_address_book_address_available_for_update(
+    entries: &[PrivateAddressBookEntry],
+    existing_recipients: &[String],
+    current_entry_uuid: &str,
+    address: &str,
+) -> Result<(), VaultError> {
+    ensure_private_address_book_address_available_except(
+        entries,
+        existing_recipients,
+        Some(current_entry_uuid),
+        address,
+    )
+}
+
+fn ensure_private_address_book_address_available_except(
+    entries: &[PrivateAddressBookEntry],
+    existing_recipients: &[String],
+    current_entry_uuid: Option<&str>,
+    address: &str,
+) -> Result<(), VaultError> {
     let address_data = parse_railgun_recipient(address)
         .map_err(|_| VaultError::InvalidPrivateAddressBookAddress)?;
     let duplicate_entry = entries.iter().any(|entry| {
+        if current_entry_uuid == Some(entry.entry_uuid.as_str()) {
+            return false;
+        }
         parse_railgun_recipient(&entry.address).is_ok_and(|entry_data| {
             entry_data.master_public_key == address_data.master_public_key
                 && entry_data.viewing_public_key == address_data.viewing_public_key
@@ -376,10 +407,34 @@ pub(super) fn ensure_public_address_book_address_available(
     existing_accounts: &[PublicAccountMetadata],
     address: Address,
 ) -> Result<(), VaultError> {
-    if entries.iter().any(|entry| entry.address == address)
-        || existing_accounts.iter().any(|account| {
-            account.status == PublicAccountStatus::Active && account.address == address
-        })
+    ensure_public_address_book_address_available_except(entries, existing_accounts, None, address)
+}
+
+pub(super) fn ensure_public_address_book_address_available_for_update(
+    entries: &[PublicAddressBookEntry],
+    existing_accounts: &[PublicAccountMetadata],
+    current_entry_uuid: &str,
+    address: Address,
+) -> Result<(), VaultError> {
+    ensure_public_address_book_address_available_except(
+        entries,
+        existing_accounts,
+        Some(current_entry_uuid),
+        address,
+    )
+}
+
+fn ensure_public_address_book_address_available_except(
+    entries: &[PublicAddressBookEntry],
+    existing_accounts: &[PublicAccountMetadata],
+    current_entry_uuid: Option<&str>,
+    address: Address,
+) -> Result<(), VaultError> {
+    if entries.iter().any(|entry| {
+        current_entry_uuid != Some(entry.entry_uuid.as_str()) && entry.address == address
+    }) || existing_accounts
+        .iter()
+        .any(|account| account.status == PublicAccountStatus::Active && account.address == address)
     {
         Err(VaultError::DuplicatePublicAddressBookAddress)
     } else {

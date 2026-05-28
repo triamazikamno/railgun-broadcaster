@@ -30,6 +30,7 @@ use wallet_ops::{
 use zeroize::Zeroizing;
 
 mod actions;
+mod address_book;
 mod broadcaster_picker;
 mod chain_load;
 mod dialogs;
@@ -62,6 +63,7 @@ mod tests;
 pub(crate) use actions::{install_utxo_navigation_bindings, install_wallet_action_bindings};
 pub(crate) use shell::{WalletAppOptions, open_wallet_window};
 
+use address_book::AddressBookState;
 use broadcaster_picker::BroadcasterPickerState;
 use chain_load::{ChainUtxoState, chain_load_overrides, start_shared_poi_cache_service};
 use gas_fee::Eip1559GasFeeEditorState;
@@ -320,6 +322,7 @@ pub(crate) struct WalletRoot {
     add_wallet_password_input: Entity<InputState>,
     import_mnemonic_input: Entity<InputState>,
     public_accounts: Vec<PublicAccountMetadata>,
+    address_book: AddressBookState,
     private_address_book: Vec<PrivateAddressBookEntry>,
     public_address_book: Vec<PublicAddressBookEntry>,
     address_book_label_input: Entity<InputState>,
@@ -572,7 +575,19 @@ impl WalletRoot {
                 .placeholder("paste recovery phrase")
         });
         let public_account_search_input = new_text_input(window, cx, "search accounts");
+        let address_book_search_input = new_text_input(window, cx, "search saved recipients");
         let address_book_label_input = new_text_input(window, cx, "recipient label");
+        let address_book = AddressBookState {
+            search_input: address_book_search_input,
+            add_label_input: new_text_input(window, cx, "recipient label"),
+            add_address_input: new_text_input(window, cx, "0zk or 0x recipient"),
+            edit_label_input: new_text_input(window, cx, "recipient label"),
+            edit_address_input: new_text_input(window, cx, "recipient address"),
+            search_query: Arc::from(""),
+            editing_entry: None,
+            pending_delete: None,
+            error: None,
+        };
         let public_form = PublicAccountFormState {
             add_label_input: new_text_input(window, cx, "account label"),
             add_password_input: new_masked_input(window, cx, "vault password"),
@@ -703,6 +718,7 @@ impl WalletRoot {
             add_wallet_password_input,
             import_mnemonic_input,
             public_accounts: Vec::new(),
+            address_book,
             private_address_book: Vec::new(),
             public_address_book: Vec::new(),
             address_book_label_input,
@@ -759,6 +775,30 @@ impl WalletRoot {
             },
         )
         .detach();
+        cx.subscribe(
+            &root.address_book.search_input,
+            |this, input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let query = input.read(cx).value().trim().to_ascii_lowercase();
+                    this.address_book.search_query = Arc::from(query);
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
+        for input in [
+            root.address_book.add_label_input.clone(),
+            root.address_book.add_address_input.clone(),
+            root.address_book.edit_label_input.clone(),
+            root.address_book.edit_address_input.clone(),
+        ] {
+            cx.subscribe(&input, |_this, _input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            })
+            .detach();
+        }
         cx.subscribe_in(
             &chain_select,
             window,

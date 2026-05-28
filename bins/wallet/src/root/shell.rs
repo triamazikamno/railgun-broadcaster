@@ -424,6 +424,7 @@ impl WalletRoot {
         match self.active_activity {
             Activity::Wallet => self.render_wallet_view(root, window).into_any_element(),
             Activity::Broadcaster => self.monitor.clone().into_any_element(),
+            Activity::AddressBook => self.render_address_book_view(root),
             Activity::Settings => self.render_settings_view().into_any_element(),
         }
     }

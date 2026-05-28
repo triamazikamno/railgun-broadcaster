@@ -91,12 +91,16 @@ pub enum VaultError {
     InvalidPrivateAddressBookAddress,
     #[error("private address book recipient already exists")]
     DuplicatePrivateAddressBookAddress,
+    #[error("private address book entry not found")]
+    PrivateAddressBookEntryNotFound,
     #[error("private address book display order overflow")]
     PrivateAddressBookDisplayOrderOverflow,
     #[error("invalid public address book recipient")]
     InvalidPublicAddressBookAddress,
     #[error("public address book recipient already exists")]
     DuplicatePublicAddressBookAddress,
+    #[error("public address book entry not found")]
+    PublicAddressBookEntryNotFound,
     #[error("public address book display order overflow")]
     PublicAddressBookDisplayOrderOverflow,
 }

@@ -85,10 +85,15 @@ fn wallet_app_options_preserve_cli_db_path() {
 }
 
 #[test]
-fn settings_sidebar_order_places_settings_after_broadcasters() {
+fn settings_sidebar_order_places_address_book_before_settings() {
     assert_eq!(
         sidebar_primary_activity_order(),
-        [Activity::Wallet, Activity::Broadcaster, Activity::Settings]
+        [
+            Activity::Wallet,
+            Activity::Broadcaster,
+            Activity::AddressBook,
+            Activity::Settings
+        ]
     );
 }
 

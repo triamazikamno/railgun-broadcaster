@@ -9,6 +9,7 @@ use super::public_action::{public_action_asset_label, public_action_max_label};
 use super::public_broadcaster_cost::public_broadcaster_cost_status;
 use super::*;
 
+mod address_book;
 mod amounts_and_balances;
 mod broadcasters;
 mod chain_loading;

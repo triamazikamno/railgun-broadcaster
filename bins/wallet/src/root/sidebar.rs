@@ -24,12 +24,18 @@ use super::{SIDEBAR_WIDTH, WalletRoot, WalletTab, rgb_with_alpha, should_focus_u
 pub(super) enum Activity {
     Wallet,
     Broadcaster,
+    AddressBook,
     Settings,
 }
 
 #[cfg(test)]
-pub(super) const fn sidebar_primary_activity_order() -> [Activity; 3] {
-    [Activity::Wallet, Activity::Broadcaster, Activity::Settings]
+pub(super) const fn sidebar_primary_activity_order() -> [Activity; 4] {
+    [
+        Activity::Wallet,
+        Activity::Broadcaster,
+        Activity::AddressBook,
+        Activity::Settings,
+    ]
 }
 
 impl WalletRoot {
@@ -41,6 +47,7 @@ impl WalletRoot {
     ) -> impl IntoElement {
         let wallet_root = root.clone();
         let broadcaster_root = root.clone();
+        let address_book_root = root.clone();
         let settings_root = root.clone();
         let logs_root = root.clone();
         let network_root = root.clone();
@@ -99,6 +106,17 @@ impl WalletRoot {
                                         cx,
                                     );
                                     root.active_activity = Activity::Broadcaster;
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child(
+                        SidebarMenuItem::new("Address book")
+                            .icon(Icon::new(RailgunSidebarIcon::BookUser).size_5())
+                            .active(self.active_activity == Activity::AddressBook)
+                            .on_click(move |_event, _window, cx| {
+                                address_book_root.update(cx, |root, cx| {
+                                    root.active_activity = Activity::AddressBook;
                                     cx.notify();
                                 });
                             }),
