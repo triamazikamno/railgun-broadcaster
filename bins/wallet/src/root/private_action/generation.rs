@@ -254,6 +254,8 @@ impl WalletRoot {
                     asset.icon_path.clone(),
                     recipient.clone(),
                     cost_estimate.clone(),
+                    self.public_broadcaster_response_timeout,
+                    self.public_broadcaster_republish_interval,
                 );
             }
             DeliveryMode::SelfBroadcast => {
@@ -790,6 +792,8 @@ impl WalletRoot {
                     asset.icon_path.clone(),
                     recipient.to_checksum(None),
                     cost_estimate.clone(),
+                    self.public_broadcaster_response_timeout,
+                    self.public_broadcaster_republish_interval,
                 );
             }
             DeliveryMode::SelfBroadcast => {

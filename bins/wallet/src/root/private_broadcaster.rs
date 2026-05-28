@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui::{
     AppContext, Context, Entity, IntoElement, ParentElement, Pixels, SharedString, Styled, Window,
@@ -58,6 +59,7 @@ const SELF_BROADCAST_UNSHIELD_PROGRESS_STAGES: [TransactionGenerationStage; 5] =
     TransactionGenerationStage::WaitingForSelfBroadcastReceipt,
 ];
 const SELF_BROADCAST_GAS_RETRY_DIALOG_WIDTH: Pixels = px(460.0);
+const PUBLIC_BROADCASTER_STOP_RESEND_THRESHOLD: usize = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PrivateSubmissionProgressFlow {
@@ -89,6 +91,9 @@ pub(super) struct PrivateBroadcasterProgressState {
     pub(super) self_broadcast_attempts: Vec<SelfBroadcastAttemptInfo>,
     pub(super) self_broadcast_current_gas_fee: Option<(u128, u128)>,
     pub(super) self_broadcast_action_error: Option<Arc<str>>,
+    pub(super) public_broadcaster_response_timeout: Option<Duration>,
+    pub(super) public_broadcaster_republish_interval: Option<Duration>,
+    pub(super) public_broadcaster_wait_started_at: Option<Instant>,
     pub(super) task_abort_handle: Option<tokio::task::AbortHandle>,
     pub(super) stop_available: bool,
     pub(super) stopped: bool,
@@ -396,9 +401,24 @@ pub(super) fn private_broadcaster_progress_footer_action(
     progress: &PrivateBroadcasterProgressState,
 ) -> ProgressFooterAction {
     progress_footer_action(
-        progress.stop_available,
+        private_broadcaster_progress_stop_available(progress, Instant::now()),
         private_broadcaster_progress_is_terminal(progress),
     )
+}
+
+fn private_broadcaster_progress_stop_available(
+    progress: &PrivateBroadcasterProgressState,
+    now: Instant,
+) -> bool {
+    progress.stop_available || public_broadcaster_waiting_can_stop(progress, now)
+}
+
+fn public_broadcaster_waiting_can_stop(
+    progress: &PrivateBroadcasterProgressState,
+    now: Instant,
+) -> bool {
+    public_broadcaster_resend_count(progress, now)
+        .is_some_and(|count| count >= PUBLIC_BROADCASTER_STOP_RESEND_THRESHOLD)
 }
 
 pub(super) fn private_broadcaster_progress_is_terminal(
@@ -479,6 +499,8 @@ impl WalletRoot {
         icon_path: Option<WalletIconSource>,
         recipient: String,
         estimate: Option<PublicBroadcasterCostEstimate>,
+        response_timeout: Duration,
+        republish_interval: Duration,
     ) {
         let asset_label = Arc::<str>::from(asset_label);
         let dialog_open = self
@@ -502,6 +524,9 @@ impl WalletRoot {
             self_broadcast_attempts: Vec::new(),
             self_broadcast_current_gas_fee: None,
             self_broadcast_action_error: None,
+            public_broadcaster_response_timeout: Some(response_timeout),
+            public_broadcaster_republish_interval: Some(republish_interval),
+            public_broadcaster_wait_started_at: None,
             task_abort_handle: None,
             stop_available: true,
             stopped: false,
@@ -545,6 +570,9 @@ impl WalletRoot {
             self_broadcast_attempts: Vec::new(),
             self_broadcast_current_gas_fee: current_gas_fee,
             self_broadcast_action_error: None,
+            public_broadcaster_response_timeout: None,
+            public_broadcaster_republish_interval: None,
+            public_broadcaster_wait_started_at: None,
             task_abort_handle: None,
             stop_available: true,
             stopped: false,
@@ -699,6 +727,12 @@ impl WalletRoot {
         }
         let should_open_dialog = !progress.stage_seen && !progress.dialog_open;
         progress.stage_seen = true;
+        if progress.flow == PrivateSubmissionProgressFlow::PublicBroadcaster
+            && stage == TransactionGenerationStage::WaitingForBroadcasterResponse
+            && progress.public_broadcaster_wait_started_at.is_none()
+        {
+            progress.public_broadcaster_wait_started_at = Some(Instant::now());
+        }
         if private_progress_stage_disables_stop(progress.flow, stage) {
             progress.stop_available = false;
         }
@@ -1150,10 +1184,21 @@ fn render_private_broadcaster_progress_footer(
     root: Entity<WalletRoot>,
     progress: &PrivateBroadcasterProgressState,
 ) -> gpui::Div {
-    let action = private_broadcaster_progress_footer_action(progress);
+    let now = Instant::now();
+    let action = progress_footer_action(
+        private_broadcaster_progress_stop_available(progress, now),
+        private_broadcaster_progress_is_terminal(progress),
+    );
     let button_root = root;
     let (id_suffix, label) = match action {
-        ProgressFooterAction::Stop => ("progress-stop", "Stop"),
+        ProgressFooterAction::Stop => (
+            "progress-stop",
+            if public_broadcaster_waiting_can_stop(progress, now) && !progress.stop_available {
+                "Stop waiting"
+            } else {
+                "Stop"
+            },
+        ),
         ProgressFooterAction::Close => ("progress-close", "Close"),
     };
     let button = app_button(
@@ -1372,8 +1417,9 @@ fn render_private_broadcaster_progress_step(
                 .child(clipboard_with_toast(copy_id, message.to_string())),
         );
     } else {
+        let detail = private_broadcaster_step_detail(progress, step, Instant::now());
         body = body.child(
-            app_muted_text(private_broadcaster_stage_detail(step.stage, step.status))
+            app_muted_text(detail)
                 .text_color(rgb(color))
                 .line_height(gpui::relative(1.0)),
         );
@@ -1477,6 +1523,78 @@ const fn private_broadcaster_retry_button_id(kind: SelfBroadcastGasRetryKind) ->
     match kind {
         SelfBroadcastGasRetryKind::RetryEstimate => "retry-self-gas",
         SelfBroadcastGasRetryKind::SpeedUp => "speed-up-self-tx",
+    }
+}
+
+fn private_broadcaster_step_detail(
+    progress: &PrivateBroadcasterProgressState,
+    step: &PrivateBroadcasterProgressStepState,
+    now: Instant,
+) -> String {
+    if step.status == PublicActionStepStatus::Pending
+        && progress.flow == PrivateSubmissionProgressFlow::PublicBroadcaster
+        && step.stage == TransactionGenerationStage::WaitingForBroadcasterResponse
+        && let Some(detail) = public_broadcaster_wait_status_detail(progress, now)
+    {
+        return detail;
+    }
+    private_broadcaster_stage_detail(step.stage, step.status).to_string()
+}
+
+pub(super) fn public_broadcaster_wait_status_detail(
+    progress: &PrivateBroadcasterProgressState,
+    now: Instant,
+) -> Option<String> {
+    let resend_count = public_broadcaster_resend_count(progress, now)?;
+    if resend_count == 0 {
+        return Some("Waiting for broadcaster response".to_string());
+    }
+    let Some(remaining) = public_broadcaster_wait_time_left(progress, now) else {
+        return Some(format!("Still waiting - re-sent {resend_count}x"));
+    };
+    Some(format!(
+        "Still waiting - re-sent {resend_count}x - {} left",
+        format_public_broadcaster_wait_remaining(remaining)
+    ))
+}
+
+fn public_broadcaster_resend_count(
+    progress: &PrivateBroadcasterProgressState,
+    now: Instant,
+) -> Option<usize> {
+    if progress.flow != PrivateSubmissionProgressFlow::PublicBroadcaster {
+        return None;
+    }
+    let started_at = progress.public_broadcaster_wait_started_at?;
+    let republish_interval = progress.public_broadcaster_republish_interval?;
+    if republish_interval.is_zero() {
+        return None;
+    }
+    let elapsed = now.saturating_duration_since(started_at);
+    let count = elapsed.as_nanos() / republish_interval.as_nanos();
+    Some(count.min(usize::MAX as u128) as usize)
+}
+
+fn public_broadcaster_wait_time_left(
+    progress: &PrivateBroadcasterProgressState,
+    now: Instant,
+) -> Option<Duration> {
+    let started_at = progress.public_broadcaster_wait_started_at?;
+    let timeout = progress.public_broadcaster_response_timeout?;
+    let elapsed = now.saturating_duration_since(started_at);
+    Some(timeout.saturating_sub(elapsed))
+}
+
+pub(super) fn format_public_broadcaster_wait_remaining(duration: Duration) -> String {
+    let total_secs = duration.as_secs();
+    let seconds = total_secs % 60;
+    let total_minutes = total_secs / 60;
+    if total_minutes < 60 {
+        format!("{total_minutes}:{seconds:02}")
+    } else {
+        let minutes = total_minutes % 60;
+        let hours = total_minutes / 60;
+        format!("{hours}:{minutes:02}:{seconds:02}")
     }
 }
 

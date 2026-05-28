@@ -455,6 +455,68 @@ fn private_public_broadcaster_stop_footer_follows_publication_boundary() {
 }
 
 #[test]
+fn private_public_broadcaster_stop_footer_reopens_after_two_re_sends() {
+    let key = UnshieldAssetKey::new(1, Address::from([0x11; 20]));
+    let mut progress =
+        private_progress_state(PrivateSubmissionProgressFlow::PublicBroadcaster, key);
+    progress.stop_available = false;
+    progress.public_broadcaster_wait_started_at = Some(
+        std::time::Instant::now()
+            .checked_sub(Duration::from_secs(6))
+            .expect("started before now"),
+    );
+
+    assert_eq!(
+        private_broadcaster_progress_footer_action(&progress),
+        ProgressFooterAction::Close,
+    );
+
+    progress.public_broadcaster_wait_started_at = Some(
+        std::time::Instant::now()
+            .checked_sub(Duration::from_secs(11))
+            .expect("started before now"),
+    );
+
+    assert_eq!(
+        private_broadcaster_progress_footer_action(&progress),
+        ProgressFooterAction::Stop,
+    );
+}
+
+#[test]
+fn public_broadcaster_wait_status_detail_is_concise() {
+    let key = UnshieldAssetKey::new(1, Address::from([0x11; 20]));
+    let mut progress =
+        private_progress_state(PrivateSubmissionProgressFlow::PublicBroadcaster, key);
+    let now = std::time::Instant::now();
+
+    progress.public_broadcaster_wait_started_at = Some(now);
+    assert_eq!(
+        public_broadcaster_wait_status_detail(&progress, now),
+        Some("Waiting for broadcaster response".to_string()),
+    );
+
+    progress.public_broadcaster_wait_started_at = Some(
+        now.checked_sub(Duration::from_secs(10))
+            .expect("started before now"),
+    );
+    assert_eq!(
+        public_broadcaster_wait_status_detail(&progress, now),
+        Some("Still waiting - re-sent 2x - 1:50 left".to_string()),
+    );
+
+    progress.public_broadcaster_response_timeout = None;
+    assert_eq!(
+        public_broadcaster_wait_status_detail(&progress, now),
+        Some("Still waiting - re-sent 2x".to_string()),
+    );
+    assert_eq!(
+        format_public_broadcaster_wait_remaining(Duration::from_secs(3661)),
+        "1:01:01",
+    );
+}
+
+#[test]
 fn stale_progress_update_guards_reject_stopped_generations() {
     assert!(public_action_accepts_update(7, 7, false));
     assert!(!public_action_accepts_update(7, 6, false));
@@ -492,6 +554,9 @@ fn closed_private_broadcaster_progress_exposes_active_stage() {
         self_broadcast_attempts: Vec::new(),
         self_broadcast_current_gas_fee: None,
         self_broadcast_action_error: None,
+        public_broadcaster_response_timeout: Some(Duration::from_secs(120)),
+        public_broadcaster_republish_interval: Some(Duration::from_secs(5)),
+        public_broadcaster_wait_started_at: None,
         task_abort_handle: None,
         stop_available: true,
         stopped: false,

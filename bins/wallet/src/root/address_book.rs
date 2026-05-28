@@ -333,7 +333,6 @@ impl WalletRoot {
         );
         if entries.is_empty() {
             return section.child(address_book_empty_state(
-                AddressBookEntryKind::Private,
                 &self.address_book.search_query,
             ));
         }
@@ -356,7 +355,6 @@ impl WalletRoot {
         );
         if entries.is_empty() {
             return section.child(address_book_empty_state(
-                AddressBookEntryKind::Public,
                 &self.address_book.search_query,
             ));
         }
@@ -865,12 +863,9 @@ fn address_book_section_shell(
     )
 }
 
-fn address_book_empty_state(kind: AddressBookEntryKind, query: &str) -> gpui::Div {
+fn address_book_empty_state(query: &str) -> gpui::Div {
     let message = if query.trim().is_empty() {
-        match kind {
-            AddressBookEntryKind::Private => "No saved private recipients yet.",
-            AddressBookEntryKind::Public => "No saved public EVM recipients yet.",
-        }
+        "No saved recipients yet."
     } else {
         "No saved recipients match this search."
     };

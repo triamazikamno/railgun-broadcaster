@@ -149,8 +149,9 @@ use private_broadcaster::{
     fail_private_broadcaster_progress_steps_at_stage, finish_private_broadcaster_progress_steps,
     finish_private_broadcaster_progress_steps_at_stage,
     finish_private_self_broadcast_progress_steps_at_stage,
-    mark_private_broadcaster_active_step_stopped, private_broadcaster_progress_footer_action,
-    private_broadcaster_progress_steps, private_progress_stage_disables_stop,
+    format_public_broadcaster_wait_remaining, mark_private_broadcaster_active_step_stopped,
+    private_broadcaster_progress_footer_action, private_broadcaster_progress_steps,
+    private_progress_stage_disables_stop, public_broadcaster_wait_status_detail,
     self_broadcast_progress_steps,
 };
 #[cfg(test)]
