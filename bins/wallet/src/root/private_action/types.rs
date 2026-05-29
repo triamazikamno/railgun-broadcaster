@@ -204,6 +204,7 @@ pub(in crate::root) struct SendSpendDraft {
     pub(in crate::root) self_broadcast_gas_payer_display: Option<String>,
     pub(in crate::root) fee_rows: Vec<FeeRow>,
     pub(in crate::root) fee_policy: BroadcasterFeePolicy,
+    pub(in crate::root) favorites_only_broadcasters: bool,
 }
 
 pub(in crate::root) struct UnshieldSpendDraft {
@@ -225,6 +226,7 @@ pub(in crate::root) struct UnshieldSpendDraft {
     pub(in crate::root) self_broadcast_gas_payer_display: Option<String>,
     pub(in crate::root) fee_rows: Vec<FeeRow>,
     pub(in crate::root) fee_policy: BroadcasterFeePolicy,
+    pub(in crate::root) favorites_only_broadcasters: bool,
 }
 
 pub(in crate::root) fn private_send_authorization_summary(
@@ -298,6 +300,7 @@ pub(in crate::root) struct UnshieldFormState {
     pub(in crate::root) broadcaster_choice: BroadcasterChoice,
     pub(in crate::root) fee_mode: FeeHandlingMode,
     pub(in crate::root) allow_suspicious_broadcasters: bool,
+    pub(in crate::root) favorites_only_broadcasters: bool,
     pub(in crate::root) transaction_fee_breakdown_open: bool,
     pub(in crate::root) pending_programmatic_amount_input: Option<String>,
     pub(in crate::root) cost_estimate_pending: bool,
@@ -332,6 +335,7 @@ pub(in crate::root) struct SendFormState {
     pub(in crate::root) broadcaster_choice: BroadcasterChoice,
     pub(in crate::root) fee_mode: FeeHandlingMode,
     pub(in crate::root) allow_suspicious_broadcasters: bool,
+    pub(in crate::root) favorites_only_broadcasters: bool,
     pub(in crate::root) transaction_fee_breakdown_open: bool,
     pub(in crate::root) pending_programmatic_amount_input: Option<String>,
     pub(in crate::root) cost_estimate_pending: bool,

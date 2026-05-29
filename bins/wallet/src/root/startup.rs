@@ -215,11 +215,25 @@ impl WalletStartupRoot {
             move |chain_id, token| public_broadcaster_anchor_cache.cached_rate(chain_id, token)
         });
         let wallet_monitor_event_rx = event_rx.clone();
+        let initial_chain_id = enabled_chain_ids[0];
+        let monitor_default_fee_tokens = ready
+            .effective_chain_configs
+            .values()
+            .filter_map(|chain| {
+                chain
+                    .wrapped_native_token
+                    .as_deref()
+                    .and_then(|token| token.parse().ok())
+                    .map(|token| (chain.chain_id, token))
+            })
+            .collect();
         let monitor = cx.new(|cx| {
             broadcaster_monitor_gpui::BroadcasterMonitorPane::new(
                 self.monitor_state.clone(),
                 event_rx,
                 &enabled_chain_ids,
+                initial_chain_id,
+                monitor_default_fee_tokens,
                 fee_anchor_lookup,
                 window,
                 cx,

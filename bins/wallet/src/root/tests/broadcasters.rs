@@ -41,6 +41,7 @@ fn fee_token_options_use_poi_spendable_balances_and_broadcaster_counts() {
         &fee_rows,
         None,
         BroadcasterFeePolicy::default(),
+        &wallet_ops::PublicBroadcasterTrustFilter::default(),
         None,
         |_| None,
     );
@@ -87,6 +88,7 @@ fn fee_token_options_use_fee_only_transaction_spend_limit() {
         &fee_rows,
         None,
         BroadcasterFeePolicy::default(),
+        &wallet_ops::PublicBroadcasterTrustFilter::default(),
         None,
         |_| None,
     );
@@ -121,6 +123,7 @@ fn fee_token_options_include_known_token_icons() {
         &fee_rows,
         None,
         BroadcasterFeePolicy::default(),
+        &wallet_ops::PublicBroadcasterTrustFilter::default(),
         None,
         |_| None,
     );
@@ -194,6 +197,7 @@ fn fee_token_options_filter_unwrap_by_effective_relay_adapter() {
         &[row.clone()],
         Some(required_relay),
         BroadcasterFeePolicy::default(),
+        &wallet_ops::PublicBroadcasterTrustFilter::default(),
         None,
         |_| None,
     );
@@ -202,6 +206,7 @@ fn fee_token_options_filter_unwrap_by_effective_relay_adapter() {
         &[row],
         Some(other_relay),
         BroadcasterFeePolicy::default(),
+        &wallet_ops::PublicBroadcasterTrustFilter::default(),
         None,
         |_| None,
     );
@@ -316,9 +321,10 @@ fn fee_token_warning_distinguishes_empty_broadcaster_monitor() {
         eligible_broadcaster_count: 0,
         icon_path: None,
     }];
+    let trust_filter = wallet_ops::PublicBroadcasterTrustFilter::default();
 
     assert_eq!(
-        public_broadcaster_fee_token_warning(&[], 1, &options, selected),
+        public_broadcaster_fee_token_warning(&[], 1, &options, selected, &trust_filter),
         Some("Searching for public broadcasters")
     );
 }
@@ -336,9 +342,10 @@ fn fee_token_warning_reports_no_supporting_broadcaster() {
         eligible_broadcaster_count: 0,
         icon_path: None,
     }];
+    let trust_filter = wallet_ops::PublicBroadcasterTrustFilter::default();
 
     assert_eq!(
-        public_broadcaster_fee_token_warning(&[row], 1, &options, selected),
+        public_broadcaster_fee_token_warning(&[row], 1, &options, selected, &trust_filter),
         Some("No detected public broadcaster supports your spendable fee tokens")
     );
 }
@@ -366,13 +373,14 @@ fn fee_token_warning_reports_selected_token_without_broadcaster() {
             icon_path: None,
         },
     ];
+    let trust_filter = wallet_ops::PublicBroadcasterTrustFilter::default();
 
     assert_eq!(
-        public_broadcaster_fee_token_warning(&[row], 1, &options, selected),
+        public_broadcaster_fee_token_warning(&[row], 1, &options, selected, &trust_filter),
         Some("Choose a fee token with at least one eligible public broadcaster before submitting.")
     );
     assert_eq!(
-        public_broadcaster_fee_token_warning(&[], 1, &options, other),
+        public_broadcaster_fee_token_warning(&[], 1, &options, other, &trust_filter),
         None
     );
 }

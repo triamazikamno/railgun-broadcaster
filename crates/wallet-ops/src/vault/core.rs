@@ -22,6 +22,8 @@ pub(super) const PUBLIC_ACCOUNT_METADATA_PREFIX: &str = "public-account-meta|";
 pub(super) const PUBLIC_ACCOUNT_SECRET_PREFIX: &str = "public-account-secret|";
 pub(super) const PRIVATE_ADDRESS_BOOK_PREFIX: &str = "private-address-book|";
 pub(super) const PUBLIC_ADDRESS_BOOK_PREFIX: &str = "public-address-book|";
+pub(super) const BROADCASTER_FAVORITE_PREFIX: &str = "broadcaster-favorite|";
+pub(super) const BROADCASTER_BANNED_PREFIX: &str = "broadcaster-banned|";
 pub const PRIMARY_WALLET_LABEL: &str = "Primary wallet";
 pub(super) const ADDITIONAL_WALLET_LABEL_PREFIX: &str = "Wallet ";
 pub(super) type HmacSha256 = Hmac<Sha256>;
@@ -103,6 +105,8 @@ pub enum VaultError {
     PublicAddressBookEntryNotFound,
     #[error("public address book display order overflow")]
     PublicAddressBookDisplayOrderOverflow,
+    #[error("invalid broadcaster preference address")]
+    InvalidBroadcasterPreferenceAddress,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -167,6 +171,8 @@ pub enum RecordKind {
     PublicAccountSecret,
     PrivateAddressBookEntry,
     PublicAddressBookEntry,
+    BroadcasterFavoriteEntry,
+    BroadcasterBannedEntry,
 }
 
 impl RecordKind {
@@ -184,6 +190,8 @@ impl RecordKind {
             Self::PublicAccountSecret => "public-account-secret",
             Self::PrivateAddressBookEntry => "private-address-book-entry",
             Self::PublicAddressBookEntry => "public-address-book-entry",
+            Self::BroadcasterFavoriteEntry => "broadcaster-favorite-entry",
+            Self::BroadcasterBannedEntry => "broadcaster-banned-entry",
         }
     }
 

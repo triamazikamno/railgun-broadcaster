@@ -1,12 +1,14 @@
 use super::{
-    ADDITIONAL_WALLET_LABEL_PREFIX, Address, BTreeSet, CacheKeys, KEY_LEN, MnemonicBuilder,
-    PRIMARY_WALLET_LABEL, PRIVATE_ADDRESS_BOOK_PREFIX, PUBLIC_ACCOUNT_METADATA_PREFIX,
-    PUBLIC_ACCOUNT_SECRET_PREFIX, PUBLIC_ADDRESS_BOOK_PREFIX, PrivateAddressBookEntry,
-    PrivateKeySigner, PublicAccountMetadata, PublicAccountScope, PublicAccountSecret,
-    PublicAccountSource, PublicAccountStatus, PublicAddressBookEntry, SigningKey, SpendUnlock,
-    VaultError, ViewUnlock, WALLET_CACHE_ROW_PREFIX, WALLET_CHAIN_METADATA_PREFIX,
-    WALLET_METADATA_PREFIX, WALLET_SPEND_PREFIX, WALLET_VIEW_PREFIX, WalletCacheError,
-    WalletMetadataBundle, WalletUtxo, Zeroizing, bip39_mnemonic_from_entropy, generate_opaque_id,
+    ADDITIONAL_WALLET_LABEL_PREFIX, Address, BROADCASTER_BANNED_PREFIX,
+    BROADCASTER_FAVORITE_PREFIX, BTreeSet, BroadcasterPreferenceEntry, CacheKeys, KEY_LEN,
+    MnemonicBuilder, PRIMARY_WALLET_LABEL, PRIVATE_ADDRESS_BOOK_PREFIX,
+    PUBLIC_ACCOUNT_METADATA_PREFIX, PUBLIC_ACCOUNT_SECRET_PREFIX, PUBLIC_ADDRESS_BOOK_PREFIX,
+    PrivateAddressBookEntry, PrivateKeySigner, PublicAccountMetadata, PublicAccountScope,
+    PublicAccountSecret, PublicAccountSource, PublicAccountStatus, PublicAddressBookEntry,
+    RecordKind, SigningKey, SpendUnlock, U256, VaultError, ViewUnlock, WALLET_CACHE_ROW_PREFIX,
+    WALLET_CHAIN_METADATA_PREFIX, WALLET_METADATA_PREFIX, WALLET_SPEND_PREFIX, WALLET_VIEW_PREFIX,
+    WalletCacheError, WalletMetadataBundle, WalletUtxo, Zeroizing, bip39_mnemonic_from_entropy,
+    generate_opaque_id,
 };
 use crate::parse_railgun_recipient;
 
@@ -55,6 +57,14 @@ pub(super) fn private_address_book_record_key(entry_uuid: &str) -> String {
 
 pub(super) fn public_address_book_record_key(entry_uuid: &str) -> String {
     format!("{PUBLIC_ADDRESS_BOOK_PREFIX}{entry_uuid}")
+}
+
+pub(super) fn broadcaster_favorite_record_key(entry_uuid: &str) -> String {
+    format!("{BROADCASTER_FAVORITE_PREFIX}{entry_uuid}")
+}
+
+pub(super) fn broadcaster_banned_record_key(entry_uuid: &str) -> String {
+    format!("{BROADCASTER_BANNED_PREFIX}{entry_uuid}")
 }
 
 pub(super) fn wallet_cache_counts(utxos: &[WalletUtxo]) -> (usize, usize) {
@@ -121,6 +131,34 @@ pub(super) fn public_address_book_record_entry(
 ) -> Result<(String, Vec<u8>), VaultError> {
     let key = public_address_book_record_key(&entry.entry_uuid);
     let record = view.encrypt_public_address_book_entry(&entry.entry_uuid, entry)?;
+    record.to_record_entry(key)
+}
+
+pub(super) fn broadcaster_favorite_record_entry(
+    view: &ViewUnlock,
+    entry_uuid: &str,
+    entry: &BroadcasterPreferenceEntry,
+) -> Result<(String, Vec<u8>), VaultError> {
+    let key = broadcaster_favorite_record_key(entry_uuid);
+    let record = view.encrypt_broadcaster_preference_entry(
+        RecordKind::BroadcasterFavoriteEntry,
+        entry_uuid,
+        entry,
+    )?;
+    record.to_record_entry(key)
+}
+
+pub(super) fn broadcaster_banned_record_entry(
+    view: &ViewUnlock,
+    entry_uuid: &str,
+    entry: &BroadcasterPreferenceEntry,
+) -> Result<(String, Vec<u8>), VaultError> {
+    let key = broadcaster_banned_record_key(entry_uuid);
+    let record = view.encrypt_broadcaster_preference_entry(
+        RecordKind::BroadcasterBannedEntry,
+        entry_uuid,
+        entry,
+    )?;
     record.to_record_entry(key)
 }
 
@@ -304,6 +342,16 @@ pub fn sort_public_address_book_entries(entries: &mut [PublicAddressBookEntry]) 
     });
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct BroadcasterAddressIdentity {
+    pub(super) master_public_key: U256,
+    pub(super) viewing_public_key: [u8; KEY_LEN],
+}
+
+pub fn sort_broadcaster_preference_entries(entries: &mut [BroadcasterPreferenceEntry]) {
+    entries.sort_by(|left, right| left.address.cmp(&right.address));
+}
+
 pub(super) fn next_private_address_book_display_order(
     entries: &[PrivateAddressBookEntry],
 ) -> Result<u32, VaultError> {
@@ -343,6 +391,27 @@ pub(super) fn validate_public_address_book_address(address: &str) -> Result<Addr
         .trim()
         .parse()
         .map_err(|_| VaultError::InvalidPublicAddressBookAddress)
+}
+
+pub(super) fn validate_broadcaster_preference_address(
+    address: &str,
+) -> Result<(String, BroadcasterAddressIdentity), VaultError> {
+    let address = address.trim();
+    let address_data = parse_railgun_recipient(address)
+        .map_err(|_| VaultError::InvalidBroadcasterPreferenceAddress)?;
+    Ok((
+        address.to_owned(),
+        BroadcasterAddressIdentity {
+            master_public_key: address_data.master_public_key,
+            viewing_public_key: address_data.viewing_public_key,
+        },
+    ))
+}
+
+pub(super) fn broadcaster_preference_entry_identity(
+    entry: &BroadcasterPreferenceEntry,
+) -> Result<BroadcasterAddressIdentity, VaultError> {
+    validate_broadcaster_preference_address(&entry.address).map(|(_, identity)| identity)
 }
 
 pub(super) fn ensure_private_address_book_address_available(

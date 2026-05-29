@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use alloy::primitives::Address;
 use broadcaster_monitor::{EventRx, Shared};
 use gpui::{
     AppContext, Context, Entity, IntoElement, ParentElement, Pixels, Render, Styled, Window,
@@ -17,7 +18,8 @@ use ui::table::ColumnWidthSync;
 use ui::theme;
 
 use crate::fees_view::{
-    FeeAnchorLookup, FeesChainFilterItem, FeesDelegate, FeesFilter, FeesTokenFilterItem,
+    BroadcasterPreferenceHooks, FeeAnchorLookup, FeesChainFilterItem, FeesDelegate, FeesFilter,
+    FeesTokenFilterItem,
 };
 use crate::peers_view::{self, PeersDelegate};
 
@@ -56,10 +58,31 @@ impl BroadcasterMonitorPane {
         });
     }
 
+    pub fn set_preference_hooks(
+        &mut self,
+        hooks: Option<BroadcasterPreferenceHooks>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.fees_table.update(cx, |state, cx| {
+            state.delegate_mut().set_preference_hooks(hooks);
+            state.refresh(cx);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    pub fn refresh_preference_status(&self, cx: &mut Context<'_, Self>) {
+        self.fees_table.update(cx, |_state, cx| {
+            cx.notify();
+        });
+    }
+
     pub fn new(
         shared: Shared,
         mut event_rx: EventRx,
         chain_ids: &[u64],
+        initial_chain_id: u64,
+        default_fee_tokens: Vec<(u64, Address)>,
         fee_anchor_lookup: FeeAnchorLookup,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
@@ -72,12 +95,12 @@ impl BroadcasterMonitorPane {
             .collect();
         let initial_chain_index = chain_ids
             .iter()
-            .position(|chain_id| *chain_id == 1)
+            .position(|chain_id| *chain_id == initial_chain_id)
             .map_or(0, |ix| ix + 1);
         let initial_chain_filter = if initial_chain_index == 0 {
             FeesFilter::All
         } else {
-            FeesFilter::One(1)
+            FeesFilter::One(initial_chain_id)
         };
         let chain_select = cx.new(|cx| {
             SelectState::new(
@@ -97,17 +120,20 @@ impl BroadcasterMonitorPane {
             .searchable(true)
         });
         let fees_table = cx.new(|cx| {
-            TableState::new(
+            let mut state = TableState::new(
                 FeesDelegate::new(
                     broadcaster_input.clone(),
                     chain_select.clone(),
                     initial_chain_filter,
                     token_select.clone(),
+                    default_fee_tokens,
                     fee_anchor_lookup,
                 ),
                 window,
                 cx,
-            )
+            );
+            state.delegate_mut().sync_filter_selects(window, cx);
+            state
         });
         let peers_table = cx.new(|cx| TableState::new(PeersDelegate::new(), window, cx));
 

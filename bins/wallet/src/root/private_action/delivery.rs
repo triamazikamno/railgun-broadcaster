@@ -63,6 +63,7 @@ pub(in crate::root) fn render_public_broadcaster_settings(
     key: UnshieldAssetKey,
     kind: DeliveryFormKind,
     allow_suspicious_broadcasters: bool,
+    favorites_only_broadcasters: bool,
     action_token: Address,
     fee_mode: FeeHandlingMode,
     choice: &BroadcasterChoice,
@@ -76,7 +77,9 @@ pub(in crate::root) fn render_public_broadcaster_settings(
     let random_root = root.clone();
     let modal_root = root.clone();
     let policy_label_root = root.clone();
-    let policy_switch_root = root;
+    let policy_switch_root = root.clone();
+    let favorites_label_root = root.clone();
+    let favorites_switch_root = root;
     let sorted = sort_specific_public_broadcasters(candidates);
     let specific_label = selected_broadcaster_label(choice, &sorted);
     let random_selected = matches!(choice, BroadcasterChoice::Random);
@@ -153,6 +156,47 @@ pub(in crate::root) fn render_public_broadcaster_settings(
                     move |checked, _window, cx| {
                         policy_switch_root.update(cx, |root, cx| {
                             root.set_allow_suspicious_broadcasters(kind, key, checked, cx);
+                        });
+                    },
+                )),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(app_muted_text("Favorites only"))
+                        .child(cost_estimate_detail_text(
+                            "Only use broadcasters saved in your favorites list.",
+                        ))
+                        .when(!generating, |this| {
+                            this.on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                                cx.stop_propagation();
+                                favorites_label_root.update(cx, |root, cx| {
+                                    root.set_favorites_only_broadcasters(
+                                        kind,
+                                        key,
+                                        !favorites_only_broadcasters,
+                                        cx,
+                                    );
+                                });
+                            })
+                        }),
+                )
+                .child(render_switch(
+                    delivery_element_id(key, kind, "favorites-only-broadcasters"),
+                    favorites_only_broadcasters,
+                    generating,
+                    theme::PRIMARY,
+                    move |checked, _window, cx| {
+                        favorites_switch_root.update(cx, |root, cx| {
+                            root.set_favorites_only_broadcasters(kind, key, checked, cx);
                         });
                     },
                 )),
@@ -394,6 +438,16 @@ pub(in crate::root) fn render_danger_switch(
     disabled: bool,
     on_toggle: impl Fn(bool, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
+    render_switch(id, checked, disabled, theme::DANGER, on_toggle)
+}
+
+pub(in crate::root) fn render_switch(
+    id: SharedString,
+    checked: bool,
+    disabled: bool,
+    checked_color: u32,
+    on_toggle: impl Fn(bool, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
     let track_width = px(36.0);
     let track_height = px(20.0);
     let thumb_size = px(16.0);
@@ -401,7 +455,7 @@ pub(in crate::root) fn render_danger_switch(
     let max_x = track_width - thumb_size - inset * 2.0;
     let thumb_x = if checked { max_x } else { px(0.0) };
     let track_color = if checked {
-        theme::DANGER
+        checked_color
     } else {
         theme::SURFACE_HOVER
     };

@@ -379,29 +379,38 @@ impl WalletRoot {
         cx: &App,
     ) -> Option<BroadcasterPickerDialogSnapshot> {
         let picker = self.broadcaster_picker.as_ref()?;
-        let (chain_id, token, unwrap, current_choice, generating, show_all_broadcasters) =
-            (match picker.kind {
-                DeliveryFormKind::Send => self.send_forms.get(&picker.key).map(|form| {
-                    (
-                        form.asset.chain_id,
-                        form.selected_fee_token,
-                        false,
-                        form.broadcaster_choice.clone(),
-                        form.generating,
-                        form.allow_suspicious_broadcasters,
-                    )
-                }),
-                DeliveryFormKind::Unshield => self.unshield_forms.get(&picker.key).map(|form| {
-                    (
-                        form.asset.chain_id,
-                        form.selected_fee_token,
-                        form.unwrap,
-                        form.broadcaster_choice.clone(),
-                        form.generating,
-                        form.allow_suspicious_broadcasters,
-                    )
-                }),
-            })?;
+        let (
+            chain_id,
+            token,
+            unwrap,
+            current_choice,
+            generating,
+            show_all_broadcasters,
+            favorites_only,
+        ) = (match picker.kind {
+            DeliveryFormKind::Send => self.send_forms.get(&picker.key).map(|form| {
+                (
+                    form.asset.chain_id,
+                    form.selected_fee_token,
+                    false,
+                    form.broadcaster_choice.clone(),
+                    form.generating,
+                    form.allow_suspicious_broadcasters,
+                    form.favorites_only_broadcasters,
+                )
+            }),
+            DeliveryFormKind::Unshield => self.unshield_forms.get(&picker.key).map(|form| {
+                (
+                    form.asset.chain_id,
+                    form.selected_fee_token,
+                    form.unwrap,
+                    form.broadcaster_choice.clone(),
+                    form.generating,
+                    form.allow_suspicious_broadcasters,
+                    form.favorites_only_broadcasters,
+                )
+            }),
+        })?;
         let query = picker
             .query_input
             .read(cx)
@@ -409,8 +418,13 @@ impl WalletRoot {
             .trim()
             .to_ascii_lowercase();
         let policy = self.public_broadcaster_fee_policy(show_all_broadcasters);
-        let candidates =
-            self.current_public_broadcaster_candidates(chain_id, token, unwrap, policy);
+        let candidates = self.current_public_broadcaster_candidates(
+            chain_id,
+            token,
+            unwrap,
+            favorites_only,
+            policy,
+        );
         let candidates = if show_all_broadcasters {
             candidates
         } else {

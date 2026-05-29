@@ -82,9 +82,15 @@ impl WalletRoot {
         ));
         if form.delivery_mode == DeliveryMode::PublicBroadcaster {
             let policy = self.public_broadcaster_fee_policy(form.allow_suspicious_broadcasters);
+            let trust_filter =
+                self.public_broadcaster_trust_filter(form.favorites_only_broadcasters);
             let fee_rows = self.monitor_fee_rows();
-            let fee_token_options =
-                self.current_public_broadcaster_fee_token_options(asset.chain_id, false, policy);
+            let fee_token_options = self.current_public_broadcaster_fee_token_options(
+                asset.chain_id,
+                false,
+                form.favorites_only_broadcasters,
+                policy,
+            );
             public_broadcaster_submit_disabled =
                 public_broadcaster_submit_disabled_for_fee_token_options(
                     &fee_token_options,
@@ -94,6 +100,7 @@ impl WalletRoot {
                 asset.chain_id,
                 form.selected_fee_token,
                 false,
+                form.favorites_only_broadcasters,
                 policy,
             );
             let visible_candidates = fee_policy_eligible_public_broadcasters(&candidates, policy);
@@ -102,6 +109,7 @@ impl WalletRoot {
                 asset.chain_id,
                 &fee_token_options,
                 form.selected_fee_token,
+                &trust_filter,
             ) {
                 card = card.child(
                     Alert::warning(
@@ -116,6 +124,7 @@ impl WalletRoot {
                 key,
                 DeliveryFormKind::Send,
                 form.allow_suspicious_broadcasters,
+                form.favorites_only_broadcasters,
                 asset.token,
                 form.fee_mode,
                 &form.broadcaster_choice,
@@ -395,10 +404,13 @@ impl WalletRoot {
         ));
         if form.delivery_mode == DeliveryMode::PublicBroadcaster {
             let policy = self.public_broadcaster_fee_policy(form.allow_suspicious_broadcasters);
+            let trust_filter =
+                self.public_broadcaster_trust_filter(form.favorites_only_broadcasters);
             let fee_rows = self.monitor_fee_rows();
             let fee_token_options = self.current_public_broadcaster_fee_token_options(
                 asset.chain_id,
                 form.unwrap,
+                form.favorites_only_broadcasters,
                 policy,
             );
             public_broadcaster_submit_disabled =
@@ -410,6 +422,7 @@ impl WalletRoot {
                 asset.chain_id,
                 form.selected_fee_token,
                 form.unwrap,
+                form.favorites_only_broadcasters,
                 policy,
             );
             let visible_candidates = fee_policy_eligible_public_broadcasters(&candidates, policy);
@@ -418,6 +431,7 @@ impl WalletRoot {
                 asset.chain_id,
                 &fee_token_options,
                 form.selected_fee_token,
+                &trust_filter,
             ) {
                 card = card.child(
                     Alert::warning(
@@ -432,6 +446,7 @@ impl WalletRoot {
                 key,
                 DeliveryFormKind::Unshield,
                 form.allow_suspicious_broadcasters,
+                form.favorites_only_broadcasters,
                 asset.token,
                 form.fee_mode,
                 &form.broadcaster_choice,

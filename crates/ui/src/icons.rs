@@ -1,6 +1,7 @@
 const LOGS_ICON_PATH: &str = "ui/icons/logs.svg";
 const ACTIVITY_ICON_PATH: &str = "ui/icons/activity.svg";
 const BAN_ICON_PATH: &str = "ui/icons/ban.svg";
+const STAR_ICON_PATH: &str = "ui/icons/star.svg";
 const CLOSE_ICON_PATH: &str = "ui/icons/close.svg";
 const SEARCH_ICON_PATH: &str = "ui/icons/search.svg";
 const WALLET_ICON_PATH: &str = "ui/icons/wallet.svg";
@@ -26,6 +27,11 @@ pub const fn activity_icon_path() -> &'static str {
 #[must_use]
 pub const fn ban_icon_path() -> &'static str {
     BAN_ICON_PATH
+}
+
+#[must_use]
+pub const fn star_icon_path() -> &'static str {
+    STAR_ICON_PATH
 }
 
 #[must_use]

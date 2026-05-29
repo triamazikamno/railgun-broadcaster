@@ -302,6 +302,7 @@ impl WalletRoot {
                 broadcaster_choice: BroadcasterChoice::Random,
                 fee_mode: FeeHandlingMode::DeductFromAmount,
                 allow_suspicious_broadcasters: self.default_allow_suspicious_broadcasters,
+                favorites_only_broadcasters: false,
                 transaction_fee_breakdown_open: true,
                 pending_programmatic_amount_input: None,
                 cost_estimate_pending: false,
@@ -478,6 +479,7 @@ impl WalletRoot {
             choice,
             fee_mode,
             allow_suspicious,
+            favorites_only,
             delivery_mode,
         )) = self.send_forms.get(&key).map(|form| {
             (
@@ -486,6 +488,7 @@ impl WalletRoot {
                 form.broadcaster_choice.clone(),
                 form.fee_mode,
                 form.allow_suspicious_broadcasters,
+                form.favorites_only_broadcasters,
                 form.delivery_mode,
             )
         })
@@ -499,8 +502,12 @@ impl WalletRoot {
         let policy = self.public_broadcaster_fee_policy(allow_suspicious);
         let asset_options =
             self.private_action_asset_options(DeliveryFormKind::Send, asset.chain_id);
-        let fee_token_options =
-            self.current_public_broadcaster_fee_token_options(asset.chain_id, false, policy);
+        let fee_token_options = self.current_public_broadcaster_fee_token_options(
+            asset.chain_id,
+            false,
+            favorites_only,
+            policy,
+        );
         let selected_fee_token = resolve_selected_public_broadcaster_fee_token(
             selected_fee_token,
             asset.token,
@@ -510,6 +517,7 @@ impl WalletRoot {
             asset.chain_id,
             selected_fee_token,
             false,
+            favorites_only,
             policy,
         );
         let broadcaster_choice =
@@ -576,6 +584,7 @@ impl WalletRoot {
             choice,
             fee_mode,
             allow_suspicious,
+            favorites_only,
             delivery_mode,
             unwrap,
         )) = self.unshield_forms.get(&key).map(|form| {
@@ -585,6 +594,7 @@ impl WalletRoot {
                 form.broadcaster_choice.clone(),
                 form.fee_mode,
                 form.allow_suspicious_broadcasters,
+                form.favorites_only_broadcasters,
                 form.delivery_mode,
                 form.unwrap,
             )
@@ -605,8 +615,12 @@ impl WalletRoot {
         let policy = self.public_broadcaster_fee_policy(allow_suspicious);
         let asset_options =
             self.private_action_asset_options(DeliveryFormKind::Unshield, asset.chain_id);
-        let fee_token_options =
-            self.current_public_broadcaster_fee_token_options(asset.chain_id, unwrap, policy);
+        let fee_token_options = self.current_public_broadcaster_fee_token_options(
+            asset.chain_id,
+            unwrap,
+            favorites_only,
+            policy,
+        );
         let selected_fee_token = resolve_selected_public_broadcaster_fee_token(
             selected_fee_token,
             asset.token,
@@ -616,6 +630,7 @@ impl WalletRoot {
             asset.chain_id,
             selected_fee_token,
             unwrap,
+            favorites_only,
             policy,
         );
         let broadcaster_choice =
@@ -748,16 +763,23 @@ impl WalletRoot {
         fee_token: Address,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some((chain_id, action_token, current_choice, generating, allow_suspicious)) =
-            self.send_forms.get(&key).map(|form| {
-                (
-                    form.asset.chain_id,
-                    form.asset.token,
-                    form.broadcaster_choice.clone(),
-                    form.generating,
-                    form.allow_suspicious_broadcasters,
-                )
-            })
+        let Some((
+            chain_id,
+            action_token,
+            current_choice,
+            generating,
+            allow_suspicious,
+            favorites_only,
+        )) = self.send_forms.get(&key).map(|form| {
+            (
+                form.asset.chain_id,
+                form.asset.token,
+                form.broadcaster_choice.clone(),
+                form.generating,
+                form.allow_suspicious_broadcasters,
+                form.favorites_only_broadcasters,
+            )
+        })
         else {
             return;
         };
@@ -765,8 +787,13 @@ impl WalletRoot {
             return;
         }
         let policy = self.public_broadcaster_fee_policy(allow_suspicious);
-        let candidates =
-            self.current_public_broadcaster_candidates(chain_id, fee_token, false, policy);
+        let candidates = self.current_public_broadcaster_candidates(
+            chain_id,
+            fee_token,
+            false,
+            favorites_only,
+            policy,
+        );
         let reset_specific =
             !broadcaster_choice_supported_by_candidates(&current_choice, &candidates, policy);
         let Some(form) = self.send_forms.get_mut(&key) else {
@@ -799,7 +826,7 @@ impl WalletRoot {
         allow: bool,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some((chain_id, fee_token, choice, generating, current_allow)) =
+        let Some((chain_id, fee_token, choice, generating, current_allow, favorites_only)) =
             self.send_forms.get(&key).map(|form| {
                 (
                     form.asset.chain_id,
@@ -807,6 +834,7 @@ impl WalletRoot {
                     form.broadcaster_choice.clone(),
                     form.generating,
                     form.allow_suspicious_broadcasters,
+                    form.favorites_only_broadcasters,
                 )
             })
         else {
@@ -816,8 +844,13 @@ impl WalletRoot {
             return;
         }
         let policy = self.public_broadcaster_fee_policy(allow);
-        let candidates =
-            self.current_public_broadcaster_candidates(chain_id, fee_token, false, policy);
+        let candidates = self.current_public_broadcaster_candidates(
+            chain_id,
+            fee_token,
+            false,
+            favorites_only,
+            policy,
+        );
         let preserve_estimate =
             should_preserve_estimate_after_broadcaster_policy_change(&choice, &candidates, policy);
         let reset_specific =
@@ -826,6 +859,73 @@ impl WalletRoot {
             return;
         };
         form.allow_suspicious_broadcasters = allow;
+        if reset_specific {
+            form.broadcaster_choice = BroadcasterChoice::Random;
+        }
+        let should_reestimate = !preserve_estimate || matches!(choice, BroadcasterChoice::Random);
+        if should_reestimate {
+            form.error = None;
+            form.result = None;
+            form.estimate_id = 0;
+            form.cost_estimate_pending = false;
+            form.estimating_cost = false;
+        }
+        cx.notify();
+        if should_reestimate {
+            self.refresh_public_broadcaster_anchor(DeliveryFormKind::Send, key, cx);
+            self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
+        }
+    }
+
+    pub(in crate::root) fn set_favorites_only_broadcasters(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        enabled: bool,
+        cx: &mut Context<'_, Self>,
+    ) {
+        match kind {
+            DeliveryFormKind::Send => self.set_send_favorites_only_broadcasters(key, enabled, cx),
+            DeliveryFormKind::Unshield => {
+                self.set_unshield_favorites_only_broadcasters(key, enabled, cx);
+            }
+        }
+    }
+
+    fn set_send_favorites_only_broadcasters(
+        &mut self,
+        key: UnshieldAssetKey,
+        enabled: bool,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some((chain_id, fee_token, choice, generating, allow_suspicious, current_enabled)) =
+            self.send_forms.get(&key).map(|form| {
+                (
+                    form.asset.chain_id,
+                    form.selected_fee_token,
+                    form.broadcaster_choice.clone(),
+                    form.generating,
+                    form.allow_suspicious_broadcasters,
+                    form.favorites_only_broadcasters,
+                )
+            })
+        else {
+            return;
+        };
+        if generating || current_enabled == enabled {
+            return;
+        }
+        let policy = self.public_broadcaster_fee_policy(allow_suspicious);
+        let candidates =
+            self.current_public_broadcaster_candidates(chain_id, fee_token, false, enabled, policy);
+        let preserve_estimate =
+            should_preserve_estimate_after_broadcaster_policy_change(&choice, &candidates, policy);
+        let reset_specific =
+            matches!(choice, BroadcasterChoice::Specific { .. }) && !preserve_estimate;
+        let Some(form) = self.send_forms.get_mut(&key) else {
+            return;
+        };
+        form.favorites_only_broadcasters = enabled;
         if reset_specific {
             form.broadcaster_choice = BroadcasterChoice::Random;
         }
@@ -1340,6 +1440,7 @@ impl WalletRoot {
                 broadcaster_choice: BroadcasterChoice::Random,
                 fee_mode: FeeHandlingMode::DeductFromAmount,
                 allow_suspicious_broadcasters: self.default_allow_suspicious_broadcasters,
+                favorites_only_broadcasters: false,
                 transaction_fee_breakdown_open: true,
                 pending_programmatic_amount_input: None,
                 cost_estimate_pending: false,
@@ -1542,7 +1643,7 @@ impl WalletRoot {
         fee_token: Address,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some((chain_id, unwrap, current_choice, generating, allow_suspicious)) =
+        let Some((chain_id, unwrap, current_choice, generating, allow_suspicious, favorites_only)) =
             self.unshield_forms.get(&key).map(|form| {
                 (
                     form.asset.chain_id,
@@ -1550,6 +1651,7 @@ impl WalletRoot {
                     form.broadcaster_choice.clone(),
                     form.generating,
                     form.allow_suspicious_broadcasters,
+                    form.favorites_only_broadcasters,
                 )
             })
         else {
@@ -1559,8 +1661,13 @@ impl WalletRoot {
             return;
         }
         let policy = self.public_broadcaster_fee_policy(allow_suspicious);
-        let candidates =
-            self.current_public_broadcaster_candidates(chain_id, fee_token, unwrap, policy);
+        let candidates = self.current_public_broadcaster_candidates(
+            chain_id,
+            fee_token,
+            unwrap,
+            favorites_only,
+            policy,
+        );
         let reset_specific =
             !broadcaster_choice_supported_by_candidates(&current_choice, &candidates, policy);
         let Some(form) = self.unshield_forms.get_mut(&key) else {
@@ -1590,7 +1697,7 @@ impl WalletRoot {
         allow: bool,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some((chain_id, fee_token, unwrap, choice, generating, current_allow)) =
+        let Some((chain_id, fee_token, unwrap, choice, generating, current_allow, favorites_only)) =
             self.unshield_forms.get(&key).map(|form| {
                 (
                     form.asset.chain_id,
@@ -1599,6 +1706,7 @@ impl WalletRoot {
                     form.broadcaster_choice.clone(),
                     form.generating,
                     form.allow_suspicious_broadcasters,
+                    form.favorites_only_broadcasters,
                 )
             })
         else {
@@ -1608,8 +1716,13 @@ impl WalletRoot {
             return;
         }
         let policy = self.public_broadcaster_fee_policy(allow);
-        let candidates =
-            self.current_public_broadcaster_candidates(chain_id, fee_token, unwrap, policy);
+        let candidates = self.current_public_broadcaster_candidates(
+            chain_id,
+            fee_token,
+            unwrap,
+            favorites_only,
+            policy,
+        );
         let preserve_estimate =
             should_preserve_estimate_after_broadcaster_policy_change(&choice, &candidates, policy);
         let reset_specific =
@@ -1618,6 +1731,66 @@ impl WalletRoot {
             return;
         };
         form.allow_suspicious_broadcasters = allow;
+        if reset_specific {
+            form.broadcaster_choice = BroadcasterChoice::Random;
+        }
+        let should_reestimate = !preserve_estimate || matches!(choice, BroadcasterChoice::Random);
+        if should_reestimate {
+            form.error = None;
+            form.result = None;
+            form.estimate_id = 0;
+            form.cost_estimate_pending = false;
+            form.estimating_cost = false;
+        }
+        cx.notify();
+        if should_reestimate {
+            self.refresh_public_broadcaster_anchor(DeliveryFormKind::Unshield, key, cx);
+            self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
+        }
+    }
+
+    fn set_unshield_favorites_only_broadcasters(
+        &mut self,
+        key: UnshieldAssetKey,
+        enabled: bool,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some((
+            chain_id,
+            fee_token,
+            unwrap,
+            choice,
+            generating,
+            allow_suspicious,
+            current_enabled,
+        )) = self.unshield_forms.get(&key).map(|form| {
+            (
+                form.asset.chain_id,
+                form.selected_fee_token,
+                form.unwrap,
+                form.broadcaster_choice.clone(),
+                form.generating,
+                form.allow_suspicious_broadcasters,
+                form.favorites_only_broadcasters,
+            )
+        })
+        else {
+            return;
+        };
+        if generating || current_enabled == enabled {
+            return;
+        }
+        let policy = self.public_broadcaster_fee_policy(allow_suspicious);
+        let candidates = self
+            .current_public_broadcaster_candidates(chain_id, fee_token, unwrap, enabled, policy);
+        let preserve_estimate =
+            should_preserve_estimate_after_broadcaster_policy_change(&choice, &candidates, policy);
+        let reset_specific =
+            matches!(choice, BroadcasterChoice::Specific { .. }) && !preserve_estimate;
+        let Some(form) = self.unshield_forms.get_mut(&key) else {
+            return;
+        };
+        form.favorites_only_broadcasters = enabled;
         if reset_specific {
             form.broadcaster_choice = BroadcasterChoice::Random;
         }

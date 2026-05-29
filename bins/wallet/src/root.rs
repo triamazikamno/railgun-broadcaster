@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use broadcaster_monitor::{EventRx, Shared};
@@ -23,8 +23,9 @@ use wallet_ops::{
     settings::{EffectiveChainConfig, EffectiveTokenRegistry, load_wallet_settings},
     subscribe_prover_cache_build,
     vault::{
-        DesktopVaultStore, DesktopViewSession, GeneratedSeedMaterial, PrivateAddressBookEntry,
-        PublicAccountMetadata, PublicAddressBookEntry, WalletMetadataBundle,
+        BroadcasterPreferences, DesktopVaultStore, DesktopViewSession, GeneratedSeedMaterial,
+        PrivateAddressBookEntry, PublicAccountMetadata, PublicAddressBookEntry,
+        WalletMetadataBundle,
     },
 };
 use zeroize::Zeroizing;
@@ -32,6 +33,8 @@ use zeroize::Zeroizing;
 mod actions;
 mod address_book;
 mod broadcaster_picker;
+mod broadcaster_preferences;
+mod broadcaster_view;
 mod chain_load;
 mod dialogs;
 mod gas_fee;
@@ -65,6 +68,10 @@ pub(crate) use shell::{WalletAppOptions, open_wallet_window};
 
 use address_book::AddressBookState;
 use broadcaster_picker::BroadcasterPickerState;
+use broadcaster_preferences::{
+    broadcaster_preference_is_banned, broadcaster_preference_is_favorite,
+};
+use broadcaster_view::{BroadcasterActivityTab, BroadcasterPreferenceListKind};
 use chain_load::{ChainUtxoState, chain_load_overrides, start_shared_poi_cache_service};
 use gas_fee::Eip1559GasFeeEditorState;
 use manage_wallets::ManageWalletsState;
@@ -326,6 +333,12 @@ pub(crate) struct WalletRoot {
     address_book: AddressBookState,
     private_address_book: Vec<PrivateAddressBookEntry>,
     public_address_book: Vec<PublicAddressBookEntry>,
+    broadcaster_preferences: BroadcasterPreferences,
+    broadcaster_preference_snapshot: Arc<RwLock<BroadcasterPreferences>>,
+    broadcaster_preference_error: Option<Arc<str>>,
+    active_broadcaster_tab: BroadcasterActivityTab,
+    favorite_broadcaster_input: Entity<InputState>,
+    banned_broadcaster_input: Entity<InputState>,
     address_book_label_input: Entity<InputState>,
     address_book_save_error: Option<Arc<str>>,
     public_form: PublicAccountFormState,
@@ -577,6 +590,9 @@ impl WalletRoot {
         });
         let public_account_search_input = new_text_input(window, cx, "search accounts");
         let address_book_search_input = new_text_input(window, cx, "search saved recipients");
+        let favorite_broadcaster_input =
+            new_text_input(window, cx, "favorite broadcaster 0zk address");
+        let banned_broadcaster_input = new_text_input(window, cx, "banned broadcaster 0zk address");
         let address_book_label_input = new_text_input(window, cx, "recipient label");
         let address_book = AddressBookState {
             search_input: address_book_search_input,
@@ -642,6 +658,44 @@ impl WalletRoot {
             SelectState::new(SearchableVec::new(Vec::new()), None, window, cx).searchable(true)
         });
         let root_weak = cx.weak_entity();
+        let broadcaster_preference_snapshot =
+            Arc::new(RwLock::new(BroadcasterPreferences::default()));
+        let preference_status_snapshot = Arc::clone(&broadcaster_preference_snapshot);
+        let preference_root = root_weak.clone();
+        let favorite_root = preference_root.clone();
+        let banned_root = preference_root;
+        monitor.update(cx, |monitor, cx| {
+            monitor.set_preference_hooks(
+                Some(broadcaster_monitor_gpui::BroadcasterPreferenceHooks::new(
+                    move |address| {
+                        preference_status_snapshot.read().map_or(
+                            broadcaster_monitor_gpui::BroadcasterPreferenceStatus::Neutral,
+                            |preferences| {
+                                if broadcaster_preference_is_banned(&preferences, address) {
+                                    broadcaster_monitor_gpui::BroadcasterPreferenceStatus::Banned
+                                } else if broadcaster_preference_is_favorite(&preferences, address)
+                                {
+                                    broadcaster_monitor_gpui::BroadcasterPreferenceStatus::Favorite
+                                } else {
+                                    broadcaster_monitor_gpui::BroadcasterPreferenceStatus::Neutral
+                                }
+                            },
+                        )
+                    },
+                    move |address, _window, cx| {
+                        let _ = favorite_root.update(cx, |root, cx| {
+                            root.toggle_favorite_broadcaster(&address, cx);
+                        });
+                    },
+                    move |address, _window, cx| {
+                        let _ = banned_root.update(cx, |root, cx| {
+                            root.toggle_banned_broadcaster(&address, cx);
+                        });
+                    },
+                )),
+                cx,
+            );
+        });
         let utxo_table = cx.new(|cx| {
             TableState::new(
                 UtxoDelegate::new(root_weak.clone(), tx_search_input.clone()),
@@ -722,6 +776,12 @@ impl WalletRoot {
             address_book,
             private_address_book: Vec::new(),
             public_address_book: Vec::new(),
+            broadcaster_preferences: BroadcasterPreferences::default(),
+            broadcaster_preference_snapshot,
+            broadcaster_preference_error: None,
+            active_broadcaster_tab: BroadcasterActivityTab::default(),
+            favorite_broadcaster_input: favorite_broadcaster_input.clone(),
+            banned_broadcaster_input: banned_broadcaster_input.clone(),
             address_book_label_input,
             address_book_save_error: None,
             public_form,
@@ -798,6 +858,32 @@ impl WalletRoot {
                     cx.notify();
                 }
             })
+            .detach();
+        }
+        for (input, kind) in [
+            (
+                favorite_broadcaster_input,
+                BroadcasterPreferenceListKind::Favorite,
+            ),
+            (
+                banned_broadcaster_input,
+                BroadcasterPreferenceListKind::Banned,
+            ),
+        ] {
+            cx.subscribe_in(
+                &input,
+                window,
+                move |this, _input, event: &InputEvent, window, cx| match event {
+                    InputEvent::PressEnter { .. } => {
+                        this.add_broadcaster_preference_from_input(kind, window, cx);
+                    }
+                    InputEvent::Change => {
+                        this.broadcaster_preference_error = None;
+                        cx.notify();
+                    }
+                    _ => {}
+                },
+            )
             .detach();
         }
         cx.subscribe_in(

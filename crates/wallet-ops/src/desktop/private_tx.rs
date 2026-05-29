@@ -667,8 +667,12 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
         policy,
         anchor_rate,
     );
-    let broadcaster =
-        select_public_broadcaster_with_policy(&candidates, &request.selection, policy)?;
+    let broadcaster = select_public_broadcaster_with_policy_and_trust(
+        &candidates,
+        &request.selection,
+        policy,
+        &request.trust_filter,
+    )?;
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls.clone(), http);
     let min_gas_price = buffered_gas_price_from_rpc_pool(&query_rpc_pool, &chain.gas).await?;
     let utxos = request.session.unspent_utxos().await;
@@ -770,8 +774,12 @@ pub async fn estimate_desktop_send_public_broadcaster_cost(
         policy,
         anchor_rate,
     );
-    let broadcaster =
-        select_public_broadcaster_with_policy(&candidates, &request.selection, policy)?;
+    let broadcaster = select_public_broadcaster_with_policy_and_trust(
+        &candidates,
+        &request.selection,
+        policy,
+        &request.trust_filter,
+    )?;
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls.clone(), http);
     let min_gas_price = buffered_gas_price_from_rpc_pool(&query_rpc_pool, &chain.gas).await?;
     let utxos = request.session.unspent_utxos().await;

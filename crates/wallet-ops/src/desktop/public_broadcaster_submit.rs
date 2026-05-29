@@ -40,6 +40,7 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
         &request.selection,
         request.unwrap,
         request.fee_policy,
+        &request.trust_filter,
         request.anchor_cache.as_ref(),
         http,
     )
@@ -380,6 +381,7 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
         &request.selection,
         false,
         request.fee_policy,
+        &request.trust_filter,
         request.anchor_cache.as_ref(),
         http,
     )

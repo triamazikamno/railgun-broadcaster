@@ -33,19 +33,20 @@ use super::{
     ApproximateTransactionShape, BlockedShieldRescueUtxoId, BroadcasterFeePolicy,
     BroadcasterFeePolicyStatus, DesktopWalletChainStart, DesktopWalletSyncStartPolicy,
     FeeHandlingMode, ListUtxosOutput, PublicBroadcasterCandidate, PublicBroadcasterFeeMargin,
-    PublicBroadcasterResultKind, PublicBroadcasterSelection, RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
-    SelfBroadcastFeeSample, SelfBroadcastGasFeeQuote, SelfBroadcastGasFeeSelection,
-    SelfBroadcastTipFallback, TokenTotal, UtxoOutput, WalletPendingOverlay, WalletPendingSpent,
-    apply_pending_overlay_to_outputs, approximate_public_broadcaster_cost,
-    approximate_public_broadcaster_gas, broadcaster_fee_amount, broadcaster_fee_covers,
-    buffered_public_broadcaster_fee, decode_public_broadcaster_response,
-    eligible_public_broadcasters, fee_policy_eligible_public_broadcasters, fixed_token_anchor_rate,
-    initial_separate_token_public_broadcaster_fee, is_self_broadcast_insufficient_native_gas_error,
-    is_self_broadcast_tx_already_known_message, is_wrapped_native_token,
-    max_broadcaster_fee_token_amount_from_outputs, max_send_amount_from_outputs,
-    max_unshield_amount_from_outputs, parse_railgun_recipient, parse_send_amount,
-    parse_submitted_tx_hash, parse_unshield_amount, public_broadcaster_amount_split,
-    public_broadcaster_amount_split_for_tokens,
+    PublicBroadcasterResultKind, PublicBroadcasterSelection, PublicBroadcasterTrustFilter,
+    RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS, SelfBroadcastFeeSample, SelfBroadcastGasFeeQuote,
+    SelfBroadcastGasFeeSelection, SelfBroadcastTipFallback, TokenTotal, UtxoOutput,
+    WalletPendingOverlay, WalletPendingSpent, apply_pending_overlay_to_outputs,
+    approximate_public_broadcaster_cost, approximate_public_broadcaster_gas,
+    broadcaster_fee_amount, broadcaster_fee_covers, buffered_public_broadcaster_fee,
+    decode_public_broadcaster_response, eligible_public_broadcasters,
+    fee_policy_eligible_public_broadcasters, filter_public_broadcasters_by_trust,
+    fixed_token_anchor_rate, initial_separate_token_public_broadcaster_fee,
+    is_self_broadcast_insufficient_native_gas_error, is_self_broadcast_tx_already_known_message,
+    is_wrapped_native_token, max_broadcaster_fee_token_amount_from_outputs,
+    max_send_amount_from_outputs, max_unshield_amount_from_outputs, parse_railgun_recipient,
+    parse_send_amount, parse_submitted_tx_hash, parse_unshield_amount,
+    public_broadcaster_amount_split, public_broadcaster_amount_split_for_tokens,
     public_broadcaster_amount_split_for_tokens_and_protocol,
     public_broadcaster_anchor_rate_for_policy, public_broadcaster_build_error,
     public_broadcaster_candidates, public_broadcaster_fee_breakdown,
@@ -54,12 +55,13 @@ use super::{
     public_broadcaster_max_entered_amount_for_tokens_and_protocol,
     public_broadcaster_republish_loop, public_broadcaster_transact_params,
     resolve_desktop_wallet_chain_start, resolve_self_broadcast_gas_fee, select_public_broadcaster,
-    select_public_broadcaster_with_policy, self_broadcast_gas_limit_with_buffer,
-    self_broadcast_insufficient_native_gas_error, self_broadcast_native_gas_cost,
-    self_broadcast_quote_from_fee_samples, self_broadcast_quote_from_fee_samples_with_tip_fallback,
-    self_broadcast_transaction_request, send_approximate_shape, sort_specific_public_broadcasters,
-    transact_topic, unshield_approximate_shape, utxo_outputs_from_utxos,
-    validate_self_broadcast_gas_fee, wrapped_native_token_for_chain,
+    select_public_broadcaster_with_policy, select_public_broadcaster_with_policy_and_trust,
+    self_broadcast_gas_limit_with_buffer, self_broadcast_insufficient_native_gas_error,
+    self_broadcast_native_gas_cost, self_broadcast_quote_from_fee_samples,
+    self_broadcast_quote_from_fee_samples_with_tip_fallback, self_broadcast_transaction_request,
+    send_approximate_shape, sort_specific_public_broadcasters, transact_topic,
+    unshield_approximate_shape, utxo_outputs_from_utxos, validate_self_broadcast_gas_fee, vault,
+    wrapped_native_token_for_chain,
 };
 
 static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -470,6 +472,12 @@ fn fee_row_with_broadcaster_seed(
         identifier: None,
         last_seen: SystemTime::now(),
         reliability,
+    }
+}
+
+fn broadcaster_preference_entry(seed: u8) -> vault::BroadcasterPreferenceEntry {
+    vault::BroadcasterPreferenceEntry {
+        address: sample_railgun_address(seed),
     }
 }
 
@@ -2102,6 +2110,117 @@ fn public_broadcaster_specific_selection_survives_fees_id_refresh() {
     .expect("specific candidate by stable address");
 
     assert_eq!(selected.fees_id, "fresh-fees-id");
+}
+
+#[test]
+fn public_broadcaster_trust_filter_gives_banned_precedence() {
+    let token = address(0x47);
+    let candidates = public_broadcaster_candidates(
+        &[
+            fee_row_with_broadcaster_seed(1, token, 10, 0.9, "favorite-and-banned", 61),
+            fee_row_with_broadcaster_seed(1, token, 11, 0.9, "neutral", 62),
+        ],
+        1,
+        token,
+        None,
+        SystemTime::now(),
+        BroadcasterFeePolicy::default(),
+        None,
+    );
+    let trust_filter = PublicBroadcasterTrustFilter {
+        preferences: vault::BroadcasterPreferences {
+            favorites: vec![broadcaster_preference_entry(61)],
+            banned: vec![broadcaster_preference_entry(61)],
+        },
+        favorites_only: false,
+    };
+
+    let trusted = filter_public_broadcasters_by_trust(&candidates, &trust_filter);
+
+    assert_eq!(trusted.len(), 1);
+    assert_eq!(trusted[0].fees_id, "neutral");
+}
+
+#[test]
+fn public_broadcaster_trust_filter_supports_favorites_only_selection() {
+    let token = address(0x48);
+    let candidates = public_broadcaster_candidates(
+        &[
+            fee_row_with_broadcaster_seed(1, token, 10, 0.9, "favorite", 63),
+            fee_row_with_broadcaster_seed(1, token, 11, 0.9, "neutral", 64),
+        ],
+        1,
+        token,
+        None,
+        SystemTime::now(),
+        BroadcasterFeePolicy::default(),
+        None,
+    );
+    let favorite_address = sample_railgun_address(63);
+    let neutral_address = sample_railgun_address(64);
+    let trust_filter = PublicBroadcasterTrustFilter {
+        preferences: vault::BroadcasterPreferences {
+            favorites: vec![broadcaster_preference_entry(63)],
+            banned: Vec::new(),
+        },
+        favorites_only: true,
+    };
+
+    let favorite = select_public_broadcaster_with_policy_and_trust(
+        &candidates,
+        &PublicBroadcasterSelection::Specific {
+            railgun_address: favorite_address,
+        },
+        BroadcasterFeePolicy::default(),
+        &trust_filter,
+    )
+    .expect("favorite broadcaster remains selectable");
+    let error = select_public_broadcaster_with_policy_and_trust(
+        &candidates,
+        &PublicBroadcasterSelection::Specific {
+            railgun_address: neutral_address,
+        },
+        BroadcasterFeePolicy::default(),
+        &trust_filter,
+    )
+    .expect_err("non-favorite should be rejected");
+
+    assert_eq!(favorite.fees_id, "favorite");
+    assert!(error.to_string().contains("preferences"));
+}
+
+#[test]
+fn public_broadcaster_trust_filter_rejects_stale_estimated_broadcaster() {
+    let token = address(0x49);
+    let railgun_address = sample_railgun_address(65);
+    let candidates = public_broadcaster_candidates(
+        &[fee_row_with_broadcaster_seed(
+            1, token, 10, 0.9, "stale", 65,
+        )],
+        1,
+        token,
+        None,
+        SystemTime::now(),
+        BroadcasterFeePolicy::default(),
+        None,
+    );
+    let trust_filter = PublicBroadcasterTrustFilter {
+        preferences: vault::BroadcasterPreferences {
+            favorites: Vec::new(),
+            banned: vec![broadcaster_preference_entry(65)],
+        },
+        favorites_only: false,
+    };
+
+    let error = select_public_broadcaster_with_policy_and_trust(
+        &candidates,
+        &PublicBroadcasterSelection::Specific { railgun_address },
+        BroadcasterFeePolicy::default(),
+        &trust_filter,
+    )
+    .expect_err("banned estimated broadcaster should be rejected");
+
+    assert!(error.to_string().contains("preferences"));
 }
 
 #[test]

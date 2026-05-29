@@ -332,9 +332,7 @@ impl WalletRoot {
             &self.address_book.search_query,
         );
         if entries.is_empty() {
-            return section.child(address_book_empty_state(
-                &self.address_book.search_query,
-            ));
+            return section.child(address_book_empty_state(&self.address_book.search_query));
         }
         for entry in entries {
             section = section.child(self.render_private_address_book_row(root, entry));
@@ -354,9 +352,7 @@ impl WalletRoot {
             &self.address_book.search_query,
         );
         if entries.is_empty() {
-            return section.child(address_book_empty_state(
-                &self.address_book.search_query,
-            ));
+            return section.child(address_book_empty_state(&self.address_book.search_query));
         }
         for entry in entries {
             section = section.child(self.render_public_address_book_row(root, entry));

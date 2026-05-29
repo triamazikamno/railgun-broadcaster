@@ -86,6 +86,54 @@ impl PublicBroadcasterCandidate {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct PublicBroadcasterTrustFilter {
+    pub preferences: vault::BroadcasterPreferences,
+    pub favorites_only: bool,
+}
+
+impl PublicBroadcasterTrustFilter {
+    #[must_use]
+    pub fn allows(&self, candidate: &PublicBroadcasterCandidate) -> bool {
+        if self
+            .preferences
+            .banned
+            .iter()
+            .any(|entry| broadcaster_preference_matches_candidate(entry, candidate))
+        {
+            return false;
+        }
+        !self.favorites_only
+            || self
+                .preferences
+                .favorites
+                .iter()
+                .any(|entry| broadcaster_preference_matches_candidate(entry, candidate))
+    }
+}
+
+#[must_use]
+pub fn filter_public_broadcasters_by_trust(
+    candidates: &[PublicBroadcasterCandidate],
+    trust_filter: &PublicBroadcasterTrustFilter,
+) -> Vec<PublicBroadcasterCandidate> {
+    candidates
+        .iter()
+        .filter(|candidate| trust_filter.allows(candidate))
+        .cloned()
+        .collect()
+}
+
+fn broadcaster_preference_matches_candidate(
+    entry: &vault::BroadcasterPreferenceEntry,
+    candidate: &PublicBroadcasterCandidate,
+) -> bool {
+    parse_railgun_recipient(&entry.address).is_ok_and(|address_data| {
+        address_data.master_public_key == candidate.address_data.master_public_key
+            && address_data.viewing_public_key == candidate.address_data.viewing_public_key
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublicBroadcasterSelection {
     Random,
@@ -183,6 +231,7 @@ pub struct DesktopUnshieldPublicBroadcasterRequest {
     pub selection: PublicBroadcasterSelection,
     pub fee_mode: FeeHandlingMode,
     pub fee_policy: BroadcasterFeePolicy,
+    pub trust_filter: PublicBroadcasterTrustFilter,
     pub anchor_cache: Option<Arc<TokenAnchorRateCache>>,
     pub waku: Arc<WakuClient>,
     pub response_timeout: Duration,
@@ -206,6 +255,7 @@ pub struct DesktopSendPublicBroadcasterRequest {
     pub selection: PublicBroadcasterSelection,
     pub fee_mode: FeeHandlingMode,
     pub fee_policy: BroadcasterFeePolicy,
+    pub trust_filter: PublicBroadcasterTrustFilter,
     pub anchor_cache: Option<Arc<TokenAnchorRateCache>>,
     pub waku: Arc<WakuClient>,
     pub response_timeout: Duration,
@@ -226,6 +276,7 @@ pub struct DesktopUnshieldPublicBroadcasterEstimateRequest {
     pub selection: PublicBroadcasterSelection,
     pub fee_mode: FeeHandlingMode,
     pub fee_policy: BroadcasterFeePolicy,
+    pub trust_filter: PublicBroadcasterTrustFilter,
     pub anchor_cache: Option<Arc<TokenAnchorRateCache>>,
 }
 
@@ -241,6 +292,7 @@ pub struct DesktopSendPublicBroadcasterEstimateRequest {
     pub selection: PublicBroadcasterSelection,
     pub fee_mode: FeeHandlingMode,
     pub fee_policy: BroadcasterFeePolicy,
+    pub trust_filter: PublicBroadcasterTrustFilter,
     pub anchor_cache: Option<Arc<TokenAnchorRateCache>>,
 }
 
@@ -790,15 +842,31 @@ pub fn select_public_broadcaster_with_policy(
     selection: &PublicBroadcasterSelection,
     policy: BroadcasterFeePolicy,
 ) -> Result<PublicBroadcasterCandidate> {
+    select_public_broadcaster_with_policy_and_trust(
+        candidates,
+        selection,
+        policy,
+        &PublicBroadcasterTrustFilter::default(),
+    )
+}
+
+pub fn select_public_broadcaster_with_policy_and_trust(
+    candidates: &[PublicBroadcasterCandidate],
+    selection: &PublicBroadcasterSelection,
+    policy: BroadcasterFeePolicy,
+    trust_filter: &PublicBroadcasterTrustFilter,
+) -> Result<PublicBroadcasterCandidate> {
     match selection {
         PublicBroadcasterSelection::Random => {
             let supported_candidates = candidates
                 .iter()
+                .filter(|candidate| trust_filter.allows(candidate))
                 .filter(|candidate| candidate.is_allowed_by_fee_policy(policy))
                 .filter(|candidate| candidate.required_poi_list_keys.is_empty())
                 .collect::<Vec<_>>();
             let eligible_candidates = candidates
                 .iter()
+                .filter(|candidate| trust_filter.allows(candidate))
                 .filter(|candidate| candidate.is_allowed_by_fee_policy(policy))
                 .collect::<Vec<_>>();
             let selected = if supported_candidates.is_empty() {
@@ -820,6 +888,11 @@ pub fn select_public_broadcaster_with_policy(
                 .find(|candidate| candidate.railgun_address == *railgun_address)
                 .cloned()
                 .ok_or_else(|| eyre!("selected public broadcaster is no longer eligible"))?;
+            if !trust_filter.allows(&candidate) {
+                return Err(eyre!(
+                    "selected public broadcaster is excluded by current preferences"
+                ));
+            }
             if candidate.is_allowed_by_fee_policy(policy) {
                 Ok(candidate)
             } else {
@@ -1295,6 +1368,7 @@ pub(super) async fn public_broadcaster_setup(
     selection: &PublicBroadcasterSelection,
     require_relay_adapt: bool,
     policy: BroadcasterFeePolicy,
+    trust_filter: &PublicBroadcasterTrustFilter,
     anchor_cache: Option<&Arc<TokenAnchorRateCache>>,
     http: &HttpContext,
 ) -> Result<PublicBroadcasterSetup> {
@@ -1313,7 +1387,12 @@ pub(super) async fn public_broadcaster_setup(
         policy,
         anchor_rate,
     );
-    let broadcaster = select_public_broadcaster_with_policy(&candidates, selection, policy)?;
+    let broadcaster = select_public_broadcaster_with_policy_and_trust(
+        &candidates,
+        selection,
+        policy,
+        trust_filter,
+    )?;
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls.clone(), http);
     let min_gas_price = buffered_gas_price_from_rpc_pool(&query_rpc_pool, &chain.gas).await?;
     let artifact_source = artifact_source(http, session.db.as_ref());

@@ -1,9 +1,9 @@
 use super::{
-    DecodedWalletMetadata, EncryptedRecord, HmacKeyInit, HmacSha256, KEY_LEN, Mac,
-    PrivateAddressBookEntry, PublicAccountMetadata, PublicAccountSecret, PublicAddressBookEntry,
-    RecordKind, SecretKey, VaultError, WalletChainMetadataBundle, WalletMetadataBundle,
-    WalletMetadataWire, WalletSpendBundle, WalletViewBundle, Zeroizing, decrypt_payload,
-    decrypt_serialized, derive_context_key, encrypt_payload, encrypt_serialized,
+    BroadcasterPreferenceEntry, DecodedWalletMetadata, EncryptedRecord, HmacKeyInit, HmacSha256,
+    KEY_LEN, Mac, PrivateAddressBookEntry, PublicAccountMetadata, PublicAccountSecret,
+    PublicAddressBookEntry, RecordKind, SecretKey, VaultError, WalletChainMetadataBundle,
+    WalletMetadataBundle, WalletMetadataWire, WalletSpendBundle, WalletViewBundle, Zeroizing,
+    decrypt_payload, decrypt_serialized, derive_context_key, encrypt_payload, encrypt_serialized,
 };
 
 pub struct ViewUnlock {
@@ -219,6 +219,24 @@ impl ViewUnlock {
             entry_uuid,
             record,
         )
+    }
+
+    pub fn encrypt_broadcaster_preference_entry(
+        &self,
+        kind: RecordKind,
+        entry_uuid: &str,
+        entry: &BroadcasterPreferenceEntry,
+    ) -> Result<EncryptedRecord, VaultError> {
+        encrypt_serialized(&self.view_dek, kind, entry_uuid, entry)
+    }
+
+    pub fn decrypt_broadcaster_preference_entry(
+        &self,
+        kind: RecordKind,
+        entry_uuid: &str,
+        record: &EncryptedRecord,
+    ) -> Result<BroadcasterPreferenceEntry, VaultError> {
+        decrypt_serialized(&self.view_dek, kind, entry_uuid, record)
     }
 
     pub fn derive_cache_keys(&self, wallet_chain_uuid: &str) -> Result<CacheKeys, VaultError> {

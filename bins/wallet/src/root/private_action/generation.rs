@@ -61,6 +61,7 @@ impl WalletRoot {
             form.fee_mode,
         );
         let allow_suspicious_broadcasters = form.allow_suspicious_broadcasters;
+        let favorites_only_broadcasters = form.favorites_only_broadcasters;
 
         let Some(view_session) = self.view_session.clone() else {
             self.set_send_form_error(key, "Unlock the wallet vault before sending", cx);
@@ -147,12 +148,15 @@ impl WalletRoot {
                 asset.chain_id,
                 fee_token,
                 false,
+                favorites_only_broadcasters,
                 policy,
             );
-            if let Err(error) = select_public_broadcaster_with_policy(
+            let trust_filter = self.public_broadcaster_trust_filter(favorites_only_broadcasters);
+            if let Err(error) = select_public_broadcaster_with_policy_and_trust(
                 &candidates,
                 &public_broadcaster_selection,
                 policy,
+                &trust_filter,
             ) {
                 self.set_send_form_error(key, error.to_string(), cx);
                 return None;
@@ -181,6 +185,7 @@ impl WalletRoot {
             self_broadcast_gas_payer_display,
             fee_rows,
             fee_policy,
+            favorites_only_broadcasters,
         })
     }
 
@@ -212,6 +217,7 @@ impl WalletRoot {
             self_broadcast_gas_payer_display,
             fee_rows,
             fee_policy,
+            favorites_only_broadcasters,
         } = draft;
 
         self.send_generation_seq = self.send_generation_seq.wrapping_add(1);
@@ -321,6 +327,7 @@ impl WalletRoot {
                     ),
                     fee_mode,
                     fee_policy,
+                    trust_filter: self.public_broadcaster_trust_filter(favorites_only_broadcasters),
                     anchor_cache: Some(Arc::clone(&self.public_broadcaster_anchor_cache)),
                     waku,
                     response_timeout: self.public_broadcaster_response_timeout,
@@ -588,6 +595,7 @@ impl WalletRoot {
             form.fee_mode,
         );
         let allow_suspicious_broadcasters = form.allow_suspicious_broadcasters;
+        let favorites_only_broadcasters = form.favorites_only_broadcasters;
 
         let Some(view_session) = self.view_session.clone() else {
             self.set_unshield_form_error(key, "Unlock the wallet vault before unshielding", cx);
@@ -683,12 +691,15 @@ impl WalletRoot {
                 asset.chain_id,
                 fee_token,
                 unwrap,
+                favorites_only_broadcasters,
                 policy,
             );
-            if let Err(error) = select_public_broadcaster_with_policy(
+            let trust_filter = self.public_broadcaster_trust_filter(favorites_only_broadcasters);
+            if let Err(error) = select_public_broadcaster_with_policy_and_trust(
                 &candidates,
                 &public_broadcaster_selection,
                 policy,
+                &trust_filter,
             ) {
                 self.set_unshield_form_error(key, error.to_string(), cx);
                 return None;
@@ -718,6 +729,7 @@ impl WalletRoot {
             self_broadcast_gas_payer_display,
             fee_rows,
             fee_policy,
+            favorites_only_broadcasters,
         })
     }
 
@@ -750,6 +762,7 @@ impl WalletRoot {
             self_broadcast_gas_payer_display,
             fee_rows,
             fee_policy,
+            favorites_only_broadcasters,
         } = draft;
 
         self.unshield_generation_seq = self.unshield_generation_seq.wrapping_add(1);
@@ -862,6 +875,7 @@ impl WalletRoot {
                     ),
                     fee_mode,
                     fee_policy,
+                    trust_filter: self.public_broadcaster_trust_filter(favorites_only_broadcasters),
                     anchor_cache: Some(Arc::clone(&self.public_broadcaster_anchor_cache)),
                     waku,
                     response_timeout: self.public_broadcaster_response_timeout,

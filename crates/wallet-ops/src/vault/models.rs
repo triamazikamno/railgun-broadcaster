@@ -153,6 +153,17 @@ pub struct PublicAddressBookEntry {
     pub display_order: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BroadcasterPreferenceEntry {
+    pub address: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BroadcasterPreferences {
+    pub favorites: Vec<BroadcasterPreferenceEntry>,
+    pub banned: Vec<BroadcasterPreferenceEntry>,
+}
+
 #[derive(Deserialize)]
 pub(super) struct WalletMetadataWire {
     pub(super) wallet_uuid: String,

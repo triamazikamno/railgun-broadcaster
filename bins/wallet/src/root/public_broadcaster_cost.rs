@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use alloy::primitives::{Address, U256};
 use gpui::{
-    Context, Entity, InteractiveElement, IntoElement, ParentElement, SharedString,
+    AnyElement, Context, Entity, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, div, img, prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
@@ -20,7 +20,7 @@ use wallet_ops::{
     estimate_desktop_send_public_broadcaster_cost,
     estimate_desktop_unshield_public_broadcaster_cost, fixed_token_anchor_rate, parse_send_amount,
     parse_unshield_amount, public_broadcaster_fee_breakdown, public_broadcaster_service_gas_price,
-    select_public_broadcaster_with_policy, settings::EffectiveTokenRegistry,
+    select_public_broadcaster_with_policy_and_trust, settings::EffectiveTokenRegistry,
 };
 
 use super::broadcaster_picker::broadcaster_candidate_label;
@@ -518,6 +518,7 @@ impl WalletRoot {
             form.fee_mode,
         );
         let allow_suspicious_broadcasters = form.allow_suspicious_broadcasters;
+        let favorites_only_broadcasters = form.favorites_only_broadcasters;
         if self.recipient_combobox_search_active(DeliveryFormKind::Send, key) {
             self.clear_pending_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
             return;
@@ -546,10 +547,23 @@ impl WalletRoot {
         let session = Arc::clone(session);
         let fee_rows = self.monitor_fee_rows();
         let policy = self.public_broadcaster_fee_policy(allow_suspicious_broadcasters);
-        let candidates =
-            self.current_public_broadcaster_candidates(asset.chain_id, fee_token, false, policy);
+        let candidates = self.current_public_broadcaster_candidates(
+            asset.chain_id,
+            fee_token,
+            false,
+            favorites_only_broadcasters,
+            policy,
+        );
         let selection = Self::public_broadcaster_selection(&broadcaster_choice);
-        if select_public_broadcaster_with_policy(&candidates, &selection, policy).is_err() {
+        let trust_filter = self.public_broadcaster_trust_filter(favorites_only_broadcasters);
+        if select_public_broadcaster_with_policy_and_trust(
+            &candidates,
+            &selection,
+            policy,
+            &trust_filter,
+        )
+        .is_err()
+        {
             self.clear_pending_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
             return;
         }
@@ -576,6 +590,7 @@ impl WalletRoot {
             selection,
             fee_mode,
             fee_policy: policy,
+            trust_filter,
             anchor_cache: Some(Arc::clone(&self.public_broadcaster_anchor_cache)),
         };
         let http = self.http.clone();
@@ -639,6 +654,7 @@ impl WalletRoot {
             form.fee_mode,
         );
         let allow_suspicious_broadcasters = form.allow_suspicious_broadcasters;
+        let favorites_only_broadcasters = form.favorites_only_broadcasters;
         if self.recipient_combobox_search_active(DeliveryFormKind::Unshield, key) {
             self.clear_pending_public_broadcaster_cost_estimate(
                 DeliveryFormKind::Unshield,
@@ -691,10 +707,23 @@ impl WalletRoot {
         let session = Arc::clone(session);
         let fee_rows = self.monitor_fee_rows();
         let policy = self.public_broadcaster_fee_policy(allow_suspicious_broadcasters);
-        let candidates =
-            self.current_public_broadcaster_candidates(asset.chain_id, fee_token, unwrap, policy);
+        let candidates = self.current_public_broadcaster_candidates(
+            asset.chain_id,
+            fee_token,
+            unwrap,
+            favorites_only_broadcasters,
+            policy,
+        );
         let selection = Self::public_broadcaster_selection(&broadcaster_choice);
-        if select_public_broadcaster_with_policy(&candidates, &selection, policy).is_err() {
+        let trust_filter = self.public_broadcaster_trust_filter(favorites_only_broadcasters);
+        if select_public_broadcaster_with_policy_and_trust(
+            &candidates,
+            &selection,
+            policy,
+            &trust_filter,
+        )
+        .is_err()
+        {
             self.clear_pending_public_broadcaster_cost_estimate(
                 DeliveryFormKind::Unshield,
                 key,
@@ -726,6 +755,7 @@ impl WalletRoot {
             selection,
             fee_mode,
             fee_policy: policy,
+            trust_filter,
             anchor_cache: Some(Arc::clone(&self.public_broadcaster_anchor_cache)),
         };
         let http = self.http.clone();
@@ -1140,6 +1170,7 @@ fn transaction_fee_breakdown_row(label: &'static str, value: String) -> gpui::Di
 pub(super) fn render_private_broadcaster_progress_context(
     progress: &PrivateBroadcasterProgressState,
     context: &PrivateBroadcasterProgressContext<'_>,
+    broadcaster_action: Option<AnyElement>,
 ) -> gpui::Div {
     let display = &context.display;
     let breakdown = display.fee_breakdown();
@@ -1158,9 +1189,10 @@ pub(super) fn render_private_broadcaster_progress_context(
         .border_1()
         .border_color(rgb(theme::BORDER_STRONG))
         .child(app_strong_text("Transaction context"))
-        .child(private_broadcaster_context_row(
+        .child(private_broadcaster_context_row_with_action(
             "Broadcaster",
             broadcaster_candidate_label(display.broadcaster),
+            broadcaster_action,
         ))
         .child(private_broadcaster_context_row(
             "Recipient",
@@ -1209,6 +1241,14 @@ pub(super) fn render_private_broadcaster_progress_context(
 }
 
 pub(super) fn private_broadcaster_context_row(label: &'static str, value: String) -> gpui::Div {
+    private_broadcaster_context_row_with_action(label, value, None)
+}
+
+fn private_broadcaster_context_row_with_action(
+    label: &'static str,
+    value: String,
+    action: Option<AnyElement>,
+) -> gpui::Div {
     div()
         .flex()
         .items_start()
@@ -1216,9 +1256,19 @@ pub(super) fn private_broadcaster_context_row(label: &'static str, value: String
         .gap_3()
         .child(app_muted_text(label).flex_none())
         .child(
-            app_strong_text(value)
+            div()
                 .min_w(px(0.0))
-                .text_align(gpui::TextAlign::Right)
-                .whitespace_normal(),
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .justify_end()
+                .gap_2()
+                .child(
+                    app_strong_text(value)
+                        .min_w(px(0.0))
+                        .text_align(gpui::TextAlign::Right)
+                        .whitespace_normal(),
+                )
+                .children(action),
         )
 }

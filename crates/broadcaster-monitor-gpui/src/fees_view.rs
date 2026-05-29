@@ -4,11 +4,11 @@ use std::time::{Duration, SystemTime};
 
 use alloy::primitives::{Address, U256};
 use gpui::{
-    App, Context, Entity, InteractiveElement, IntoElement, ParentElement, Pixels, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, img, px, rgb,
+    App, Context, Div, Entity, InteractiveElement, IntoElement, ParentElement, Pixels,
+    SharedString, Stateful, StatefulInteractiveElement, Styled, Window, div, img, px, rgb,
 };
 use gpui_component::{
-    Sizable, Size,
+    Icon, IconNamed, Sizable, Size,
     input::{Input, InputState},
     select::{SearchableVec, Select, SelectItem, SelectState},
     table::{Column, ColumnSort, TableDelegate, TableState},
@@ -21,9 +21,62 @@ use railgun_ui::{
     lookup_token, short_address, token_icon_asset_path,
 };
 use ui::clipboard::clipboard_with_toast;
+use ui::icons;
 use ui::theme::{self, APP_MONO_FONT_FAMILY};
 
 pub type FeeAnchorLookup = Arc<dyn Fn(u64, Address) -> Option<U256> + Send + Sync>;
+
+type PreferenceStatusFn = dyn Fn(&str) -> BroadcasterPreferenceStatus;
+type PreferenceToggleFn = dyn Fn(String, &mut Window, &mut App);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BroadcasterPreferenceStatus {
+    Neutral,
+    Favorite,
+    Banned,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BroadcasterPreferenceIcon {
+    Favorite,
+    Banned,
+}
+
+impl IconNamed for BroadcasterPreferenceIcon {
+    fn path(self) -> SharedString {
+        match self {
+            Self::Favorite => icons::star_icon_path(),
+            Self::Banned => icons::ban_icon_path(),
+        }
+        .into()
+    }
+}
+
+#[derive(Clone)]
+pub struct BroadcasterPreferenceHooks {
+    status: Arc<PreferenceStatusFn>,
+    toggle_favorite: Arc<PreferenceToggleFn>,
+    toggle_banned: Arc<PreferenceToggleFn>,
+}
+
+impl BroadcasterPreferenceHooks {
+    #[must_use]
+    pub fn new(
+        status: impl Fn(&str) -> BroadcasterPreferenceStatus + 'static,
+        toggle_favorite: impl Fn(String, &mut Window, &mut App) + 'static,
+        toggle_banned: impl Fn(String, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        Self {
+            status: Arc::new(status),
+            toggle_favorite: Arc::new(toggle_favorite),
+            toggle_banned: Arc::new(toggle_banned),
+        }
+    }
+
+    fn status(&self, address: &str) -> BroadcasterPreferenceStatus {
+        (self.status)(address)
+    }
+}
 
 /// A single-select filter: either "All" (no filter) or a specific value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,8 +224,9 @@ impl FeesTokenFilterItem {
 pub(crate) struct FeesDelegate {
     all_rows: Arc<[FeeRow]>,
     rows: Arc<[FeeRow]>,
-    columns: [Column; 9],
+    columns: Vec<Column>,
     fee_anchor_lookup: FeeAnchorLookup,
+    preference_hooks: Option<BroadcasterPreferenceHooks>,
     chain_select: Entity<SelectState<Vec<FeesChainFilterItem>>>,
     chain_filter: FeesFilter<u64>,
     /// Lower-cased substring query for the broadcaster filter (empty = no filter).
@@ -180,6 +234,7 @@ pub(crate) struct FeesDelegate {
     /// Owned by the delegate so `render_th(col=1)` can render the live `Input`.
     broadcaster_input: Entity<InputState>,
     token_filter: FeesFilter<(u64, Address)>,
+    default_fee_tokens: Vec<(u64, Address)>,
     token_select: Entity<SelectState<SearchableVec<FeesTokenFilterItem>>>,
     synced_token_filter_items: Vec<FeesTokenFilterItem>,
     /// Active sort state for the fee column. `Default` preserves the natural
@@ -195,44 +250,23 @@ impl FeesDelegate {
         chain_select: Entity<SelectState<Vec<FeesChainFilterItem>>>,
         initial_chain_filter: FeesFilter<u64>,
         token_select: Entity<SelectState<SearchableVec<FeesTokenFilterItem>>>,
+        default_fee_tokens: Vec<(u64, Address)>,
         fee_anchor_lookup: FeeAnchorLookup,
     ) -> Self {
+        let initial_token_filter =
+            default_token_filter_for_chain(initial_chain_filter, default_fee_tokens.as_slice());
         Self {
             all_rows: Arc::from(Vec::<FeeRow>::new()),
             rows: Arc::from(Vec::<FeeRow>::new()),
-            columns: [
-                Column::new("chain", "chain").width(px(60.0)).movable(false),
-                Column::new("broadcaster", "broadcaster")
-                    .width(px(240.0))
-                    .movable(false),
-                Column::new("token", "token")
-                    .width(px(120.0))
-                    .movable(false),
-                // Sorting is driven by our own cell-wide click handler in
-                // `render_th` — not `.sortable()`. The built-in sort icon
-                // hitbox was too small (a ~14px square on the right edge);
-                // our replacement makes the entire header area clickable.
-                Column::new("fee", "fee").width(px(100.0)).movable(false),
-                Column::new("bonus", "bonus %")
-                    .width(px(78.0))
-                    .movable(false),
-                Column::new("sig", "sig").width(px(40.0)).movable(false),
-                Column::new("reliability", "rel")
-                    .width(px(50.0))
-                    .movable(false),
-                Column::new("last_seen", "last seen")
-                    .width(px(120.0))
-                    .movable(false),
-                Column::new("expires", "expires in")
-                    .width(px(120.0))
-                    .movable(false),
-            ],
+            columns: fee_columns(false),
             fee_anchor_lookup,
+            preference_hooks: None,
             chain_select,
             chain_filter: initial_chain_filter,
             broadcaster_query: Arc::from(""),
             broadcaster_input,
-            token_filter: FeesFilter::All,
+            token_filter: initial_token_filter,
+            default_fee_tokens,
             token_select,
             synced_token_filter_items: Vec::new(),
             fee_sort: ColumnSort::Default,
@@ -253,12 +287,16 @@ impl FeesDelegate {
     }
 
     pub(crate) fn set_chain_filter(&mut self, filter: FeesFilter<u64>) {
+        let changed = self.chain_filter != filter;
         self.chain_filter = filter;
-        // Cascade: if a chain-scoped token is selected and the chain filter
-        // no longer matches, drop the token filter back to All. The
-        // broadcaster query is a substring — it self-corrects when rows
+        // Chain changes reset to the chain's native broadcaster fee token.
+        // The broadcaster query is a substring — it self-corrects when rows
         // stop matching, no reset needed.
-        self.token_filter = cascade_reset_token(filter, self.token_filter);
+        self.token_filter = if changed {
+            self.default_token_filter(filter)
+        } else {
+            cascade_reset_token(filter, self.token_filter)
+        };
         self.rebuild_visible();
     }
 
@@ -298,6 +336,12 @@ impl FeesDelegate {
 
     pub(crate) fn refresh_anchor_values(&mut self) {
         self.rebuild_visible();
+    }
+
+    pub(crate) fn set_preference_hooks(&mut self, hooks: Option<BroadcasterPreferenceHooks>) {
+        let enabled = hooks.is_some();
+        self.preference_hooks = hooks;
+        self.columns = fee_columns(enabled);
     }
 
     fn rebuild_visible(&mut self) {
@@ -343,11 +387,35 @@ impl FeesDelegate {
                 seen.push(key);
             }
         }
+        if let FeesFilter::One(chain_id) = self.chain_filter
+            && let Some(token) = self.default_fee_token(chain_id)
+        {
+            let key = (chain_id, token);
+            if !seen.contains(&key) {
+                seen.push(key);
+            }
+        }
+        if let FeesFilter::One(key) = self.token_filter
+            && matches_chain_id(key.0, self.chain_filter)
+            && !seen.contains(&key)
+        {
+            seen.push(key);
+        }
         seen.sort_by(|a, b| {
             a.0.cmp(&b.0)
                 .then_with(|| token_label(a.0, &a.1).cmp(&token_label(b.0, &b.1)))
         });
         seen
+    }
+
+    fn default_fee_token(&self, chain_id: u64) -> Option<Address> {
+        self.default_fee_tokens
+            .iter()
+            .find_map(|(default_chain_id, token)| (*default_chain_id == chain_id).then_some(*token))
+    }
+
+    fn default_token_filter(&self, filter: FeesFilter<u64>) -> FeesFilter<(u64, Address)> {
+        default_token_filter_for_chain(filter, self.default_fee_tokens.as_slice())
     }
 
     fn token_filter_items(&self) -> Vec<FeesTokenFilterItem> {
@@ -384,7 +452,7 @@ impl FeesDelegate {
             if token_items_changed {
                 select.set_items(SearchableVec::new(token_items), window, cx);
             }
-            if selected_value != Some(self.token_filter) {
+            if token_items_changed || selected_value != Some(self.token_filter) {
                 select.set_selected_value(&self.token_filter, window, cx);
             }
         });
@@ -392,10 +460,29 @@ impl FeesDelegate {
 }
 
 const fn matches_chain(row: &FeeRow, filter: FeesFilter<u64>) -> bool {
+    matches_chain_id(row.chain_id, filter)
+}
+
+const fn matches_chain_id(chain_id: u64, filter: FeesFilter<u64>) -> bool {
     match filter {
         FeesFilter::All => true,
-        FeesFilter::One(id) => row.chain_id == id,
+        FeesFilter::One(id) => chain_id == id,
     }
+}
+
+fn default_token_filter_for_chain(
+    chain: FeesFilter<u64>,
+    default_fee_tokens: &[(u64, Address)],
+) -> FeesFilter<(u64, Address)> {
+    let FeesFilter::One(chain_id) = chain else {
+        return FeesFilter::All;
+    };
+    default_fee_tokens
+        .iter()
+        .find_map(|(default_chain_id, token)| {
+            (*default_chain_id == chain_id).then_some(FeesFilter::One((chain_id, *token)))
+        })
+        .unwrap_or(FeesFilter::All)
 }
 
 fn matches_token(row: &FeeRow, filter: FeesFilter<(u64, Address)>) -> bool {
@@ -539,6 +626,17 @@ impl TableDelegate for FeesDelegate {
         }
     }
 
+    fn render_tr(
+        &mut self,
+        row_ix: usize,
+        _window: &mut Window,
+        _cx: &mut Context<'_, TableState<Self>>,
+    ) -> Stateful<Div> {
+        div()
+            .id(SharedString::from(format!("broadcaster-fee-row-{row_ix}")))
+            .group(fee_row_group(row_ix))
+    }
+
     fn render_td(
         &mut self,
         row_ix: usize,
@@ -577,6 +675,11 @@ impl TableDelegate for FeesDelegate {
                     .gap_1()
                     .font_family(APP_MONO_FONT_FAMILY)
                     .text_color(rgb(theme::PURPLE))
+                    .children(
+                        self.preference_hooks
+                            .as_ref()
+                            .map(|hooks| render_preference_cell(row_ix, row, hooks)),
+                    )
                     .child(SharedString::from(label))
                     .child(
                         div()
@@ -705,7 +808,7 @@ impl TableDelegate for FeesDelegate {
                     .child(SharedString::from(format!("{age} ago")))
                     .into_any_element()
             }
-            _ => {
+            8 => {
                 let now = SystemTime::now();
                 if let Ok(d) = row.fee_expiration.duration_since(now) {
                     let expires = humantime::Duration::from(Duration::from_secs(d.as_secs()));
@@ -725,8 +828,43 @@ impl TableDelegate for FeesDelegate {
                         .into_any_element()
                 }
             }
+            _ => div().into_any_element(),
         }
     }
+}
+
+fn fee_columns(with_preferences: bool) -> Vec<Column> {
+    let broadcaster_width = if with_preferences {
+        px(316.0)
+    } else {
+        px(240.0)
+    };
+    let columns = vec![
+        Column::new("chain", "chain").width(px(60.0)).movable(false),
+        Column::new("broadcaster", "broadcaster")
+            .width(broadcaster_width)
+            .movable(false),
+        Column::new("token", "token")
+            .width(px(120.0))
+            .movable(false),
+        // Sorting is driven by our own cell-wide click handler in `render_th`
+        // instead of the built-in sort icon, whose hitbox is too small.
+        Column::new("fee", "fee").width(px(100.0)).movable(false),
+        Column::new("bonus", "bonus %")
+            .width(px(78.0))
+            .movable(false),
+        Column::new("sig", "sig").width(px(40.0)).movable(false),
+        Column::new("reliability", "rel")
+            .width(px(50.0))
+            .movable(false),
+        Column::new("last_seen", "last seen")
+            .width(px(120.0))
+            .movable(false),
+        Column::new("expires", "expires in")
+            .width(px(120.0))
+            .movable(false),
+    ];
+    columns
 }
 
 fn raw_fee_label(row: &FeeRow) -> String {
@@ -792,6 +930,95 @@ fn compare_optional_bonus(a: Option<i128>, b: Option<i128>, sort: ColumnSort) ->
         (None, Some(_)) => Ordering::Greater,
         (None, None) => Ordering::Equal,
     }
+}
+
+fn fee_row_group(row_ix: usize) -> SharedString {
+    SharedString::from(format!("broadcaster-fee-row-group-{row_ix}"))
+}
+
+fn render_preference_cell(
+    row_ix: usize,
+    row: &FeeRow,
+    hooks: &BroadcasterPreferenceHooks,
+) -> gpui::Div {
+    let status = hooks.status(row.railgun_address.as_ref());
+    let row_group = fee_row_group(row_ix);
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap_1()
+        .child(render_preference_toggle(
+            row_ix,
+            "favorite",
+            BroadcasterPreferenceIcon::Favorite,
+            "Favorite broadcaster",
+            matches!(status, BroadcasterPreferenceStatus::Favorite),
+            theme::WARNING,
+            row.railgun_address.to_string(),
+            Arc::clone(&hooks.toggle_favorite),
+            row_group.clone(),
+        ))
+        .child(render_preference_toggle(
+            row_ix,
+            "banned",
+            BroadcasterPreferenceIcon::Banned,
+            "Ban broadcaster",
+            matches!(status, BroadcasterPreferenceStatus::Banned),
+            theme::DANGER,
+            row.railgun_address.to_string(),
+            Arc::clone(&hooks.toggle_banned),
+            row_group,
+        ))
+}
+
+fn render_preference_toggle(
+    row_ix: usize,
+    action: &'static str,
+    icon: BroadcasterPreferenceIcon,
+    tooltip: &'static str,
+    active: bool,
+    color: u32,
+    address: String,
+    toggle: Arc<PreferenceToggleFn>,
+    row_group: SharedString,
+) -> impl IntoElement {
+    let bg = if active {
+        rgb_with_alpha(color, 0.16)
+    } else {
+        rgb_with_alpha(theme::SURFACE, 0.0)
+    };
+    let border = if active { color } else { theme::BORDER_SUBTLE };
+    let text = if active { color } else { theme::TEXT_MUTED };
+    div()
+        .id(SharedString::from(format!(
+            "broadcaster-preference-{action}-{row_ix}"
+        )))
+        .w(px(28.0))
+        .h(px(26.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb_with_alpha(border, 0.0))
+        .bg(bg)
+        .text_color(rgb(text))
+        .cursor_pointer()
+        .group_hover(row_group, move |this| this.border_color(rgb(border)))
+        .hover(move |this| this.bg(rgb_with_alpha(color, 0.12)))
+        .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
+        .on_click(move |_event, window, cx| {
+            cx.stop_propagation();
+            toggle(address.clone(), window, cx);
+        })
+        .child(Icon::new(icon).size_3().text_color(rgb(text)))
+}
+
+fn rgb_with_alpha(hex: u32, alpha: f32) -> gpui::Rgba {
+    let mut color = rgb(hex);
+    color.a = alpha;
+    color
 }
 
 fn render_chain_header(select: &Entity<SelectState<Vec<FeesChainFilterItem>>>) -> impl IntoElement {

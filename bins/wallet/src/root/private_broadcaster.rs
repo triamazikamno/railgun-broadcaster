@@ -5,9 +5,9 @@ use gpui::{
     AppContext, Context, Entity, IntoElement, ParentElement, Pixels, SharedString, Styled, Window,
     div, prelude::FluentBuilder as _, px, rgb,
 };
-use gpui_component::{Icon, Sizable, WindowExt, button::ButtonVariants};
+use gpui_component::{Icon, IconName, Sizable, WindowExt, button::ButtonVariants};
 use ui::clipboard::clipboard_with_toast;
-use ui::controls::{app_button, app_muted_text, app_strong_text};
+use ui::controls::{app_button, app_button_base, app_muted_text, app_strong_text};
 use ui::theme;
 use wallet_ops::{
     DesktopSelfBroadcastResult, PublicBroadcasterCostEstimate, PublicBroadcasterResultKind,
@@ -601,14 +601,17 @@ impl WalletRoot {
         let asset_label = Arc::clone(&progress.asset_label);
         let icon_path = progress.icon_path.clone();
         let root = cx.entity();
+        let viewport_size = window.viewport_size();
         let dialog_width =
-            (window.viewport_size().width * 0.92).min(PRIVATE_BROADCASTER_PROGRESS_DIALOG_WIDTH);
+            (viewport_size.width * 0.92).min(PRIVATE_BROADCASTER_PROGRESS_DIALOG_WIDTH);
+        let dialog_max_height = viewport_size.height * 0.84;
         let content_width = secondary_dialog_content_width(dialog_width);
         window.open_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
             let content_root = root.clone();
             dialog
                 .w(dialog_width)
+                .max_h(dialog_max_height)
                 .title(private_action_title_row(
                     private_submission_dialog_title_action(flow, kind),
                     asset_label.as_ref(),
@@ -1030,8 +1033,12 @@ impl WalletRoot {
         match progress.flow {
             PrivateSubmissionProgressFlow::PublicBroadcaster => {
                 if let Some(context) = self.private_broadcaster_progress_context(progress) {
+                    let broadcaster_action =
+                        self.render_public_broadcaster_preference_action(root, progress);
                     content = content.child(render_private_broadcaster_progress_context(
-                        progress, &context,
+                        progress,
+                        &context,
+                        broadcaster_action,
                     ));
                 } else {
                     content =
@@ -1095,6 +1102,106 @@ impl WalletRoot {
             settled: false,
         })
     }
+
+    fn render_public_broadcaster_preference_action(
+        &self,
+        root: &Entity<Self>,
+        progress: &PrivateBroadcasterProgressState,
+    ) -> Option<gpui::AnyElement> {
+        let address = public_broadcaster_progress_address(progress)?;
+        if self.is_banned_broadcaster(address) {
+            return Some(
+                render_broadcaster_preference_progress_chip("Banned", theme::DANGER)
+                    .into_any_element(),
+            );
+        }
+
+        let submitted = progress.result.as_ref().is_some_and(|result| {
+            matches!(
+                &result.result,
+                PublicBroadcasterResultKind::Submitted { .. }
+            )
+        });
+        if submitted {
+            if self.is_favorite_broadcaster(address) {
+                return Some(
+                    render_broadcaster_preference_progress_chip("Favorited", theme::WARNING)
+                        .into_any_element(),
+                );
+            }
+            let action_root = root.clone();
+            let address = address.to_owned();
+            return Some(
+                app_button_base(delivery_element_id(
+                    progress.key,
+                    progress.kind,
+                    "favorite-current-broadcaster",
+                ))
+                .outline()
+                .xsmall()
+                .icon(Icon::new(IconName::Star))
+                .tooltip(
+                    "Save this broadcaster to your favorites so future transactions can prefer it.",
+                )
+                .on_click(move |_event, _window, cx| {
+                    let address = address.clone();
+                    action_root.update(cx, |root, cx| {
+                        root.add_favorite_broadcaster(&address, cx);
+                    });
+                })
+                .into_any_element(),
+            );
+        }
+
+        if public_broadcaster_waiting_can_stop(progress, Instant::now()) && !progress.stop_available
+        {
+            let action_root = root.clone();
+            let address = address.to_owned();
+            return Some(
+                app_button(
+                    delivery_element_id(progress.key, progress.kind, "ban-current-broadcaster"),
+                    "Ban this broadcaster",
+                )
+                .danger()
+                .outline()
+                .xsmall()
+                .tooltip("Exclude this broadcaster from future selections. This does not stop the current wait.")
+                .on_click(move |_event, _window, cx| {
+                    let address = address.clone();
+                    action_root.update(cx, |root, cx| {
+                        root.add_banned_broadcaster(&address, cx);
+                    });
+                })
+                .into_any_element(),
+            );
+        }
+
+        None
+    }
+}
+
+fn public_broadcaster_progress_address(progress: &PrivateBroadcasterProgressState) -> Option<&str> {
+    progress.result.as_ref().map_or_else(
+        || {
+            progress
+                .estimate
+                .as_ref()
+                .map(|estimate| estimate.broadcaster.railgun_address.as_ref())
+        },
+        |result| Some(result.broadcaster.railgun_address.as_ref()),
+    )
+}
+
+fn render_broadcaster_preference_progress_chip(label: &'static str, color: u32) -> gpui::Div {
+    div()
+        .flex_none()
+        .px(px(8.0))
+        .py(px(2.0))
+        .rounded_full()
+        .bg(super::rgb_with_alpha(color, 0.12))
+        .text_color(rgb(color))
+        .text_size(px(11.0))
+        .child(label)
 }
 
 fn render_pending_public_broadcaster_progress_context(

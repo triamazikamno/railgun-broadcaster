@@ -1,14 +1,18 @@
 use super::{
-    Arc, BTreeSet, CreatedVault, DbConfig, DbStore, DesktopVaultStore, DesktopViewSession,
-    EncryptedRecord, GeneratedSeedMaterial, KEY_LEN, KdfParams, LoadedWalletMetadata,
-    PRIVATE_ADDRESS_BOOK_PREFIX, PUBLIC_ACCOUNT_METADATA_PREFIX, PUBLIC_ADDRESS_BOOK_PREFIX,
-    PathBuf, PrivateAddressBookEntry, PublicAccountMetadata, PublicAccountScope,
-    PublicAccountSecret, PublicAccountSource, PublicAccountStatus, PublicAddressBookEntry,
-    SoftwareRailgunSpendSigner, SpendGrant, StoredWalletRecord, VAULT_METADATA_KEY, VaultError,
-    VaultMetadata, VaultRecordEntries, ViewUnlock, WALLET_CHAIN_METADATA_PREFIX,
-    WALLET_VIEW_PREFIX, WalletChainMetadataBundle, WalletKeys, WalletMetadataBundle, WalletSource,
-    WalletSpendBundle, WalletStatus, WalletViewBundle, Zeroizing, assign_missing_display_orders,
-    bip39_entropy_from_mnemonic, create_spend_grant, create_with_params,
+    Arc, BROADCASTER_BANNED_PREFIX, BROADCASTER_FAVORITE_PREFIX, BTreeSet,
+    BroadcasterAddressIdentity, BroadcasterPreferenceEntry, BroadcasterPreferences, CreatedVault,
+    DbConfig, DbStore, DesktopVaultStore, DesktopViewSession, EncryptedRecord,
+    GeneratedSeedMaterial, KEY_LEN, KdfParams, LoadedWalletMetadata, PRIVATE_ADDRESS_BOOK_PREFIX,
+    PUBLIC_ACCOUNT_METADATA_PREFIX, PUBLIC_ADDRESS_BOOK_PREFIX, PathBuf, PrivateAddressBookEntry,
+    PublicAccountMetadata, PublicAccountScope, PublicAccountSecret, PublicAccountSource,
+    PublicAccountStatus, PublicAddressBookEntry, RecordKind, SoftwareRailgunSpendSigner,
+    SpendGrant, StoredWalletRecord, VAULT_METADATA_KEY, VaultError, VaultMetadata,
+    VaultRecordEntries, ViewUnlock, WALLET_CHAIN_METADATA_PREFIX, WALLET_VIEW_PREFIX,
+    WalletChainMetadataBundle, WalletKeys, WalletMetadataBundle, WalletSource, WalletSpendBundle,
+    WalletStatus, WalletViewBundle, Zeroizing, assign_missing_display_orders,
+    bip39_entropy_from_mnemonic, broadcaster_banned_record_entry, broadcaster_banned_record_key,
+    broadcaster_favorite_record_entry, broadcaster_favorite_record_key,
+    broadcaster_preference_entry_identity, create_spend_grant, create_with_params,
     default_wallet_label_for_metadata, derive_public_evm_address_from_entropy,
     derive_public_evm_private_key_from_entropy, deserialize_wallet_utxo,
     ensure_private_address_book_address_available,
@@ -23,14 +27,23 @@ use super::{
     public_account_metadata_record_entry, public_account_metadata_record_key,
     public_account_secret_record_entry, public_account_secret_record_key,
     public_address_book_record_entry, public_address_book_record_key,
-    public_evm_address_from_private_key, serialize_wallet_utxo, sort_private_address_book_entries,
+    public_evm_address_from_private_key, serialize_wallet_utxo,
+    sort_broadcaster_preference_entries, sort_private_address_book_entries,
     sort_public_account_metadata, sort_public_address_book_entries, sort_wallet_metadata,
-    unlock_spend, unlock_view, validate_address_book_label, validate_private_address_book_address,
+    unlock_spend, unlock_view, validate_address_book_label,
+    validate_broadcaster_preference_address, validate_private_address_book_address,
     validate_public_address_book_address, validate_wallet_label, vault_error_from_wallet_cache,
     wallet_cache_row_prefix, wallet_cache_row_record_key, wallet_chain_metadata_record_key,
     wallet_metadata_record_entry, wallet_metadata_record_key, wallet_spend_record_key,
     wallet_utxo_stable_identity, wallet_view_record_key,
 };
+
+#[derive(Clone)]
+struct LoadedBroadcasterPreferenceEntry {
+    entry_uuid: String,
+    entry: BroadcasterPreferenceEntry,
+    identity: BroadcasterAddressIdentity,
+}
 
 impl DesktopVaultStore {
     pub fn open(db_path: PathBuf) -> Result<Self, VaultError> {
@@ -348,6 +361,150 @@ impl DesktopVaultStore {
         view_session: &DesktopViewSession,
     ) -> Result<Vec<PublicAddressBookEntry>, VaultError> {
         self.list_public_address_book_entries_with_view(&view_session.view)
+    }
+
+    pub fn list_broadcaster_preferences_for_session(
+        &self,
+        view_session: &DesktopViewSession,
+    ) -> Result<BroadcasterPreferences, VaultError> {
+        let banned = self.list_broadcaster_banned_entries_with_view(&view_session.view)?;
+        let banned_identities = banned
+            .iter()
+            .map(|loaded| loaded.identity)
+            .collect::<BTreeSet<_>>();
+        let mut favorites = self
+            .list_broadcaster_favorite_entries_with_view(&view_session.view)?
+            .into_iter()
+            .filter(|loaded| !banned_identities.contains(&loaded.identity))
+            .map(|loaded| loaded.entry)
+            .collect::<Vec<_>>();
+        let mut banned = banned
+            .into_iter()
+            .map(|loaded| loaded.entry)
+            .collect::<Vec<_>>();
+        sort_broadcaster_preference_entries(&mut favorites);
+        sort_broadcaster_preference_entries(&mut banned);
+        Ok(BroadcasterPreferences { favorites, banned })
+    }
+
+    pub fn list_favorite_broadcasters_for_session(
+        &self,
+        view_session: &DesktopViewSession,
+    ) -> Result<Vec<BroadcasterPreferenceEntry>, VaultError> {
+        Ok(self
+            .list_broadcaster_preferences_for_session(view_session)?
+            .favorites)
+    }
+
+    pub fn list_banned_broadcasters_for_session(
+        &self,
+        view_session: &DesktopViewSession,
+    ) -> Result<Vec<BroadcasterPreferenceEntry>, VaultError> {
+        Ok(self
+            .list_broadcaster_preferences_for_session(view_session)?
+            .banned)
+    }
+
+    pub fn add_favorite_broadcaster_for_session(
+        &self,
+        view_session: &DesktopViewSession,
+        address: &str,
+    ) -> Result<BroadcasterPreferenceEntry, VaultError> {
+        let (address, identity) = validate_broadcaster_preference_address(address)?;
+        let favorites = self.list_broadcaster_favorite_entries_with_view(&view_session.view)?;
+        let banned = self.list_broadcaster_banned_entries_with_view(&view_session.view)?;
+        let existing = favorites
+            .iter()
+            .find(|loaded| loaded.identity == identity)
+            .cloned();
+        for loaded in banned.iter().filter(|loaded| loaded.identity == identity) {
+            self.db
+                .delete_desktop_wallet_vault_record(&broadcaster_banned_record_key(
+                    &loaded.entry_uuid,
+                ))?;
+        }
+        if let Some(existing) = existing {
+            return Ok(existing.entry);
+        }
+
+        let entry_uuid = generate_opaque_id()?;
+        let entry = BroadcasterPreferenceEntry { address };
+        let (key, data) =
+            broadcaster_favorite_record_entry(&view_session.view, &entry_uuid, &entry)?;
+        self.db.put_desktop_wallet_vault_record(&key, &data)?;
+        Ok(entry)
+    }
+
+    pub fn add_banned_broadcaster_for_session(
+        &self,
+        view_session: &DesktopViewSession,
+        address: &str,
+    ) -> Result<BroadcasterPreferenceEntry, VaultError> {
+        let (address, identity) = validate_broadcaster_preference_address(address)?;
+        let favorites = self.list_broadcaster_favorite_entries_with_view(&view_session.view)?;
+        let banned = self.list_broadcaster_banned_entries_with_view(&view_session.view)?;
+        let existing = banned
+            .iter()
+            .find(|loaded| loaded.identity == identity)
+            .cloned();
+        for loaded in favorites
+            .iter()
+            .filter(|loaded| loaded.identity == identity)
+        {
+            self.db
+                .delete_desktop_wallet_vault_record(&broadcaster_favorite_record_key(
+                    &loaded.entry_uuid,
+                ))?;
+        }
+        if let Some(existing) = existing {
+            return Ok(existing.entry);
+        }
+
+        let entry_uuid = generate_opaque_id()?;
+        let entry = BroadcasterPreferenceEntry { address };
+        let (key, data) = broadcaster_banned_record_entry(&view_session.view, &entry_uuid, &entry)?;
+        self.db.put_desktop_wallet_vault_record(&key, &data)?;
+        Ok(entry)
+    }
+
+    pub fn remove_favorite_broadcaster_for_session(
+        &self,
+        view_session: &DesktopViewSession,
+        address: &str,
+    ) -> Result<Option<BroadcasterPreferenceEntry>, VaultError> {
+        let (_, identity) = validate_broadcaster_preference_address(address)?;
+        let favorites = self.list_broadcaster_favorite_entries_with_view(&view_session.view)?;
+        let Some(loaded) = favorites
+            .into_iter()
+            .find(|loaded| loaded.identity == identity)
+        else {
+            return Ok(None);
+        };
+        self.db
+            .delete_desktop_wallet_vault_record(&broadcaster_favorite_record_key(
+                &loaded.entry_uuid,
+            ))?;
+        Ok(Some(loaded.entry))
+    }
+
+    pub fn remove_banned_broadcaster_for_session(
+        &self,
+        view_session: &DesktopViewSession,
+        address: &str,
+    ) -> Result<Option<BroadcasterPreferenceEntry>, VaultError> {
+        let (_, identity) = validate_broadcaster_preference_address(address)?;
+        let banned = self.list_broadcaster_banned_entries_with_view(&view_session.view)?;
+        let Some(loaded) = banned
+            .into_iter()
+            .find(|loaded| loaded.identity == identity)
+        else {
+            return Ok(None);
+        };
+        self.db
+            .delete_desktop_wallet_vault_record(&broadcaster_banned_record_key(
+                &loaded.entry_uuid,
+            ))?;
+        Ok(Some(loaded.entry))
     }
 
     pub fn add_private_address_book_entry_for_session(
@@ -1463,6 +1620,78 @@ impl DesktopVaultStore {
             entries.push(entry);
         }
         sort_public_address_book_entries(&mut entries);
+        Ok(entries)
+    }
+
+    fn list_broadcaster_favorite_entries_with_view(
+        &self,
+        view: &ViewUnlock,
+    ) -> Result<Vec<LoadedBroadcasterPreferenceEntry>, VaultError> {
+        self.list_broadcaster_preference_entries_with_view(
+            view,
+            BROADCASTER_FAVORITE_PREFIX,
+            RecordKind::BroadcasterFavoriteEntry,
+            "favorite",
+        )
+    }
+
+    fn list_broadcaster_banned_entries_with_view(
+        &self,
+        view: &ViewUnlock,
+    ) -> Result<Vec<LoadedBroadcasterPreferenceEntry>, VaultError> {
+        self.list_broadcaster_preference_entries_with_view(
+            view,
+            BROADCASTER_BANNED_PREFIX,
+            RecordKind::BroadcasterBannedEntry,
+            "banned",
+        )
+    }
+
+    fn list_broadcaster_preference_entries_with_view(
+        &self,
+        view: &ViewUnlock,
+        prefix: &str,
+        kind: RecordKind,
+        preference_kind: &str,
+    ) -> Result<Vec<LoadedBroadcasterPreferenceEntry>, VaultError> {
+        let records = self.db.list_desktop_wallet_vault_records(prefix)?;
+        let mut entries = Vec::with_capacity(records.len());
+        let mut seen = BTreeSet::new();
+        for stored in records {
+            let Some(entry_uuid) = stored.key.strip_prefix(prefix) else {
+                continue;
+            };
+            let Ok(record) = rmp_serde::from_slice::<EncryptedRecord>(&stored.payload) else {
+                tracing::warn!(
+                    kind = preference_kind,
+                    "ignoring invalid broadcaster preference record"
+                );
+                continue;
+            };
+            let Ok(entry) = view.decrypt_broadcaster_preference_entry(kind, entry_uuid, &record)
+            else {
+                tracing::warn!(
+                    kind = preference_kind,
+                    "ignoring undecryptable broadcaster preference record"
+                );
+                continue;
+            };
+            let Ok(identity) = broadcaster_preference_entry_identity(&entry) else {
+                tracing::warn!(
+                    kind = preference_kind,
+                    "ignoring invalid broadcaster preference address"
+                );
+                continue;
+            };
+            if seen.insert(identity) {
+                entries.push(LoadedBroadcasterPreferenceEntry {
+                    entry_uuid: entry_uuid.to_owned(),
+                    entry,
+                    identity,
+                });
+            }
+        }
+        entries.sort_by(|left, right| left.entry.address.cmp(&right.entry.address));
         Ok(entries)
     }
 

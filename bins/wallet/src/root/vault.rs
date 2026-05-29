@@ -11,7 +11,9 @@ use wallet_ops::vault::{
 use zeroize::Zeroizing;
 
 use super::wallet_header::WalletSelectItem;
-use super::{ChainUtxoState, WalletRoot, WalletTab, secondary_dialog_content_width};
+use super::{
+    BroadcasterActivityTab, ChainUtxoState, WalletRoot, WalletTab, secondary_dialog_content_width,
+};
 
 pub(super) enum VaultState {
     CreateVault,
@@ -93,6 +95,7 @@ pub(super) const fn vault_error_kind(error: &VaultError) -> &'static str {
         VaultError::PublicAddressBookDisplayOrderOverflow => {
             "public_address_book_display_order_overflow"
         }
+        VaultError::InvalidBroadcasterPreferenceAddress => "invalid_broadcaster_preference_address",
     }
 }
 
@@ -632,6 +635,7 @@ impl WalletRoot {
         self.sync_wallet_select(window, cx);
         self.reset_wallet_scoped_state(cx);
         self.reload_address_books(cx);
+        self.reload_broadcaster_preferences(cx);
         self.reload_public_accounts(window, cx);
         self.setup_password = None;
         self.generated_seed = None;
@@ -690,11 +694,18 @@ impl WalletRoot {
         self.wallet_options.clear();
         self.private_address_book.clear();
         self.public_address_book.clear();
+        self.set_broadcaster_preferences(wallet_ops::vault::BroadcasterPreferences::default(), cx);
+        self.broadcaster_preference_error = None;
         self.address_book.search_query = Arc::from("");
         self.address_book
             .search_input
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.address_book.clear_dialog_state(window, cx);
+        self.favorite_broadcaster_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.banned_broadcaster_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.active_broadcaster_tab = BroadcasterActivityTab::default();
         self.address_book_save_error = None;
         self.selected_wallet_id = None;
         self.active_wallet_generation = self.active_wallet_generation.wrapping_add(1);

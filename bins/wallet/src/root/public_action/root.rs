@@ -636,13 +636,16 @@ impl WalletRoot {
         let asset_label = Arc::clone(&self.public_form.action_progress_asset_label);
         let icon_path = self.public_form.action_progress_icon_path.clone();
         let root = cx.entity();
-        let dialog_width = (window.viewport_size().width * 0.92).min(PUBLIC_ACTION_DIALOG_WIDTH);
+        let viewport_size = window.viewport_size();
+        let dialog_width = (viewport_size.width * 0.92).min(PUBLIC_ACTION_DIALOG_WIDTH);
+        let dialog_max_height = viewport_size.height * 0.84;
         let content_width = secondary_dialog_content_width(dialog_width);
         window.open_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
             let content_root = root.clone();
             dialog
                 .w(dialog_width)
+                .max_h(dialog_max_height)
                 .title(public_action_title_row(
                     format!("{} {}", public_action_mode_verb(mode), asset_label.as_ref()),
                     icon_path.clone(),

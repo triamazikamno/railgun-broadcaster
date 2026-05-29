@@ -5,8 +5,9 @@ use alloy::primitives::{Address, U256, address};
 use gpui::Context;
 use wallet_ops::{
     BroadcasterFeePolicy, BroadcasterFeePolicyStatus, FeeHandlingMode, ListUtxosOutput,
-    PublicBroadcasterCandidate, PublicBroadcasterCostEstimate, RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS,
-    eligible_public_broadcasters_for_asset, fee_policy_eligible_public_broadcasters,
+    PublicBroadcasterCandidate, PublicBroadcasterCostEstimate, PublicBroadcasterTrustFilter,
+    RAILGUN_UNSHIELD_PROTOCOL_FEE_BPS, eligible_public_broadcasters_for_asset,
+    fee_policy_eligible_public_broadcasters, filter_public_broadcasters_by_trust,
     max_broadcaster_fee_token_amount_from_outputs as planner_max_broadcaster_fee_token_amount_from_outputs,
     public_broadcaster_candidates_for_asset,
     settings::{EffectiveChainConfig, EffectiveTokenRegistry},
@@ -46,16 +47,27 @@ impl WalletRoot {
             .with_allow_suspicious_broadcasters(allow_suspicious_broadcasters)
     }
 
+    pub(super) fn public_broadcaster_trust_filter(
+        &self,
+        favorites_only: bool,
+    ) -> PublicBroadcasterTrustFilter {
+        PublicBroadcasterTrustFilter {
+            preferences: self.broadcaster_preferences.clone(),
+            favorites_only,
+        }
+    }
+
     pub(super) fn current_public_broadcaster_candidates(
         &self,
         chain_id: u64,
         token: Address,
         unwrap: bool,
+        favorites_only: bool,
         policy: BroadcasterFeePolicy,
     ) -> Vec<PublicBroadcasterCandidate> {
         let required_relay_adapt =
             required_relay_adapt_for_unwrap(&self.effective_chain_configs, chain_id, unwrap);
-        public_broadcaster_candidates_for_asset(
+        let candidates = public_broadcaster_candidates_for_asset(
             &self.monitor_fee_rows(),
             chain_id,
             token,
@@ -64,13 +76,18 @@ impl WalletRoot {
             self.public_broadcaster_anchor_cache
                 .cached_rate(chain_id, token),
         )
-        .unwrap_or_default()
+        .unwrap_or_default();
+        filter_public_broadcasters_by_trust(
+            &candidates,
+            &self.public_broadcaster_trust_filter(favorites_only),
+        )
     }
 
     pub(super) fn current_public_broadcaster_fee_token_options(
         &self,
         chain_id: u64,
         unwrap: bool,
+        favorites_only: bool,
         policy: BroadcasterFeePolicy,
     ) -> Vec<PublicBroadcasterFeeTokenOption> {
         let Some(snapshot) = self
@@ -88,6 +105,7 @@ impl WalletRoot {
             &fee_rows,
             required_relay_adapt,
             policy,
+            &self.public_broadcaster_trust_filter(favorites_only),
             Some(&self.effective_token_registry),
             |token| {
                 self.public_broadcaster_anchor_cache
@@ -104,7 +122,8 @@ impl WalletRoot {
         allow_suspicious_broadcasters: bool,
     ) -> Address {
         let policy = self.public_broadcaster_fee_policy(allow_suspicious_broadcasters);
-        let options = self.current_public_broadcaster_fee_token_options(chain_id, unwrap, policy);
+        let options =
+            self.current_public_broadcaster_fee_token_options(chain_id, unwrap, false, policy);
         resolve_selected_public_broadcaster_fee_token(action_token, action_token, &options)
     }
 
@@ -237,6 +256,7 @@ pub(super) fn public_broadcaster_fee_token_options_from_snapshot(
     fee_rows: &[broadcaster_monitor::FeeRow],
     required_relay_adapt: Option<Address>,
     policy: BroadcasterFeePolicy,
+    trust_filter: &PublicBroadcasterTrustFilter,
     registry: Option<&EffectiveTokenRegistry>,
     mut anchor_rate_for_token: impl FnMut(Address) -> Option<U256>,
 ) -> Vec<PublicBroadcasterFeeTokenOption> {
@@ -261,6 +281,7 @@ pub(super) fn public_broadcaster_fee_token_options_from_snapshot(
                 anchor_rate_for_token(token),
             )
             .unwrap_or_default();
+            let candidates = filter_public_broadcasters_by_trust(&candidates, trust_filter);
             let eligible_broadcaster_count =
                 fee_policy_eligible_public_broadcasters(&candidates, policy).len();
             Some(PublicBroadcasterFeeTokenOption {
@@ -314,6 +335,7 @@ pub(super) fn public_broadcaster_fee_token_warning(
     chain_id: u64,
     options: &[PublicBroadcasterFeeTokenOption],
     selected_fee_token: Address,
+    trust_filter: &PublicBroadcasterTrustFilter,
 ) -> Option<&'static str> {
     if selected_fee_token_eligible_broadcaster_count(options, selected_fee_token)
         .unwrap_or_default()
@@ -323,6 +345,15 @@ pub(super) fn public_broadcaster_fee_token_warning(
     }
     if !fee_rows.iter().any(|row| row.chain_id == chain_id) {
         return Some("Searching for public broadcasters");
+    }
+    if trust_filter.favorites_only && trust_filter.preferences.favorites.is_empty() {
+        return Some("Favorites-only mode is on, but no favorite broadcasters are saved yet.");
+    }
+    if trust_filter.favorites_only {
+        return Some("No favorite broadcaster currently supports your spendable fee tokens.");
+    }
+    if !trust_filter.preferences.banned.is_empty() {
+        return Some("No non-banned broadcaster currently supports your spendable fee tokens.");
     }
     if options
         .iter()

@@ -40,7 +40,7 @@ use wallet_ops::{
     TransactionGenerationStage, WalletSession, fee_policy_eligible_public_broadcasters,
     parse_railgun_recipient, parse_send_amount, parse_unshield_amount,
     prepare_desktop_send_calldata, prepare_desktop_unshield_calldata,
-    quote_desktop_self_broadcast_gas_fee, select_public_broadcaster_with_policy,
+    quote_desktop_self_broadcast_gas_fee, select_public_broadcaster_with_policy_and_trust,
     settings::EffectiveTokenRegistry,
     sort_specific_public_broadcasters, submit_desktop_send_public_broadcaster,
     submit_desktop_send_self_broadcast, submit_desktop_unshield_public_broadcaster,
