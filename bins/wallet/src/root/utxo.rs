@@ -27,17 +27,17 @@ use ui::icons;
 use ui::theme::{self, APP_MONO_FONT_FAMILY};
 use wallet_ops::{
     BlockedShieldRescueEligibilityRequest, BlockedShieldRescueInfo,
-    BlockedShieldRescueSelfBroadcastRequest, BlockedShieldRescueUtxoId, ListUtxosOutput,
-    SelfBroadcastGasFeeSelection, UtxoOutput,
+    BlockedShieldRescueSelfBroadcastRequest, BlockedShieldRescueUtxoId,
+    DesktopPrivateSpendAuthorization, ListUtxosOutput, SelfBroadcastGasFeeSelection, UtxoOutput,
 };
-use zeroize::Zeroizing;
 
 use super::actions::{UtxoEnd, UtxoHome, UtxoPageDown, UtxoPageUp};
 use super::chain_load::ChainUtxoState;
 use super::shell::WalletTab;
 use super::sidebar::Activity;
 use super::spend_authorization::{
-    SpendAuthorizationIntent, SpendAuthorizationSummary, SpendAuthorizationSummaryRow,
+    HardwareSpendAuthorizationCompletion, SpendAuthorizationIntent, SpendAuthorizationSummary,
+    SpendAuthorizationSummaryRow,
 };
 use super::tokens::parse_address;
 use super::{
@@ -221,8 +221,44 @@ impl WalletRoot {
             return;
         };
         let summary = blocked_shield_refund_authorization_summary(row, rescue, &origin_address);
-        self.request_spend_authorization(
-            SpendAuthorizationIntent::BlockedShieldRefund(utxo_id),
+        let intent = if self.selected_wallet_source().is_hardware_derived() {
+            SpendAuthorizationIntent::BlockedShieldRefundGasPassword(utxo_id)
+        } else {
+            SpendAuthorizationIntent::BlockedShieldRefund(utxo_id)
+        };
+        self.request_spend_authorization(intent, summary, window, cx);
+    }
+
+    pub(super) fn request_blocked_shield_refund_hardware_authorization(
+        &mut self,
+        utxo_id: BlockedShieldRescueUtxoId,
+        vault_password: zeroize::Zeroizing<String>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(row) = self.active_blocked_shield_rescue_display_row(utxo_id) else {
+            tracing::warn!("blocked Shield hardware refund requested without display row");
+            return;
+        };
+        let Some(rescue) = self
+            .blocked_shield_rescue_rows
+            .get(&utxo_id)
+            .map(BlockedShieldRescueRowState::info)
+            .filter(|rescue| rescue.eligible)
+        else {
+            tracing::warn!("blocked Shield hardware refund requested for ineligible UTXO");
+            return;
+        };
+        let Some(origin_address) = rescue.origin_address.clone() else {
+            tracing::warn!("blocked Shield hardware refund requested without origin address");
+            return;
+        };
+        let summary = blocked_shield_refund_authorization_summary(&row, rescue, &origin_address);
+        self.open_hardware_spend_authorization_dialog(
+            HardwareSpendAuthorizationCompletion::BlockedShieldRefund {
+                utxo_id,
+                vault_password,
+            },
             summary,
             window,
             cx,
@@ -316,10 +352,27 @@ impl WalletRoot {
     pub(super) fn submit_blocked_shield_refund_authorized(
         &mut self,
         utxo_id: BlockedShieldRescueUtxoId,
-        password: Zeroizing<String>,
+        spend_authorization: DesktopPrivateSpendAuthorization,
+        vault_password: Option<zeroize::Zeroizing<String>>,
         _window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let password = if let Some(password) = vault_password {
+            password
+        } else {
+            let DesktopPrivateSpendAuthorization::VaultPassword(password) = &spend_authorization
+            else {
+                tracing::warn!(
+                    "blocked Shield refund self-broadcast requested without gas-payer password"
+                );
+                self.set_vault_error(
+                    "Blocked Shield refund self-broadcast requires the vault password for the public gas payer.",
+                    cx,
+                );
+                return;
+            };
+            password.clone()
+        };
         let Some(session) = self.selected_chain_session() else {
             tracing::warn!("blocked Shield refund requested without selected chain session");
             return;
@@ -361,6 +414,7 @@ impl WalletRoot {
             view_session,
             session,
             vault_store,
+            spend_authorization,
             vault_password: password,
             utxo_id,
             requested_public_account_uuid: Some(public_account_uuid),

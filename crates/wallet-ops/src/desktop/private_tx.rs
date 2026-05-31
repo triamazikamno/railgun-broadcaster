@@ -53,14 +53,11 @@ pub(super) async fn prepare_desktop_unshield_plan_without_broadcaster_fee(
     let selection_info = unshield_selection_info(&utxos, request.token, receiver_amount, false)
         .wrap_err("select POI-verified unshield notes")?;
 
-    let mut grant = request
-        .vault_store
-        .create_spend_grant(request.vault_password)
-        .wrap_err("authorize unshield spend")?;
-    let signer = request
-        .vault_store
-        .railgun_spend_signer(&mut grant, request.view_session.wallet_id())
-        .wrap_err("load unshield spend signer")?;
+    let signer = request.spend_authorization.into_signer(
+        request.vault_store,
+        request.view_session.wallet_id(),
+        "unshield",
+    )?;
 
     let tx_builder = TransactionBuilder {
         chain_type: 0,
@@ -205,14 +202,11 @@ pub(super) async fn prepare_blocked_shield_rescue_plan(
         ));
     }
 
-    let mut grant = request
-        .vault_store
-        .create_spend_grant(request.vault_password.as_str())
-        .wrap_err("authorize blocked Shield refund spend")?;
-    let signer = request
-        .vault_store
-        .railgun_spend_signer(&mut grant, request.view_session.wallet_id())
-        .wrap_err("load blocked Shield refund spend signer")?;
+    let signer = request.spend_authorization.signer(
+        request.vault_store.as_ref(),
+        request.view_session.wallet_id(),
+        "blocked Shield refund",
+    )?;
     let tx_builder = TransactionBuilder {
         chain_type: 0,
         chain_id: request.chain_id,
@@ -372,14 +366,11 @@ pub(super) async fn prepare_desktop_send_plan_without_broadcaster_fee(
     let selection_info = send_selection_info(&utxos, request.token, request.amount, false)
         .wrap_err("select POI-verified send notes")?;
 
-    let mut grant = request
-        .vault_store
-        .create_spend_grant(request.vault_password)
-        .wrap_err("authorize send spend")?;
-    let signer = request
-        .vault_store
-        .railgun_spend_signer(&mut grant, request.view_session.wallet_id())
-        .wrap_err("load send spend signer")?;
+    let signer = request.spend_authorization.into_signer(
+        request.vault_store,
+        request.view_session.wallet_id(),
+        "send",
+    )?;
 
     let tx_builder = TransactionBuilder {
         chain_type: 0,
@@ -542,7 +533,7 @@ pub async fn prepare_desktop_unshield_calldata(
             view_session: request.view_session.as_ref(),
             session: request.session.as_ref(),
             vault_store: request.vault_store.as_ref(),
-            vault_password: request.vault_password.as_str(),
+            spend_authorization: request.spend_authorization,
             token: request.token,
             amount: request.amount,
             fee_mode: request.fee_mode,
@@ -594,7 +585,7 @@ pub async fn prepare_desktop_send_calldata(
             view_session: request.view_session.as_ref(),
             session: request.session.as_ref(),
             vault_store: request.vault_store.as_ref(),
-            vault_password: request.vault_password.as_str(),
+            spend_authorization: request.spend_authorization,
             token: request.token,
             amount: request.amount,
             recipient: &recipient,
@@ -934,7 +925,7 @@ pub async fn submit_desktop_unshield_self_broadcast(
             view_session: request.view_session.as_ref(),
             session: request.session.as_ref(),
             vault_store: request.vault_store.as_ref(),
-            vault_password: request.vault_password.as_str(),
+            spend_authorization: request.spend_authorization,
             token: request.token,
             amount: request.amount,
             fee_mode: request.fee_mode,
@@ -982,7 +973,10 @@ pub async fn submit_desktop_unshield_self_broadcast(
         request.effective_chain.as_ref(),
         request.view_session.as_ref(),
         request.vault_store.as_ref(),
-        request.vault_password.as_str(),
+        request
+            .vault_password
+            .as_ref()
+            .map(|password| password.as_str()),
         request.public_account_uuid,
         Arc::clone(&request.session),
         prepared.plan.call.to,
@@ -1026,7 +1020,7 @@ pub async fn submit_blocked_shield_rescue_self_broadcast(
         request.effective_chain.as_ref(),
         request.view_session.as_ref(),
         request.vault_store.as_ref(),
-        request.vault_password.as_str(),
+        Some(request.vault_password.as_str()),
         prepared.public_account_uuid,
         Arc::clone(&request.session),
         prepared.plan.call.to,
@@ -1053,7 +1047,7 @@ pub async fn submit_desktop_send_self_broadcast(
             view_session: request.view_session.as_ref(),
             session: request.session.as_ref(),
             vault_store: request.vault_store.as_ref(),
-            vault_password: request.vault_password.as_str(),
+            spend_authorization: request.spend_authorization,
             token: request.token,
             amount: request.amount,
             recipient: &recipient,
@@ -1089,7 +1083,10 @@ pub async fn submit_desktop_send_self_broadcast(
         request.effective_chain.as_ref(),
         request.view_session.as_ref(),
         request.vault_store.as_ref(),
-        request.vault_password.as_str(),
+        request
+            .vault_password
+            .as_ref()
+            .map(|password| password.as_str()),
         request.public_account_uuid,
         Arc::clone(&request.session),
         prepared.plan.call.to,

@@ -18,6 +18,7 @@ pub(super) const WALLET_VIEW_PREFIX: &str = "wallet-view|";
 pub(super) const WALLET_SPEND_PREFIX: &str = "wallet-spend|";
 pub(super) const WALLET_CHAIN_METADATA_PREFIX: &str = "wallet-chain-meta|";
 pub(super) const WALLET_CACHE_ROW_PREFIX: &str = "wallet-cache-row|";
+pub(super) const HARDWARE_WALLET_ACCOUNT_INDEX_PREFIX: &str = "hardware-wallet-account-index|";
 pub(super) const PUBLIC_ACCOUNT_METADATA_PREFIX: &str = "public-account-meta|";
 pub(super) const PUBLIC_ACCOUNT_SECRET_PREFIX: &str = "public-account-secret|";
 pub(super) const PRIVATE_ADDRESS_BOOK_PREFIX: &str = "private-address-book|";
@@ -107,6 +108,14 @@ pub enum VaultError {
     PublicAddressBookDisplayOrderOverflow,
     #[error("invalid broadcaster preference address")]
     InvalidBroadcasterPreferenceAddress,
+    #[error("invalid hardware wallet descriptor")]
+    InvalidHardwareWalletDescriptor,
+    #[error("hardware wallet account index overflow")]
+    HardwareWalletAccountIndexOverflow,
+    #[error("hardware wallet account index already exists")]
+    DuplicateHardwareWalletAccountIndex,
+    #[error("derived hardware wallet key does not match the stored wallet")]
+    HardwareWalletIdentityMismatch,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -167,6 +176,7 @@ pub enum RecordKind {
     WalletMetadata,
     WalletChainMetadata,
     WalletCacheRow,
+    HardwareWalletAccountIndexReservation,
     PublicAccountMetadata,
     PublicAccountSecret,
     PrivateAddressBookEntry,
@@ -186,6 +196,9 @@ impl RecordKind {
             Self::WalletMetadata => "wallet-metadata",
             Self::WalletChainMetadata => "wallet-chain-metadata",
             Self::WalletCacheRow => "wallet-cache-row",
+            Self::HardwareWalletAccountIndexReservation => {
+                "hardware-wallet-account-index-reservation"
+            }
             Self::PublicAccountMetadata => "public-account-metadata",
             Self::PublicAccountSecret => "public-account-secret",
             Self::PrivateAddressBookEntry => "private-address-book-entry",
@@ -253,6 +266,14 @@ pub struct StoredWalletRecord {
     pub derivation_index: u32,
     pub view_record_key: String,
     pub spend_record_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredHardwareWalletRecord {
+    pub wallet_id: String,
+    pub derivation_index: u32,
+    pub view_record_key: String,
+    pub metadata_record_key: String,
 }
 
 pub struct GeneratedSeedMaterial {

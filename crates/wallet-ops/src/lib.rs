@@ -6,11 +6,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use alloy::eips::BlockNumberOrTag;
-use alloy::eips::Encodable2718;
 use alloy::hex;
-use alloy::network::{
-    EthereumWallet, NetworkTransactionBuilder, TransactionBuilder as _, TransactionResponse,
-};
+use alloy::network::{EthereumWallet, TransactionBuilder as _, TransactionResponse};
 use alloy::primitives::{Address, Bytes, FixedBytes, U256, address, keccak256};
 use alloy::providers::Provider;
 use alloy::rpc::types::{FeeHistory, TransactionReceipt, TransactionRequest};
@@ -77,6 +74,7 @@ static ACTIVE_PROVER_CACHE_BUILDS: LazyLock<
 mod amounts;
 mod anchors;
 mod desktop;
+pub mod hardware;
 mod http;
 mod poi_contexts;
 mod public_wallet;
@@ -103,7 +101,6 @@ pub use http::{
     build_wallet_network_context_with_progress, request_tor_state_reset,
     resolve_wallet_network_mode,
 };
-use public_wallet::vaulted_public_signer;
 pub use public_wallet::{
     PublicAccountBalance, PublicActionAttemptInfo, PublicActionCommand, PublicActionCommandKind,
     PublicActionCommandReceiver, PublicActionCommandSender, PublicActionGasFeeQuote,
@@ -118,7 +115,7 @@ pub use public_wallet::{
     submit_public_send, submit_public_send_with_progress, submit_public_shield,
     submit_public_shield_with_progress,
 };
-use signer::EvmTransactionSigner;
+use public_wallet::{VaultedPublicSigner, vaulted_public_signer};
 use utxos::apply_pending_overlay_to_outputs;
 pub use utxos::{
     ActivityUtxoClassification, BlockedShieldRescueInfo, ListUtxosOutput, TokenTotal, UtxoOutput,

@@ -20,6 +20,7 @@ use wallet_ops::{
     BlockedShieldRescueUtxoId, BroadcasterFeePolicy, HttpContext, PoiCacheService, PoiReadSource,
     ProverCacheBuildProgress, PublicBalanceSnapshot, PublicBroadcasterWakuClient,
     TokenAnchorRateCache, TokenAnchorRefreshHandle, WalletNetworkHealth, WalletSessionStore,
+    hardware::HardwareWalletSyncIntent,
     settings::{EffectiveChainConfig, EffectiveTokenRegistry, load_wallet_settings},
     subscribe_prover_cache_build,
     vault::{
@@ -125,7 +126,7 @@ use gas_fee::{format_gwei, parse_gwei_to_wei, validate_custom_gas_fee};
 #[cfg(test)]
 use manage_wallets::{
     WalletManagementSelection, active_wallet_management_rows, hidden_wallet_management_rows,
-    selected_wallet_after_metadata_refresh, wallet_ids_after_drop,
+    selected_wallet_after_metadata_refresh, wallet_ids_after_drop, wallet_source_label,
 };
 #[cfg(test)]
 use private_action::{
@@ -139,7 +140,8 @@ use private_action::{
     private_action_metrics, private_send_recipient_options, private_unshield_recipient_options,
     random_self_broadcast_gas_payer_uuid, recipient_option_matches_search,
     selected_recipient_address, self_broadcast_gas_payer_matches_search,
-    self_broadcast_native_balance_label, self_broadcast_native_balance_state, send_element_id,
+    self_broadcast_native_balance_label, self_broadcast_native_balance_state,
+    self_broadcast_requires_software_gas_payer_password, send_element_id,
     send_public_broadcaster_estimate_input_error, unshield_element_id,
     unshield_public_broadcaster_estimate_input_error,
 };
@@ -226,7 +228,10 @@ use utxo::{
     format_compact_age, should_show_blocked_shield_refund_action,
 };
 #[cfg(test)]
-use vault::wallet_options_from_metadata;
+use vault::{
+    default_hardware_wallet_setup_intent, hardware_wallet_creation_result_is_current,
+    parse_hardware_wallet_restore_account_index, wallet_options_from_metadata,
+};
 #[cfg(test)]
 use vault_ui::should_show_pre_unlock_settings_action;
 #[cfg(test)]
@@ -285,6 +290,11 @@ pub(crate) struct WalletRoot {
     spend_authorization_lifetime: SpendAuthorizationLifetime,
     view_session: Option<Arc<DesktopViewSession>>,
     generated_seed: Option<GeneratedSeedMaterial>,
+    hardware_wallet_creation_in_progress: bool,
+    hardware_wallet_creation_generation: u64,
+    hardware_wallet_creation_intent: Option<HardwareWalletSyncIntent>,
+    hardware_wallet_restore_account_index_input: Entity<InputState>,
+    hardware_wallet_restore_account_index_set: bool,
     http: HttpContext,
     network_health: WalletNetworkHealth,
     waku_worker_shutdown: watch::Sender<bool>,
@@ -583,6 +593,8 @@ impl WalletRoot {
         let wallet_name_input = new_text_input(window, cx, "wallet name");
         let manage_wallet_label_input = new_text_input(window, cx, "wallet label");
         let add_wallet_password_input = new_masked_input(window, cx, "vault password");
+        let hardware_wallet_restore_account_index_input =
+            new_text_input(window, cx, "optional restore account index");
         let import_mnemonic_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .auto_grow(3, 6)
@@ -628,6 +640,7 @@ impl WalletRoot {
             action_progress: Vec::new(),
             expanded_action_error_steps: BTreeSet::new(),
             action_progress_dialog_open: false,
+            action_requires_device_approval: false,
             action_progress_asset_label: Arc::from(""),
             action_progress_icon_path: None,
             action_task_abort_handle: None,
@@ -729,6 +742,12 @@ impl WalletRoot {
             spend_authorization_lifetime: SpendAuthorizationLifetime::Once,
             view_session: None,
             generated_seed: None,
+            hardware_wallet_creation_in_progress: false,
+            hardware_wallet_creation_generation: 0,
+            hardware_wallet_creation_intent: None,
+            hardware_wallet_restore_account_index_input:
+                hardware_wallet_restore_account_index_input.clone(),
+            hardware_wallet_restore_account_index_set: false,
             http,
             network_health,
             waku_worker_shutdown,
@@ -956,6 +975,43 @@ impl WalletRoot {
                 if matches!(event, InputEvent::PressEnter { .. }) {
                     this.create_vault_from_inputs(window, cx);
                 }
+            },
+        )
+        .detach();
+        cx.subscribe_in(
+            &root.wallet_name_input,
+            window,
+            |this, _input, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.submit_default_hardware_wallet_setup(window, cx);
+                }
+            },
+        )
+        .detach();
+        cx.subscribe_in(
+            &root.add_wallet_password_input,
+            window,
+            |this, _input, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.submit_default_hardware_wallet_setup(window, cx);
+                }
+            },
+        )
+        .detach();
+        cx.subscribe_in(
+            &root.hardware_wallet_restore_account_index_input,
+            window,
+            |this, input, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { .. } => {
+                    this.submit_default_hardware_wallet_setup(window, cx);
+                }
+                InputEvent::Change => {
+                    this.hardware_wallet_restore_account_index_set =
+                        !input.read(cx).value().trim().is_empty();
+                    this.vault_error = None;
+                    cx.notify();
+                }
+                _ => {}
             },
         )
         .detach();

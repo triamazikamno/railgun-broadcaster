@@ -731,18 +731,32 @@ fn wallet_label_content(wallet: &WalletMetadataBundle, current: bool) -> gpui::D
             })),
     );
     content = content.child(
-        app_muted_text(wallet_source_label(wallet.source))
+        app_muted_text(wallet_source_label(wallet))
             .text_size(px(11.0))
             .truncate(),
     );
     content
 }
 
-const fn wallet_source_label(source: WalletSource) -> &'static str {
-    match source {
-        WalletSource::Generated => "Generated wallet",
-        WalletSource::Imported => "Imported wallet",
+pub(super) fn wallet_source_label(wallet: &WalletMetadataBundle) -> String {
+    match wallet.source {
+        WalletSource::Generated => "Generated wallet".to_owned(),
+        WalletSource::Imported => "Imported wallet".to_owned(),
+        WalletSource::LedgerDerived => hardware_wallet_source_label("Ledger", wallet),
+        WalletSource::TrezorDerived => hardware_wallet_source_label("Trezor", wallet),
     }
+}
+
+fn hardware_wallet_source_label(device_label: &str, wallet: &WalletMetadataBundle) -> String {
+    wallet.hardware_descriptor.as_ref().map_or_else(
+        || format!("{device_label}-derived wallet"),
+        |descriptor| {
+            format!(
+                "{device_label}-derived wallet - account {}",
+                descriptor.account_index
+            )
+        },
+    )
 }
 
 fn wallet_management_error_message(error: &VaultError) -> Arc<str> {

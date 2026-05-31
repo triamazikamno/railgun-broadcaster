@@ -3,6 +3,15 @@ use std::sync::Arc;
 use gpui::{Context, Entity, Focusable, ParentElement, Window, px};
 use gpui_component::{WindowExt, input::InputState, select::SearchableVec};
 use ui::controls::app_strong_text;
+#[cfg(feature = "hardware")]
+use wallet_ops::hardware::{
+    DEFAULT_HARDWARE_DERIVATION_PATH, HardwareDerivationDescriptor, HardwareDerivationError,
+    SyntheticRailgunEntropy, ledger::LedgerHardwareDerivationClient, parse_bip32_path,
+    synthetic_entropy_from_hardware_output, trezor::TrezorHardwareDerivationClient,
+};
+use wallet_ops::hardware::{HARDENED_BIP32_INDEX, HardwareDeviceKind, HardwareWalletSyncIntent};
+#[cfg(feature = "hardware")]
+use wallet_ops::vault::{DesktopVaultStore, HardwareWalletProfile};
 use wallet_ops::vault::{
     DesktopViewSession, PRIMARY_WALLET_LABEL, VaultError, WalletMetadataBundle, WalletSource,
     default_wallet_label_for_metadata, generate_opaque_id, generate_seed_material,
@@ -28,6 +37,7 @@ pub(super) enum WalletSetupMode {
     Choose,
     GeneratedReview,
     Import,
+    Hardware(HardwareDeviceKind),
 }
 
 #[derive(Clone)]
@@ -35,6 +45,29 @@ pub(super) struct WalletOption {
     pub(super) wallet_id: Arc<str>,
     pub(super) label: Arc<str>,
     pub(super) source: WalletSource,
+}
+
+#[cfg(feature = "hardware")]
+enum HardwareWalletCreationError {
+    Hardware(HardwareDerivationError),
+    Vault(VaultError),
+}
+
+#[cfg(feature = "hardware")]
+type HardwareWalletCreationResult = (DesktopViewSession, Vec<WalletMetadataBundle>);
+
+#[cfg(feature = "hardware")]
+impl From<HardwareDerivationError> for HardwareWalletCreationError {
+    fn from(error: HardwareDerivationError) -> Self {
+        Self::Hardware(error)
+    }
+}
+
+#[cfg(feature = "hardware")]
+impl From<VaultError> for HardwareWalletCreationError {
+    fn from(error: VaultError) -> Self {
+        Self::Vault(error)
+    }
 }
 
 pub(super) fn wallet_options_from_metadata(
@@ -96,6 +129,119 @@ pub(super) const fn vault_error_kind(error: &VaultError) -> &'static str {
             "public_address_book_display_order_overflow"
         }
         VaultError::InvalidBroadcasterPreferenceAddress => "invalid_broadcaster_preference_address",
+        VaultError::InvalidHardwareWalletDescriptor => "invalid_hardware_wallet_descriptor",
+        VaultError::HardwareWalletAccountIndexOverflow => "hardware_wallet_account_index_overflow",
+        VaultError::DuplicateHardwareWalletAccountIndex => {
+            "duplicate_hardware_wallet_account_index"
+        }
+        VaultError::HardwareWalletIdentityMismatch => "hardware_wallet_identity_mismatch",
+    }
+}
+
+#[cfg(feature = "hardware")]
+pub(in crate::root) fn hardware_setup_error_preserves_password(
+    error: &HardwareDerivationError,
+) -> bool {
+    error.is_early_device_readiness_error()
+}
+
+#[cfg(feature = "hardware")]
+#[derive(Clone, Copy)]
+enum HardwareSetupErrorFocus {
+    WalletName,
+    VaultPassword,
+}
+
+pub(in crate::root) fn vault_error_message(error: &VaultError) -> Arc<str> {
+    match error {
+        VaultError::UnlockFailed => "Unlock failed. Check the password and try again.".into(),
+        VaultError::Key(_) => "Invalid recovery phrase. Paste it again to retry.".into(),
+        VaultError::VaultNotFound => {
+            "Wallet vault not found. Create a new vault to continue.".into()
+        }
+        VaultError::InvalidWalletLabel => "Enter a wallet name before continuing.".into(),
+        VaultError::DuplicateWalletLabel => {
+            "A wallet with that name already exists. Choose a different wallet name.".into()
+        }
+        VaultError::DuplicateHardwareWalletAccountIndex => {
+            "A hardware-derived wallet with that account index already exists. Choose a different restore index or unhide the existing wallet.".into()
+        }
+        VaultError::HardwareWalletIdentityMismatch => {
+            "Hardware wallet identity mismatch. Check that the correct device, passphrase wallet, path, and account index are active, then try again.".into()
+        }
+        _ => "Wallet vault operation failed. See logs for non-sensitive diagnostics.".into(),
+    }
+}
+
+#[cfg(any(feature = "hardware", test))]
+pub(in crate::root) fn hardware_setup_vault_error_message(
+    error: &VaultError,
+    label: &str,
+) -> Arc<str> {
+    match error {
+        VaultError::DuplicateWalletLabel => format!(
+            "A wallet named {:?} already exists. Choose a different wallet name.",
+            label.trim()
+        )
+        .into(),
+        VaultError::InvalidWalletLabel => "Enter a wallet name before continuing.".into(),
+        _ => vault_error_message(error),
+    }
+}
+
+pub(in crate::root) const fn default_hardware_wallet_setup_intent(
+    retry_intent: Option<HardwareWalletSyncIntent>,
+    restore_account_index_set: bool,
+) -> HardwareWalletSyncIntent {
+    if restore_account_index_set {
+        return HardwareWalletSyncIntent::RecoverExisting;
+    }
+    match retry_intent {
+        Some(intent) => intent,
+        None => HardwareWalletSyncIntent::CreateNew,
+    }
+}
+
+pub(in crate::root) const fn hardware_wallet_creation_result_is_current(
+    current_generation: u64,
+    result_generation: u64,
+) -> bool {
+    current_generation == result_generation
+}
+
+pub(in crate::root) fn parse_hardware_wallet_restore_account_index(
+    value: &str,
+) -> Result<Option<u32>, &'static str> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let index = value.parse::<u32>().map_err(
+        |_| "Enter a valid Railgun account index to restore, or leave the restore index blank.",
+    )?;
+    if index >= HARDENED_BIP32_INDEX {
+        return Err(
+            "Enter a Railgun account index below 2147483648 to restore, or leave the restore index blank.",
+        );
+    }
+    Ok(Some(index))
+}
+
+#[cfg(feature = "hardware")]
+const fn hardware_setup_vault_error_preserves_password(error: &VaultError) -> bool {
+    matches!(
+        error,
+        VaultError::InvalidWalletLabel | VaultError::DuplicateWalletLabel
+    )
+}
+
+#[cfg(feature = "hardware")]
+const fn hardware_setup_vault_error_focus(error: &VaultError) -> HardwareSetupErrorFocus {
+    match error {
+        VaultError::InvalidWalletLabel | VaultError::DuplicateWalletLabel => {
+            HardwareSetupErrorFocus::WalletName
+        }
+        _ => HardwareSetupErrorFocus::VaultPassword,
     }
 }
 
@@ -131,6 +277,16 @@ impl WalletRoot {
         });
     }
 
+    fn clear_hardware_wallet_restore_account_index(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.hardware_wallet_restore_account_index_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.hardware_wallet_restore_account_index_set = false;
+    }
+
     pub(super) fn select_wallet(
         &mut self,
         wallet_id: &str,
@@ -149,10 +305,19 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        self.open_add_wallet_dialog_with_mode(WalletSetupMode::Choose, window, cx);
+    }
+
+    fn open_add_wallet_dialog_with_mode(
+        &mut self,
+        initial_mode: WalletSetupMode,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         window.close_all_dialogs(cx);
         self.generated_seed = None;
         self.vault_error = None;
-        self.wallet_setup_mode = WalletSetupMode::Choose;
+        self.wallet_setup_mode = initial_mode;
         let label = default_wallet_label_for_metadata(&self.wallet_metadata);
         let root = cx.entity();
         let dialog_width = (window.viewport_size().width * 0.92).min(px(520.0));
@@ -429,7 +594,7 @@ impl WalletRoot {
         self.vault_error = None;
         self.wallet_setup_mode = WalletSetupMode::Import;
         cx.notify();
-        cx.defer_in(window, |root, window, cx| {
+        cx.defer_in(window, move |root, window, cx| {
             if root.wallet_setup_mode == WalletSetupMode::Import {
                 root.import_mnemonic_input
                     .read(cx)
@@ -437,6 +602,49 @@ impl WalletRoot {
                     .focus(window);
             }
         });
+    }
+
+    pub(super) fn choose_hardware_wallet(
+        &mut self,
+        device_kind: HardwareDeviceKind,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.generated_seed = None;
+        self.vault_error = None;
+        self.wallet_setup_mode = WalletSetupMode::Hardware(device_kind);
+        self.hardware_wallet_creation_intent = None;
+        self.clear_hardware_wallet_restore_account_index(window, cx);
+        cx.notify();
+        cx.defer_in(window, move |root, window, cx| {
+            if matches!(root.vault_state, VaultState::ViewUnlocked)
+                && root.wallet_setup_mode == WalletSetupMode::Hardware(device_kind)
+            {
+                root.add_wallet_password_input
+                    .read(cx)
+                    .focus_handle(cx)
+                    .focus(window);
+            }
+        });
+    }
+
+    pub(super) fn submit_default_hardware_wallet_setup(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let WalletSetupMode::Hardware(device_kind) = self.wallet_setup_mode else {
+            return;
+        };
+        self.store_hardware_derived_wallet(
+            device_kind,
+            default_hardware_wallet_setup_intent(
+                self.hardware_wallet_creation_intent,
+                self.hardware_wallet_restore_account_index_set,
+            ),
+            window,
+            cx,
+        );
     }
 
     pub(super) fn back_to_wallet_setup_choice(
@@ -449,6 +657,8 @@ impl WalletRoot {
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.vault_error = None;
         self.wallet_setup_mode = WalletSetupMode::Choose;
+        self.hardware_wallet_creation_intent = None;
+        self.clear_hardware_wallet_restore_account_index(window, cx);
         cx.notify();
     }
 
@@ -470,6 +680,46 @@ impl WalletRoot {
             return None;
         };
         Some(Zeroizing::new(password.to_string()))
+    }
+
+    #[cfg(feature = "hardware")]
+    fn hardware_wallet_creation_password(
+        &mut self,
+        cx: &mut Context<'_, Self>,
+    ) -> Option<Zeroizing<String>> {
+        if matches!(self.vault_state, VaultState::ViewUnlocked) {
+            let password =
+                Zeroizing::new(self.add_wallet_password_input.read(cx).value().to_string());
+            if password.trim().is_empty() {
+                self.set_vault_error("Enter the vault password to add a wallet", cx);
+                return None;
+            }
+            return Some(password);
+        }
+        let Some(password) = self.setup_password.as_ref() else {
+            self.set_vault_error("Unlock the wallet vault before adding a wallet", cx);
+            return None;
+        };
+        Some(Zeroizing::new(password.to_string()))
+    }
+
+    #[cfg(feature = "hardware")]
+    fn hardware_wallet_restore_account_index(
+        &mut self,
+        cx: &mut Context<'_, Self>,
+    ) -> Option<Option<u32>> {
+        let value = self
+            .hardware_wallet_restore_account_index_input
+            .read(cx)
+            .value()
+            .to_string();
+        match parse_hardware_wallet_restore_account_index(&value) {
+            Ok(index) => Some(index),
+            Err(message) => {
+                self.set_vault_error(message, cx);
+                None
+            }
+        }
     }
 
     fn wallet_name_from_input(&self, cx: &Context<'_, Self>) -> String {
@@ -594,6 +844,190 @@ impl WalletRoot {
         }
     }
 
+    #[cfg(not(feature = "hardware"))]
+    pub(super) fn store_hardware_derived_wallet(
+        &mut self,
+        _device_kind: HardwareDeviceKind,
+        sync_intent: HardwareWalletSyncIntent,
+        _window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.hardware_wallet_creation_intent = Some(sync_intent);
+        self.set_vault_error(
+            "Hardware wallet support is not enabled in this build. Rebuild the wallet with the hardware feature to use Ledger-derived or Trezor-derived wallets.",
+            cx,
+        );
+    }
+
+    #[cfg(feature = "hardware")]
+    pub(super) fn store_hardware_derived_wallet(
+        &mut self,
+        device_kind: HardwareDeviceKind,
+        sync_intent: HardwareWalletSyncIntent,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.hardware_wallet_creation_in_progress {
+            return;
+        }
+        self.hardware_wallet_creation_intent = Some(sync_intent);
+        let Some(explicit_account_index) = self.hardware_wallet_restore_account_index(cx) else {
+            return;
+        };
+        if sync_intent == HardwareWalletSyncIntent::CreateNew && explicit_account_index.is_some() {
+            self.set_vault_error(
+                "Clear the restore account index before creating a new hardware-derived wallet.",
+                cx,
+            );
+            return;
+        }
+        let wallet_id = match generate_opaque_id() {
+            Ok(wallet_id) => wallet_id,
+            Err(error) => {
+                self.handle_vault_error(&error, cx);
+                return;
+            }
+        };
+        let label = self.wallet_name_from_input(cx);
+        let Some(password) = self.hardware_wallet_creation_password(cx) else {
+            return;
+        };
+        let Some(store) = self.vault_store.clone() else {
+            self.set_vault_error("Wallet vault storage is unavailable", cx);
+            return;
+        };
+        let label = match store.preflight_new_wallet_metadata(password.as_str(), &label) {
+            Ok(label) => label,
+            Err(error) => {
+                self.handle_hardware_wallet_setup_vault_error(&error, &label, window, cx);
+                return;
+            }
+        };
+
+        window.blur();
+        self.focus_vault_input_on_render = false;
+        self.hardware_wallet_creation_in_progress = true;
+        self.hardware_wallet_creation_generation =
+            self.hardware_wallet_creation_generation.wrapping_add(1);
+        let creation_generation = self.hardware_wallet_creation_generation;
+        self.vault_error = None;
+        cx.notify();
+
+        let join = self.runtime.spawn(create_hardware_derived_wallet(
+            store,
+            password,
+            wallet_id,
+            label,
+            device_kind,
+            sync_intent,
+            explicit_account_index,
+        ));
+        cx.spawn_in(window, async move |this, cx| {
+            let result = join.await;
+            let _ = this.update_in(cx, |root, window, cx| {
+                if !hardware_wallet_creation_result_is_current(
+                    root.hardware_wallet_creation_generation,
+                    creation_generation,
+                ) {
+                    return;
+                }
+                root.hardware_wallet_creation_in_progress = false;
+                match result {
+                    Ok(Ok((session, metadata))) => {
+                        root.enter_view_unlocked(session, metadata, window, cx);
+                    }
+                    Ok(Err(HardwareWalletCreationError::Vault(error))) => {
+                        root.handle_hardware_wallet_setup_vault_error(&error, "", window, cx);
+                    }
+                    Ok(Err(HardwareWalletCreationError::Hardware(error))) => {
+                        let clear_password = !hardware_setup_error_preserves_password(&error);
+                        root.set_vault_error(
+                            format!("Hardware wallet derivation failed: {error}"),
+                            cx,
+                        );
+                        root.finish_hardware_wallet_setup_error(
+                            window,
+                            cx,
+                            clear_password,
+                            HardwareSetupErrorFocus::VaultPassword,
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "desktop hardware wallet setup task failed");
+                        root.set_vault_error(
+                            "Hardware wallet setup failed. See logs for non-sensitive diagnostics.",
+                            cx,
+                        );
+                        root.finish_hardware_wallet_setup_error(
+                            window,
+                            cx,
+                            true,
+                            HardwareSetupErrorFocus::VaultPassword,
+                        );
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    #[cfg(feature = "hardware")]
+    fn handle_hardware_wallet_setup_vault_error(
+        &mut self,
+        error: &VaultError,
+        label: &str,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        tracing::warn!(
+            error_kind = vault_error_kind(error),
+            "desktop wallet vault operation failed"
+        );
+        self.set_vault_error(hardware_setup_vault_error_message(error, label), cx);
+        self.finish_hardware_wallet_setup_error(
+            window,
+            cx,
+            !hardware_setup_vault_error_preserves_password(error),
+            hardware_setup_vault_error_focus(error),
+        );
+    }
+
+    #[cfg(feature = "hardware")]
+    fn finish_hardware_wallet_setup_error(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+        clear_password: bool,
+        focus: HardwareSetupErrorFocus,
+    ) {
+        if !matches!(self.vault_state, VaultState::ViewUnlocked) {
+            return;
+        }
+        if clear_password {
+            self.add_wallet_password_input
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        cx.defer_in(window, move |root, window, cx| {
+            if matches!(root.vault_state, VaultState::ViewUnlocked)
+                && matches!(root.wallet_setup_mode, WalletSetupMode::Hardware(_))
+                && !root.hardware_wallet_creation_in_progress
+            {
+                match focus {
+                    HardwareSetupErrorFocus::WalletName => root
+                        .wallet_name_input
+                        .read(cx)
+                        .focus_handle(cx)
+                        .focus(window),
+                    HardwareSetupErrorFocus::VaultPassword => root
+                        .add_wallet_password_input
+                        .read(cx)
+                        .focus_handle(cx)
+                        .focus(window),
+                }
+            }
+        });
+    }
+
     fn install_view_session(
         &mut self,
         session: DesktopViewSession,
@@ -639,6 +1073,11 @@ impl WalletRoot {
         self.reload_public_accounts(window, cx);
         self.setup_password = None;
         self.generated_seed = None;
+        self.hardware_wallet_creation_in_progress = false;
+        self.hardware_wallet_creation_generation =
+            self.hardware_wallet_creation_generation.wrapping_add(1);
+        self.hardware_wallet_creation_intent = None;
+        self.clear_hardware_wallet_restore_account_index(window, cx);
         self.add_wallet_password_input
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.import_mnemonic_input
@@ -719,6 +1158,11 @@ impl WalletRoot {
         self.active_wallet_tab = WalletTab::default();
         self.setup_password = None;
         self.generated_seed = None;
+        self.hardware_wallet_creation_in_progress = false;
+        self.hardware_wallet_creation_generation =
+            self.hardware_wallet_creation_generation.wrapping_add(1);
+        self.hardware_wallet_creation_intent = None;
+        self.clear_hardware_wallet_restore_account_index(window, cx);
         self.vault_error = None;
         self.repair_cache_error = None;
         self.vault_state = VaultState::UnlockVault;
@@ -747,15 +1191,7 @@ impl WalletRoot {
             error_kind = vault_error_kind(error),
             "desktop wallet vault operation failed"
         );
-        let message: Arc<str> = match error {
-            VaultError::UnlockFailed => "Unlock failed. Check the password and try again.".into(),
-            VaultError::Key(_) => "Invalid recovery phrase. Paste it again to retry.".into(),
-            VaultError::VaultNotFound => {
-                "Wallet vault not found. Create a new vault to continue.".into()
-            }
-            _ => "Wallet vault operation failed. See logs for non-sensitive diagnostics.".into(),
-        };
-        self.set_vault_error(message, cx);
+        self.set_vault_error(vault_error_message(error), cx);
     }
 
     pub(super) fn set_vault_error(
@@ -766,4 +1202,111 @@ impl WalletRoot {
         self.vault_error = Some(message.into());
         cx.notify();
     }
+}
+
+#[cfg(feature = "hardware")]
+async fn create_hardware_derived_wallet(
+    store: Arc<DesktopVaultStore>,
+    password: Zeroizing<String>,
+    wallet_id: String,
+    label: String,
+    device_kind: HardwareDeviceKind,
+    sync_intent: HardwareWalletSyncIntent,
+    explicit_account_index: Option<u32>,
+) -> Result<HardwareWalletCreationResult, HardwareWalletCreationError> {
+    let path = parse_bip32_path(DEFAULT_HARDWARE_DERIVATION_PATH)?;
+    let (descriptor, entropy) = match device_kind {
+        HardwareDeviceKind::Ledger => {
+            let client = LedgerHardwareDerivationClient::connect().await?;
+            let profile_fingerprint = client.profile_fingerprint(&path).await?;
+            let account_index = match explicit_account_index {
+                Some(index) => index,
+                None => next_hardware_account_index(
+                    store.as_ref(),
+                    password.as_str(),
+                    device_kind,
+                    &profile_fingerprint,
+                )?,
+            };
+            let descriptor = HardwareDerivationDescriptor::ledger_eip1024_v1(
+                path,
+                account_index,
+                profile_fingerprint,
+                None,
+                sync_intent,
+            );
+            let output = client.eip1024_shared_secret(&descriptor.path, true).await?;
+            let entropy = synthetic_entropy_from_hardware_output(&descriptor, output)?;
+            (descriptor, entropy)
+        }
+        HardwareDeviceKind::Trezor => {
+            let mut client = TrezorHardwareDerivationClient::connect()?;
+            let profile_fingerprint = client.profile_fingerprint(&path)?;
+            let account_index = match explicit_account_index {
+                Some(index) => index,
+                None => next_hardware_account_index(
+                    store.as_ref(),
+                    password.as_str(),
+                    device_kind,
+                    &profile_fingerprint,
+                )?,
+            };
+            let descriptor = HardwareDerivationDescriptor::trezor_cipher_key_value_v1(
+                path,
+                account_index,
+                profile_fingerprint,
+                None,
+                sync_intent,
+            );
+            let output = client.cipher_key_value(&descriptor)?;
+            let entropy = synthetic_entropy_from_hardware_output(&descriptor, output)?;
+            (descriptor, entropy)
+        }
+    };
+    let (session, metadata) = store_hardware_wallet(
+        store.as_ref(),
+        password.as_str(),
+        &wallet_id,
+        &label,
+        descriptor,
+        &entropy,
+    )?;
+    Ok((session, metadata))
+}
+
+#[cfg(feature = "hardware")]
+fn next_hardware_account_index(
+    store: &DesktopVaultStore,
+    password: &str,
+    device_kind: HardwareDeviceKind,
+    profile_fingerprint: &str,
+) -> Result<u32, VaultError> {
+    let profile = HardwareWalletProfile {
+        device_kind,
+        profile_fingerprint: profile_fingerprint.to_owned(),
+    };
+    store.next_hardware_account_index_for_profile(password, &profile)
+}
+
+#[cfg(feature = "hardware")]
+fn store_hardware_wallet(
+    store: &DesktopVaultStore,
+    password: &str,
+    wallet_id: &str,
+    label: &str,
+    descriptor: HardwareDerivationDescriptor,
+    entropy: &SyntheticRailgunEntropy,
+) -> Result<(DesktopViewSession, Vec<WalletMetadataBundle>), HardwareWalletCreationError> {
+    let account_index = descriptor.account_index;
+    let metadata = store.new_hardware_wallet_metadata(password, wallet_id, label, descriptor)?;
+    store.store_hardware_derived_wallet_from_entropy_with_metadata(
+        password,
+        wallet_id,
+        account_index,
+        entropy.expose_secret(),
+        &metadata,
+    )?;
+    let metadata = store.list_wallet_metadata(password)?;
+    let session = store.load_view_session(password, wallet_id)?;
+    Ok((session, metadata))
 }

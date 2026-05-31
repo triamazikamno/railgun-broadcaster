@@ -1,5 +1,6 @@
 use super::*;
 use alloy::uint;
+use railgun_wallet::RailgunSpendSigner;
 
 pub(crate) use crate::poi_contexts::{
     active_list_pre_transaction_pois, persist_pending_send_output_poi_contexts,
@@ -56,6 +57,99 @@ impl From<vault::WalletSource> for DesktopWalletSyncStartPolicy {
         match value {
             vault::WalletSource::Generated => Self::CurrentSafeHeadNoBackfill,
             vault::WalletSource::Imported => Self::ImportedHistoricalBackfill,
+            vault::WalletSource::LedgerDerived | vault::WalletSource::TrezorDerived => {
+                Self::ImportedHistoricalBackfill
+            }
+        }
+    }
+}
+
+impl From<&vault::WalletMetadataBundle> for DesktopWalletSyncStartPolicy {
+    fn from(value: &vault::WalletMetadataBundle) -> Self {
+        match value.source {
+            vault::WalletSource::Generated => Self::CurrentSafeHeadNoBackfill,
+            vault::WalletSource::Imported => Self::ImportedHistoricalBackfill,
+            vault::WalletSource::LedgerDerived | vault::WalletSource::TrezorDerived => {
+                match value
+                    .hardware_descriptor
+                    .as_ref()
+                    .map(|descriptor| descriptor.sync_intent)
+                {
+                    Some(crate::hardware::HardwareWalletSyncIntent::CreateNew) => {
+                        Self::CurrentSafeHeadNoBackfill
+                    }
+                    Some(crate::hardware::HardwareWalletSyncIntent::RecoverExisting) | None => {
+                        Self::ImportedHistoricalBackfill
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub enum DesktopPrivateSpendAuthorization {
+    VaultPassword(Zeroizing<String>),
+    PreauthorizedSigner(vault::SoftwareRailgunSpendSigner),
+}
+
+pub(crate) enum DesktopPrivateSpendSigner<'a> {
+    Owned(Box<vault::SoftwareRailgunSpendSigner>),
+    Borrowed(&'a vault::SoftwareRailgunSpendSigner),
+}
+
+impl RailgunSpendSigner for DesktopPrivateSpendSigner<'_> {
+    fn spending_public_key(&self) -> [U256; 2] {
+        match self {
+            Self::Owned(signer) => signer.spending_public_key(),
+            Self::Borrowed(signer) => signer.spending_public_key(),
+        }
+    }
+
+    fn sign_spend_message(&self, msg: U256) -> [U256; 3] {
+        match self {
+            Self::Owned(signer) => signer.sign_spend_message(msg),
+            Self::Borrowed(signer) => signer.sign_spend_message(msg),
+        }
+    }
+}
+
+impl DesktopPrivateSpendAuthorization {
+    pub(crate) fn signer<'a>(
+        &'a self,
+        vault_store: &vault::DesktopVaultStore,
+        wallet_id: &str,
+        operation: &'static str,
+    ) -> Result<DesktopPrivateSpendSigner<'a>> {
+        match self {
+            Self::VaultPassword(password) => {
+                let mut grant = vault_store
+                    .create_spend_grant(password.as_str())
+                    .wrap_err_with(|| format!("authorize {operation} spend"))?;
+                let signer = vault_store
+                    .railgun_spend_signer(&mut grant, wallet_id)
+                    .wrap_err_with(|| format!("load {operation} spend signer"))?;
+                Ok(DesktopPrivateSpendSigner::Owned(Box::new(signer)))
+            }
+            Self::PreauthorizedSigner(signer) => Ok(DesktopPrivateSpendSigner::Borrowed(signer)),
+        }
+    }
+
+    pub(crate) fn into_signer(
+        self,
+        vault_store: &vault::DesktopVaultStore,
+        wallet_id: &str,
+        operation: &'static str,
+    ) -> Result<vault::SoftwareRailgunSpendSigner> {
+        match self {
+            Self::VaultPassword(password) => {
+                let mut grant = vault_store
+                    .create_spend_grant(password.as_str())
+                    .wrap_err_with(|| format!("authorize {operation} spend"))?;
+                vault_store
+                    .railgun_spend_signer(&mut grant, wallet_id)
+                    .wrap_err_with(|| format!("load {operation} spend signer"))
+            }
+            Self::PreauthorizedSigner(signer) => Ok(signer),
         }
     }
 }
@@ -80,7 +174,7 @@ pub struct DesktopUnshieldCalldataRequest {
     pub view_session: Arc<vault::DesktopViewSession>,
     pub session: Arc<WalletSession>,
     pub vault_store: Arc<vault::DesktopVaultStore>,
-    pub vault_password: Zeroizing<String>,
+    pub spend_authorization: DesktopPrivateSpendAuthorization,
     pub token: Address,
     pub fee_token: Address,
     pub amount: U256,
@@ -97,7 +191,7 @@ pub struct DesktopSendCalldataRequest {
     pub view_session: Arc<vault::DesktopViewSession>,
     pub session: Arc<WalletSession>,
     pub vault_store: Arc<vault::DesktopVaultStore>,
-    pub vault_password: Zeroizing<String>,
+    pub spend_authorization: DesktopPrivateSpendAuthorization,
     pub token: Address,
     pub fee_token: Address,
     pub amount: U256,
@@ -229,7 +323,8 @@ pub struct DesktopUnshieldSelfBroadcastRequest {
     pub view_session: Arc<vault::DesktopViewSession>,
     pub session: Arc<WalletSession>,
     pub vault_store: Arc<vault::DesktopVaultStore>,
-    pub vault_password: Zeroizing<String>,
+    pub spend_authorization: DesktopPrivateSpendAuthorization,
+    pub vault_password: Option<Zeroizing<String>>,
     pub public_account_uuid: String,
     pub token: Address,
     pub fee_token: Address,
@@ -250,7 +345,8 @@ pub struct DesktopSendSelfBroadcastRequest {
     pub view_session: Arc<vault::DesktopViewSession>,
     pub session: Arc<WalletSession>,
     pub vault_store: Arc<vault::DesktopVaultStore>,
-    pub vault_password: Zeroizing<String>,
+    pub spend_authorization: DesktopPrivateSpendAuthorization,
+    pub vault_password: Option<Zeroizing<String>>,
     pub public_account_uuid: String,
     pub token: Address,
     pub fee_token: Address,
@@ -316,6 +412,7 @@ pub struct BlockedShieldRescueSelfBroadcastRequest {
     pub view_session: Arc<vault::DesktopViewSession>,
     pub session: Arc<WalletSession>,
     pub vault_store: Arc<vault::DesktopVaultStore>,
+    pub spend_authorization: DesktopPrivateSpendAuthorization,
     pub vault_password: Zeroizing<String>,
     pub utxo_id: BlockedShieldRescueUtxoId,
     pub requested_public_account_uuid: Option<String>,

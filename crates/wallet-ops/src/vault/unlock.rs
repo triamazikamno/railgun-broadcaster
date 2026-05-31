@@ -1,9 +1,10 @@
 use super::{
-    BroadcasterPreferenceEntry, DecodedWalletMetadata, EncryptedRecord, HmacKeyInit, HmacSha256,
-    KEY_LEN, Mac, PrivateAddressBookEntry, PublicAccountMetadata, PublicAccountSecret,
-    PublicAddressBookEntry, RecordKind, SecretKey, VaultError, WalletChainMetadataBundle,
-    WalletMetadataBundle, WalletMetadataWire, WalletSpendBundle, WalletViewBundle, Zeroizing,
-    decrypt_payload, decrypt_serialized, derive_context_key, encrypt_payload, encrypt_serialized,
+    BroadcasterPreferenceEntry, DecodedWalletMetadata, EncryptedRecord,
+    HardwareWalletAccountIndexReservation, HmacKeyInit, HmacSha256, KEY_LEN, Mac,
+    PrivateAddressBookEntry, PublicAccountMetadata, PublicAccountSecret, PublicAddressBookEntry,
+    RecordKind, SecretKey, VaultError, WalletChainMetadataBundle, WalletMetadataBundle,
+    WalletMetadataWire, WalletSpendBundle, WalletViewBundle, Zeroizing, decrypt_payload,
+    decrypt_serialized, derive_context_key, encrypt_payload, encrypt_serialized,
 };
 
 pub struct ViewUnlock {
@@ -111,6 +112,7 @@ impl ViewUnlock {
                 source: wire.source.unwrap_or_default(),
                 status: wire.status.unwrap_or_default(),
                 display_order: wire.display_order.unwrap_or_default(),
+                hardware_descriptor: wire.hardware_descriptor,
             },
             missing_lifecycle_fields,
             missing_display_order,
@@ -139,6 +141,32 @@ impl ViewUnlock {
             &self.view_dek,
             RecordKind::WalletChainMetadata,
             wallet_chain_uuid,
+            record,
+        )
+    }
+
+    pub(super) fn encrypt_hardware_wallet_account_index_reservation(
+        &self,
+        reservation_uuid: &str,
+        reservation: &HardwareWalletAccountIndexReservation,
+    ) -> Result<EncryptedRecord, VaultError> {
+        encrypt_serialized(
+            &self.view_dek,
+            RecordKind::HardwareWalletAccountIndexReservation,
+            reservation_uuid,
+            reservation,
+        )
+    }
+
+    pub(super) fn decrypt_hardware_wallet_account_index_reservation(
+        &self,
+        reservation_uuid: &str,
+        record: &EncryptedRecord,
+    ) -> Result<HardwareWalletAccountIndexReservation, VaultError> {
+        decrypt_serialized(
+            &self.view_dek,
+            RecordKind::HardwareWalletAccountIndexReservation,
+            reservation_uuid,
             record,
         )
     }

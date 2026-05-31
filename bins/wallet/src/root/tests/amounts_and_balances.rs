@@ -1,4 +1,5 @@
 use super::*;
+use crate::root::public_action::public_action_progress_steps_for_source;
 
 #[test]
 fn private_action_metrics_hide_values_matching_total() {
@@ -477,6 +478,7 @@ fn public_account_for_search_with_uuid(
         source: PublicAccountSource::Imported,
         scope: PublicAccountScope::Global,
         derivation_index: None,
+        hardware_descriptor: None,
         status: PublicAccountStatus::Active,
         display_order: 0,
     }
@@ -1125,6 +1127,35 @@ fn public_action_progress_steps_skip_wrap_for_erc20_shield() {
             PublicAssetId::Erc20(Address::from([0xef; 20])),
         ),
         vec![
+            PublicActionProgressStep::Approve,
+            PublicActionProgressStep::Shield,
+        ],
+    );
+}
+
+#[test]
+fn hardware_public_shield_progress_steps_start_with_shield_key_authorization() {
+    assert_eq!(
+        public_action_progress_steps_for_source(
+            PublicActionMode::Shield,
+            PublicAssetId::Erc20(Address::from([0xef; 20])),
+            wallet_ops::vault::PublicAccountSource::HardwareDerived,
+        ),
+        vec![
+            PublicActionProgressStep::ShieldKey,
+            PublicActionProgressStep::Approve,
+            PublicActionProgressStep::Shield,
+        ],
+    );
+    assert_eq!(
+        public_action_progress_steps_for_source(
+            PublicActionMode::Shield,
+            PublicAssetId::Native,
+            wallet_ops::vault::PublicAccountSource::HardwareDerived,
+        ),
+        vec![
+            PublicActionProgressStep::ShieldKey,
+            PublicActionProgressStep::Wrap,
             PublicActionProgressStep::Approve,
             PublicActionProgressStep::Shield,
         ],

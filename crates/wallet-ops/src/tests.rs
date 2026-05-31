@@ -28,6 +28,7 @@ use railgun_wallet::{PoiStatus, Utxo, UtxoCommitmentKind, UtxoSource, WalletKeys
 use serde_json::json;
 use sync_service::ChainConfigDefaults;
 
+use super::hardware::{HardwareDerivationDescriptor, HardwareWalletSyncIntent, parse_bip32_path};
 use super::signer::{EvmMessageSigner, EvmTransactionSigner, SoftwareEvmSigner};
 use super::{
     ApproximateTransactionShape, BlockedShieldRescueUtxoId, BroadcasterFeePolicy,
@@ -86,6 +87,25 @@ fn source(byte: u8) -> UtxoSource {
         tx_hash: FixedBytes::from([byte; 32]),
         block_number: u64::from(byte),
         block_timestamp: 1_700_000_000 + u64::from(byte),
+    }
+}
+
+fn hardware_wallet_metadata(sync_intent: HardwareWalletSyncIntent) -> vault::WalletMetadataBundle {
+    let descriptor = HardwareDerivationDescriptor::ledger_eip1024_v1(
+        parse_bip32_path("m/44'/60'/0'/0/0").expect("valid path"),
+        0,
+        "ledger:evm:0x1111111111111111111111111111111111111111".to_string(),
+        None,
+        sync_intent,
+    );
+    vault::WalletMetadataBundle {
+        wallet_uuid: "hardware-wallet".to_string(),
+        label: "Hardware wallet".to_string(),
+        derivation_index: descriptor.account_index,
+        source: vault::WalletSource::LedgerDerived,
+        status: vault::WalletStatus::Active,
+        display_order: 0,
+        hardware_descriptor: Some(descriptor),
     }
 }
 
@@ -198,6 +218,60 @@ fn desktop_wallet_start_policy_imported_uses_deployment_block() {
         false,
     )
     .expect("resolve imported start");
+
+    assert_eq!(
+        resolved,
+        DesktopWalletChainStart {
+            start_block: 100,
+            last_scanned_block: 99,
+        }
+    );
+}
+
+#[test]
+fn desktop_wallet_start_policy_new_hardware_uses_safe_head_no_backfill() {
+    let metadata = hardware_wallet_metadata(HardwareWalletSyncIntent::CreateNew);
+    assert_eq!(
+        DesktopWalletSyncStartPolicy::from(&metadata),
+        DesktopWalletSyncStartPolicy::CurrentSafeHeadNoBackfill
+    );
+
+    let resolved = resolve_desktop_wallet_chain_start(
+        DesktopWalletSyncStartPolicy::from(&metadata),
+        None,
+        None,
+        100,
+        Some(250),
+        false,
+    )
+    .expect("resolve new hardware start");
+
+    assert_eq!(
+        resolved,
+        DesktopWalletChainStart {
+            start_block: 251,
+            last_scanned_block: 250,
+        }
+    );
+}
+
+#[test]
+fn desktop_wallet_start_policy_recovered_hardware_uses_deployment_block() {
+    let metadata = hardware_wallet_metadata(HardwareWalletSyncIntent::RecoverExisting);
+    assert_eq!(
+        DesktopWalletSyncStartPolicy::from(&metadata),
+        DesktopWalletSyncStartPolicy::ImportedHistoricalBackfill
+    );
+
+    let resolved = resolve_desktop_wallet_chain_start(
+        DesktopWalletSyncStartPolicy::from(&metadata),
+        None,
+        None,
+        100,
+        Some(250),
+        false,
+    )
+    .expect("resolve recovered hardware start");
 
     assert_eq!(
         resolved,
@@ -540,6 +614,7 @@ fn public_account(
         source: super::vault::PublicAccountSource::Imported,
         scope: super::vault::PublicAccountScope::Global,
         derivation_index: None,
+        hardware_descriptor: None,
         status,
         display_order: 0,
     }

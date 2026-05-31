@@ -6,10 +6,11 @@ use gpui_component::progress::Progress as UiProgress;
 use gpui_component::{Disableable, IconName, WindowExt, button::ButtonVariants};
 use ui::controls::{app_button, app_button_base, app_input, app_muted_text, app_strong_text};
 use ui::theme::{self, APP_TEXT_SIZE};
+use wallet_ops::hardware::{HardwareDeviceKind, HardwareWalletSyncIntent};
 
 use super::settings::settings_dialog_dimensions;
 use super::shell::render_wallet_hero_screen;
-use super::{Activity, VaultState, WalletRoot, WalletSetupMode, rgb_with_alpha};
+use super::{Activity, VaultState, WalletRoot, WalletSetupMode, labeled_field, rgb_with_alpha};
 
 impl WalletRoot {
     pub(super) const fn titlebar_color(&self) -> u32 {
@@ -51,6 +52,8 @@ impl WalletRoot {
                 WalletSetupMode::Choose => "Add your first wallet",
                 WalletSetupMode::GeneratedReview => "Save recovery phrase",
                 WalletSetupMode::Import => "Import wallet",
+                WalletSetupMode::Hardware(HardwareDeviceKind::Ledger) => "Ledger-derived wallet",
+                WalletSetupMode::Hardware(HardwareDeviceKind::Trezor) => "Trezor-derived wallet",
             },
             VaultState::ViewUnlocked => "Wallet",
             VaultState::Error(_) => "Wallet vault unavailable",
@@ -303,14 +306,19 @@ impl WalletRoot {
             WalletSetupMode::Choose => self.render_wallet_setup_choice(root),
             WalletSetupMode::GeneratedReview => self.render_generated_wallet_review(root),
             WalletSetupMode::Import => self.render_import_wallet(root),
+            WalletSetupMode::Hardware(device_kind) => {
+                self.render_hardware_wallet_setup(root, device_kind)
+            }
         }
     }
 
     fn render_wallet_setup_choice(&self, root: Entity<Self>) -> gpui::AnyElement {
         let generate_root = root.clone();
-        let import_root = root;
+        let import_root = root.clone();
+        let ledger_root = root.clone();
+        let trezor_root = root;
         let mut body = vault_dialog_body(
-            "Generate a new recovery phrase or import an existing one. Seed material will be encrypted into the vault.",
+            "Generate or import a Railgun recovery phrase, or derive a Railgun wallet from a Ledger or Trezor device.",
         );
         if let Some(error) = self.render_vault_error() {
             body = body.child(error);
@@ -333,6 +341,26 @@ impl WalletRoot {
                 .on_click(move |_event, window, cx| {
                     import_root.update(cx, |root, cx| {
                         root.choose_import_wallet(window, cx);
+                    });
+                }),
+        )
+        .child(
+            app_button("ledger-derived-vault-wallet", "Ledger-derived wallet")
+                .outline()
+                .w_full()
+                .on_click(move |_event, window, cx| {
+                    ledger_root.update(cx, |root, cx| {
+                        root.choose_hardware_wallet(HardwareDeviceKind::Ledger, window, cx);
+                    });
+                }),
+        )
+        .child(
+            app_button("trezor-derived-vault-wallet", "Trezor-derived wallet")
+                .outline()
+                .w_full()
+                .on_click(move |_event, window, cx| {
+                    trezor_root.update(cx, |root, cx| {
+                        root.choose_hardware_wallet(HardwareDeviceKind::Trezor, window, cx);
                     });
                 }),
         )
@@ -433,6 +461,111 @@ impl WalletRoot {
             .into_any_element()
     }
 
+    fn render_hardware_wallet_setup(
+        &self,
+        root: Entity<Self>,
+        device_kind: HardwareDeviceKind,
+    ) -> gpui::AnyElement {
+        let create_root = root.clone();
+        let recover_root = root.clone();
+        let back_root = root;
+        let device_label = hardware_device_label(device_kind);
+        let create_button_id = hardware_create_button_id(device_kind);
+        let recover_button_id = hardware_recover_button_id(device_kind);
+        let create_active = self.hardware_wallet_creation_in_progress
+            && self.hardware_wallet_creation_intent == Some(HardwareWalletSyncIntent::CreateNew);
+        let recover_active = self.hardware_wallet_creation_in_progress
+            && self.hardware_wallet_creation_intent
+                == Some(HardwareWalletSyncIntent::RecoverExisting);
+        let restore_index_set = self.hardware_wallet_restore_account_index_set;
+        let mut body = vault_dialog_body(format!(
+            "Choose whether this {device_label}-derived Railgun wallet is new or already has private history. The choice only changes the first sync baseline."
+        ));
+        if let Some(error) = self.render_vault_error() {
+            body = body.child(error);
+        }
+
+        body.child(
+            app_input(&self.wallet_name_input).disabled(self.hardware_wallet_creation_in_progress),
+        )
+        .when(
+            matches!(self.vault_state, VaultState::ViewUnlocked),
+            |this| {
+                this.child(
+                    app_input(&self.add_wallet_password_input)
+                        .disabled(self.hardware_wallet_creation_in_progress),
+                )
+            },
+        )
+        .child(labeled_field(
+            "Restore Railgun account index (optional)",
+            app_input(&self.hardware_wallet_restore_account_index_input)
+                .disabled(self.hardware_wallet_creation_in_progress),
+        ))
+        .child(
+            app_muted_text(
+                "Leave blank to use the next unused index. Enter an index to restore a deleted hardware-derived wallet; creating a new wallet is disabled while this is set.",
+            )
+            .whitespace_normal(),
+        )
+        .child(hardware_setup_notice(device_kind))
+        .when(self.hardware_wallet_creation_in_progress, |this| {
+            this.child(hardware_setup_progress(device_kind))
+        })
+        .child(
+            app_button(
+                create_button_id,
+                format!("Create new {device_label}-derived wallet"),
+            )
+            .primary()
+            .w_full()
+            .loading(create_active)
+            .disabled(self.hardware_wallet_creation_in_progress || restore_index_set)
+            .on_click(move |_event, window, cx| {
+                create_root.update(cx, |root, cx| {
+                    root.store_hardware_derived_wallet(
+                        device_kind,
+                        HardwareWalletSyncIntent::CreateNew,
+                        window,
+                        cx,
+                    );
+                });
+            }),
+        )
+        .child(
+            app_button(
+                recover_button_id,
+                format!("Recover existing {device_label}-derived wallet"),
+            )
+            .outline()
+            .w_full()
+            .loading(recover_active)
+            .disabled(self.hardware_wallet_creation_in_progress)
+            .on_click(move |_event, window, cx| {
+                recover_root.update(cx, |root, cx| {
+                    root.store_hardware_derived_wallet(
+                        device_kind,
+                        HardwareWalletSyncIntent::RecoverExisting,
+                        window,
+                        cx,
+                    );
+                });
+            }),
+        )
+        .child(
+            app_button("back-hardware-wallet", "Back")
+                .ghost()
+                .w_full()
+                .disabled(self.hardware_wallet_creation_in_progress)
+                .on_click(move |_event, window, cx| {
+                    back_root.update(cx, |root, cx| {
+                        root.back_to_wallet_setup_choice(window, cx);
+                    });
+                }),
+        )
+        .into_any_element()
+    }
+
     fn render_vault_fatal(&self, message: &str) -> gpui::Div {
         let mut body = vault_dialog_body(SharedString::from(message.to_owned()));
         if let Some(error) = self.render_vault_error() {
@@ -470,4 +603,97 @@ fn vault_dialog_body(subtitle: impl Into<SharedString>) -> gpui::Div {
         .flex_col()
         .gap_3()
         .child(app_muted_text(subtitle).line_height(px(18.0)))
+}
+
+pub(in crate::root) const fn hardware_device_label(
+    device_kind: HardwareDeviceKind,
+) -> &'static str {
+    match device_kind {
+        HardwareDeviceKind::Ledger => "Ledger",
+        HardwareDeviceKind::Trezor => "Trezor",
+    }
+}
+
+pub(in crate::root) const fn hardware_create_button_id(
+    device_kind: HardwareDeviceKind,
+) -> &'static str {
+    match device_kind {
+        HardwareDeviceKind::Ledger => "create-ledger-derived-wallet",
+        HardwareDeviceKind::Trezor => "create-trezor-derived-wallet",
+    }
+}
+
+pub(in crate::root) const fn hardware_recover_button_id(
+    device_kind: HardwareDeviceKind,
+) -> &'static str {
+    match device_kind {
+        HardwareDeviceKind::Ledger => "recover-ledger-derived-wallet",
+        HardwareDeviceKind::Trezor => "recover-trezor-derived-wallet",
+    }
+}
+
+fn hardware_setup_notice(device_kind: HardwareDeviceKind) -> gpui::Div {
+    let [connect, passphrase, sync_baseline, custody] = hardware_setup_notice_lines(device_kind);
+    div()
+        .w_full()
+        .p(px(12.0))
+        .flex()
+        .flex_col()
+        .gap_2()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .bg(rgb_with_alpha(theme::SURFACE, 0.72))
+        .child(app_strong_text("Before approving on the device"))
+        .child(app_muted_text(connect))
+        .child(app_muted_text(passphrase))
+        .child(app_muted_text(sync_baseline))
+        .child(app_muted_text(custody).text_color(rgb(theme::WARNING)))
+}
+
+fn hardware_setup_progress(device_kind: HardwareDeviceKind) -> gpui::Div {
+    div()
+        .w_full()
+        .p(px(12.0))
+        .flex()
+        .flex_col()
+        .gap_2()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(theme::INFO))
+        .bg(rgb_with_alpha(theme::SURFACE_ELEVATED, 0.74))
+        .child(
+            app_strong_text(hardware_setup_progress_title(device_kind))
+                .text_color(rgb(theme::INFO)),
+        )
+        .child(app_muted_text(hardware_setup_progress_detail(device_kind)).whitespace_normal())
+}
+
+pub(in crate::root) fn hardware_setup_progress_title(device_kind: HardwareDeviceKind) -> String {
+    let device_label = hardware_device_label(device_kind);
+    format!("Waiting for {device_label} approval")
+}
+
+pub(in crate::root) fn hardware_setup_progress_detail(device_kind: HardwareDeviceKind) -> String {
+    let device_label = hardware_device_label(device_kind);
+    match device_kind {
+        HardwareDeviceKind::Ledger => format!(
+            "Check your {device_label} and approve the Railgun derivation request. The device may describe this as providing a public key or shared secret."
+        ),
+        HardwareDeviceKind::Trezor => {
+            format!("Check your {device_label} and approve the Railgun derivation request.")
+        }
+    }
+}
+
+pub(in crate::root) fn hardware_setup_notice_lines(device_kind: HardwareDeviceKind) -> [String; 4] {
+    let device_label = hardware_device_label(device_kind);
+    [
+        format!(
+            "Connect your {device_label}, open the Ethereum app, and approve the Railgun derivation request."
+        ),
+        "If you use a hardware passphrase wallet, activate the intended passphrase context on the device. Do not enter that passphrase into this app.".to_owned(),
+        "Create new starts from the current safe head. Recover existing backfills from deployment and is safer if unsure.".to_owned(),
+        "This is hardware-derived software custody, not true hardware signing: the desktop app signs Railgun spends with temporary in-memory keys.".to_owned(),
+    ]
 }

@@ -251,6 +251,8 @@ impl WalletRoot {
             let label = match self.selected_wallet_source() {
                 WalletSource::Generated => "generated wallet start block",
                 WalletSource::Imported => "wallet init block",
+                WalletSource::LedgerDerived => "Ledger-derived wallet start block",
+                WalletSource::TrezorDerived => "Trezor-derived wallet start block",
             };
 
             div()

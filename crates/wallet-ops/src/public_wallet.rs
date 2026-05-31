@@ -4,9 +4,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
+use alloy::consensus::SignableTransaction;
 use alloy::eips::Encodable2718;
-use alloy::network::{EthereumWallet, NetworkTransactionBuilder, TransactionBuilder as _};
-use alloy::primitives::{Address, FixedBytes, U256, keccak256};
+use alloy::network::{NetworkTransactionBuilder, TransactionBuilder as _};
+use alloy::primitives::{Address, FixedBytes, Signature, U256, keccak256};
 use alloy::providers::{CallItem, Provider};
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol;
@@ -19,6 +20,7 @@ use sync_service::ChainConfigDefaults;
 use zeroize::Zeroizing;
 
 use crate::amounts::wrapped_native_token_for_chain;
+use crate::hardware::HardwarePublicAccountDescriptor;
 use crate::settings::{EffectiveChainConfig, EffectiveChainGasSettings, EffectiveTokenRegistry};
 use crate::signer::{EvmMessageSigner, EvmTransactionSigner, SoftwareEvmSigner};
 use crate::vault::{DesktopVaultStore, DesktopViewSession, PublicAccountMetadata};
@@ -204,6 +206,7 @@ pub struct PublicShieldRequest {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PublicActionProgressStep {
+    ShieldKey,
     Send,
     Wrap,
     Approve,
@@ -302,7 +305,12 @@ fn public_native_action_gas_units_with_buffer(
     gas_limit_buffer: u64,
 ) -> u64 {
     steps.iter().fold(0_u64, |total, step| {
-        total.saturating_add(public_native_step_gas_units(*step) + gas_limit_buffer)
+        let gas_units = public_native_step_gas_units(*step);
+        if gas_units == 0 {
+            total
+        } else {
+            total.saturating_add(gas_units + gas_limit_buffer)
+        }
     })
 }
 
@@ -380,6 +388,7 @@ const fn public_action_tip_fallback(chain_id: u64) -> SelfBroadcastTipFallback {
 
 const fn public_native_step_gas_units(step: PublicActionProgressStep) -> u64 {
     match step {
+        PublicActionProgressStep::ShieldKey => 0,
         PublicActionProgressStep::Send => PUBLIC_NATIVE_SEND_GAS_UNITS,
         PublicActionProgressStep::Wrap => PUBLIC_NATIVE_WRAP_GAS_UNITS,
         PublicActionProgressStep::Approve => PUBLIC_NATIVE_APPROVE_GAS_UNITS,
@@ -511,11 +520,10 @@ pub async fn submit_public_send_with_progress(
     let signer = vaulted_public_signer(
         &request.vault_store,
         &request.view_session,
-        &request.vault_password,
+        Some(request.vault_password.as_str()),
         &request.public_account_uuid,
     )?;
     let from_address = signer.address();
-    let wallet = signer.ethereum_wallet();
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
     let tx_req = public_send_transaction_request(
         request.chain_id,
@@ -528,7 +536,7 @@ pub async fn submit_public_send_with_progress(
     let tx = submit_public_action_step_session(
         PublicActionProgressStep::Send,
         tx_req,
-        &wallet,
+        &signer,
         "public-send",
         &query_rpc_pool,
         http.network_mode(),
@@ -576,10 +584,56 @@ pub async fn submit_public_shield_with_progress(
     let signer = vaulted_public_signer(
         &request.vault_store,
         &request.view_session,
-        &request.vault_password,
+        Some(request.vault_password.as_str()),
         &request.public_account_uuid,
     )?;
-    let shield_private_key = signer.derive_shield_private_key()?;
+    let mut nonce = None;
+    let mut gas_fee = request.gas_fee;
+    let mut command_rx = request.command_rx;
+    let event_tx = request.event_tx;
+    let shield_private_key = if signer.requires_device_approval() {
+        loop {
+            progress(public_action_progress_update(
+                PublicActionProgressStep::ShieldKey,
+                PublicActionProgressStatus::Pending,
+                None,
+                None,
+            ));
+            match signer.derive_shield_private_key().await {
+                Ok(shield_private_key) => {
+                    progress(public_action_progress_update(
+                        PublicActionProgressStep::ShieldKey,
+                        PublicActionProgressStatus::Done,
+                        None,
+                        None,
+                    ));
+                    break shield_private_key;
+                }
+                Err(error) => {
+                    let message = report_chain_string(&error);
+                    progress(public_action_progress_update(
+                        PublicActionProgressStep::ShieldKey,
+                        PublicActionProgressStatus::Error,
+                        None,
+                        Some(message.clone()),
+                    ));
+                    emit_public_action_event(
+                        event_tx.as_ref(),
+                        PublicActionSessionEvent::StepFailed {
+                            step: PublicActionProgressStep::ShieldKey,
+                            message,
+                        },
+                    );
+                    let Some(command) = recv_public_action_command(&mut command_rx).await else {
+                        return Err(error);
+                    };
+                    gas_fee = command.gas_fee;
+                }
+            }
+        }
+    } else {
+        signer.derive_shield_private_key().await?
+    };
     let approve_data = broadcaster_core::contracts::shield::build_approve_calldata(
         chain.railgun_contract,
         request.amount,
@@ -594,12 +648,7 @@ pub async fn submit_public_shield_with_progress(
     .wrap_err("build public shield calldata")?;
 
     let from_address = signer.address();
-    let wallet = signer.ethereum_wallet();
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
-    let mut nonce = None;
-    let mut gas_fee = request.gas_fee;
-    let mut command_rx = request.command_rx;
-    let event_tx = request.event_tx;
 
     let wrap_receipt = if request.asset == PublicAssetId::Native {
         let tx_req = TransactionRequest::default()
@@ -612,7 +661,7 @@ pub async fn submit_public_shield_with_progress(
         let outcome = submit_public_action_step_session(
             PublicActionProgressStep::Wrap,
             tx_req,
-            &wallet,
+            &signer,
             "public-shield-wrap",
             &query_rpc_pool,
             http.network_mode(),
@@ -649,7 +698,7 @@ pub async fn submit_public_shield_with_progress(
     let approve_outcome = submit_public_action_step_session(
         PublicActionProgressStep::Approve,
         approve_tx,
-        &wallet,
+        &signer,
         "public-shield-approve",
         &query_rpc_pool,
         http.network_mode(),
@@ -682,7 +731,7 @@ pub async fn submit_public_shield_with_progress(
     let shield_receipt = submit_public_action_step_session(
         PublicActionProgressStep::Shield,
         shield_tx,
-        &wallet,
+        &signer,
         "public-shield",
         &query_rpc_pool,
         http.network_mode(),
@@ -743,10 +792,220 @@ struct PublicActionSentTx {
     provider_handles: Vec<ProviderHandle>,
 }
 
+pub(crate) enum VaultedPublicSigner {
+    Software(SoftwareEvmSigner),
+    Hardware(HardwarePublicEvmSigner),
+}
+
+pub(crate) struct HardwarePublicEvmSigner {
+    address: Address,
+    descriptor: HardwarePublicAccountDescriptor,
+}
+
+impl VaultedPublicSigner {
+    pub(crate) fn address(&self) -> Address {
+        match self {
+            Self::Software(signer) => signer.address(),
+            Self::Hardware(signer) => signer.address,
+        }
+    }
+
+    pub(crate) const fn requires_device_approval(&self) -> bool {
+        matches!(self, Self::Hardware(_))
+    }
+
+    pub(crate) async fn sign_transaction_request(
+        &self,
+        tx_req: TransactionRequest,
+        label: &str,
+    ) -> Result<Vec<u8>> {
+        match self {
+            Self::Software(signer) => {
+                let wallet = signer.ethereum_wallet();
+                Ok(tx_req
+                    .build(&wallet)
+                    .await
+                    .wrap_err_with(|| format!("{label}: sign"))?
+                    .encoded_2718())
+            }
+            Self::Hardware(signer) => signer.sign_transaction_request(tx_req, label).await,
+        }
+    }
+
+    pub(crate) async fn derive_shield_private_key(&self) -> Result<Zeroizing<[u8; 32]>> {
+        match self {
+            Self::Software(signer) => Ok(Zeroizing::new(signer.derive_shield_private_key()?)),
+            Self::Hardware(signer) => signer.derive_shield_private_key().await,
+        }
+    }
+}
+
+impl HardwarePublicEvmSigner {
+    async fn sign_transaction_request(
+        &self,
+        tx_req: TransactionRequest,
+        label: &str,
+    ) -> Result<Vec<u8>> {
+        let tx = tx_req
+            .build_consensus_tx()
+            .map_err(|error| eyre!(error.error))
+            .wrap_err_with(|| format!("{label}: build hardware transaction"))?;
+        let signature = self
+            .sign_transaction(&tx)
+            .await
+            .wrap_err_with(|| format!("{label}: hardware sign"))?;
+        let signing_hash = tx.signature_hash();
+        let recovered = signature
+            .recover_address_from_prehash(&signing_hash)
+            .wrap_err_with(|| format!("{label}: recover hardware signature"))?;
+        if recovered != self.address {
+            return Err(eyre!(
+                "hardware public signer address mismatch: expected {}, got {}",
+                self.address,
+                recovered
+            ));
+        }
+        Ok(tx.into_envelope(signature).encoded_2718())
+    }
+
+    async fn derive_shield_private_key(&self) -> Result<Zeroizing<[u8; 32]>> {
+        const SHIELD_MESSAGE: &[u8] = b"RAILGUN_SHIELD";
+        let signature = self
+            .sign_message(SHIELD_MESSAGE)
+            .await
+            .wrap_err("hardware sign shield key message")?;
+        let recovered = signature
+            .recover_address_from_msg(SHIELD_MESSAGE)
+            .wrap_err("recover hardware shield key signature")?;
+        if recovered != self.address {
+            return Err(eyre!(
+                "hardware public signer address mismatch: expected {}, got {}",
+                self.address,
+                recovered
+            ));
+        }
+        let signature_bytes = Zeroizing::new(signature.as_bytes());
+        Ok(Zeroizing::new(keccak256(*signature_bytes).0))
+    }
+
+    async fn sign_transaction(&self, tx: &dyn SignableTransaction<Signature>) -> Result<Signature> {
+        sign_hardware_public_transaction(&self.descriptor, self.address, tx).await
+    }
+
+    async fn sign_message(&self, message: &[u8]) -> Result<Signature> {
+        sign_hardware_public_message(&self.descriptor, self.address, message).await
+    }
+}
+
+#[cfg(feature = "hardware")]
+async fn sign_hardware_public_transaction(
+    descriptor: &HardwarePublicAccountDescriptor,
+    expected_address: Address,
+    tx: &dyn SignableTransaction<Signature>,
+) -> Result<Signature> {
+    match descriptor.device_kind {
+        crate::hardware::HardwareDeviceKind::Ledger => {
+            let client = crate::hardware::ledger::LedgerHardwareDerivationClient::connect()
+                .await
+                .wrap_err("connect Ledger for public transaction signing")?;
+            let address = client
+                .public_ethereum_address(descriptor)
+                .await
+                .wrap_err("verify Ledger public account address")?;
+            ensure_hardware_public_address(expected_address, address)?;
+            client
+                .sign_transaction_rlp(descriptor, &tx.encoded_for_signing())
+                .await
+                .wrap_err("sign public transaction on Ledger")
+        }
+        crate::hardware::HardwareDeviceKind::Trezor => {
+            let mut client = crate::hardware::trezor::TrezorHardwareDerivationClient::connect()
+                .wrap_err("connect Trezor for public transaction signing")?;
+            let address = client
+                .public_ethereum_address(descriptor)
+                .wrap_err("verify Trezor public account address")?;
+            ensure_hardware_public_address(expected_address, address)?;
+            client
+                .sign_transaction(descriptor, tx)
+                .wrap_err("sign public transaction on Trezor")
+        }
+    }
+}
+
+#[cfg(not(feature = "hardware"))]
+async fn sign_hardware_public_transaction(
+    _descriptor: &HardwarePublicAccountDescriptor,
+    _expected_address: Address,
+    _tx: &dyn SignableTransaction<Signature>,
+) -> Result<Signature> {
+    Err(eyre!(
+        "hardware public signing is not enabled in this build"
+    ))
+}
+
+#[cfg(feature = "hardware")]
+async fn sign_hardware_public_message(
+    descriptor: &HardwarePublicAccountDescriptor,
+    expected_address: Address,
+    message: &[u8],
+) -> Result<Signature> {
+    match descriptor.device_kind {
+        crate::hardware::HardwareDeviceKind::Ledger => {
+            let client = crate::hardware::ledger::LedgerHardwareDerivationClient::connect()
+                .await
+                .wrap_err("connect Ledger for public message signing")?;
+            let address = client
+                .public_ethereum_address(descriptor)
+                .await
+                .wrap_err("verify Ledger public account address")?;
+            ensure_hardware_public_address(expected_address, address)?;
+            client
+                .sign_message(descriptor, message)
+                .await
+                .wrap_err("sign public message on Ledger")
+        }
+        crate::hardware::HardwareDeviceKind::Trezor => {
+            let mut client = crate::hardware::trezor::TrezorHardwareDerivationClient::connect()
+                .wrap_err("connect Trezor for public message signing")?;
+            let address = client
+                .public_ethereum_address(descriptor)
+                .wrap_err("verify Trezor public account address")?;
+            ensure_hardware_public_address(expected_address, address)?;
+            client
+                .sign_message(descriptor, message)
+                .wrap_err("sign public message on Trezor")
+        }
+    }
+}
+
+#[cfg(not(feature = "hardware"))]
+async fn sign_hardware_public_message(
+    _descriptor: &HardwarePublicAccountDescriptor,
+    _expected_address: Address,
+    _message: &[u8],
+) -> Result<Signature> {
+    Err(eyre!(
+        "hardware public signing is not enabled in this build"
+    ))
+}
+
+#[cfg_attr(not(feature = "hardware"), allow(dead_code))]
+fn ensure_hardware_public_address(expected: Address, actual: Address) -> Result<()> {
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(eyre!(
+            "hardware public account identity mismatch: expected {}, got {}",
+            expected,
+            actual
+        ))
+    }
+}
+
 async fn submit_public_action_step_session(
     step: PublicActionProgressStep,
     base_tx_req: TransactionRequest,
-    wallet: &EthereumWallet,
+    signer: &VaultedPublicSigner,
     label: &str,
     query_rpc_pool: &QueryRpcPool,
     network_mode: crate::WalletNetworkMode,
@@ -811,14 +1070,16 @@ async fn submit_public_action_step_session(
             preflight,
             query_rpc_pool,
             network_mode,
-            wallet,
+            signer,
             label,
             event_tx,
         )
         .await
         {
             Ok(attempt) => attempt,
-            Err(error) => {
+            Err(
+                PublicActionAttemptError::Signing(error) | PublicActionAttemptError::Sending(error),
+            ) => {
                 let message = report_chain_string(&error);
                 progress(public_action_progress_update(
                     step,
@@ -897,7 +1158,7 @@ async fn submit_public_action_step_session(
                             replacement,
                             query_rpc_pool,
                             network_mode,
-                            wallet,
+                            signer,
                             label,
                             event_tx,
                         )
@@ -916,7 +1177,7 @@ async fn submit_public_action_step_session(
                                 event_tx,
                                 PublicActionSessionEvent::AttemptRejected {
                                     step,
-                                    message: report_chain_string(&error),
+                                    message: error.message(),
                                 },
                             ),
                         }
@@ -946,12 +1207,32 @@ async fn submit_public_action_step_session(
                         None,
                     ));
                 } else {
+                    let message = "Transaction reverted".to_string();
                     progress(public_action_progress_update(
                         step,
                         PublicActionProgressStatus::Error,
                         Some(receipt.tx_hash.clone()),
-                        Some("Transaction reverted".to_string()),
+                        Some(message.clone()),
                     ));
+                    emit_public_action_event(
+                        event_tx,
+                        PublicActionSessionEvent::StepFailed { step, message },
+                    );
+                    let gas_fee = PublicActionGasFeeSelection::Custom {
+                        max_fee_per_gas: winner.info.max_fee_per_gas,
+                        max_priority_fee_per_gas: winner.info.max_priority_fee_per_gas,
+                    };
+                    let Some(command) = recv_public_action_command(command_rx).await else {
+                        return Ok(PublicActionStepOutcome {
+                            receipt,
+                            next_nonce: winner.info.nonce.saturating_add(1),
+                            gas_fee,
+                        });
+                    };
+                    nonce = Some(winner.info.nonce.saturating_add(1));
+                    next_gas_fee = command.gas_fee;
+                    submitted_attempts.clear();
+                    break;
                 }
                 let gas_fee = PublicActionGasFeeSelection::Custom {
                     max_fee_per_gas: winner.info.max_fee_per_gas,
@@ -972,14 +1253,14 @@ async fn submit_public_action_attempt(
     preflight: PublicActionPreflight,
     query_rpc_pool: &QueryRpcPool,
     network_mode: crate::WalletNetworkMode,
-    wallet: &EthereumWallet,
+    signer: &VaultedPublicSigner,
     label: &str,
     event_tx: Option<&PublicActionSessionEventSender>,
-) -> Result<SubmittedPublicActionAttempt> {
+) -> Result<SubmittedPublicActionAttempt, PublicActionAttemptError> {
     let sent = sign_send_public_action_transaction(
         query_rpc_pool,
         network_mode,
-        wallet,
+        signer,
         preflight.tx_req,
         label,
     )
@@ -1006,6 +1287,19 @@ async fn submit_public_action_attempt(
         estimated_native_gas_cost: preflight.estimated_native_gas_cost,
         live_native_balance: preflight.live_native_balance,
     })
+}
+
+enum PublicActionAttemptError {
+    Signing(eyre::Report),
+    Sending(eyre::Report),
+}
+
+impl PublicActionAttemptError {
+    fn message(&self) -> String {
+        match self {
+            Self::Signing(error) | Self::Sending(error) => report_chain_string(error),
+        }
+    }
 }
 
 async fn public_action_preflight_from_rpc_pool(
@@ -1141,10 +1435,10 @@ fn public_action_native_gas_cost(value: U256, gas_limit: u64, max_fee_per_gas: u
 async fn sign_send_public_action_transaction(
     query_rpc_pool: &QueryRpcPool,
     network_mode: crate::WalletNetworkMode,
-    wallet: &EthereumWallet,
+    signer: &VaultedPublicSigner,
     tx_req: TransactionRequest,
     label: &str,
-) -> Result<PublicActionSentTx> {
+) -> Result<PublicActionSentTx, PublicActionAttemptError> {
     tracing::info!(
         from = %tx_req.from.unwrap_or_default(),
         to = ?tx_req.to,
@@ -1152,11 +1446,12 @@ async fn sign_send_public_action_transaction(
         label,
         "signing and sending public action transaction",
     );
-    let signed_tx = tx_req
-        .build(wallet)
+    let signed_tx = signer
+        .sign_transaction_request(tx_req, label)
         .await
-        .wrap_err_with(|| format!("{label}: sign"))?
-        .encoded_2718();
+        .map_err(PublicActionAttemptError::Signing)?;
+    // Stop/abort requested during synchronous hardware approval is observed here before RPC broadcast.
+    public_action_before_raw_broadcast_checkpoint().await;
     let tx_hash = keccak256(&signed_tx);
     let provider_handles = self_broadcast_send_raw_transaction_to_rpc_pool(
         query_rpc_pool,
@@ -1165,7 +1460,8 @@ async fn sign_send_public_action_transaction(
         tx_hash,
     )
     .await
-    .wrap_err_with(|| format!("{label}: send"))?;
+    .wrap_err_with(|| format!("{label}: send"))
+    .map_err(PublicActionAttemptError::Sending)?;
     let tx_hash_string = alloy::hex::encode_prefixed(tx_hash);
     tracing::info!(%tx_hash, providers = provider_handles.len(), label, "sent public action transaction");
     Ok(PublicActionSentTx {
@@ -1173,6 +1469,10 @@ async fn sign_send_public_action_transaction(
         tx_hash_string,
         provider_handles,
     })
+}
+
+async fn public_action_before_raw_broadcast_checkpoint() {
+    tokio::task::yield_now().await;
 }
 
 async fn poll_public_action_attempt_receipts(
@@ -1404,16 +1704,42 @@ fn parse_effective_address(label: &str, value: &str) -> Result<Address> {
 pub(crate) fn vaulted_public_signer(
     vault_store: &DesktopVaultStore,
     view_session: &DesktopViewSession,
-    vault_password: &str,
+    vault_password: Option<&str>,
     public_account_uuid: &str,
-) -> Result<SoftwareEvmSigner> {
+) -> Result<VaultedPublicSigner> {
+    let accounts = vault_store
+        .list_public_accounts_for_session(view_session, true)
+        .wrap_err("load public account metadata")?;
+    let account = accounts
+        .iter()
+        .find(|account| account.public_account_uuid == public_account_uuid)
+        .ok_or_else(|| eyre!("public account not found"))?;
+    if account.source == crate::vault::PublicAccountSource::HardwareDerived {
+        let descriptor = account
+            .hardware_descriptor
+            .clone()
+            .ok_or_else(|| eyre!("hardware public account descriptor missing"))?;
+        descriptor
+            .validate()
+            .map_err(|error| eyre!(error))
+            .wrap_err("validate hardware public account descriptor")?;
+        return Ok(VaultedPublicSigner::Hardware(HardwarePublicEvmSigner {
+            address: account.address,
+            descriptor,
+        }));
+    }
+
+    let vault_password = vault_password
+        .ok_or_else(|| eyre!("vault password required for software public account signer"))?;
     let mut grant = vault_store
         .create_spend_grant(vault_password)
         .wrap_err("authorize public account spend")?;
     let private_key = vault_store
         .public_account_signing_key(&mut grant, view_session, public_account_uuid)
         .wrap_err("load public account signing key")?;
-    SoftwareEvmSigner::from_private_key(*private_key).wrap_err("create public account signer")
+    let signer = SoftwareEvmSigner::from_private_key(*private_key)
+        .wrap_err("create public account signer")?;
+    Ok(VaultedPublicSigner::Software(signer))
 }
 
 fn public_send_transaction_request(
@@ -1455,6 +1781,7 @@ mod tests {
     use local_db::{DbConfig, DbStore};
 
     use super::*;
+    use crate::hardware::{HardwareDeviceKind, HardwarePublicAccountDescriptor};
     use crate::vault::{
         KdfParams, PublicAccountScope, PublicAccountSource, PublicAccountStatus, WalletSource,
     };
@@ -1464,6 +1791,37 @@ mod tests {
     const TEST_IMPORTED_PRIVATE_KEY: &str =
         "0x59c6995e998f97a5a0044966f0945387e7d5e4a4dbd4b3f1b530b87d9b4a5c2f";
     static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn public_action_attempt_errors_distinguish_signing_from_retryable_sending() {
+        let signing = PublicActionAttemptError::Signing(eyre!("user rejected on device"));
+        let sending = PublicActionAttemptError::Sending(eyre!("rpc rejected transaction"));
+
+        assert!(matches!(signing, PublicActionAttemptError::Signing(_)));
+        assert!(matches!(sending, PublicActionAttemptError::Sending(_)));
+    }
+
+    #[test]
+    fn public_action_pre_broadcast_checkpoint_yields_for_abort() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+
+        runtime.block_on(async {
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                let _ = ready_tx.send(());
+                public_action_before_raw_broadcast_checkpoint().await;
+                true
+            });
+
+            ready_rx.await.expect("checkpoint task started");
+            task.abort();
+            let error = task.await.expect_err("checkpoint task should abort");
+            assert!(error.is_cancelled());
+        });
+    }
 
     fn test_kdf() -> KdfParams {
         KdfParams::new(1024, 1, 1)
@@ -1536,6 +1894,7 @@ mod tests {
                 wallet_uuid: "wallet-1".to_string(),
             },
             derivation_index: Some(0),
+            hardware_descriptor: None,
             status: PublicAccountStatus::Active,
             display_order: 0,
         };
@@ -1606,6 +1965,7 @@ mod tests {
                 wallet_uuid: "wallet-1".to_string(),
             },
             derivation_index: Some(0),
+            hardware_descriptor: None,
             status: PublicAccountStatus::Active,
             display_order: 0,
         };
@@ -1676,6 +2036,7 @@ mod tests {
         );
 
         let shield_steps = [
+            PublicActionProgressStep::ShieldKey,
             PublicActionProgressStep::Wrap,
             PublicActionProgressStep::Approve,
             PublicActionProgressStep::Shield,
@@ -1918,11 +2279,45 @@ mod tests {
         let derived_signer = vaulted_public_signer(
             &store,
             &view_session,
-            TEST_PASSWORD,
+            Some(TEST_PASSWORD),
             &derived.public_account_uuid,
         )
         .expect("derived signer");
         assert_eq!(derived_signer.address(), derived.address);
+        let Err(missing_password) =
+            vaulted_public_signer(&store, &view_session, None, &derived.public_account_uuid)
+        else {
+            panic!("software public signer without password unexpectedly succeeded");
+        };
+        assert!(
+            missing_password
+                .to_string()
+                .contains("vault password required for software public account signer")
+        );
+
+        let hardware_index = store
+            .next_derived_public_account_index_for_session(&view_session)
+            .expect("next hardware public index");
+        let hardware_descriptor = HardwarePublicAccountDescriptor::for_wallet_public_index(
+            HardwareDeviceKind::Ledger,
+            view_session.derivation_index(),
+            hardware_index,
+        )
+        .expect("hardware descriptor");
+        let hardware_address = address!("0x2222222222222222222222222222222222222222");
+        let hardware = store
+            .add_hardware_public_account(
+                &view_session,
+                hardware_descriptor,
+                hardware_address,
+                Some("Ledger Gas"),
+            )
+            .expect("hardware public account");
+        let hardware_signer =
+            vaulted_public_signer(&store, &view_session, None, &hardware.public_account_uuid)
+                .expect("hardware signer without password");
+        assert_eq!(hardware_signer.address(), hardware.address);
+        assert!(hardware_signer.requires_device_approval());
 
         let imported = store
             .import_public_account(
@@ -1936,7 +2331,7 @@ mod tests {
         let imported_signer = vaulted_public_signer(
             &store,
             &view_session,
-            TEST_PASSWORD,
+            Some(TEST_PASSWORD),
             &imported.public_account_uuid,
         )
         .expect("imported signer");

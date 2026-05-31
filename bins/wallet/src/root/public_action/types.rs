@@ -10,6 +10,7 @@ pub(in crate::root) struct PublicSendDraft {
     pub(in crate::root) asset_decimals: Option<u8>,
     pub(in crate::root) public_account_uuid: Arc<str>,
     pub(in crate::root) public_account_label: String,
+    pub(in crate::root) public_account_source: PublicAccountSource,
     pub(in crate::root) view_session: Arc<DesktopViewSession>,
     pub(in crate::root) vault_store: Arc<DesktopVaultStore>,
     pub(in crate::root) amount: U256,
@@ -25,6 +26,7 @@ pub(in crate::root) struct PublicShieldDraft {
     pub(in crate::root) asset_decimals: Option<u8>,
     pub(in crate::root) public_account_uuid: Arc<str>,
     pub(in crate::root) public_account_label: String,
+    pub(in crate::root) public_account_source: PublicAccountSource,
     pub(in crate::root) view_session: Arc<DesktopViewSession>,
     pub(in crate::root) vault_store: Arc<DesktopVaultStore>,
     pub(in crate::root) amount: U256,
@@ -36,7 +38,7 @@ pub(in crate::root) fn public_send_authorization_summary(
 ) -> SpendAuthorizationSummary {
     SpendAuthorizationSummary::new(
         "Public send",
-        "Enter your vault password to authorize this public send.",
+        public_send_authorization_detail(draft.public_account_source),
         vec![
             SpendAuthorizationSummaryRow::new("Amount", public_action_amount_label(draft))
                 .with_icon(draft.asset_icon_path.clone()),
@@ -51,7 +53,7 @@ pub(in crate::root) fn public_shield_authorization_summary(
 ) -> SpendAuthorizationSummary {
     SpendAuthorizationSummary::new(
         "Public shield",
-        "Enter your vault password to authorize this public shield.",
+        public_shield_authorization_detail(draft.public_account_source),
         vec![
             SpendAuthorizationSummaryRow::new("Amount", public_shield_amount_label(draft))
                 .with_icon(draft.asset_icon_path.clone()),
@@ -59,6 +61,32 @@ pub(in crate::root) fn public_shield_authorization_summary(
             SpendAuthorizationSummaryRow::new("Recipient", "Selected private wallet"),
         ],
     )
+}
+
+pub(in crate::root) const fn public_send_authorization_detail(
+    source: PublicAccountSource,
+) -> &'static str {
+    match source {
+        PublicAccountSource::HardwareDerived => {
+            "Connect your hardware wallet and approve the public send transaction on the device. No EVM private key is stored in the vault."
+        }
+        PublicAccountSource::Derived | PublicAccountSource::Imported => {
+            "Enter your vault password to authorize this public send."
+        }
+    }
+}
+
+pub(in crate::root) const fn public_shield_authorization_detail(
+    source: PublicAccountSource,
+) -> &'static str {
+    match source {
+        PublicAccountSource::HardwareDerived => {
+            "Connect your hardware wallet and approve the shield key message plus public shield transactions on the device. No EVM private key is stored in the vault."
+        }
+        PublicAccountSource::Derived | PublicAccountSource::Imported => {
+            "Enter your vault password to authorize this public shield."
+        }
+    }
 }
 
 pub(in crate::root) fn public_action_amount_label(draft: &PublicSendDraft) -> String {
@@ -106,6 +134,13 @@ pub(in crate::root) enum ProgressFooterAction {
     Close,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::root) enum ProgressDialogCloseBehavior {
+    TopOnly,
+    TopAndClear,
+    AllAndClear,
+}
+
 pub(in crate::root) const STOPPED_PROGRESS_MESSAGE: &str =
     "Stopped locally. Already-submitted network work may continue.";
 
@@ -117,6 +152,19 @@ pub(in crate::root) const fn progress_footer_action(
         ProgressFooterAction::Stop
     } else {
         ProgressFooterAction::Close
+    }
+}
+
+pub(in crate::root) const fn progress_dialog_close_behavior(
+    successful: bool,
+    stopped: bool,
+) -> ProgressDialogCloseBehavior {
+    if successful {
+        ProgressDialogCloseBehavior::AllAndClear
+    } else if stopped {
+        ProgressDialogCloseBehavior::TopAndClear
+    } else {
+        ProgressDialogCloseBehavior::TopOnly
     }
 }
 
@@ -158,6 +206,22 @@ pub(in crate::root) fn public_action_progress_is_terminal(steps: &[PublicActionS
             }))
 }
 
+pub(in crate::root) fn public_action_progress_is_successful(
+    steps: &[PublicActionStepState],
+) -> bool {
+    !steps.is_empty()
+        && steps
+            .iter()
+            .all(|step| step.status == PublicActionStepStatus::Done)
+}
+
+pub(in crate::root) const fn public_action_discard_attempt_available(
+    command_available: bool,
+    step: &PublicActionStepState,
+) -> bool {
+    command_available && matches!(step.status, PublicActionStepStatus::Error)
+}
+
 pub(in crate::root) fn mark_public_action_active_step_stopped(
     steps: &mut [PublicActionStepState],
 ) -> bool {
@@ -185,6 +249,7 @@ pub(in crate::root) fn mark_public_action_active_step_stopped(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::root) enum PublicActionGasRetryKind {
+    RetryStep,
     RetryEstimate,
     SpeedUp,
 }
@@ -231,10 +296,14 @@ impl PublicActionGasRetryDialogContent {
 impl gpui::Render for PublicActionGasRetryDialogContent {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let title = match self.retry_kind {
+            PublicActionGasRetryKind::RetryStep => "Retry step",
             PublicActionGasRetryKind::RetryEstimate => "Retry with custom gas",
             PublicActionGasRetryKind::SpeedUp => "Speed up transaction",
         };
         let detail = match self.retry_kind {
+            PublicActionGasRetryKind::RetryStep => {
+                "Retry this Public action step using the current gas fee values."
+            }
             PublicActionGasRetryKind::RetryEstimate => {
                 "Retry this Public action step using these EIP-1559 fee values."
             }

@@ -69,6 +69,20 @@ fn import_wallet_with_metadata(
         .expect("load view session")
 }
 
+fn test_hardware_descriptor(account_index: u32) -> HardwareDerivationDescriptor {
+    HardwareDerivationDescriptor::ledger_eip1024_v1(
+        crate::hardware::parse_bip32_path("m/44'/60'/0'/0/0").expect("valid path"),
+        account_index,
+        "ledger-profile-fingerprint".to_owned(),
+        None,
+        crate::hardware::HardwareWalletSyncIntent::CreateNew,
+    )
+}
+
+fn test_hardware_wallet(account_index: u32) -> WalletKeys {
+    WalletKeys::from_bip39_entropy(&[42u8; 32], account_index).expect("derive hardware wallet")
+}
+
 #[derive(Serialize)]
 struct LegacyWalletMetadataBundle {
     wallet_uuid: String,
@@ -247,6 +261,7 @@ fn wallet_with_metadata_stores_records_in_one_batch() {
         source: WalletSource::Generated,
         status: WalletStatus::Active,
         display_order: 0,
+        hardware_descriptor: None,
     };
 
     let stored = store
@@ -276,6 +291,485 @@ fn wallet_with_metadata_stores_records_in_one_batch() {
     assert_eq!(loaded.wallet_uuid, wallet_id);
     assert_eq!(loaded.label, "Primary wallet");
     assert_eq!(loaded.derivation_index, 0);
+
+    drop(store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn hardware_derived_wallet_stores_view_and_descriptor_without_spend_entropy() {
+    let (root_dir, db, store) = desktop_store_with_vault();
+    let wallet_id = "hardware-wallet";
+    let descriptor = test_hardware_descriptor(0);
+    let wallet = test_hardware_wallet(descriptor.account_index);
+    let metadata = store
+        .new_hardware_wallet_metadata(
+            TEST_PASSWORD,
+            wallet_id,
+            "Ledger wallet",
+            descriptor.clone(),
+        )
+        .expect("hardware metadata");
+
+    let stored = store
+        .store_hardware_derived_wallet_with_metadata(
+            TEST_PASSWORD,
+            wallet_id,
+            descriptor.account_index,
+            &wallet,
+            &metadata,
+        )
+        .expect("store hardware wallet");
+
+    assert!(
+        db.get_desktop_wallet_vault_record(&stored.view_record_key)
+            .expect("load view record")
+            .is_some()
+    );
+    assert!(
+        db.get_desktop_wallet_vault_record(&stored.metadata_record_key)
+            .expect("load metadata record")
+            .is_some()
+    );
+    assert!(
+        db.get_desktop_wallet_vault_record(&wallet_spend_record_key(wallet_id))
+            .expect("load spend record")
+            .is_none()
+    );
+
+    let loaded = store
+        .load_wallet_metadata(TEST_PASSWORD, wallet_id)
+        .expect("load hardware metadata");
+    assert_eq!(loaded.source, WalletSource::LedgerDerived);
+    assert_eq!(loaded.hardware_descriptor, Some(descriptor.clone()));
+
+    let view_session = store
+        .load_view_session(TEST_PASSWORD, wallet_id)
+        .expect("load hardware view session");
+    assert!(matches!(
+        store
+            .wallet_spend_source_for_session(&view_session, wallet_id)
+            .expect("spend source"),
+        WalletSpendSource::HardwareDerived(found) if found == descriptor
+    ));
+    let mut grant = store
+        .create_spend_grant(TEST_PASSWORD)
+        .expect("create grant");
+    assert!(matches!(
+        store.load_spend_bundle(&mut grant, wallet_id),
+        Err(VaultError::VaultNotFound)
+    ));
+
+    drop(store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn hardware_spend_signer_rejects_wrong_derived_key() {
+    let (root_dir, db, store) = desktop_store_with_vault();
+    let wallet_id = "hardware-wallet";
+    let descriptor = test_hardware_descriptor(0);
+    let wallet = test_hardware_wallet(descriptor.account_index);
+    let metadata = store
+        .new_hardware_wallet_metadata(
+            TEST_PASSWORD,
+            wallet_id,
+            "Ledger wallet",
+            descriptor.clone(),
+        )
+        .expect("hardware metadata");
+    store
+        .store_hardware_derived_wallet_with_metadata(
+            TEST_PASSWORD,
+            wallet_id,
+            descriptor.account_index,
+            &wallet,
+            &metadata,
+        )
+        .expect("store hardware wallet");
+    let view_session = store
+        .load_view_session(TEST_PASSWORD, wallet_id)
+        .expect("load hardware view session");
+
+    assert!(matches!(
+        store.hardware_railgun_spend_signer_from_entropy(&view_session, &descriptor, &[43u8; 32]),
+        Err(VaultError::HardwareWalletIdentityMismatch)
+    ));
+    store
+        .hardware_railgun_spend_signer_from_entropy(&view_session, &descriptor, &[42u8; 32])
+        .expect("matching hardware entropy signs");
+
+    drop(store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn hardware_public_account_stores_descriptor_without_secret() {
+    let (root_dir, db, store) = desktop_store_with_vault();
+    let wallet_id = "hardware-public-wallet";
+    let wallet_descriptor = test_hardware_descriptor(0);
+    let wallet = test_hardware_wallet(wallet_descriptor.account_index);
+    let wallet_metadata = store
+        .new_hardware_wallet_metadata(
+            TEST_PASSWORD,
+            wallet_id,
+            "Ledger wallet",
+            wallet_descriptor.clone(),
+        )
+        .expect("hardware metadata");
+    store
+        .store_hardware_derived_wallet_with_metadata(
+            TEST_PASSWORD,
+            wallet_id,
+            wallet_descriptor.account_index,
+            &wallet,
+            &wallet_metadata,
+        )
+        .expect("store hardware wallet");
+    let view_session = store
+        .load_view_session(TEST_PASSWORD, wallet_id)
+        .expect("load hardware view session");
+    let descriptor =
+        HardwarePublicAccountDescriptor::for_device_index(HardwareDeviceKind::Ledger, 0)
+            .expect("hardware public descriptor");
+    let address = Address::from([0x44; 20]);
+
+    let account = store
+        .add_hardware_public_account(&view_session, descriptor.clone(), address, Some("Ledger 1"))
+        .expect("add hardware public account");
+
+    assert_eq!(account.source, PublicAccountSource::HardwareDerived);
+    assert_eq!(account.derivation_index, Some(0));
+    assert_eq!(account.hardware_descriptor.as_ref(), Some(&descriptor));
+    assert_eq!(descriptor.path_display(), "m/44'/60'/0'/0/0",);
+    assert!(
+        db.get_desktop_wallet_vault_record(&public_account_secret_record_key(
+            &account.public_account_uuid,
+        ))
+        .expect("load public secret record")
+        .is_none()
+    );
+    assert!(
+        db.get_desktop_wallet_vault_record(&wallet_spend_record_key(wallet_id))
+            .expect("load wallet spend record")
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .next_derived_public_account_index_for_session(&view_session)
+            .expect("next hardware public index"),
+        1,
+    );
+
+    drop(store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn hardware_public_account_paths_partition_by_private_wallet_index() {
+    let (root_dir, db, store) = desktop_store_with_vault();
+
+    for account_index in 0..=1 {
+        let wallet_id = format!("hardware-public-wallet-{account_index}");
+        let wallet_descriptor = test_hardware_descriptor(account_index);
+        let wallet = test_hardware_wallet(wallet_descriptor.account_index);
+        let wallet_metadata = store
+            .new_hardware_wallet_metadata(
+                TEST_PASSWORD,
+                &wallet_id,
+                &format!("Ledger wallet {account_index}"),
+                wallet_descriptor.clone(),
+            )
+            .expect("hardware metadata");
+        store
+            .store_hardware_derived_wallet_with_metadata(
+                TEST_PASSWORD,
+                &wallet_id,
+                wallet_descriptor.account_index,
+                &wallet,
+                &wallet_metadata,
+            )
+            .expect("store hardware wallet");
+        let view_session = store
+            .load_view_session(TEST_PASSWORD, &wallet_id)
+            .expect("load hardware view session");
+        let descriptor = HardwarePublicAccountDescriptor::for_wallet_public_index(
+            HardwareDeviceKind::Ledger,
+            view_session.derivation_index(),
+            0,
+        )
+        .expect("hardware public descriptor");
+        let address = Address::from([0x44 + u8::try_from(account_index).expect("index fits"); 20]);
+
+        let account = store
+            .add_hardware_public_account(&view_session, descriptor.clone(), address, None)
+            .expect("add hardware public account");
+
+        assert_eq!(account.derivation_index, Some(0));
+        assert_eq!(account.hardware_descriptor.as_ref(), Some(&descriptor));
+        assert_eq!(descriptor.wallet_account_index, account_index);
+        assert_eq!(descriptor.public_account_index, 0);
+    }
+
+    let first_session = store
+        .load_view_session(TEST_PASSWORD, "hardware-public-wallet-0")
+        .expect("load first session");
+    let second_session = store
+        .load_view_session(TEST_PASSWORD, "hardware-public-wallet-1")
+        .expect("load second session");
+    let first = store
+        .list_public_accounts_for_session(&first_session, true)
+        .expect("first public accounts");
+    let second = store
+        .list_public_accounts_for_session(&second_session, true)
+        .expect("second public accounts");
+
+    assert_eq!(
+        first[0]
+            .hardware_descriptor
+            .as_ref()
+            .expect("first hardware descriptor")
+            .path_display(),
+        "m/44'/60'/0'/0/0",
+    );
+    assert_eq!(
+        second[0]
+            .hardware_descriptor
+            .as_ref()
+            .expect("second hardware descriptor")
+            .path_display(),
+        "m/44'/60'/1'/0/0",
+    );
+
+    drop(store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn hardware_profile_account_index_auto_increments() {
+    let (root_dir, db, store) = desktop_store_with_vault();
+    let profile = HardwareWalletProfile {
+        device_kind: crate::hardware::HardwareDeviceKind::Ledger,
+        profile_fingerprint: "ledger-profile-fingerprint".to_owned(),
+    };
+    assert_eq!(
+        store
+            .next_hardware_account_index_for_profile(TEST_PASSWORD, &profile)
+            .expect("next empty index"),
+        0
+    );
+
+    for (wallet_id, label, account_index) in [
+        ("hardware-wallet-0", "Ledger wallet 0", 0),
+        ("hardware-wallet-2", "Ledger wallet 2", 2),
+    ] {
+        let descriptor = test_hardware_descriptor(account_index);
+        let wallet = test_hardware_wallet(account_index);
+        let metadata = store
+            .new_hardware_wallet_metadata(TEST_PASSWORD, wallet_id, label, descriptor.clone())
+            .expect("hardware metadata");
+        store
+            .store_hardware_derived_wallet_with_metadata(
+                TEST_PASSWORD,
+                wallet_id,
+                account_index,
+                &wallet,
+                &metadata,
+            )
+            .expect("store hardware wallet");
+    }
+
+    assert_eq!(
+        store
+            .next_hardware_account_index_for_profile(TEST_PASSWORD, &profile)
+            .expect("next used index"),
+        3
+    );
+    assert_eq!(
+        store
+            .list_hardware_wallet_profiles(TEST_PASSWORD)
+            .expect("profiles"),
+        vec![profile]
+    );
+
+    drop(store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn deleted_hardware_wallet_account_index_remains_reserved() {
+    let (root_dir, db, store) = desktop_store_with_vault();
+    let primary_session = import_wallet_with_metadata(&store, "software-wallet", "Software");
+    let profile = HardwareWalletProfile {
+        device_kind: crate::hardware::HardwareDeviceKind::Ledger,
+        profile_fingerprint: "ledger-profile-fingerprint".to_owned(),
+    };
+    let descriptor = test_hardware_descriptor(0);
+    let wallet = test_hardware_wallet(0);
+    let metadata = store
+        .new_hardware_wallet_metadata(
+            TEST_PASSWORD,
+            "hardware-wallet-0",
+            "Ledger wallet 0",
+            descriptor,
+        )
+        .expect("hardware metadata");
+    store
+        .store_hardware_derived_wallet_with_metadata(
+            TEST_PASSWORD,
+            "hardware-wallet-0",
+            0,
+            &wallet,
+            &metadata,
+        )
+        .expect("store hardware wallet");
+    for record in db
+        .list_desktop_wallet_vault_records(HARDWARE_WALLET_ACCOUNT_INDEX_PREFIX)
+        .expect("list hardware index reservations")
+    {
+        db.delete_desktop_wallet_vault_record(&record.key)
+            .expect("delete setup reservation");
+    }
+
+    store
+        .delete_wallet_for_session(&primary_session, "hardware-wallet-0")
+        .expect("delete hardware wallet");
+
+    assert_eq!(
+        store
+            .next_hardware_account_index_for_profile(TEST_PASSWORD, &profile)
+            .expect("next reserved index"),
+        1
+    );
+
+    let descriptor = test_hardware_descriptor(0);
+    let wallet = test_hardware_wallet(0);
+    let metadata = store
+        .new_hardware_wallet_metadata(
+            TEST_PASSWORD,
+            "hardware-wallet-restored",
+            "Ledger wallet restored",
+            descriptor.clone(),
+        )
+        .expect("explicit restore metadata");
+    store
+        .store_hardware_derived_wallet_with_metadata(
+            TEST_PASSWORD,
+            "hardware-wallet-restored",
+            0,
+            &wallet,
+            &metadata,
+        )
+        .expect("store restored hardware wallet");
+    let loaded = store
+        .load_wallet_metadata(TEST_PASSWORD, "hardware-wallet-restored")
+        .expect("load restored hardware metadata");
+    assert_eq!(loaded.hardware_descriptor, Some(descriptor));
+    assert_eq!(
+        store
+            .next_hardware_account_index_for_profile(TEST_PASSWORD, &profile)
+            .expect("next index after explicit restore"),
+        1
+    );
+
+    drop(store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn hardware_wallet_account_index_rejects_existing_inactive_wallet() {
+    let (root_dir, db, store) = desktop_store_with_vault();
+    let _primary_session = import_wallet_with_metadata(&store, "software-wallet", "Software");
+    let descriptor = test_hardware_descriptor(0);
+    let wallet = test_hardware_wallet(0);
+    let metadata = store
+        .new_hardware_wallet_metadata(
+            TEST_PASSWORD,
+            "hardware-wallet-0",
+            "Ledger wallet 0",
+            descriptor.clone(),
+        )
+        .expect("hardware metadata");
+    store
+        .store_hardware_derived_wallet_with_metadata(
+            TEST_PASSWORD,
+            "hardware-wallet-0",
+            0,
+            &wallet,
+            &metadata,
+        )
+        .expect("store hardware wallet");
+    store
+        .deactivate_wallet(TEST_PASSWORD, "hardware-wallet-0")
+        .expect("deactivate hardware wallet");
+
+    assert!(matches!(
+        store.new_hardware_wallet_metadata(
+            TEST_PASSWORD,
+            "hardware-wallet-copy",
+            "Ledger wallet copy",
+            descriptor,
+        ),
+        Err(VaultError::DuplicateHardwareWalletAccountIndex)
+    ));
+
+    drop(store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn hardware_wallet_metadata_rejects_duplicate_labels_and_invalid_sources() {
+    let (root_dir, db, store) = desktop_store_with_vault();
+    let descriptor = test_hardware_descriptor(0);
+    let wallet = test_hardware_wallet(0);
+    let metadata = store
+        .new_hardware_wallet_metadata(
+            TEST_PASSWORD,
+            "hardware-wallet-a",
+            "Ledger wallet",
+            descriptor,
+        )
+        .expect("hardware metadata");
+    store
+        .store_hardware_derived_wallet_with_metadata(
+            TEST_PASSWORD,
+            "hardware-wallet-a",
+            0,
+            &wallet,
+            &metadata,
+        )
+        .expect("store hardware wallet");
+
+    assert!(matches!(
+        store.new_hardware_wallet_metadata(
+            TEST_PASSWORD,
+            "hardware-wallet-b",
+            "Ledger wallet",
+            test_hardware_descriptor(1),
+        ),
+        Err(VaultError::DuplicateWalletLabel)
+    ));
+
+    let mut invalid = metadata;
+    invalid.source = WalletSource::Imported;
+    assert!(matches!(
+        store.store_hardware_derived_wallet_with_metadata(
+            TEST_PASSWORD,
+            "hardware-wallet-a",
+            0,
+            &wallet,
+            &invalid,
+        ),
+        Err(VaultError::InvalidHardwareWalletDescriptor)
+    ));
 
     drop(store);
     drop(db);
@@ -762,7 +1256,7 @@ fn broadcaster_preferences_validate_dedupe_remove_and_exclude() {
     let preferences = store
         .list_broadcaster_preferences_for_session(&view_session)
         .expect("preferences after duplicate");
-    assert_eq!(preferences.favorites, vec![favorite.clone()]);
+    assert_eq!(preferences.favorites, vec![favorite]);
     assert!(preferences.banned.is_empty());
 
     let banned = store
@@ -807,9 +1301,7 @@ fn broadcaster_preferences_banned_wins_and_invalid_persisted_entries_are_ignored
     let view_session =
         import_wallet_with_metadata(&store, "broadcaster-pref-inconsistent", "Prefs");
     let address = railgun_recipient_for_derivation(15);
-    let entry = BroadcasterPreferenceEntry {
-        address: address.clone(),
-    };
+    let entry = BroadcasterPreferenceEntry { address };
     let favorite_uuid = generate_opaque_id().expect("favorite id");
     let banned_uuid = generate_opaque_id().expect("banned id");
     let invalid_uuid = generate_opaque_id().expect("invalid id");
@@ -1364,6 +1856,20 @@ fn wallet_label_validation_defaults_update_reorder_and_deactivate() {
         store.new_wallet_metadata(TEST_PASSWORD, "empty", 0, WalletSource::Imported, "   "),
         Err(VaultError::InvalidWalletLabel)
     ));
+    assert!(matches!(
+        store.preflight_new_wallet_metadata(TEST_PASSWORD, "primary wallet"),
+        Err(VaultError::DuplicateWalletLabel)
+    ));
+    assert!(matches!(
+        store.preflight_new_wallet_metadata(TEST_PASSWORD, "   "),
+        Err(VaultError::InvalidWalletLabel)
+    ));
+    assert_eq!(
+        store
+            .preflight_new_wallet_metadata(TEST_PASSWORD, "  Wallet 2  ")
+            .expect("preflight new label"),
+        "Wallet 2"
+    );
 
     let second_wallet_id = "second-wallet";
     let second_metadata = store
@@ -1992,6 +2498,7 @@ fn opaque_wallet_metadata_keeps_chain_details_encrypted() {
         source: WalletSource::Imported,
         status: WalletStatus::Active,
         display_order: 0,
+        hardware_descriptor: None,
     };
     let chain_metadata = WalletChainMetadataBundle {
         wallet_chain_uuid: wallet_chain_uuid.clone(),

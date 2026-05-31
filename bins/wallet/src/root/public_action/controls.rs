@@ -92,8 +92,13 @@ pub(in crate::root) fn render_public_action_active_status_notice(
     root: Entity<WalletRoot>,
     mode: PublicActionMode,
     step: &PublicActionStepState,
+    requires_device_approval: bool,
+    command_available: bool,
 ) -> gpui::Div {
     let step_kind = step.step;
+    let discard_available = public_action_discard_attempt_available(command_available, step);
+    let view_root = root.clone();
+    let discard_root = root;
     let title = match (mode, step.status) {
         (PublicActionMode::Shield, PublicActionStepStatus::Error) => {
             "Public shield needs attention"
@@ -105,7 +110,12 @@ pub(in crate::root) fn render_public_action_active_status_notice(
     let detail = format!(
         "{}: {}",
         public_action_step_label(step.step),
-        public_action_step_detail(step.step, step.status)
+        public_action_step_detail_for_context(
+            step.step,
+            step.status,
+            requires_device_approval,
+            step.tx_hash.is_some(),
+        )
     );
     div()
         .flex()
@@ -128,20 +138,45 @@ pub(in crate::root) fn render_public_action_active_status_notice(
                 .child(app_muted_text(detail).whitespace_normal()),
         )
         .child(
-            app_button(
-                SharedString::from(format!(
-                    "wallet-public-action-{}-view-progress",
-                    public_action_step_id(step_kind)
-                )),
-                "View status",
-            )
-            .outline()
-            .small()
-            .on_click(move |_event, window, cx| {
-                root.update(cx, |root, cx| {
-                    root.show_public_action_progress_dialog(window, cx);
-                });
-            }),
+            div()
+                .flex()
+                .flex_wrap()
+                .justify_end()
+                .gap_2()
+                .child(
+                    app_button(
+                        SharedString::from(format!(
+                            "wallet-public-action-{}-view-progress",
+                            public_action_step_id(step_kind)
+                        )),
+                        "View status",
+                    )
+                    .outline()
+                    .small()
+                    .on_click(move |_event, window, cx| {
+                        view_root.update(cx, |root, cx| {
+                            root.show_public_action_progress_dialog(window, cx);
+                        });
+                    }),
+                )
+                .when(discard_available, |this| {
+                    this.child(
+                        app_button(
+                            SharedString::from(format!(
+                                "wallet-public-action-{}-discard-attempt",
+                                public_action_step_id(step_kind)
+                            )),
+                            "Discard attempt",
+                        )
+                        .danger()
+                        .small()
+                        .on_click(move |_event, _window, cx| {
+                            discard_root.update(cx, |root, cx| {
+                                root.discard_public_action_attempt(cx);
+                            });
+                        }),
+                    )
+                }),
         )
 }
 

@@ -242,6 +242,8 @@ impl WalletRoot {
                 progress_root,
                 mode,
                 active_step,
+                self.public_form.action_requires_device_approval,
+                self.public_form.action_command_tx.is_some(),
             ));
         }
 
@@ -298,6 +300,7 @@ impl WalletRoot {
         self.public_form.action_progress.clear();
         self.public_form.expanded_action_error_steps.clear();
         self.public_form.action_progress_dialog_open = false;
+        self.public_form.action_requires_device_approval = false;
         self.public_form.action_progress_asset_label = Arc::from("");
         self.public_form.action_progress_icon_path = None;
         self.public_form.action_stop_available = false;
@@ -412,6 +415,7 @@ impl WalletRoot {
         asset: PublicAssetId,
         asset_label: String,
         icon_path: Option<WalletIconSource>,
+        public_account_source: PublicAccountSource,
         command_tx: Option<PublicActionCommandSender>,
         initial_gas_fee: Option<(u128, u128)>,
     ) -> u64 {
@@ -421,6 +425,8 @@ impl WalletRoot {
         self.public_form.action_progress_asset_label = Arc::from(asset_label);
         self.public_form.action_progress_icon_path = icon_path;
         self.public_form.action_progress_dialog_open = false;
+        self.public_form.action_requires_device_approval =
+            public_account_source == PublicAccountSource::HardwareDerived;
         self.public_form.action_task_abort_handle = None;
         self.public_form.action_stop_available = true;
         self.public_form.action_stopped = false;
@@ -428,15 +434,16 @@ impl WalletRoot {
         self.public_form.action_attempts.clear();
         self.public_form.action_current_gas_fee = initial_gas_fee;
         self.public_form.action_action_error = None;
-        self.public_form.action_progress = public_action_progress_steps(mode, asset)
-            .into_iter()
-            .map(|step| PublicActionStepState {
-                step,
-                status: PublicActionStepStatus::NotStarted,
-                tx_hash: None,
-                message: None,
-            })
-            .collect();
+        self.public_form.action_progress =
+            public_action_progress_steps_for_source(mode, asset, public_account_source)
+                .into_iter()
+                .map(|step| PublicActionStepState {
+                    step,
+                    status: PublicActionStepStatus::NotStarted,
+                    tx_hash: None,
+                    message: None,
+                })
+                .collect();
         if let Some(first) = self.public_form.action_progress.first_mut() {
             first.status = PublicActionStepStatus::Pending;
         }
@@ -650,14 +657,10 @@ impl WalletRoot {
                     format!("{} {}", public_action_mode_verb(mode), asset_label.as_ref()),
                     icon_path.clone(),
                 ))
-                .on_close(move |_event, _window, cx| {
+                .on_close(move |_event, window, cx| {
                     close_root.update(cx, |root, cx| {
                         if root.public_form.action_generation == generation {
-                            if root.public_form.action_stopped {
-                                root.clear_public_action_progress_state();
-                            } else {
-                                root.public_form.action_progress_dialog_open = false;
-                            }
+                            root.apply_public_action_progress_dialog_close(window, cx, false);
                             cx.notify();
                         }
                     });
@@ -667,6 +670,15 @@ impl WalletRoot {
                         .read(cx)
                         .render_public_action_progress_dialog_content(&content_root, content_width),
                 )
+        });
+    }
+
+    pub(in crate::root) fn show_public_action_progress_dialog_after_close(
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        cx.defer_in(window, |root, window, cx| {
+            root.show_public_action_progress_dialog(window, cx);
         });
     }
 
@@ -693,18 +705,58 @@ impl WalletRoot {
         cx.notify();
     }
 
+    pub(in crate::root) fn discard_public_action_attempt(&mut self, cx: &mut Context<'_, Self>) {
+        if self.public_form.action_command_tx.is_none() {
+            return;
+        }
+        self.public_form.action_generation = self.public_form.action_generation.wrapping_add(1);
+        match self.public_form.action_mode {
+            PublicActionMode::Shield => self.public_form.shielding = false,
+            PublicActionMode::Send => self.public_form.sending = false,
+        }
+        self.clear_public_action_progress_state();
+        cx.notify();
+    }
+
     pub(in crate::root) fn close_public_action_progress_dialog(
         &mut self,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.public_form.action_stopped {
-            self.clear_public_action_progress_state();
-        } else {
-            self.public_form.action_progress_dialog_open = false;
-        }
-        window.close_dialog(cx);
+        self.apply_public_action_progress_dialog_close(window, cx, true);
         cx.notify();
+    }
+
+    fn apply_public_action_progress_dialog_close(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+        close_top_dialog: bool,
+    ) {
+        match progress_dialog_close_behavior(
+            public_action_progress_is_successful(&self.public_form.action_progress),
+            self.public_form.action_stopped,
+        ) {
+            ProgressDialogCloseBehavior::AllAndClear => {
+                self.public_form.sending = false;
+                self.public_form.shielding = false;
+                self.clear_public_action_dialog_inputs(window, cx);
+                self.clear_public_action_progress_state();
+                window.close_all_dialogs(cx);
+            }
+            ProgressDialogCloseBehavior::TopAndClear => {
+                self.clear_public_action_progress_state();
+                if close_top_dialog {
+                    window.close_dialog(cx);
+                }
+            }
+            ProgressDialogCloseBehavior::TopOnly => {
+                self.public_form.action_progress_dialog_open = false;
+                if close_top_dialog {
+                    window.close_dialog(cx);
+                }
+            }
+        }
     }
 
     pub(in crate::root) fn render_public_action_progress_dialog_content(
@@ -728,6 +780,7 @@ impl WalletRoot {
                     &self.public_form.action_progress,
                     &self.public_form.expanded_action_error_steps,
                     self.public_form.action_progress_asset_label.as_ref(),
+                    self.public_form.action_requires_device_approval,
                     self.public_form.action_command_tx.is_some(),
                     self.public_form.action_current_gas_fee,
                     self.public_form.action_action_error.as_deref(),
@@ -813,7 +866,9 @@ impl WalletRoot {
             return;
         };
         let kind = match retry_kind {
-            PublicActionGasRetryKind::RetryEstimate => PublicActionCommandKind::Retry,
+            PublicActionGasRetryKind::RetryStep | PublicActionGasRetryKind::RetryEstimate => {
+                PublicActionCommandKind::Retry
+            }
             PublicActionGasRetryKind::SpeedUp => PublicActionCommandKind::Replacement,
         };
         let send_result = command_tx.send(PublicActionCommand {
@@ -822,6 +877,34 @@ impl WalletRoot {
                 max_fee_per_gas,
                 max_priority_fee_per_gas,
             },
+        });
+        self.public_form.action_action_error = send_result
+            .err()
+            .map(|_| Arc::from("Public action is no longer accepting retry commands."));
+        cx.notify();
+    }
+
+    pub(in crate::root) fn submit_public_action_step_retry(
+        &mut self,
+        generation: u64,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.public_form.action_generation != generation {
+            return;
+        }
+        let Some(command_tx) = self.public_form.action_command_tx.as_ref() else {
+            return;
+        };
+        let gas_fee = self.public_form.action_current_gas_fee.map_or(
+            PublicActionGasFeeSelection::Auto,
+            |(max_fee_per_gas, max_priority_fee_per_gas)| PublicActionGasFeeSelection::Custom {
+                max_fee_per_gas,
+                max_priority_fee_per_gas,
+            },
+        );
+        let send_result = command_tx.send(PublicActionCommand {
+            kind: PublicActionCommandKind::Retry,
+            gas_fee,
         });
         self.public_form.action_action_error = send_result
             .err()
@@ -1014,12 +1097,22 @@ impl WalletRoot {
         let Some(draft) = self.public_send_draft(cx) else {
             return;
         };
-        self.request_spend_authorization(
-            SpendAuthorizationIntent::PublicSend,
-            public_send_authorization_summary(&draft),
-            window,
-            cx,
-        );
+        let summary = public_send_authorization_summary(&draft);
+        if draft.public_account_source == PublicAccountSource::HardwareDerived {
+            Self::open_hardware_public_action_authorization_dialog(
+                SpendAuthorizationIntent::PublicSend,
+                summary,
+                window,
+                cx,
+            );
+        } else {
+            self.request_spend_authorization(
+                SpendAuthorizationIntent::PublicSend,
+                summary,
+                window,
+                cx,
+            );
+        }
     }
 
     pub(in crate::root) fn public_send_draft(
@@ -1053,15 +1146,15 @@ impl WalletRoot {
             public_action_asset_label(chain_id, asset, Some(&self.effective_token_registry));
         let asset_icon_path =
             public_asset_icon_path(chain_id, asset, Some(&self.effective_token_registry));
-        let public_account_label = self
-            .public_account_for_uuid(Some(public_account_uuid.as_ref()))
-            .map_or_else(
-                || public_account_uuid.to_string(),
-                |account| {
-                    public_account_display_label(account)
-                        .unwrap_or_else(|| short_address(&account.address))
-                },
-            );
+        let Some(public_account) = self.public_account_for_uuid(Some(public_account_uuid.as_ref()))
+        else {
+            self.public_form.send_error = Some(Arc::from("Selected public account was not found"));
+            cx.notify();
+            return None;
+        };
+        let public_account_label = public_account_display_label(public_account)
+            .unwrap_or_else(|| short_address(&public_account.address));
+        let public_account_source = public_account.source;
         let amount_input = self
             .public_form
             .send_amount_input
@@ -1108,6 +1201,7 @@ impl WalletRoot {
             asset_decimals,
             public_account_uuid,
             public_account_label,
+            public_account_source,
             view_session,
             vault_store,
             amount,
@@ -1119,7 +1213,7 @@ impl WalletRoot {
     pub(in crate::root) fn submit_public_send_authorized(
         &mut self,
         vault_password: Zeroizing<String>,
-        window: &mut Window,
+        window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
         if self.public_form.sending {
@@ -1133,6 +1227,7 @@ impl WalletRoot {
             asset,
             asset_label,
             public_account_uuid,
+            public_account_source,
             view_session,
             vault_store,
             amount,
@@ -1155,6 +1250,7 @@ impl WalletRoot {
             asset,
             asset_label,
             icon_path,
+            public_account_source,
             Some(command_tx),
             initial_gas_fee,
         );
@@ -1173,7 +1269,7 @@ impl WalletRoot {
             event_rx,
             cx,
         );
-        self.show_public_action_progress_dialog(window, cx);
+        Self::show_public_action_progress_dialog_after_close(window, cx);
         let request = PublicSendRequest {
             chain_id,
             effective_chain: self.effective_chain_configs.get(&chain_id).cloned(),
@@ -1260,12 +1356,22 @@ impl WalletRoot {
         let Some(draft) = self.public_shield_draft(cx) else {
             return;
         };
-        self.request_spend_authorization(
-            SpendAuthorizationIntent::PublicShield,
-            public_shield_authorization_summary(&draft),
-            window,
-            cx,
-        );
+        let summary = public_shield_authorization_summary(&draft);
+        if draft.public_account_source == PublicAccountSource::HardwareDerived {
+            Self::open_hardware_public_action_authorization_dialog(
+                SpendAuthorizationIntent::PublicShield,
+                summary,
+                window,
+                cx,
+            );
+        } else {
+            self.request_spend_authorization(
+                SpendAuthorizationIntent::PublicShield,
+                summary,
+                window,
+                cx,
+            );
+        }
     }
 
     pub(in crate::root) fn public_shield_draft(
@@ -1299,15 +1405,16 @@ impl WalletRoot {
             public_action_asset_label(chain_id, asset, Some(&self.effective_token_registry));
         let asset_icon_path =
             public_asset_icon_path(chain_id, asset, Some(&self.effective_token_registry));
-        let public_account_label = self
-            .public_account_for_uuid(Some(public_account_uuid.as_ref()))
-            .map_or_else(
-                || public_account_uuid.to_string(),
-                |account| {
-                    public_account_display_label(account)
-                        .unwrap_or_else(|| short_address(&account.address))
-                },
-            );
+        let Some(public_account) = self.public_account_for_uuid(Some(public_account_uuid.as_ref()))
+        else {
+            self.public_form.shield_error =
+                Some(Arc::from("Selected public account was not found"));
+            cx.notify();
+            return None;
+        };
+        let public_account_label = public_account_display_label(public_account)
+            .unwrap_or_else(|| short_address(&public_account.address));
+        let public_account_source = public_account.source;
         let amount_input = self
             .public_form
             .shield_amount_input
@@ -1343,6 +1450,7 @@ impl WalletRoot {
             asset_decimals,
             public_account_uuid,
             public_account_label,
+            public_account_source,
             view_session,
             vault_store,
             amount,
@@ -1353,7 +1461,7 @@ impl WalletRoot {
     pub(in crate::root) fn submit_public_shield_authorized(
         &mut self,
         vault_password: Zeroizing<String>,
-        window: &mut Window,
+        window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
         if self.public_form.shielding {
@@ -1367,6 +1475,7 @@ impl WalletRoot {
             asset,
             asset_label,
             public_account_uuid,
+            public_account_source,
             view_session,
             vault_store,
             amount,
@@ -1388,6 +1497,7 @@ impl WalletRoot {
             asset,
             asset_label,
             icon_path,
+            public_account_source,
             Some(command_tx),
             initial_gas_fee,
         );
@@ -1406,7 +1516,7 @@ impl WalletRoot {
             event_rx,
             cx,
         );
-        self.show_public_action_progress_dialog(window, cx);
+        Self::show_public_action_progress_dialog_after_close(window, cx);
         let request = PublicShieldRequest {
             chain_id,
             effective_chain: self.effective_chain_configs.get(&chain_id).cloned(),

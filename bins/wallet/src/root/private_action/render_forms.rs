@@ -265,7 +265,7 @@ impl WalletRoot {
                 form.delivery_mode,
                 DeliveryMode::PublicBroadcaster | DeliveryMode::SelfBroadcast
             )
-            && let Some((flow, stage)) = private_broadcaster_closed_active_progress(
+            && let Some(active) = private_broadcaster_closed_active_progress(
                 self.private_broadcaster_progress.as_ref(),
                 DeliveryFormKind::Send,
                 key,
@@ -276,8 +276,7 @@ impl WalletRoot {
                 progress_root.clone(),
                 key,
                 DeliveryFormKind::Send,
-                flow,
-                stage,
+                &active,
             ));
         }
 
@@ -605,7 +604,7 @@ impl WalletRoot {
                 form.delivery_mode,
                 DeliveryMode::PublicBroadcaster | DeliveryMode::SelfBroadcast
             )
-            && let Some((flow, stage)) = private_broadcaster_closed_active_progress(
+            && let Some(active) = private_broadcaster_closed_active_progress(
                 self.private_broadcaster_progress.as_ref(),
                 DeliveryFormKind::Unshield,
                 key,
@@ -616,8 +615,7 @@ impl WalletRoot {
                 progress_root.clone(),
                 key,
                 DeliveryFormKind::Unshield,
-                flow,
-                stage,
+                &active,
             ));
         }
 

@@ -217,7 +217,16 @@ impl WalletRoot {
     }
 
     fn selected_wallet_sync_start_policy(&self) -> DesktopWalletSyncStartPolicy {
-        DesktopWalletSyncStartPolicy::from(self.selected_wallet_source())
+        let Some(selected_wallet_id) = self.selected_wallet_id.as_ref() else {
+            return DesktopWalletSyncStartPolicy::ImportedHistoricalBackfill;
+        };
+        self.wallet_metadata
+            .iter()
+            .find(|metadata| metadata.wallet_uuid == selected_wallet_id.as_ref())
+            .map_or(
+                DesktopWalletSyncStartPolicy::ImportedHistoricalBackfill,
+                DesktopWalletSyncStartPolicy::from,
+            )
     }
 
     pub(super) fn selected_chain_wallet_start_block(&self) -> Option<u64> {

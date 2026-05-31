@@ -19,7 +19,8 @@ use wallet_ops::{
 use super::gas_fee::{GasRetryInputs, format_gwei};
 use super::private_action::{delivery_element_id, private_action_title_row};
 use super::public_action::{
-    ProgressFooterAction, PublicActionStepStatus, progress_footer_action, public_action_step_color,
+    ProgressDialogCloseBehavior, ProgressFooterAction, PublicActionStepStatus,
+    progress_dialog_close_behavior, progress_footer_action, public_action_step_color,
     render_public_action_step_marker,
 };
 use super::public_broadcaster_cost::{
@@ -27,6 +28,7 @@ use super::public_broadcaster_cost::{
     private_broadcaster_context_row, render_private_broadcaster_progress_context,
     render_public_broadcaster_tx_hash_row,
 };
+use super::spend_authorization::spend_authorization_recipient_display;
 use super::{
     DeliveryFormKind, PRIVATE_BROADCASTER_PROGRESS_DIALOG_WIDTH, UnshieldAssetKey, WalletRoot,
     format_native_token_amount_for_display, secondary_dialog_content_width,
@@ -72,6 +74,13 @@ pub(super) struct PrivateBroadcasterProgressStepState {
     pub(super) stage: TransactionGenerationStage,
     pub(super) status: PublicActionStepStatus,
     pub(super) message: Option<Arc<str>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PrivateBroadcasterClosedActiveProgress {
+    pub(super) flow: PrivateSubmissionProgressFlow,
+    pub(super) generation_id: u64,
+    pub(super) step: PrivateBroadcasterProgressStepState,
 }
 
 pub(super) struct PrivateBroadcasterProgressState {
@@ -121,6 +130,7 @@ impl PrivateBroadcasterProgressState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SelfBroadcastGasRetryKind {
+    RetryStep,
     RetryEstimate,
     SpeedUp,
 }
@@ -197,10 +207,14 @@ impl SelfBroadcastGasRetryDialogContent {
 impl gpui::Render for SelfBroadcastGasRetryDialogContent {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let title = match self.retry_kind {
+            SelfBroadcastGasRetryKind::RetryStep => "Retry step",
             SelfBroadcastGasRetryKind::RetryEstimate => "Retry with custom gas",
             SelfBroadcastGasRetryKind::SpeedUp => "Speed up transaction",
         };
         let detail = match self.retry_kind {
+            SelfBroadcastGasRetryKind::RetryStep => {
+                "Retry signing and sending this self-broadcast step with the current gas fee values."
+            }
             SelfBroadcastGasRetryKind::RetryEstimate => {
                 "Retry gas estimation and signing using these EIP-1559 fee values."
             }
@@ -353,7 +367,7 @@ pub(super) fn private_broadcaster_closed_active_progress(
     kind: DeliveryFormKind,
     key: UnshieldAssetKey,
     generation_id: u64,
-) -> Option<(PrivateSubmissionProgressFlow, TransactionGenerationStage)> {
+) -> Option<PrivateBroadcasterClosedActiveProgress> {
     let progress = progress?;
     if !progress.accepts_update(kind, key, generation_id)
         || progress.dialog_open
@@ -361,11 +375,21 @@ pub(super) fn private_broadcaster_closed_active_progress(
     {
         return None;
     }
-    progress
+    let step = progress
         .steps
         .iter()
         .find(|step| step.status == PublicActionStepStatus::Pending)
-        .map(|step| (progress.flow, step.stage))
+        .or_else(|| {
+            progress
+                .steps
+                .iter()
+                .find(|step| step.status == PublicActionStepStatus::Error)
+        })?;
+    Some(PrivateBroadcasterClosedActiveProgress {
+        flow: progress.flow,
+        generation_id: progress.generation_id,
+        step: step.clone(),
+    })
 }
 
 #[cfg(test)]
@@ -376,7 +400,13 @@ pub(super) fn private_broadcaster_closed_active_stage(
     generation_id: u64,
 ) -> Option<TransactionGenerationStage> {
     private_broadcaster_closed_active_progress(progress, kind, key, generation_id)
-        .map(|(_, stage)| stage)
+        .map(|active| active.step.stage)
+}
+
+pub(super) const fn private_submission_discard_attempt_available(
+    active: &PrivateBroadcasterClosedActiveProgress,
+) -> bool {
+    matches!(active.step.status, PublicActionStepStatus::Error)
 }
 
 pub(super) const fn private_progress_stage_disables_stop(
@@ -439,6 +469,22 @@ pub(super) fn private_broadcaster_progress_is_terminal(
                         PublicActionStepStatus::Error | PublicActionStepStatus::Stopped
                     )
                 })))
+}
+
+pub(super) fn private_broadcaster_progress_is_successful(
+    progress: &PrivateBroadcasterProgressState,
+) -> bool {
+    match progress.flow {
+        PrivateSubmissionProgressFlow::PublicBroadcaster => {
+            progress.result.as_ref().is_some_and(|result| {
+                matches!(result.result, PublicBroadcasterResultKind::Submitted { .. })
+            })
+        }
+        PrivateSubmissionProgressFlow::SelfBroadcast => progress
+            .self_broadcast_result
+            .as_ref()
+            .is_some_and(|result| result.tx.status),
+    }
 }
 
 pub(super) fn mark_private_broadcaster_active_step_stopped(
@@ -619,7 +665,7 @@ impl WalletRoot {
                     None,
                     false,
                 ))
-                .on_close(move |_event, _window, cx| {
+                .on_close(move |_event, window, cx| {
                     close_root.update(cx, |root, cx| {
                         let matches_progress = root
                             .private_broadcaster_progress
@@ -632,15 +678,7 @@ impl WalletRoot {
                         if !matches_progress {
                             return;
                         }
-                        if root
-                            .private_broadcaster_progress
-                            .as_ref()
-                            .is_some_and(|progress| progress.stopped)
-                        {
-                            root.clear_private_broadcaster_progress_state();
-                        } else if let Some(progress) = root.private_broadcaster_progress.as_mut() {
-                            progress.dialog_open = false;
-                        }
+                        root.apply_private_broadcaster_progress_dialog_close(window, cx, false);
                         cx.notify();
                     });
                 })
@@ -696,22 +734,100 @@ impl WalletRoot {
         cx.notify();
     }
 
+    fn discard_private_submission_attempt(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        generation_id: u64,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let matches_progress = self
+            .private_broadcaster_progress
+            .as_ref()
+            .is_some_and(|progress| {
+                progress.kind == kind
+                    && progress.key == key
+                    && progress.generation_id == generation_id
+                    && progress
+                        .steps
+                        .iter()
+                        .any(|step| matches!(step.status, PublicActionStepStatus::Error))
+            });
+        if !matches_progress {
+            return;
+        }
+        match kind {
+            DeliveryFormKind::Send => {
+                if let Some(form) = self.send_forms.get_mut(&key)
+                    && form.generation_id == generation_id
+                {
+                    form.generating = false;
+                    form.error = None;
+                }
+            }
+            DeliveryFormKind::Unshield => {
+                if let Some(form) = self.unshield_forms.get_mut(&key)
+                    && form.generation_id == generation_id
+                {
+                    form.generating = false;
+                    form.error = None;
+                }
+            }
+        }
+        self.clear_private_broadcaster_progress_state();
+        cx.notify();
+    }
+
     fn close_private_broadcaster_progress_dialog(
         &mut self,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if self
-            .private_broadcaster_progress
-            .as_ref()
-            .is_some_and(|progress| progress.stopped)
-        {
-            self.clear_private_broadcaster_progress_state();
-        } else if let Some(progress) = self.private_broadcaster_progress.as_mut() {
-            progress.dialog_open = false;
-        }
-        window.close_dialog(cx);
+        self.apply_private_broadcaster_progress_dialog_close(window, cx, true);
         cx.notify();
+    }
+
+    fn apply_private_broadcaster_progress_dialog_close(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+        close_top_dialog: bool,
+    ) {
+        let Some(progress) = self.private_broadcaster_progress.as_ref() else {
+            if close_top_dialog {
+                window.close_dialog(cx);
+            }
+            return;
+        };
+        let kind = progress.kind;
+        let key = progress.key;
+        let behavior = progress_dialog_close_behavior(
+            private_broadcaster_progress_is_successful(progress),
+            progress.stopped,
+        );
+        match behavior {
+            ProgressDialogCloseBehavior::AllAndClear => {
+                match kind {
+                    DeliveryFormKind::Send => self.close_send_form(key, cx),
+                    DeliveryFormKind::Unshield => self.close_unshield_form(key, cx),
+                }
+                window.close_all_dialogs(cx);
+            }
+            ProgressDialogCloseBehavior::TopAndClear => {
+                self.clear_private_broadcaster_progress_state();
+                if close_top_dialog {
+                    window.close_dialog(cx);
+                }
+            }
+            ProgressDialogCloseBehavior::TopOnly => {
+                if let Some(progress) = self.private_broadcaster_progress.as_mut() {
+                    progress.dialog_open = false;
+                }
+                if close_top_dialog {
+                    window.close_dialog(cx);
+                }
+            }
+        }
     }
 
     pub(super) fn update_private_broadcaster_progress_stage(
@@ -995,7 +1111,9 @@ impl WalletRoot {
             return;
         };
         let command_kind = match retry_kind {
-            SelfBroadcastGasRetryKind::RetryEstimate => SelfBroadcastCommandKind::Retry,
+            SelfBroadcastGasRetryKind::RetryStep | SelfBroadcastGasRetryKind::RetryEstimate => {
+                SelfBroadcastCommandKind::Retry
+            }
             SelfBroadcastGasRetryKind::SpeedUp => SelfBroadcastCommandKind::Replacement,
         };
         let send_result = command_tx.send(SelfBroadcastCommand {
@@ -1004,6 +1122,41 @@ impl WalletRoot {
                 max_fee_per_gas,
                 max_priority_fee_per_gas,
             },
+        });
+        if let Some(progress) = self.private_broadcaster_progress.as_mut() {
+            progress.self_broadcast_action_error = send_result.err().map(|_| {
+                Arc::from("Self-broadcast session is no longer accepting retry commands.")
+            });
+        }
+        cx.notify();
+    }
+
+    fn submit_self_broadcast_step_retry(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        generation_id: u64,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(progress) = self.private_broadcaster_progress.as_ref() else {
+            return;
+        };
+        if !progress.accepts_update(kind, key, generation_id) {
+            return;
+        }
+        let Some(command_tx) = progress.self_broadcast_command_tx.as_ref() else {
+            return;
+        };
+        let gas_fee = progress.self_broadcast_current_gas_fee.map_or(
+            SelfBroadcastGasFeeSelection::Auto,
+            |(max_fee_per_gas, max_priority_fee_per_gas)| SelfBroadcastGasFeeSelection::Custom {
+                max_fee_per_gas,
+                max_priority_fee_per_gas,
+            },
+        );
+        let send_result = command_tx.send(SelfBroadcastCommand {
+            kind: SelfBroadcastCommandKind::Retry,
+            gas_fee,
         });
         if let Some(progress) = self.private_broadcaster_progress.as_mut() {
             progress.self_broadcast_action_error = send_result.err().map(|_| {
@@ -1085,7 +1238,6 @@ impl WalletRoot {
                     anchor_rate,
                     Some(&self.effective_token_registry),
                 ),
-                settled: true,
             });
         }
         let estimate = progress.estimate.as_ref()?;
@@ -1099,7 +1251,6 @@ impl WalletRoot {
                 anchor_rate,
                 Some(&self.effective_token_registry),
             ),
-            settled: false,
         })
     }
 
@@ -1223,7 +1374,7 @@ fn render_pending_public_broadcaster_progress_context(
         ))
         .child(private_broadcaster_context_row(
             "Recipient",
-            progress.recipient.to_string(),
+            spend_authorization_recipient_display(progress.recipient.as_ref()),
         ))
         .child(cost_estimate_detail_text(
             "Fee and gas cost will appear after the transaction fee is calculated.",
@@ -1251,7 +1402,7 @@ fn render_self_broadcast_progress_context(progress: &PrivateBroadcasterProgressS
         ))
         .child(private_broadcaster_context_row(
             "Recipient",
-            progress.recipient.to_string(),
+            spend_authorization_recipient_display(progress.recipient.as_ref()),
         ));
     if let Some(result) = progress.self_broadcast_result.as_ref() {
         context = context
@@ -1571,19 +1722,9 @@ fn render_self_broadcast_step_action(
     {
         return None;
     }
-    let retry_kind = match (step.stage, step.status) {
-        (
-            TransactionGenerationStage::EstimatingSelfBroadcastGas
-            | TransactionGenerationStage::SigningSelfBroadcast,
-            PublicActionStepStatus::Error,
-        ) => SelfBroadcastGasRetryKind::RetryEstimate,
-        (
-            TransactionGenerationStage::WaitingForSelfBroadcastReceipt,
-            PublicActionStepStatus::Pending,
-        ) if !progress.self_broadcast_attempts.is_empty() => SelfBroadcastGasRetryKind::SpeedUp,
-        _ => return None,
-    };
+    let retry_kind = self_broadcast_step_retry_kind(progress, step)?;
     let label = match retry_kind {
+        SelfBroadcastGasRetryKind::RetryStep => "Retry step",
         SelfBroadcastGasRetryKind::RetryEstimate => "Retry with custom gas",
         SelfBroadcastGasRetryKind::SpeedUp => "Speed up transaction",
     };
@@ -1605,14 +1746,18 @@ fn render_self_broadcast_step_action(
             .outline()
             .on_click(move |_event, window, cx| {
                 root.update(cx, |root, cx| {
-                    root.open_self_broadcast_gas_retry_dialog(
-                        kind,
-                        key,
-                        generation_id,
-                        retry_kind,
-                        window,
-                        cx,
-                    );
+                    if retry_kind == SelfBroadcastGasRetryKind::RetryStep {
+                        root.submit_self_broadcast_step_retry(kind, key, generation_id, cx);
+                    } else {
+                        root.open_self_broadcast_gas_retry_dialog(
+                            kind,
+                            key,
+                            generation_id,
+                            retry_kind,
+                            window,
+                            cx,
+                        );
+                    }
                 });
             }),
         );
@@ -1626,8 +1771,30 @@ fn render_self_broadcast_step_action(
     Some(action.into_any_element())
 }
 
+pub(super) const fn self_broadcast_step_retry_kind(
+    progress: &PrivateBroadcasterProgressState,
+    step: &PrivateBroadcasterProgressStepState,
+) -> Option<SelfBroadcastGasRetryKind> {
+    match (step.stage, step.status) {
+        (TransactionGenerationStage::EstimatingSelfBroadcastGas, PublicActionStepStatus::Error) => {
+            Some(SelfBroadcastGasRetryKind::RetryEstimate)
+        }
+        (TransactionGenerationStage::SigningSelfBroadcast, PublicActionStepStatus::Error) => {
+            Some(SelfBroadcastGasRetryKind::RetryStep)
+        }
+        (
+            TransactionGenerationStage::WaitingForSelfBroadcastReceipt,
+            PublicActionStepStatus::Pending,
+        ) if !progress.self_broadcast_attempts.is_empty() => {
+            Some(SelfBroadcastGasRetryKind::SpeedUp)
+        }
+        _ => None,
+    }
+}
+
 const fn private_broadcaster_retry_button_id(kind: SelfBroadcastGasRetryKind) -> &'static str {
     match kind {
+        SelfBroadcastGasRetryKind::RetryStep => "retry-self-step",
         SelfBroadcastGasRetryKind::RetryEstimate => "retry-self-gas",
         SelfBroadcastGasRetryKind::SpeedUp => "speed-up-self-tx",
     }
@@ -1775,7 +1942,7 @@ pub(super) fn render_private_broadcaster_status_notice(
             theme::WARNING,
         ),
     };
-    render_private_broadcaster_status_notice_box(root, key, kind, title, detail, border)
+    render_private_broadcaster_status_notice_box(root, key, kind, title, detail, border, None)
 }
 
 pub(super) fn render_private_self_broadcast_status_notice(
@@ -1797,28 +1964,66 @@ pub(super) fn render_private_self_broadcast_status_notice(
             theme::DANGER,
         )
     };
-    render_private_broadcaster_status_notice_box(root, key, kind, title, detail, border)
+    render_private_broadcaster_status_notice_box(root, key, kind, title, detail, border, None)
 }
 
 pub(super) fn render_private_submission_active_status_notice(
     root: Entity<WalletRoot>,
     key: UnshieldAssetKey,
     kind: DeliveryFormKind,
-    flow: PrivateSubmissionProgressFlow,
-    stage: TransactionGenerationStage,
+    active: &PrivateBroadcasterClosedActiveProgress,
 ) -> gpui::Div {
-    let title = match flow {
-        PrivateSubmissionProgressFlow::PublicBroadcaster => "Public broadcaster in progress",
-        PrivateSubmissionProgressFlow::SelfBroadcast => "Self-broadcast in progress",
+    let title = match (active.flow, active.step.status) {
+        (PrivateSubmissionProgressFlow::PublicBroadcaster, PublicActionStepStatus::Error) => {
+            "Public broadcaster needs attention"
+        }
+        (PrivateSubmissionProgressFlow::SelfBroadcast, PublicActionStepStatus::Error) => {
+            "Self-broadcast needs attention"
+        }
+        (PrivateSubmissionProgressFlow::PublicBroadcaster, _) => "Public broadcaster in progress",
+        (PrivateSubmissionProgressFlow::SelfBroadcast, _) => "Self-broadcast in progress",
     };
+    let border = if active.step.status == PublicActionStepStatus::Error {
+        theme::DANGER
+    } else {
+        theme::INFO
+    };
+    let discard_generation_id =
+        private_submission_discard_attempt_available(active).then_some(active.generation_id);
     render_private_broadcaster_status_notice_box(
         root,
         key,
         kind,
         title,
-        format!("{}: {}", stage.label(), stage.detail()),
-        theme::INFO,
+        private_submission_active_status_detail(active),
+        border,
+        discard_generation_id,
     )
+}
+
+fn private_submission_active_status_detail(
+    active: &PrivateBroadcasterClosedActiveProgress,
+) -> String {
+    let stage = active.step.stage;
+    let detail = match active.step.status {
+        PublicActionStepStatus::Error => active.step.message.as_deref().map_or_else(
+            || "This private submission step failed.".to_string(),
+            private_submission_error_summary,
+        ),
+        _ => private_broadcaster_stage_detail(stage, active.step.status).to_string(),
+    };
+    format!("{}: {detail}", stage.label())
+}
+
+fn private_submission_error_summary(message: &str) -> String {
+    let normalized = message.to_ascii_lowercase();
+    if normalized.contains("cancel")
+        || normalized.contains("rejected")
+        || normalized.contains("denied")
+    {
+        return "Signing was cancelled.".to_string();
+    }
+    message.to_string()
 }
 
 fn render_private_broadcaster_status_notice_box(
@@ -1828,8 +2033,10 @@ fn render_private_broadcaster_status_notice_box(
     title: impl Into<SharedString>,
     detail: impl Into<SharedString>,
     border: u32,
+    discard_generation_id: Option<u64>,
 ) -> gpui::Div {
-    let button_root = root;
+    let view_root = root.clone();
+    let discard_root = root;
     div()
         .flex()
         .items_center()
@@ -1851,16 +2058,36 @@ fn render_private_broadcaster_status_notice_box(
                 .child(app_muted_text(detail).whitespace_normal()),
         )
         .child(
-            app_button(
-                delivery_element_id(key, kind, "view-broadcaster-progress"),
-                "View status",
-            )
-            .outline()
-            .small()
-            .on_click(move |_event, window, cx| {
-                button_root.update(cx, |root, cx| {
-                    root.show_private_broadcaster_progress_dialog(window, cx);
-                });
-            }),
+            div()
+                .flex()
+                .flex_wrap()
+                .justify_end()
+                .gap_2()
+                .child(
+                    app_button(
+                        delivery_element_id(key, kind, "view-broadcaster-progress"),
+                        "View status",
+                    )
+                    .outline()
+                    .small()
+                    .on_click(move |_event, window, cx| {
+                        view_root.update(cx, |root, cx| {
+                            root.show_private_broadcaster_progress_dialog(window, cx);
+                        });
+                    }),
+                )
+                .children(discard_generation_id.map(|generation_id| {
+                    app_button(
+                        delivery_element_id(key, kind, "discard-attempt"),
+                        "Discard attempt",
+                    )
+                    .danger()
+                    .small()
+                    .on_click(move |_event, _window, cx| {
+                        discard_root.update(cx, |root, cx| {
+                            root.discard_private_submission_attempt(kind, key, generation_id, cx);
+                        });
+                    })
+                })),
         )
 }

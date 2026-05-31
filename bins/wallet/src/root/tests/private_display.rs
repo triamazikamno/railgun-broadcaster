@@ -125,6 +125,26 @@ fn form_error_formats_broadcaster_max_in_token_units() {
 }
 
 #[test]
+fn self_broadcast_software_gas_payers_require_password() {
+    assert!(self_broadcast_requires_software_gas_payer_password(
+        DeliveryMode::SelfBroadcast,
+        Some(wallet_ops::vault::PublicAccountSource::Derived),
+    ));
+    assert!(self_broadcast_requires_software_gas_payer_password(
+        DeliveryMode::SelfBroadcast,
+        Some(wallet_ops::vault::PublicAccountSource::Imported),
+    ));
+    assert!(!self_broadcast_requires_software_gas_payer_password(
+        DeliveryMode::SelfBroadcast,
+        Some(wallet_ops::vault::PublicAccountSource::HardwareDerived),
+    ));
+    assert!(!self_broadcast_requires_software_gas_payer_password(
+        DeliveryMode::PublicBroadcaster,
+        Some(wallet_ops::vault::PublicAccountSource::Derived),
+    ));
+}
+
+#[test]
 fn report_chain_preserves_wrapped_public_broadcaster_error() {
     let asset = UnshieldAsset {
         chain_id: 1,
@@ -327,6 +347,32 @@ fn remembered_spend_authorization_expires_by_lifetime() {
         SpendAuthorizationLifetime::UntilVaultLock,
         Duration::from_secs(60 * 60 * 24),
     ));
+}
+
+#[test]
+fn hardware_spend_authorization_copy_uses_concise_device_language() {
+    let copy = crate::root::spend_authorization::hardware_spend_authorization_instruction("Ledger");
+    let detail = crate::root::spend_authorization::hardware_spend_authorization_detail();
+
+    assert!(copy.contains("intended Ledger passphrase wallet"));
+    assert!(copy.contains("approve the Railgun derivation request"));
+    assert!(!copy.contains("Remembered spend authorization"));
+    assert!(detail.contains("hardware wallet"));
+    assert!(!detail.contains("vault password"));
+}
+
+#[test]
+fn spend_authorization_recipient_display_shortens_long_recipients() {
+    let recipient = "0zk1qy4v02p5zkq0zfpaxhz79j5tslrv8c44d80d8jr2fuecrtxlp8lemrv7j6fe3z53ll0jm7u592n0hr8elesd0xzv6y9jpdvsyln80m95jcxhvnmagfqg5p6e9mp";
+
+    assert_eq!(
+        crate::root::spend_authorization::spend_authorization_recipient_display(recipient),
+        "0zk1qy4v...g5p6e9mp",
+    );
+    assert_eq!(
+        crate::root::spend_authorization::spend_authorization_recipient_display("0x1234"),
+        "0x1234",
+    );
 }
 
 #[test]
@@ -648,6 +694,7 @@ fn public_account_metadata(
         source: wallet_ops::vault::PublicAccountSource::Imported,
         scope: wallet_ops::vault::PublicAccountScope::Global,
         derivation_index: None,
+        hardware_descriptor: None,
         status,
         display_order: 0,
     }

@@ -6,7 +6,7 @@ pub(super) async fn submit_self_broadcast_plan(
     effective_chain: Option<&settings::EffectiveChainConfig>,
     view_session: &vault::DesktopViewSession,
     vault_store: &vault::DesktopVaultStore,
-    vault_password: &str,
+    vault_password: Option<&str>,
     public_account_uuid: String,
     session: Arc<WalletSession>,
     to: Address,
@@ -32,7 +32,6 @@ pub(super) async fn submit_self_broadcast_plan(
             "selected public account signer address does not match account metadata"
         ));
     }
-    let wallet = signer.ethereum_wallet();
     let mut next_gas_fee = gas_fee;
     let mut submitted_attempts = Vec::new();
     let mut nonce = None;
@@ -82,7 +81,7 @@ pub(super) async fn submit_self_broadcast_plan(
             preflight,
             &query_rpc_pool,
             http.network_mode(),
-            &wallet,
+            &signer,
             &session,
             &pending_spent_inputs,
             event_tx.as_ref(),
@@ -184,7 +183,7 @@ pub(super) async fn submit_self_broadcast_plan(
                         replacement,
                         &query_rpc_pool,
                         http.network_mode(),
-                        &wallet,
+                        &signer,
                         &session,
                         &pending_spent_inputs,
                         event_tx.as_ref(),
@@ -238,7 +237,7 @@ pub(super) async fn submit_self_broadcast_attempt(
     preflight: SelfBroadcastPreflight,
     query_rpc_pool: &QueryRpcPool,
     network_mode: WalletNetworkMode,
-    wallet: &EthereumWallet,
+    signer: &VaultedPublicSigner,
     session: &WalletSession,
     pending_spent_inputs: &[Utxo],
     event_tx: Option<&SelfBroadcastSessionEventSender>,
@@ -246,7 +245,7 @@ pub(super) async fn submit_self_broadcast_attempt(
     let sent = sign_send_self_broadcast_transaction(
         query_rpc_pool,
         network_mode,
-        wallet,
+        signer,
         preflight.tx_req,
         session,
         pending_spent_inputs,
@@ -926,7 +925,7 @@ pub(super) struct SelfBroadcastRawTxBroadcastResult {
 pub(super) async fn sign_send_self_broadcast_transaction(
     query_rpc_pool: &QueryRpcPool,
     network_mode: WalletNetworkMode,
-    wallet: &EthereumWallet,
+    signer: &VaultedPublicSigner,
     tx_req: TransactionRequest,
     session: &WalletSession,
     pending_spent_inputs: &[Utxo],
@@ -937,11 +936,9 @@ pub(super) async fn sign_send_self_broadcast_transaction(
         gas = ?tx_req.gas,
         "signing and sending self-broadcast transaction",
     );
-    let signed_tx = tx_req
-        .build(wallet)
-        .await
-        .wrap_err("self-broadcast: sign")?
-        .encoded_2718();
+    let signed_tx = signer
+        .sign_transaction_request(tx_req, "self-broadcast")
+        .await?;
     let tx_hash = keccak256(&signed_tx);
     let provider_handles = self_broadcast_send_raw_transaction_to_rpc_pool(
         query_rpc_pool,

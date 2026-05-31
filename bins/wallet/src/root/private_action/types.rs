@@ -1,7 +1,7 @@
 use super::{
     Address, App, Arc, BroadcasterChoice, BroadcasterFeePolicy, DesktopSelfBroadcastResult,
     DesktopVaultStore, DesktopViewSession, Eip1559GasFeeEditorState, Entity, FeeHandlingMode,
-    FeeRow, InputState, IntoElement, PreparedSendCall, PreparedUnshieldCall,
+    FeeRow, InputState, IntoElement, PreparedSendCall, PreparedUnshieldCall, PublicAccountSource,
     PublicBroadcasterCostEstimate, PublicBroadcasterResultKind, PublicBroadcasterSubmissionResult,
     ScrollHandle, SearchableVec, SelectItem, SelectState, SelfBroadcastGasFeeSelection,
     SharedString, SpendAuthorizationSummary, SpendAuthorizationSummaryRow,
@@ -158,6 +158,14 @@ pub(in crate::root) fn unshield_form_submitted(form: &UnshieldFormState) -> bool
     ) || matches!(form.result.as_ref(), Some(UnshieldResult::SelfBroadcast(_)))
 }
 
+pub(in crate::root) fn self_broadcast_requires_software_gas_payer_password(
+    delivery_mode: DeliveryMode,
+    gas_payer_source: Option<PublicAccountSource>,
+) -> bool {
+    delivery_mode == DeliveryMode::SelfBroadcast
+        && gas_payer_source.is_some_and(|source| source != PublicAccountSource::HardwareDerived)
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub(in crate::root) struct UnshieldAsset {
     pub(in crate::root) chain_id: u64,
@@ -202,6 +210,7 @@ pub(in crate::root) struct SendSpendDraft {
     pub(in crate::root) amount: U256,
     pub(in crate::root) self_broadcast_public_account_uuid: Option<String>,
     pub(in crate::root) self_broadcast_gas_payer_display: Option<String>,
+    pub(in crate::root) self_broadcast_gas_payer_source: Option<PublicAccountSource>,
     pub(in crate::root) fee_rows: Vec<FeeRow>,
     pub(in crate::root) fee_policy: BroadcasterFeePolicy,
     pub(in crate::root) favorites_only_broadcasters: bool,
@@ -224,6 +233,7 @@ pub(in crate::root) struct UnshieldSpendDraft {
     pub(in crate::root) amount: U256,
     pub(in crate::root) self_broadcast_public_account_uuid: Option<String>,
     pub(in crate::root) self_broadcast_gas_payer_display: Option<String>,
+    pub(in crate::root) self_broadcast_gas_payer_source: Option<PublicAccountSource>,
     pub(in crate::root) fee_rows: Vec<FeeRow>,
     pub(in crate::root) fee_policy: BroadcasterFeePolicy,
     pub(in crate::root) favorites_only_broadcasters: bool,
@@ -247,6 +257,30 @@ pub(in crate::root) fn private_send_authorization_summary(
     )
 }
 
+pub(in crate::root) fn private_send_gas_payer_authorization_summary(
+    draft: &SendSpendDraft,
+) -> SpendAuthorizationSummary {
+    SpendAuthorizationSummary::new(
+        "Self-broadcast gas payer",
+        "Enter the vault password to unlock the selected software Public gas-payer account. Hardware approval is still required for the private spend.",
+        vec![
+            SpendAuthorizationSummaryRow::new(
+                "Amount",
+                private_amount_label(draft.amount, &draft.asset, true),
+            )
+            .with_icon(draft.asset.icon_path.clone()),
+            SpendAuthorizationSummaryRow::new("Recipient", draft.recipient.clone()),
+            SpendAuthorizationSummaryRow::new(
+                "Gas payer",
+                draft
+                    .self_broadcast_gas_payer_display
+                    .clone()
+                    .unwrap_or_else(|| "Selected Public account".to_owned()),
+            ),
+        ],
+    )
+}
+
 pub(in crate::root) fn private_unshield_authorization_summary(
     draft: &UnshieldSpendDraft,
 ) -> SpendAuthorizationSummary {
@@ -261,6 +295,30 @@ pub(in crate::root) fn private_unshield_authorization_summary(
             .with_icon(draft.asset.icon_path.clone()),
             SpendAuthorizationSummaryRow::new("Recipient", draft.recipient.to_checksum(None)),
             SpendAuthorizationSummaryRow::new("Delivery", draft.delivery_mode.label()),
+        ],
+    )
+}
+
+pub(in crate::root) fn private_unshield_gas_payer_authorization_summary(
+    draft: &UnshieldSpendDraft,
+) -> SpendAuthorizationSummary {
+    SpendAuthorizationSummary::new(
+        "Self-broadcast gas payer",
+        "Enter the vault password to unlock the selected software Public gas-payer account. Hardware approval is still required for the private spend.",
+        vec![
+            SpendAuthorizationSummaryRow::new(
+                "Amount",
+                private_amount_label(draft.amount, &draft.asset, false),
+            )
+            .with_icon(draft.asset.icon_path.clone()),
+            SpendAuthorizationSummaryRow::new("Recipient", draft.recipient.to_checksum(None)),
+            SpendAuthorizationSummaryRow::new(
+                "Gas payer",
+                draft
+                    .self_broadcast_gas_payer_display
+                    .clone()
+                    .unwrap_or_else(|| "Selected Public account".to_owned()),
+            ),
         ],
     )
 }

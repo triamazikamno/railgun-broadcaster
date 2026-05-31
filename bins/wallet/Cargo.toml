@@ -4,6 +4,10 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+hardware = ["wallet-ops/hardware"]
+
 [[bin]]
 name = "wallet"
 path = "src/main.rs"

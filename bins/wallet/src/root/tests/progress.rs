@@ -1,4 +1,9 @@
 use super::*;
+use crate::root::public_action::{
+    PublicActionGasRetryKind, public_action_discard_attempt_available,
+    public_action_error_retry_kind, public_action_step_detail_for_context,
+};
+use wallet_ops::{DesktopSelfBroadcastResult, SelfBroadcastAttemptInfo, TxReceiptOutput};
 
 #[test]
 fn private_broadcaster_progress_stage_marks_prior_steps_done() {
@@ -240,6 +245,107 @@ fn stopped_progress_status_uses_danger_stop_marker_and_copy() {
             PublicActionStepStatus::Stopped,
         ),
         "Stopped locally. Already-submitted network work may continue.",
+    );
+    assert_eq!(
+        public_action_step_detail_for_context(
+            PublicActionProgressStep::ShieldKey,
+            PublicActionStepStatus::Pending,
+            true,
+            false,
+        ),
+        "Approve the RAILGUN_SHIELD message on your hardware wallet.",
+    );
+    assert_eq!(
+        public_action_step_detail_for_context(
+            PublicActionProgressStep::Approve,
+            PublicActionStepStatus::Pending,
+            true,
+            false,
+        ),
+        "Approve the transaction on your hardware wallet, then wait for broadcast.",
+    );
+}
+
+#[test]
+fn public_action_failed_step_retry_kind_distinguishes_gas_from_signing_cancel() {
+    let gas_error = PublicActionStepState {
+        step: PublicActionProgressStep::Wrap,
+        status: PublicActionStepStatus::Error,
+        tx_hash: None,
+        message: Some(Arc::from("public-shield-wrap: estimate gas failed")),
+    };
+    let signing_cancel = PublicActionStepState {
+        step: PublicActionProgressStep::Wrap,
+        status: PublicActionStepStatus::Error,
+        tx_hash: None,
+        message: Some(Arc::from(
+            "public-shield-wrap: hardware sign: Failure_ActionCancelled",
+        )),
+    };
+
+    assert_eq!(
+        public_action_error_retry_kind(&gas_error),
+        PublicActionGasRetryKind::RetryEstimate,
+    );
+    assert_eq!(
+        public_action_error_retry_kind(&signing_cancel),
+        PublicActionGasRetryKind::RetryStep,
+    );
+    assert_eq!(
+        public_action_error_summary(
+            PublicActionProgressStep::Wrap,
+            signing_cancel.message.as_deref(),
+            "ETH",
+        ),
+        "Wrapping ETH was cancelled on the hardware wallet.",
+    );
+}
+
+#[test]
+fn public_action_discard_attempt_only_shows_for_active_failed_steps() {
+    let failed = PublicActionStepState {
+        step: PublicActionProgressStep::Wrap,
+        status: PublicActionStepStatus::Error,
+        tx_hash: None,
+        message: Some(Arc::from("cancelled")),
+    };
+    let pending = PublicActionStepState {
+        status: PublicActionStepStatus::Pending,
+        ..failed.clone()
+    };
+
+    assert!(public_action_discard_attempt_available(true, &failed));
+    assert!(!public_action_discard_attempt_available(false, &failed));
+    assert!(!public_action_discard_attempt_available(true, &pending));
+}
+
+#[test]
+fn progress_dialog_close_behavior_distinguishes_success_from_failure_and_stop() {
+    let success_steps = vec![PublicActionStepState {
+        step: PublicActionProgressStep::Send,
+        status: PublicActionStepStatus::Done,
+        tx_hash: Some(Arc::from("0xabc")),
+        message: None,
+    }];
+    let failed_steps = vec![PublicActionStepState {
+        status: PublicActionStepStatus::Error,
+        message: Some(Arc::from("failed")),
+        ..success_steps[0].clone()
+    }];
+
+    assert!(public_action_progress_is_successful(&success_steps));
+    assert!(!public_action_progress_is_successful(&failed_steps));
+    assert_eq!(
+        progress_dialog_close_behavior(true, false),
+        ProgressDialogCloseBehavior::AllAndClear,
+    );
+    assert_eq!(
+        progress_dialog_close_behavior(false, true),
+        ProgressDialogCloseBehavior::TopAndClear,
+    );
+    assert_eq!(
+        progress_dialog_close_behavior(false, false),
+        ProgressDialogCloseBehavior::TopOnly,
     );
 }
 
@@ -591,4 +697,107 @@ fn closed_private_broadcaster_progress_exposes_active_stage() {
         private_broadcaster_closed_active_stage(Some(&progress), DeliveryFormKind::Send, key, 7,),
         None
     );
+}
+
+#[test]
+fn closed_private_broadcaster_progress_exposes_failed_step_for_discard() {
+    let key = UnshieldAssetKey::new(1, Address::from([0x11; 20]));
+    let mut progress = private_progress_state(PrivateSubmissionProgressFlow::SelfBroadcast, key);
+    progress.stage_seen = true;
+    fail_private_broadcaster_progress_steps_at_stage(
+        &mut progress.steps,
+        TransactionGenerationStage::SigningSelfBroadcast,
+        "hardware sign: Failure_ActionCancelled",
+    );
+
+    let active =
+        private_broadcaster_closed_active_progress(Some(&progress), DeliveryFormKind::Send, key, 7)
+            .expect("active failed step");
+
+    assert_eq!(active.flow, PrivateSubmissionProgressFlow::SelfBroadcast);
+    assert_eq!(
+        active.step.stage,
+        TransactionGenerationStage::SigningSelfBroadcast
+    );
+    assert_eq!(active.step.status, PublicActionStepStatus::Error);
+    assert!(private_submission_discard_attempt_available(&active));
+}
+
+#[test]
+fn private_self_broadcast_step_retry_kind_separates_signing_from_gas_and_speed_up() {
+    let key = UnshieldAssetKey::new(1, Address::from([0x11; 20]));
+    let mut progress = private_progress_state(PrivateSubmissionProgressFlow::SelfBroadcast, key);
+    let gas_step = PrivateBroadcasterProgressStepState {
+        stage: TransactionGenerationStage::EstimatingSelfBroadcastGas,
+        status: PublicActionStepStatus::Error,
+        message: Some(Arc::from("gas failed")),
+    };
+    let signing_step = PrivateBroadcasterProgressStepState {
+        stage: TransactionGenerationStage::SigningSelfBroadcast,
+        status: PublicActionStepStatus::Error,
+        message: Some(Arc::from("cancelled")),
+    };
+    let receipt_step = PrivateBroadcasterProgressStepState {
+        stage: TransactionGenerationStage::WaitingForSelfBroadcastReceipt,
+        status: PublicActionStepStatus::Pending,
+        message: None,
+    };
+
+    assert_eq!(
+        self_broadcast_step_retry_kind(&progress, &gas_step),
+        Some(SelfBroadcastGasRetryKind::RetryEstimate),
+    );
+    assert_eq!(
+        self_broadcast_step_retry_kind(&progress, &signing_step),
+        Some(SelfBroadcastGasRetryKind::RetryStep),
+    );
+    assert_eq!(
+        self_broadcast_step_retry_kind(&progress, &receipt_step),
+        None
+    );
+    progress
+        .self_broadcast_attempts
+        .push(SelfBroadcastAttemptInfo {
+            tx_hash: "0xabc".to_string(),
+            nonce: 7,
+            gas_limit: 21_000,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+        });
+    assert_eq!(
+        self_broadcast_step_retry_kind(&progress, &receipt_step),
+        Some(SelfBroadcastGasRetryKind::SpeedUp),
+    );
+}
+
+#[test]
+fn private_self_broadcast_success_requires_successful_receipt() {
+    let key = UnshieldAssetKey::new(1, Address::from([0x11; 20]));
+    let mut progress = private_progress_state(PrivateSubmissionProgressFlow::SelfBroadcast, key);
+    progress.self_broadcast_result = Some(test_self_broadcast_result(true));
+    assert!(private_broadcaster_progress_is_successful(&progress));
+
+    progress.self_broadcast_result = Some(test_self_broadcast_result(false));
+    assert!(!private_broadcaster_progress_is_successful(&progress));
+}
+
+fn test_self_broadcast_result(status: bool) -> DesktopSelfBroadcastResult {
+    DesktopSelfBroadcastResult {
+        chain_id: 1,
+        public_account_uuid: "public-account".to_string(),
+        gas_payer: Address::from([0x22; 20]),
+        gas_limit: 21_000,
+        rpc_gas_price: 1,
+        max_fee_per_gas: 2,
+        max_priority_fee_per_gas: 1,
+        estimated_native_gas_cost: U256::from(21_000),
+        live_native_balance: U256::from(42_000),
+        tx: TxReceiptOutput {
+            tx_hash: "0xabc".to_string(),
+            status,
+            block_number: 10,
+            gas_used: 21_000,
+        },
+        attempts: Vec::new(),
+    }
 }

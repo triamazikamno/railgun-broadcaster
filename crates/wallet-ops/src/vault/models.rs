@@ -1,4 +1,7 @@
-use super::{Address, Deserialize, KEY_LEN, Serialize, U256, ViewingKeyData, WalletKeys, Zeroize};
+use super::{
+    Address, Deserialize, HardwareDerivationDescriptor, HardwareDeviceKind,
+    HardwarePublicAccountDescriptor, KEY_LEN, Serialize, U256, ViewingKeyData, WalletKeys, Zeroize,
+};
 
 #[derive(Serialize, Deserialize, Zeroize)]
 #[zeroize(drop)]
@@ -63,6 +66,29 @@ pub enum WalletSource {
     Generated,
     #[default]
     Imported,
+    LedgerDerived,
+    TrezorDerived,
+}
+
+impl WalletSource {
+    #[must_use]
+    pub const fn is_hardware_derived(self) -> bool {
+        matches!(self, Self::LedgerDerived | Self::TrezorDerived)
+    }
+
+    #[must_use]
+    pub const fn from_hardware_device_kind(device_kind: HardwareDeviceKind) -> Self {
+        match device_kind {
+            HardwareDeviceKind::Ledger => Self::LedgerDerived,
+            HardwareDeviceKind::Trezor => Self::TrezorDerived,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WalletSpendSource {
+    Software,
+    HardwareDerived(HardwareDerivationDescriptor),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -76,11 +102,26 @@ pub struct WalletMetadataBundle {
     pub status: WalletStatus,
     #[serde(default)]
     pub display_order: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware_descriptor: Option<HardwareDerivationDescriptor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct HardwareWalletProfile {
+    pub device_kind: HardwareDeviceKind,
+    pub profile_fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(super) struct HardwareWalletAccountIndexReservation {
+    pub(super) profile: HardwareWalletProfile,
+    pub(super) account_index: u32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PublicAccountSource {
     Derived,
+    HardwareDerived,
     Imported,
 }
 
@@ -105,6 +146,8 @@ pub struct PublicAccountMetadata {
     pub source: PublicAccountSource,
     pub scope: PublicAccountScope,
     pub derivation_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware_descriptor: Option<HardwarePublicAccountDescriptor>,
     pub status: PublicAccountStatus,
     pub display_order: u32,
 }
@@ -175,6 +218,8 @@ pub(super) struct WalletMetadataWire {
     pub(super) status: Option<WalletStatus>,
     #[serde(default)]
     pub(super) display_order: Option<u32>,
+    #[serde(default)]
+    pub(super) hardware_descriptor: Option<HardwareDerivationDescriptor>,
 }
 
 pub(super) struct DecodedWalletMetadata {

@@ -28,6 +28,10 @@ use sha2::Sha256;
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::hardware::{
+    HardwareDerivationDescriptor, HardwareDeviceKind, HardwarePublicAccountDescriptor,
+};
+
 mod core;
 mod crypto;
 mod models;

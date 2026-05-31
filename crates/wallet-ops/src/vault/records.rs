@@ -1,6 +1,7 @@
 use super::{
     ADDITIONAL_WALLET_LABEL_PREFIX, Address, BROADCASTER_BANNED_PREFIX,
-    BROADCASTER_FAVORITE_PREFIX, BTreeSet, BroadcasterPreferenceEntry, CacheKeys, KEY_LEN,
+    BROADCASTER_FAVORITE_PREFIX, BTreeSet, BroadcasterPreferenceEntry, CacheKeys,
+    HARDWARE_WALLET_ACCOUNT_INDEX_PREFIX, HardwareWalletAccountIndexReservation, KEY_LEN,
     MnemonicBuilder, PRIMARY_WALLET_LABEL, PRIVATE_ADDRESS_BOOK_PREFIX,
     PUBLIC_ACCOUNT_METADATA_PREFIX, PUBLIC_ACCOUNT_SECRET_PREFIX, PUBLIC_ADDRESS_BOOK_PREFIX,
     PrivateAddressBookEntry, PrivateKeySigner, PublicAccountMetadata, PublicAccountScope,
@@ -26,6 +27,10 @@ pub(super) fn wallet_metadata_record_key(wallet_uuid: &str) -> String {
 
 pub(super) fn wallet_chain_metadata_record_key(wallet_chain_uuid: &str) -> String {
     format!("{WALLET_CHAIN_METADATA_PREFIX}{wallet_chain_uuid}")
+}
+
+pub(super) fn hardware_wallet_account_index_record_key(reservation_uuid: &str) -> String {
+    format!("{HARDWARE_WALLET_ACCOUNT_INDEX_PREFIX}{reservation_uuid}")
 }
 
 pub(super) fn wallet_cache_row_prefix(wallet_chain_uuid: &str) -> String {
@@ -94,6 +99,17 @@ pub(super) fn wallet_metadata_record_entry(
 ) -> Result<(String, Vec<u8>), VaultError> {
     let key = wallet_metadata_record_key(&metadata.wallet_uuid);
     let record = view.encrypt_wallet_metadata(&metadata.wallet_uuid, metadata)?;
+    record.to_record_entry(key)
+}
+
+pub(super) fn hardware_wallet_account_index_record_entry(
+    view: &ViewUnlock,
+    reservation_uuid: &str,
+    reservation: &HardwareWalletAccountIndexReservation,
+) -> Result<(String, Vec<u8>), VaultError> {
+    let key = hardware_wallet_account_index_record_key(reservation_uuid);
+    let record =
+        view.encrypt_hardware_wallet_account_index_reservation(reservation_uuid, reservation)?;
     record.to_record_entry(key)
 }
 
@@ -517,7 +533,12 @@ pub(super) fn next_derived_public_account_index(
 ) -> Result<u32, VaultError> {
     metadata
         .iter()
-        .filter(|account| account.source == PublicAccountSource::Derived)
+        .filter(|account| {
+            matches!(
+                account.source,
+                PublicAccountSource::Derived | PublicAccountSource::HardwareDerived
+            )
+        })
         .filter(|account| {
             matches!(
                 &account.scope,
@@ -573,6 +594,7 @@ pub(super) fn initial_derived_public_account(
         source: PublicAccountSource::Derived,
         scope,
         derivation_index: Some(0),
+        hardware_descriptor: None,
         status: PublicAccountStatus::Active,
         display_order: next_public_account_display_order(existing_accounts)?,
     })

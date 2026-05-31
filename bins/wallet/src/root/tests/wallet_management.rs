@@ -74,6 +74,209 @@ fn wallet_management_rows_split_and_sort_like_selector() {
 }
 
 #[test]
+fn wallet_source_label_includes_hardware_descriptor_details() {
+    let mut wallet = wallet_metadata(
+        "wallet-ledger",
+        "Ledger",
+        WalletSource::LedgerDerived,
+        WalletStatus::Active,
+        0,
+    );
+    wallet.hardware_descriptor = Some(
+        wallet_ops::hardware::HardwareDerivationDescriptor::ledger_eip1024_v1(
+            wallet_ops::hardware::parse_bip32_path("m/44'/60'/0'/0/0").expect("valid path"),
+            2,
+            "ledger:evm:0x1111111111111111111111111111111111111111".to_string(),
+            None,
+            wallet_ops::hardware::HardwareWalletSyncIntent::RecoverExisting,
+        ),
+    );
+
+    assert_eq!(
+        wallet_source_label(&wallet),
+        "Ledger-derived wallet - account 2"
+    );
+}
+
+#[test]
+fn hardware_setup_copy_covers_choices_and_passphrase_guidance() {
+    assert_eq!(
+        crate::root::vault_ui::hardware_create_button_id(
+            wallet_ops::hardware::HardwareDeviceKind::Ledger,
+        ),
+        "create-ledger-derived-wallet"
+    );
+    assert_eq!(
+        crate::root::vault_ui::hardware_recover_button_id(
+            wallet_ops::hardware::HardwareDeviceKind::Trezor,
+        ),
+        "recover-trezor-derived-wallet"
+    );
+
+    let copy = crate::root::vault_ui::hardware_setup_notice_lines(
+        wallet_ops::hardware::HardwareDeviceKind::Ledger,
+    )
+    .join("\n");
+    assert!(copy.contains("Connect your Ledger"));
+    assert!(copy.contains("hardware passphrase wallet"));
+    assert!(copy.contains("Do not enter that passphrase into this app"));
+    assert!(copy.contains("Create new starts from the current safe head"));
+    assert!(copy.contains("Recover existing backfills from deployment"));
+    assert!(copy.contains("not true hardware signing"));
+
+    let progress_title = crate::root::vault_ui::hardware_setup_progress_title(
+        wallet_ops::hardware::HardwareDeviceKind::Ledger,
+    );
+    let progress_detail = crate::root::vault_ui::hardware_setup_progress_detail(
+        wallet_ops::hardware::HardwareDeviceKind::Ledger,
+    );
+    assert_eq!(progress_title, "Waiting for Ledger approval");
+    assert!(progress_detail.contains("Check your Ledger"));
+    assert!(progress_detail.contains("public key or shared secret"));
+}
+
+#[test]
+fn hardware_setup_enter_retries_last_sync_intent() {
+    assert_eq!(
+        default_hardware_wallet_setup_intent(None, false),
+        wallet_ops::hardware::HardwareWalletSyncIntent::CreateNew,
+    );
+    assert_eq!(
+        default_hardware_wallet_setup_intent(
+            Some(wallet_ops::hardware::HardwareWalletSyncIntent::RecoverExisting,),
+            false
+        ),
+        wallet_ops::hardware::HardwareWalletSyncIntent::RecoverExisting,
+    );
+    assert_eq!(
+        default_hardware_wallet_setup_intent(
+            Some(wallet_ops::hardware::HardwareWalletSyncIntent::CreateNew),
+            true,
+        ),
+        wallet_ops::hardware::HardwareWalletSyncIntent::RecoverExisting,
+    );
+}
+
+#[test]
+fn stale_hardware_setup_result_is_rejected_after_generation_change() {
+    assert!(hardware_wallet_creation_result_is_current(3, 3));
+    assert!(!hardware_wallet_creation_result_is_current(4, 3));
+}
+
+#[test]
+fn hardware_restore_account_index_input_parses_optional_index() {
+    assert_eq!(parse_hardware_wallet_restore_account_index(""), Ok(None));
+    assert_eq!(
+        parse_hardware_wallet_restore_account_index("  7 "),
+        Ok(Some(7))
+    );
+    assert_eq!(
+        parse_hardware_wallet_restore_account_index("2147483647"),
+        Ok(Some(2_147_483_647))
+    );
+    assert!(parse_hardware_wallet_restore_account_index("-1").is_err());
+    assert!(parse_hardware_wallet_restore_account_index("abc").is_err());
+    assert!(parse_hardware_wallet_restore_account_index("2147483648").is_err());
+}
+
+#[test]
+fn wallet_label_vault_errors_are_actionable() {
+    assert_eq!(
+        crate::root::vault::vault_error_message(&wallet_ops::vault::VaultError::InvalidWalletLabel)
+            .as_ref(),
+        "Enter a wallet name before continuing."
+    );
+    assert_eq!(
+        crate::root::vault::vault_error_message(
+            &wallet_ops::vault::VaultError::DuplicateWalletLabel,
+        )
+        .as_ref(),
+        "A wallet with that name already exists. Choose a different wallet name."
+    );
+    assert_eq!(
+        crate::root::vault::hardware_setup_vault_error_message(
+            &wallet_ops::vault::VaultError::DuplicateWalletLabel,
+            "  trezor  ",
+        )
+        .as_ref(),
+        "A wallet named \"trezor\" already exists. Choose a different wallet name."
+    );
+    assert!(
+        crate::root::vault::vault_error_message(
+            &wallet_ops::vault::VaultError::DuplicateHardwareWalletAccountIndex,
+        )
+        .contains("account index already exists")
+    );
+}
+
+#[cfg(feature = "hardware")]
+#[test]
+fn hardware_setup_password_preservation_policy_keeps_early_device_errors() {
+    use wallet_ops::hardware::HardwareDerivationError;
+
+    assert!(crate::root::vault::hardware_setup_error_preserves_password(
+        &HardwareDerivationError::LedgerUnavailable("unlock Ledger")
+    ));
+    assert!(crate::root::vault::hardware_setup_error_preserves_password(
+        &HardwareDerivationError::LedgerStatus {
+            operation: "get Ethereum address",
+            status: 0x6511,
+            message: "Open the Ethereum app on your Ledger, then retry.",
+        }
+    ));
+    assert!(crate::root::vault::hardware_setup_error_preserves_password(
+        &HardwareDerivationError::TrezorBridge(
+            "Trezor Bridge did not report a connected device".to_owned()
+        )
+    ));
+    assert!(
+        !crate::root::vault::hardware_setup_error_preserves_password(
+            &HardwareDerivationError::LedgerStatus {
+                operation: "derive Railgun secret",
+                status: 0x6985,
+                message: "The request was rejected or the Ledger is not ready. Approve on device or retry.",
+            }
+        )
+    );
+    assert!(
+        !crate::root::vault::hardware_setup_error_preserves_password(
+            &HardwareDerivationError::UnexpectedHardwareResponse("bad response")
+        )
+    );
+}
+
+#[test]
+fn hardware_public_account_copy_uses_device_signing_language() {
+    let copy = crate::root::public_account::hardware_public_account_setup_copy(
+        wallet_ops::hardware::HardwareDeviceKind::Trezor,
+    );
+
+    assert!(copy.contains("hardware-native Public EVM account"));
+    assert!(copy.contains("Trezor"));
+    assert!(copy.contains("partitioned by the selected Private wallet account index"));
+    assert!(copy.contains("Confirm the receive address on your device"));
+    assert!(copy.contains("public transactions will require device approval"));
+    assert_eq!(
+        crate::root::public_account::public_account_source_label(
+            wallet_ops::vault::PublicAccountSource::HardwareDerived,
+        ),
+        "Hardware"
+    );
+    assert!(
+        crate::root::public_action::public_send_authorization_detail(
+            wallet_ops::vault::PublicAccountSource::HardwareDerived,
+        )
+        .contains("approve the public send transaction on the device")
+    );
+    assert!(
+        crate::root::public_action::public_shield_authorization_detail(
+            wallet_ops::vault::PublicAccountSource::HardwareDerived,
+        )
+        .contains("approve the shield key message")
+    );
+}
+
+#[test]
 fn wallet_ids_after_drop_moves_active_wallets_between_drop_zones() {
     let active = vec![
         Arc::from("wallet-a"),

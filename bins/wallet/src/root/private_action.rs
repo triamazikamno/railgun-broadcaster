@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::assets::{RailgunActionIcon, WalletIconSource};
 use alloy::primitives::{Address, U256};
 use broadcaster_monitor::FeeRow;
 use gpui::{
@@ -29,17 +30,17 @@ use ui::controls::{
 };
 use ui::theme::{self, APP_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
-    BroadcasterFeePolicy, DesktopSelfBroadcastResult, DesktopSendCalldataRequest,
-    DesktopSendPublicBroadcasterRequest, DesktopSendSelfBroadcastRequest,
-    DesktopUnshieldCalldataRequest, DesktopUnshieldPublicBroadcasterRequest,
-    DesktopUnshieldSelfBroadcastRequest, FeeHandlingMode, ListUtxosOutput, PreparedSendCall,
-    PreparedUnshieldCall, PublicAssetId, PublicBalanceAmount, PublicBalanceEntry,
-    PublicBalanceSnapshot, PublicBroadcasterCandidate, PublicBroadcasterCostEstimate,
-    PublicBroadcasterResultKind, PublicBroadcasterSubmissionResult, SelfBroadcastGasFeeQuote,
-    SelfBroadcastGasFeeSelection, SelfBroadcastSessionEvent, TokenAnchorRateCache,
-    TransactionGenerationStage, WalletSession, fee_policy_eligible_public_broadcasters,
-    parse_railgun_recipient, parse_send_amount, parse_unshield_amount,
-    prepare_desktop_send_calldata, prepare_desktop_unshield_calldata,
+    BroadcasterFeePolicy, DesktopPrivateSpendAuthorization, DesktopSelfBroadcastResult,
+    DesktopSendCalldataRequest, DesktopSendPublicBroadcasterRequest,
+    DesktopSendSelfBroadcastRequest, DesktopUnshieldCalldataRequest,
+    DesktopUnshieldPublicBroadcasterRequest, DesktopUnshieldSelfBroadcastRequest, FeeHandlingMode,
+    ListUtxosOutput, PreparedSendCall, PreparedUnshieldCall, PublicAssetId, PublicBalanceAmount,
+    PublicBalanceEntry, PublicBalanceSnapshot, PublicBroadcasterCandidate,
+    PublicBroadcasterCostEstimate, PublicBroadcasterResultKind, PublicBroadcasterSubmissionResult,
+    SelfBroadcastGasFeeQuote, SelfBroadcastGasFeeSelection, SelfBroadcastSessionEvent,
+    TokenAnchorRateCache, TransactionGenerationStage, WalletSession,
+    fee_policy_eligible_public_broadcasters, parse_railgun_recipient, parse_send_amount,
+    parse_unshield_amount, prepare_desktop_send_calldata, prepare_desktop_unshield_calldata,
     quote_desktop_self_broadcast_gas_fee, select_public_broadcaster_with_policy_and_trust,
     settings::EffectiveTokenRegistry,
     sort_specific_public_broadcasters, submit_desktop_send_public_broadcaster,
@@ -47,12 +48,9 @@ use wallet_ops::{
     submit_desktop_unshield_self_broadcast,
     vault::{
         DesktopVaultStore, DesktopViewSession, PrivateAddressBookEntry, PublicAccountMetadata,
-        PublicAccountStatus, PublicAddressBookEntry, WalletStatus,
+        PublicAccountSource, PublicAccountStatus, PublicAddressBookEntry, WalletStatus,
     },
 };
-use zeroize::Zeroizing;
-
-use crate::assets::{RailgunActionIcon, WalletIconSource};
 
 use super::broadcaster_picker::{
     BroadcasterChoice, broadcaster_choice_supported_by_candidates,

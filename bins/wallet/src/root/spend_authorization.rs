@@ -7,17 +7,27 @@ use gpui::{
     prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
-    Selectable, Sizable, WindowExt,
+    Disableable, Selectable, Sizable, WindowExt,
     alert::Alert,
     button::{Button, ButtonGroup, ButtonVariants},
     description_list::{DescriptionItem, DescriptionList},
+    dialog::DialogButtonProps,
     input::{InputEvent, InputState},
+    spinner::Spinner,
     tooltip::Tooltip,
 };
 use ui::clipboard::clipboard_with_toast;
 use ui::controls::{app_button, app_input, app_muted_text, app_strong_text, app_text};
 use ui::theme::{self, APP_MONO_FONT_FAMILY};
-use wallet_ops::BlockedShieldRescueUtxoId;
+use wallet_ops::hardware::{HardwareDerivationDescriptor, HardwareDeviceKind};
+#[cfg(feature = "hardware")]
+use wallet_ops::hardware::{
+    HardwareDerivationError, ledger::LedgerHardwareDerivationClient,
+    synthetic_entropy_from_hardware_output, trezor::TrezorHardwareDerivationClient,
+};
+#[cfg(feature = "hardware")]
+use wallet_ops::vault::{DesktopVaultStore, DesktopViewSession, VaultError};
+use wallet_ops::{BlockedShieldRescueUtxoId, DesktopPrivateSpendAuthorization};
 use zeroize::Zeroizing;
 
 use crate::assets::WalletIconSource;
@@ -27,6 +37,9 @@ use super::{WalletRoot, new_masked_input, secondary_dialog_content_width, token_
 
 const SPEND_AUTHORIZATION_DIALOG_WIDTH: gpui::Pixels = px(560.0);
 const SPEND_AUTHORIZATION_SESSION_WARNING: &str = "This will allow on-chain spending from this vault without re-entering the password until you lock the vault or close the app. Only use this on a trusted device.";
+const SUMMARY_RECIPIENT_PREFIX_CHARS: usize = 8;
+const SUMMARY_RECIPIENT_SUFFIX_CHARS: usize = 8;
+const SUMMARY_RECIPIENT_SHORTEN_THRESHOLD_CHARS: usize = 28;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SpendAuthorizationLifetime {
@@ -90,10 +103,60 @@ impl SpendAuthorizationCache {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SpendAuthorizationIntent {
     PrivateSend(UnshieldAssetKey),
+    PrivateSendSelfBroadcastGasPassword(UnshieldAssetKey),
     PrivateUnshield(UnshieldAssetKey),
+    PrivateUnshieldSelfBroadcastGasPassword(UnshieldAssetKey),
     BlockedShieldRefund(BlockedShieldRescueUtxoId),
+    BlockedShieldRefundGasPassword(BlockedShieldRescueUtxoId),
     PublicSend,
     PublicShield,
+}
+
+impl SpendAuthorizationIntent {
+    const fn uses_private_wallet(self) -> bool {
+        matches!(
+            self,
+            Self::PrivateSend(_) | Self::PrivateUnshield(_) | Self::BlockedShieldRefund(_)
+        )
+    }
+}
+
+#[derive(Clone)]
+#[cfg_attr(not(feature = "hardware"), allow(dead_code))]
+pub(super) enum HardwareSpendAuthorizationCompletion {
+    Continue(SpendAuthorizationIntent),
+    PrivateSendSelfBroadcast {
+        key: UnshieldAssetKey,
+        vault_password: Zeroizing<String>,
+    },
+    PrivateUnshieldSelfBroadcast {
+        key: UnshieldAssetKey,
+        vault_password: Zeroizing<String>,
+    },
+    BlockedShieldRefund {
+        utxo_id: BlockedShieldRescueUtxoId,
+        vault_password: Zeroizing<String>,
+    },
+}
+
+#[cfg(feature = "hardware")]
+enum HardwareSpendAuthorizationError {
+    Hardware(HardwareDerivationError),
+    Vault(VaultError),
+}
+
+#[cfg(feature = "hardware")]
+impl From<HardwareDerivationError> for HardwareSpendAuthorizationError {
+    fn from(error: HardwareDerivationError) -> Self {
+        Self::Hardware(error)
+    }
+}
+
+#[cfg(feature = "hardware")]
+impl From<VaultError> for HardwareSpendAuthorizationError {
+    fn from(error: VaultError) -> Self {
+        Self::Vault(error)
+    }
 }
 
 #[derive(Clone)]
@@ -146,6 +209,155 @@ struct SpendAuthorizationDialogContent {
     password_input: Entity<InputState>,
     lifetime: SpendAuthorizationLifetime,
     error: Option<Arc<str>>,
+}
+
+#[cfg_attr(not(feature = "hardware"), allow(dead_code))]
+struct HardwareSpendAuthorizationDialogContent {
+    root: Entity<WalletRoot>,
+    completion: HardwareSpendAuthorizationCompletion,
+    summary: SpendAuthorizationSummary,
+    device_label: &'static str,
+    pending: bool,
+    cancelled: bool,
+    error: Option<Arc<str>>,
+}
+
+impl HardwareSpendAuthorizationDialogContent {
+    #[allow(clippy::missing_const_for_fn)]
+    fn new(
+        root: Entity<WalletRoot>,
+        completion: HardwareSpendAuthorizationCompletion,
+        summary: SpendAuthorizationSummary,
+        device_label: &'static str,
+    ) -> Self {
+        Self {
+            root,
+            completion,
+            summary,
+            device_label,
+            pending: false,
+            cancelled: false,
+            error: None,
+        }
+    }
+
+    fn cancel(&mut self, cx: &mut Context<'_, Self>) {
+        self.cancelled = true;
+        cx.notify();
+    }
+
+    fn start(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
+        if self.pending {
+            return;
+        }
+        self.pending = true;
+        self.cancelled = false;
+        self.error = None;
+        cx.notify();
+
+        #[cfg(not(feature = "hardware"))]
+        {
+            let _ = window;
+            self.pending = false;
+            self.error = Some(Arc::from(
+                "Hardware wallet support is not enabled in this build. Rebuild the wallet with the hardware feature to authorize hardware-derived spends.",
+            ));
+            cx.notify();
+        }
+
+        #[cfg(feature = "hardware")]
+        {
+            let root = self.root.clone();
+            let completion = self.completion.clone();
+            let task = root.update(cx, |root, _cx| {
+                root.start_hardware_spend_authorization_task()
+            });
+            match task {
+                Ok(join) => {
+                    cx.spawn_in(window, async move |this, cx| {
+                        let result = join.await;
+                        let _ = this.update_in(cx, |dialog, window, cx| {
+                            if dialog.cancelled {
+                                return;
+                            }
+                            dialog.pending = false;
+                            match result {
+                                Ok(Ok(authorization)) => {
+                                    let root = dialog.root.clone();
+                                    window.close_dialog(cx);
+                                    root.update(cx, |root, cx| match completion {
+                                        HardwareSpendAuthorizationCompletion::Continue(intent) => {
+                                            root.continue_authorized_spend(
+                                                intent,
+                                                authorization,
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                        HardwareSpendAuthorizationCompletion::PrivateSendSelfBroadcast {
+                                            key,
+                                            vault_password,
+                                        } => {
+                                            root.generate_send_calldata_authorized_with_gas_password(
+                                                key,
+                                                authorization,
+                                                Some(vault_password),
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                        HardwareSpendAuthorizationCompletion::PrivateUnshieldSelfBroadcast {
+                                            key,
+                                            vault_password,
+                                        } => {
+                                            root.generate_unshield_calldata_authorized_with_gas_password(
+                                                key,
+                                                authorization,
+                                                Some(vault_password),
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                        HardwareSpendAuthorizationCompletion::BlockedShieldRefund {
+                                            utxo_id,
+                                            vault_password,
+                                        } => {
+                                            root.submit_blocked_shield_refund_authorized(
+                                                utxo_id,
+                                                authorization,
+                                                Some(vault_password),
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    });
+                                }
+                                Ok(Err(error)) => {
+                                    dialog.error = Some(Arc::from(
+                                        hardware_spend_authorization_error_message(&error),
+                                    ));
+                                    cx.notify();
+                                }
+                                Err(error) => {
+                                    tracing::warn!(%error, "desktop hardware spend authorization task failed");
+                                    dialog.error = Some(Arc::from(
+                                        "Hardware spend authorization failed. See logs for non-sensitive diagnostics.",
+                                    ));
+                                    cx.notify();
+                                }
+                            }
+                        });
+                    })
+                    .detach();
+                }
+                Err(message) => {
+                    self.pending = false;
+                    self.error = Some(message);
+                    cx.notify();
+                }
+            }
+        }
+    }
 }
 
 impl SpendAuthorizationDialogContent {
@@ -271,6 +483,75 @@ impl gpui::Render for SpendAuthorizationDialogContent {
     }
 }
 
+impl gpui::Render for HardwareSpendAuthorizationDialogContent {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        let dialog = cx.entity();
+        let pending = self.pending;
+        let submit_label = if pending {
+            "Waiting for device..."
+        } else if self.error.is_some() {
+            "Try again"
+        } else {
+            "Approve on device"
+        };
+
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(app_strong_text(self.summary.title.to_string()))
+            .child(app_muted_text(hardware_spend_authorization_detail()).whitespace_normal())
+            .child(render_spend_authorization_summary(&self.summary))
+            .child(Alert::warning(
+                "wallet-hardware-spend-custody-warning",
+                "This is hardware-derived software custody, not true hardware signing. The device derives a temporary seed, and the desktop app signs this Railgun spend in memory.",
+            ).small())
+            .child(
+                app_muted_text(hardware_spend_authorization_instruction(self.device_label))
+                    .whitespace_normal(),
+            )
+            .when(pending, |this| {
+                this.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(Spinner::new().small())
+                        .child(app_muted_text("Waiting for device approval...")),
+                )
+            })
+            .when_some(self.error.as_ref(), |this, error| {
+                this.child(app_muted_text(error.to_string()).text_color(rgb(theme::DANGER)))
+            })
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_wrap()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        app_button("wallet-hardware-spend-auth-cancel", "Cancel")
+                            .flex_none()
+                            .disabled(pending)
+                            .on_click(move |_event, window, cx| {
+                                window.close_dialog(cx);
+                            }),
+                    )
+                    .child(
+                        app_button("wallet-hardware-spend-auth-submit", submit_label)
+                            .primary()
+                            .flex_none()
+                            .disabled(pending)
+                            .on_click(move |_event, window, cx| {
+                                dialog.update(cx, |dialog, cx| dialog.start(window, cx));
+                            }),
+                    ),
+            )
+    }
+}
+
 fn render_spend_authorization_summary(summary: &SpendAuthorizationSummary) -> DescriptionList {
     DescriptionList::vertical()
         .large()
@@ -299,6 +580,11 @@ fn spend_authorization_summary_value(row: &SpendAuthorizationSummaryRow) -> AnyE
 
     if row.label.as_ref() == "Recipient" {
         let copyable = row.value.as_ref() != "Selected private wallet";
+        let display_value = if copyable {
+            spend_authorization_recipient_display(row.value.as_ref())
+        } else {
+            row.value.to_string()
+        };
         return div()
             .w_full()
             .flex()
@@ -306,7 +592,7 @@ fn spend_authorization_summary_value(row: &SpendAuthorizationSummaryRow) -> AnyE
             .gap_2()
             .py(px(2.0))
             .child(
-                app_text(row.value.to_string())
+                app_text(display_value)
                     .flex_1()
                     .min_w(px(0.0))
                     .line_height(px(17.0))
@@ -336,6 +622,20 @@ fn spend_authorization_summary_value(row: &SpendAuthorizationSummaryRow) -> AnyE
         .text_color(rgb(theme::TEXT))
         .whitespace_normal()
         .into_any_element()
+}
+
+pub(in crate::root) fn spend_authorization_recipient_display(value: &str) -> String {
+    if value.chars().count() <= SUMMARY_RECIPIENT_SHORTEN_THRESHOLD_CHARS {
+        return value.to_string();
+    }
+    let prefix: String = value.chars().take(SUMMARY_RECIPIENT_PREFIX_CHARS).collect();
+    let suffix_chars: Vec<char> = value
+        .chars()
+        .rev()
+        .take(SUMMARY_RECIPIENT_SUFFIX_CHARS)
+        .collect();
+    let suffix: String = suffix_chars.into_iter().rev().collect();
+    format!("{prefix}...{suffix}")
 }
 
 fn render_spend_authorization_lifetime_buttons(
@@ -401,8 +701,23 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        if intent.uses_private_wallet() && self.selected_wallet_source().is_hardware_derived() {
+            self.clear_spend_authorization(cx);
+            self.open_hardware_spend_authorization_dialog(
+                HardwareSpendAuthorizationCompletion::Continue(intent),
+                summary,
+                window,
+                cx,
+            );
+            return;
+        }
         if let Some(password) = self.valid_spend_authorization_password(cx) {
-            self.continue_authorized_spend(intent, password, window, cx);
+            self.continue_authorized_spend(
+                intent,
+                DesktopPrivateSpendAuthorization::VaultPassword(password),
+                window,
+                cx,
+            );
             return;
         }
 
@@ -443,6 +758,129 @@ impl WalletRoot {
         });
     }
 
+    pub(super) fn open_hardware_public_action_authorization_dialog(
+        intent: SpendAuthorizationIntent,
+        summary: SpendAuthorizationSummary,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let root = cx.entity();
+        let dialog_width =
+            (window.viewport_size().width * 0.92).min(SPEND_AUTHORIZATION_DIALOG_WIDTH);
+        let content_width = secondary_dialog_content_width(dialog_width);
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            let submit_root = root.clone();
+            dialog
+                .w(dialog_width)
+                .title(app_strong_text("Authorize hardware public action"))
+                .button_props(DialogButtonProps::default().ok_text("Approve on device"))
+                .footer(|ok, cancel, window, cx| vec![cancel(window, cx), ok(window, cx)])
+                .on_ok(move |_event, window, cx| {
+                    submit_root.update(cx, |root, cx| {
+                        root.continue_authorized_spend(
+                            intent,
+                            DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(
+                                String::new(),
+                            )),
+                            window,
+                            cx,
+                        );
+                    });
+                    true
+                })
+                .child(
+                    div()
+                        .w(content_width)
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .child(app_strong_text(summary.title.to_string()))
+                        .child(app_muted_text(summary.detail.to_string()).whitespace_normal())
+                        .child(render_spend_authorization_summary(&summary))
+                        .child(
+                            app_muted_text("The app will verify the stored public account address against the connected device before signing.")
+                                .whitespace_normal(),
+                        ),
+                )
+        });
+    }
+
+    pub(super) fn open_hardware_spend_authorization_dialog(
+        &mut self,
+        completion: HardwareSpendAuthorizationCompletion,
+        summary: SpendAuthorizationSummary,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(descriptor) = self.selected_hardware_descriptor() else {
+            self.set_vault_error(
+                "Selected wallet is missing its hardware derivation descriptor",
+                cx,
+            );
+            return;
+        };
+        let root = cx.entity();
+        let device_label = hardware_device_label(descriptor.device_kind);
+        let dialog_width =
+            (window.viewport_size().width * 0.92).min(SPEND_AUTHORIZATION_DIALOG_WIDTH);
+        let content_width = secondary_dialog_content_width(dialog_width);
+        let content = cx.new(|_cx| {
+            HardwareSpendAuthorizationDialogContent::new(
+                root.clone(),
+                completion,
+                summary,
+                device_label,
+            )
+        });
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            let close_content = content.clone();
+            dialog
+                .w(dialog_width)
+                .title(app_strong_text("Authorize hardware spend"))
+                .on_close(move |_event, _window, cx| {
+                    close_content.update(cx, HardwareSpendAuthorizationDialogContent::cancel);
+                })
+                .child(div().w(content_width).child(content.clone()))
+        });
+    }
+
+    fn selected_hardware_descriptor(&self) -> Option<HardwareDerivationDescriptor> {
+        let selected_wallet_id = self.selected_wallet_id.as_ref()?;
+        self.wallet_metadata
+            .iter()
+            .find(|metadata| metadata.wallet_uuid == selected_wallet_id.as_ref())
+            .and_then(|metadata| metadata.hardware_descriptor.clone())
+    }
+
+    #[cfg(feature = "hardware")]
+    fn start_hardware_spend_authorization_task(
+        &self,
+    ) -> Result<
+        tokio::task::JoinHandle<
+            Result<DesktopPrivateSpendAuthorization, HardwareSpendAuthorizationError>,
+        >,
+        Arc<str>,
+    > {
+        let Some(descriptor) = self.selected_hardware_descriptor() else {
+            return Err(Arc::from(
+                "Selected wallet is missing its hardware derivation descriptor",
+            ));
+        };
+        let Some(store) = self.vault_store.clone() else {
+            return Err(Arc::from("Wallet vault storage is unavailable"));
+        };
+        let Some(view_session) = self.view_session.clone() else {
+            return Err(Arc::from(
+                "Unlock the wallet vault before authorizing a spend",
+            ));
+        };
+        Ok(self.runtime.spawn(derive_hardware_spend_authorization(
+            store,
+            view_session,
+            descriptor,
+        )))
+    }
+
     fn valid_spend_authorization_password(
         &mut self,
         cx: &mut Context<'_, Self>,
@@ -476,7 +914,12 @@ impl WalletRoot {
         self.spend_authorization_cache =
             SpendAuthorizationCache::new(password.clone(), lifetime, Instant::now());
         window.close_dialog(cx);
-        self.continue_authorized_spend(intent, password, window, cx);
+        self.continue_authorized_spend(
+            intent,
+            DesktopPrivateSpendAuthorization::VaultPassword(password),
+            window,
+            cx,
+        );
     }
 
     pub(super) fn clear_spend_authorization(&mut self, cx: &mut Context<'_, Self>) {
@@ -488,28 +931,186 @@ impl WalletRoot {
     fn continue_authorized_spend(
         &mut self,
         intent: SpendAuthorizationIntent,
-        password: Zeroizing<String>,
+        authorization: DesktopPrivateSpendAuthorization,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
         match intent {
             SpendAuthorizationIntent::PrivateSend(key) => {
-                self.generate_send_calldata_authorized(key, password, window, cx);
+                self.generate_send_calldata_authorized(key, authorization, window, cx);
+            }
+            SpendAuthorizationIntent::PrivateSendSelfBroadcastGasPassword(key) => {
+                let DesktopPrivateSpendAuthorization::VaultPassword(password) = authorization
+                else {
+                    self.set_vault_error(
+                        "Self-broadcast software gas-payer authorization requires the vault password",
+                        cx,
+                    );
+                    return;
+                };
+                self.request_private_send_hardware_authorization_with_gas_password(
+                    key, password, window, cx,
+                );
             }
             SpendAuthorizationIntent::PrivateUnshield(key) => {
-                self.generate_unshield_calldata_authorized(key, password, window, cx);
+                self.generate_unshield_calldata_authorized(key, authorization, window, cx);
+            }
+            SpendAuthorizationIntent::PrivateUnshieldSelfBroadcastGasPassword(key) => {
+                let DesktopPrivateSpendAuthorization::VaultPassword(password) = authorization
+                else {
+                    self.set_vault_error(
+                        "Self-broadcast software gas-payer authorization requires the vault password",
+                        cx,
+                    );
+                    return;
+                };
+                self.request_private_unshield_hardware_authorization_with_gas_password(
+                    key, password, window, cx,
+                );
             }
             SpendAuthorizationIntent::BlockedShieldRefund(utxo_id) => {
-                self.submit_blocked_shield_refund_authorized(utxo_id, password, window, cx);
+                self.submit_blocked_shield_refund_authorized(
+                    utxo_id,
+                    authorization,
+                    None,
+                    window,
+                    cx,
+                );
+            }
+            SpendAuthorizationIntent::BlockedShieldRefundGasPassword(utxo_id) => {
+                let DesktopPrivateSpendAuthorization::VaultPassword(password) = authorization
+                else {
+                    self.set_vault_error(
+                        "Blocked Shield refund gas-payer authorization requires the vault password",
+                        cx,
+                    );
+                    return;
+                };
+                self.request_blocked_shield_refund_hardware_authorization(
+                    utxo_id, password, window, cx,
+                );
             }
             SpendAuthorizationIntent::PublicSend => {
+                let DesktopPrivateSpendAuthorization::VaultPassword(password) = authorization
+                else {
+                    self.set_vault_error(
+                        "Public account spend authorization requires the vault password",
+                        cx,
+                    );
+                    return;
+                };
                 self.submit_public_send_authorized(password, window, cx);
             }
             SpendAuthorizationIntent::PublicShield => {
+                let DesktopPrivateSpendAuthorization::VaultPassword(password) = authorization
+                else {
+                    self.set_vault_error(
+                        "Public account spend authorization requires the vault password",
+                        cx,
+                    );
+                    return;
+                };
                 self.submit_public_shield_authorized(password, window, cx);
             }
         }
     }
+
+    fn request_private_send_hardware_authorization_with_gas_password(
+        &mut self,
+        key: UnshieldAssetKey,
+        vault_password: Zeroizing<String>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(draft) = self.send_spend_draft(key, cx) else {
+            return;
+        };
+        self.open_hardware_spend_authorization_dialog(
+            HardwareSpendAuthorizationCompletion::PrivateSendSelfBroadcast {
+                key,
+                vault_password,
+            },
+            super::private_action::private_send_authorization_summary(&draft),
+            window,
+            cx,
+        );
+    }
+
+    fn request_private_unshield_hardware_authorization_with_gas_password(
+        &mut self,
+        key: UnshieldAssetKey,
+        vault_password: Zeroizing<String>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(draft) = self.unshield_spend_draft(key, cx) else {
+            return;
+        };
+        self.open_hardware_spend_authorization_dialog(
+            HardwareSpendAuthorizationCompletion::PrivateUnshieldSelfBroadcast {
+                key,
+                vault_password,
+            },
+            super::private_action::private_unshield_authorization_summary(&draft),
+            window,
+            cx,
+        );
+    }
+}
+
+const fn hardware_device_label(device_kind: HardwareDeviceKind) -> &'static str {
+    match device_kind {
+        HardwareDeviceKind::Ledger => "Ledger",
+        HardwareDeviceKind::Trezor => "Trezor",
+    }
+}
+
+pub(in crate::root) fn hardware_spend_authorization_instruction(device_label: &str) -> String {
+    format!(
+        "Use the intended {device_label} passphrase wallet, then approve the Railgun derivation request."
+    )
+}
+
+pub(in crate::root) const fn hardware_spend_authorization_detail() -> &'static str {
+    "Approve the Railgun derivation request on your hardware wallet to authorize this private spend."
+}
+
+#[cfg(feature = "hardware")]
+fn hardware_spend_authorization_error_message(error: &HardwareSpendAuthorizationError) -> String {
+    match error {
+        HardwareSpendAuthorizationError::Hardware(error) => {
+            format!("Hardware spend authorization failed: {error}")
+        }
+        HardwareSpendAuthorizationError::Vault(error) => format!("Vault error: {error}"),
+    }
+}
+
+#[cfg(feature = "hardware")]
+async fn derive_hardware_spend_authorization(
+    store: Arc<DesktopVaultStore>,
+    view_session: Arc<DesktopViewSession>,
+    descriptor: HardwareDerivationDescriptor,
+) -> Result<DesktopPrivateSpendAuthorization, HardwareSpendAuthorizationError> {
+    let entropy = match descriptor.device_kind {
+        HardwareDeviceKind::Ledger => {
+            let client = LedgerHardwareDerivationClient::connect().await?;
+            let output = client.eip1024_shared_secret(&descriptor.path, true).await?;
+            synthetic_entropy_from_hardware_output(&descriptor, output)?
+        }
+        HardwareDeviceKind::Trezor => {
+            let mut client = TrezorHardwareDerivationClient::connect()?;
+            let output = client.cipher_key_value(&descriptor)?;
+            synthetic_entropy_from_hardware_output(&descriptor, output)?
+        }
+    };
+    let signer = store.hardware_railgun_spend_signer_from_entropy(
+        view_session.as_ref(),
+        &descriptor,
+        entropy.expose_secret(),
+    )?;
+    Ok(DesktopPrivateSpendAuthorization::PreauthorizedSigner(
+        signer,
+    ))
 }
 
 pub(super) fn is_spend_authorization_failure_error(error: &str) -> bool {

@@ -5,6 +5,7 @@ pub(in crate::root) fn render_public_action_stepper(
     steps: &[PublicActionStepState],
     expanded_error_steps: &BTreeSet<PublicActionProgressStep>,
     asset_label: &str,
+    requires_device_approval: bool,
     command_available: bool,
     current_gas_fee: Option<(u128, u128)>,
     action_error: Option<&str>,
@@ -27,6 +28,7 @@ pub(in crate::root) fn render_public_action_stepper(
             index == last_index,
             expanded_error_steps.contains(&step.step),
             asset_label,
+            requires_device_approval,
             command_available,
             current_gas_fee,
             action_error,
@@ -42,6 +44,7 @@ pub(in crate::root) fn render_public_action_step(
     is_last: bool,
     error_details_open: bool,
     asset_label: &str,
+    requires_device_approval: bool,
     command_available: bool,
     current_gas_fee: Option<(u128, u128)>,
     action_error: Option<&str>,
@@ -49,7 +52,12 @@ pub(in crate::root) fn render_public_action_step(
 ) -> gpui::Div {
     let color = public_action_step_color(step.status);
     let title = public_action_step_label(step.step);
-    let detail = public_action_step_detail(step.step, step.status);
+    let detail = public_action_step_detail_for_context(
+        step.step,
+        step.status,
+        requires_device_approval,
+        step.tx_hash.is_some(),
+    );
     let mut body = div()
         .flex_1()
         .min_w(px(0.0))
@@ -127,13 +135,14 @@ pub(in crate::root) fn render_public_action_step_action(
         return None;
     }
     let retry_kind = match step.status {
-        PublicActionStepStatus::Error => PublicActionGasRetryKind::RetryEstimate,
+        PublicActionStepStatus::Error => public_action_error_retry_kind(step),
         PublicActionStepStatus::Pending if step.tx_hash.is_some() && current_gas_fee.is_some() => {
             PublicActionGasRetryKind::SpeedUp
         }
         _ => return None,
     };
     let label = match retry_kind {
+        PublicActionGasRetryKind::RetryStep => "Retry step",
         PublicActionGasRetryKind::RetryEstimate => "Retry with custom gas",
         PublicActionGasRetryKind::SpeedUp => "Speed up transaction",
     };
@@ -149,9 +158,13 @@ pub(in crate::root) fn render_public_action_step_action(
                 .outline()
                 .on_click(move |_event, window, cx| {
                     root.update(cx, |root, cx| {
-                        root.open_public_action_gas_retry_dialog(
-                            generation, retry_kind, window, cx,
-                        );
+                        if retry_kind == PublicActionGasRetryKind::RetryStep {
+                            root.submit_public_action_step_retry(generation, cx);
+                        } else {
+                            root.open_public_action_gas_retry_dialog(
+                                generation, retry_kind, window, cx,
+                            );
+                        }
                     });
                 }),
         );

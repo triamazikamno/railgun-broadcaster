@@ -29,6 +29,7 @@ use super::private_action::{
     unshield_public_broadcaster_estimate_input_error,
 };
 use super::private_broadcaster::PrivateBroadcasterProgressState;
+use super::spend_authorization::spend_authorization_recipient_display;
 use super::{
     COST_ESTIMATE_DEBOUNCE, ChainUtxoState, DeliveryFormKind, DeliveryMode, UnshieldAsset,
     UnshieldAssetKey, WalletRoot, broadcaster_candidate_anchor_rate, effective_fee_handling_mode,
@@ -64,7 +65,6 @@ pub(super) struct PublicBroadcasterCostDisplay<'a> {
 
 pub(super) struct PrivateBroadcasterProgressContext<'a> {
     pub(super) display: PublicBroadcasterCostDisplay<'a>,
-    pub(super) settled: bool,
 }
 
 pub(super) fn format_public_broadcaster_fee_margin(
@@ -1173,12 +1173,6 @@ pub(super) fn render_private_broadcaster_progress_context(
     broadcaster_action: Option<AnyElement>,
 ) -> gpui::Div {
     let display = &context.display;
-    let breakdown = display.fee_breakdown();
-    let fee_label = if context.settled {
-        "Settled fee"
-    } else {
-        "Estimated fee"
-    };
     div()
         .flex()
         .flex_col()
@@ -1196,7 +1190,7 @@ pub(super) fn render_private_broadcaster_progress_context(
         ))
         .child(private_broadcaster_context_row(
             "Recipient",
-            progress.recipient.to_string(),
+            spend_authorization_recipient_display(progress.recipient.as_ref()),
         ))
         .child(private_broadcaster_context_row(
             "Entered amount",
@@ -1222,22 +1216,9 @@ pub(super) fn render_private_broadcaster_progress_context(
             ))
         })
         .child(private_broadcaster_context_row(
-            fee_label,
-            display.fee_amount(),
-        ))
-        .child(private_broadcaster_context_row(
-            "Tx gas cost",
-            display.native_gas_cost_value(&breakdown),
-        ))
-        .child(private_broadcaster_context_row(
-            "Transaction fee",
-            display.broadcaster_fee_value(&breakdown),
-        ))
-        .child(private_broadcaster_context_row(
             "Network gas",
             display.gas_value(),
         ))
-        .child(cost_estimate_detail_text(display.fee_mode_summary()))
 }
 
 pub(super) fn private_broadcaster_context_row(label: &'static str, value: String) -> gpui::Div {

@@ -27,9 +27,10 @@ use ui::theme::{self, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
     PublicActionAttemptInfo, PublicActionCommandSender, PublicActionProgressStep, PublicAssetId,
     PublicBalanceEntry,
+    hardware::{HardwareDeviceKind, HardwarePublicAccountDescriptor},
     vault::{
-        PublicAccountMetadata, PublicAccountSource, PublicAccountStatus,
-        public_account_default_label,
+        DesktopVaultStore, DesktopViewSession, PublicAccountMetadata, PublicAccountSource,
+        PublicAccountStatus, WalletSource, public_account_default_label,
     },
 };
 
@@ -94,6 +95,7 @@ pub(super) struct PublicAccountFormState {
     pub(super) action_progress: Vec<PublicActionStepState>,
     pub(super) expanded_action_error_steps: BTreeSet<PublicActionProgressStep>,
     pub(super) action_progress_dialog_open: bool,
+    pub(super) action_requires_device_approval: bool,
     pub(super) action_progress_asset_label: Arc<str>,
     pub(super) action_progress_icon_path: Option<WalletIconSource>,
     pub(super) action_task_abort_handle: Option<tokio::task::AbortHandle>,
@@ -568,6 +570,17 @@ impl WalletRoot {
             cx.notify();
             return;
         }
+        if let Some(device_kind) = self.selected_hardware_public_device_kind() {
+            self.add_hardware_public_account_from_input(
+                store,
+                view_session,
+                device_kind,
+                label,
+                window,
+                cx,
+            );
+            return;
+        }
         let password = Self::read_and_clear_input(&self.public_form.add_password_input, window, cx);
         if password.trim().is_empty() {
             self.public_form.error = Some(Arc::from("Enter the vault password to add an account"));
@@ -598,6 +611,67 @@ impl WalletRoot {
             }
         }
         cx.notify();
+    }
+
+    fn add_hardware_public_account_from_input(
+        &mut self,
+        store: Arc<DesktopVaultStore>,
+        view_session: Arc<DesktopViewSession>,
+        device_kind: HardwareDeviceKind,
+        label: String,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.public_form.adding_account = true;
+        self.public_form.error = None;
+
+        #[cfg(feature = "hardware")]
+        let join = self.runtime.spawn(async move {
+            create_hardware_public_account(store, view_session, device_kind, label).await
+        });
+
+        #[cfg(not(feature = "hardware"))]
+        let join: tokio::task::JoinHandle<Result<PublicAccountMetadata, String>> =
+            self.runtime.spawn(async move {
+                let _ = (store, view_session, device_kind, label);
+                Err("hardware public account support is not enabled in this build".to_owned())
+            });
+
+        cx.spawn_in(window, async move |this, cx| {
+            let result = join.await;
+            let _ = this.update_in(cx, |root, window, cx| {
+                root.public_form.adding_account = false;
+                match result {
+                    Ok(Ok(account)) => {
+                        root.public_form.selected_account_uuid =
+                            Some(Arc::from(account.public_account_uuid.as_str()));
+                        root.public_form
+                            .add_label_input
+                            .update(cx, |input, cx| input.set_value("", window, cx));
+                        root.reload_public_accounts(window, cx);
+                        root.schedule_public_balance_refresh(cx);
+                        window.close_all_dialogs(cx);
+                    }
+                    Ok(Err(error)) => {
+                        root.public_form.error = Some(Arc::from(error));
+                    }
+                    Err(error) => {
+                        root.public_form.error = Some(Arc::from(error.to_string()));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn selected_hardware_public_device_kind(&self) -> Option<HardwareDeviceKind> {
+        match self.selected_wallet_source() {
+            WalletSource::LedgerDerived => Some(HardwareDeviceKind::Ledger),
+            WalletSource::TrezorDerived => Some(HardwareDeviceKind::Trezor),
+            WalletSource::Generated | WalletSource::Imported => None,
+        }
     }
 
     pub(super) fn import_public_account_from_input(
@@ -886,6 +960,60 @@ impl WalletRoot {
                     || "Next index unavailable".to_string(),
                     |index| format!("Next derived index: {index}"),
                 );
+                if let Some(device_kind) = self.selected_hardware_public_device_kind() {
+                    let path = self
+                        .public_form
+                        .next_derived_index
+                        .and_then(|public_index| {
+                            let wallet_index = self.view_session.as_ref()?.derivation_index();
+                            HardwarePublicAccountDescriptor::for_wallet_public_index(
+                                device_kind,
+                                wallet_index,
+                                public_index,
+                            )
+                            .ok()
+                        })
+                        .map_or_else(
+                            || "Next hardware path unavailable".to_string(),
+                            |descriptor| {
+                                format!("Next hardware path: {}", descriptor.path_display())
+                            },
+                        );
+                    return div()
+                        .w(content_width)
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .child(app_muted_text(hardware_public_account_setup_copy(
+                            device_kind,
+                        )))
+                        .child(app_muted_text(next_index))
+                        .child(app_muted_text(path))
+                        .child(app_input(&self.public_form.add_label_input))
+                        .children(self.public_form.error.as_ref().map(|message| {
+                            Alert::error("wallet-public-add-derived-error", message.to_string())
+                                .small()
+                        }))
+                        .child(
+                            app_button(
+                                "wallet-public-add-derived-submit",
+                                if self.public_form.adding_account {
+                                    "Deriving..."
+                                } else {
+                                    "Add hardware account"
+                                },
+                            )
+                            .primary()
+                            .small()
+                            .loading(self.public_form.adding_account)
+                            .disabled(self.public_form.adding_account)
+                            .on_click(move |_event, window, cx| {
+                                add_root.update(cx, |root, cx| {
+                                    root.add_public_derived_account_from_input(window, cx);
+                                });
+                            }),
+                        );
+                }
                 div()
                     .w(content_width)
                     .flex()
@@ -1289,7 +1417,7 @@ impl WalletRoot {
                 }),
             );
         let action_buttons = match account.source {
-            PublicAccountSource::Derived => {
+            PublicAccountSource::Derived | PublicAccountSource::HardwareDerived => {
                 let status_uuid = Arc::clone(&account_uuid);
                 let inactive = account.status == PublicAccountStatus::Inactive;
                 action_buttons.child(
@@ -1880,9 +2008,60 @@ pub(super) fn next_public_account_label_number(account_count: usize) -> u32 {
         .unwrap_or(u32::MAX)
 }
 
+pub(super) fn hardware_public_account_setup_copy(device_kind: HardwareDeviceKind) -> String {
+    let device_label = match device_kind {
+        HardwareDeviceKind::Ledger => "Ledger",
+        HardwareDeviceKind::Trezor => "Trezor",
+    };
+    format!(
+        "Add a hardware-native Public EVM account from your {device_label}. The path is partitioned by the selected Private wallet account index. Confirm the receive address on your device before it is saved, and public transactions will require device approval."
+    )
+}
+
+#[cfg(feature = "hardware")]
+async fn create_hardware_public_account(
+    store: Arc<DesktopVaultStore>,
+    view_session: Arc<DesktopViewSession>,
+    device_kind: HardwareDeviceKind,
+    label: String,
+) -> Result<PublicAccountMetadata, String> {
+    let account_index = store
+        .next_derived_public_account_index_for_session(view_session.as_ref())
+        .map_err(|error| error.to_string())?;
+    let descriptor = HardwarePublicAccountDescriptor::for_wallet_public_index(
+        device_kind,
+        view_session.derivation_index(),
+        account_index,
+    )
+    .map_err(|error| error.to_string())?;
+    let address = match device_kind {
+        HardwareDeviceKind::Ledger => {
+            let client = wallet_ops::hardware::ledger::LedgerHardwareDerivationClient::connect()
+                .await
+                .map_err(|error| error.to_string())?;
+            client
+                .confirmed_public_ethereum_address(&descriptor)
+                .await
+                .map_err(|error| error.to_string())?
+        }
+        HardwareDeviceKind::Trezor => {
+            let mut client =
+                wallet_ops::hardware::trezor::TrezorHardwareDerivationClient::connect()
+                    .map_err(|error| error.to_string())?;
+            client
+                .confirmed_public_ethereum_address(&descriptor)
+                .map_err(|error| error.to_string())?
+        }
+    };
+    store
+        .add_hardware_public_account(view_session.as_ref(), descriptor, address, Some(&label))
+        .map_err(|error| error.to_string())
+}
+
 pub(super) const fn public_account_source_label(source: PublicAccountSource) -> &'static str {
     match source {
         PublicAccountSource::Derived => "Derived",
+        PublicAccountSource::HardwareDerived => "Hardware",
         PublicAccountSource::Imported => "Imported",
     }
 }
@@ -1891,7 +2070,9 @@ pub(super) const fn public_account_source_icon(
     source: PublicAccountSource,
 ) -> RailgunPublicAccountIcon {
     match source {
-        PublicAccountSource::Derived => RailgunPublicAccountIcon::Derived,
+        PublicAccountSource::Derived | PublicAccountSource::HardwareDerived => {
+            RailgunPublicAccountIcon::Derived
+        }
         PublicAccountSource::Imported => RailgunPublicAccountIcon::Imported,
     }
 }

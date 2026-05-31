@@ -1,4 +1,10 @@
 use super::*;
+use zeroize::Zeroizing;
+
+const SOFTWARE_SELF_BROADCAST_GAS_PAYER_PASSWORD_REQUIRED: &str = concat!(
+    "The selected gas payer is a software Public account, so self-broadcast requires the vault ",
+    "password. Choose a hardware Public account, manual calldata, or public broadcaster delivery."
+);
 
 impl WalletRoot {
     pub(in crate::root) fn generate_send_calldata_from_form(
@@ -10,12 +16,22 @@ impl WalletRoot {
         let Some(draft) = self.send_spend_draft(key, cx) else {
             return;
         };
-        self.request_spend_authorization(
-            SpendAuthorizationIntent::PrivateSend(key),
-            private_send_authorization_summary(&draft),
-            window,
-            cx,
-        );
+        let requires_gas_payer_password = self.selected_wallet_source().is_hardware_derived()
+            && self_broadcast_requires_software_gas_payer_password(
+                draft.delivery_mode,
+                draft.self_broadcast_gas_payer_source,
+            );
+        let intent = if requires_gas_payer_password {
+            SpendAuthorizationIntent::PrivateSendSelfBroadcastGasPassword(key)
+        } else {
+            SpendAuthorizationIntent::PrivateSend(key)
+        };
+        let summary = if requires_gas_payer_password {
+            private_send_gas_payer_authorization_summary(&draft)
+        } else {
+            private_send_authorization_summary(&draft)
+        };
+        self.request_spend_authorization(intent, summary, window, cx);
     }
 
     pub(in crate::root) fn send_spend_draft(
@@ -116,26 +132,32 @@ impl WalletRoot {
             return None;
         }
 
-        let (self_broadcast_public_account_uuid, self_broadcast_gas_payer_display) =
-            if delivery_mode == DeliveryMode::SelfBroadcast {
-                let Some(uuid) = self_broadcast_gas_payer_uuid else {
-                    self.set_send_form_error(key, "Choose a Public account to pay gas", cx);
-                    return None;
-                };
-                let Some(account) =
-                    self.selected_self_broadcast_gas_payer_account(Some(uuid.as_ref()))
-                else {
-                    self.set_send_form_error(key, "Choose an active Public account to pay gas", cx);
-                    return None;
-                };
-                let gas_payer_display = public_account_display_label(account).map_or_else(
-                    || short_address(&account.address),
-                    |label| format!("{label} · {}", short_address(&account.address)),
-                );
-                (Some(uuid.to_string()), Some(gas_payer_display))
-            } else {
-                (None, None)
+        let (
+            self_broadcast_public_account_uuid,
+            self_broadcast_gas_payer_display,
+            self_broadcast_gas_payer_source,
+        ) = if delivery_mode == DeliveryMode::SelfBroadcast {
+            let Some(uuid) = self_broadcast_gas_payer_uuid else {
+                self.set_send_form_error(key, "Choose a Public account to pay gas", cx);
+                return None;
             };
+            let Some(account) = self.selected_self_broadcast_gas_payer_account(Some(uuid.as_ref()))
+            else {
+                self.set_send_form_error(key, "Choose an active Public account to pay gas", cx);
+                return None;
+            };
+            let gas_payer_display = public_account_display_label(account).map_or_else(
+                || short_address(&account.address),
+                |label| format!("{label} · {}", short_address(&account.address)),
+            );
+            (
+                Some(uuid.to_string()),
+                Some(gas_payer_display),
+                Some(account.source),
+            )
+        } else {
+            (None, None, None)
+        };
 
         let fee_rows = if delivery_mode == DeliveryMode::PublicBroadcaster {
             let rows = self.monitor_fee_rows();
@@ -183,6 +205,7 @@ impl WalletRoot {
             amount,
             self_broadcast_public_account_uuid,
             self_broadcast_gas_payer_display,
+            self_broadcast_gas_payer_source,
             fee_rows,
             fee_policy,
             favorites_only_broadcasters,
@@ -192,7 +215,24 @@ impl WalletRoot {
     pub(in crate::root) fn generate_send_calldata_authorized(
         &mut self,
         key: UnshieldAssetKey,
-        vault_password: Zeroizing<String>,
+        spend_authorization: DesktopPrivateSpendAuthorization,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.generate_send_calldata_authorized_with_gas_password(
+            key,
+            spend_authorization,
+            None,
+            window,
+            cx,
+        );
+    }
+
+    pub(in crate::root) fn generate_send_calldata_authorized_with_gas_password(
+        &mut self,
+        key: UnshieldAssetKey,
+        spend_authorization: DesktopPrivateSpendAuthorization,
+        gas_payer_password: Option<Zeroizing<String>>,
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -215,10 +255,35 @@ impl WalletRoot {
             amount,
             self_broadcast_public_account_uuid,
             self_broadcast_gas_payer_display,
+            self_broadcast_gas_payer_source,
             fee_rows,
             fee_policy,
             favorites_only_broadcasters,
         } = draft;
+
+        let self_broadcast_vault_password = if delivery_mode == DeliveryMode::SelfBroadcast {
+            if self_broadcast_gas_payer_source == Some(PublicAccountSource::HardwareDerived) {
+                None
+            } else if let Some(password) = gas_payer_password {
+                Some(password)
+            } else {
+                match &spend_authorization {
+                    DesktopPrivateSpendAuthorization::VaultPassword(password) => {
+                        Some(password.clone())
+                    }
+                    DesktopPrivateSpendAuthorization::PreauthorizedSigner(_) => {
+                        self.set_send_form_error(
+                            key,
+                            SOFTWARE_SELF_BROADCAST_GAS_PAYER_PASSWORD_REQUIRED,
+                            cx,
+                        );
+                        return;
+                    }
+                }
+            }
+        } else {
+            None
+        };
 
         self.send_generation_seq = self.send_generation_seq.wrapping_add(1);
         let generation_id = self.send_generation_seq;
@@ -293,7 +358,7 @@ impl WalletRoot {
                     view_session,
                     session,
                     vault_store,
-                    vault_password,
+                    spend_authorization,
                     token,
                     fee_token,
                     amount,
@@ -314,7 +379,7 @@ impl WalletRoot {
                     view_session,
                     session,
                     vault_store,
-                    vault_password,
+                    spend_authorization,
                     token,
                     fee_token,
                     amount,
@@ -347,7 +412,8 @@ impl WalletRoot {
                     view_session,
                     session,
                     vault_store,
-                    vault_password,
+                    spend_authorization,
+                    vault_password: self_broadcast_vault_password,
                     public_account_uuid: self_broadcast_public_account_uuid
                         .expect("self-broadcast gas payer was validated"),
                     token,
@@ -543,12 +609,22 @@ impl WalletRoot {
         let Some(draft) = self.unshield_spend_draft(key, cx) else {
             return;
         };
-        self.request_spend_authorization(
-            SpendAuthorizationIntent::PrivateUnshield(key),
-            private_unshield_authorization_summary(&draft),
-            window,
-            cx,
-        );
+        let requires_gas_payer_password = self.selected_wallet_source().is_hardware_derived()
+            && self_broadcast_requires_software_gas_payer_password(
+                draft.delivery_mode,
+                draft.self_broadcast_gas_payer_source,
+            );
+        let intent = if requires_gas_payer_password {
+            SpendAuthorizationIntent::PrivateUnshieldSelfBroadcastGasPassword(key)
+        } else {
+            SpendAuthorizationIntent::PrivateUnshield(key)
+        };
+        let summary = if requires_gas_payer_password {
+            private_unshield_gas_payer_authorization_summary(&draft)
+        } else {
+            private_unshield_authorization_summary(&draft)
+        };
+        self.request_spend_authorization(intent, summary, window, cx);
     }
 
     pub(in crate::root) fn unshield_spend_draft(
@@ -655,30 +731,32 @@ impl WalletRoot {
             return None;
         }
 
-        let (self_broadcast_public_account_uuid, self_broadcast_gas_payer_display) =
-            if delivery_mode == DeliveryMode::SelfBroadcast {
-                let Some(uuid) = self_broadcast_gas_payer_uuid else {
-                    self.set_unshield_form_error(key, "Choose a Public account to pay gas", cx);
-                    return None;
-                };
-                let Some(account) =
-                    self.selected_self_broadcast_gas_payer_account(Some(uuid.as_ref()))
-                else {
-                    self.set_unshield_form_error(
-                        key,
-                        "Choose an active Public account to pay gas",
-                        cx,
-                    );
-                    return None;
-                };
-                let gas_payer_display = public_account_display_label(account).map_or_else(
-                    || short_address(&account.address),
-                    |label| format!("{label} · {}", short_address(&account.address)),
-                );
-                (Some(uuid.to_string()), Some(gas_payer_display))
-            } else {
-                (None, None)
+        let (
+            self_broadcast_public_account_uuid,
+            self_broadcast_gas_payer_display,
+            self_broadcast_gas_payer_source,
+        ) = if delivery_mode == DeliveryMode::SelfBroadcast {
+            let Some(uuid) = self_broadcast_gas_payer_uuid else {
+                self.set_unshield_form_error(key, "Choose a Public account to pay gas", cx);
+                return None;
             };
+            let Some(account) = self.selected_self_broadcast_gas_payer_account(Some(uuid.as_ref()))
+            else {
+                self.set_unshield_form_error(key, "Choose an active Public account to pay gas", cx);
+                return None;
+            };
+            let gas_payer_display = public_account_display_label(account).map_or_else(
+                || short_address(&account.address),
+                |label| format!("{label} · {}", short_address(&account.address)),
+            );
+            (
+                Some(uuid.to_string()),
+                Some(gas_payer_display),
+                Some(account.source),
+            )
+        } else {
+            (None, None, None)
+        };
 
         let fee_rows = if delivery_mode == DeliveryMode::PublicBroadcaster {
             let rows = self.monitor_fee_rows();
@@ -727,6 +805,7 @@ impl WalletRoot {
             amount,
             self_broadcast_public_account_uuid,
             self_broadcast_gas_payer_display,
+            self_broadcast_gas_payer_source,
             fee_rows,
             fee_policy,
             favorites_only_broadcasters,
@@ -736,7 +815,24 @@ impl WalletRoot {
     pub(in crate::root) fn generate_unshield_calldata_authorized(
         &mut self,
         key: UnshieldAssetKey,
-        vault_password: Zeroizing<String>,
+        spend_authorization: DesktopPrivateSpendAuthorization,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.generate_unshield_calldata_authorized_with_gas_password(
+            key,
+            spend_authorization,
+            None,
+            window,
+            cx,
+        );
+    }
+
+    pub(in crate::root) fn generate_unshield_calldata_authorized_with_gas_password(
+        &mut self,
+        key: UnshieldAssetKey,
+        spend_authorization: DesktopPrivateSpendAuthorization,
+        gas_payer_password: Option<Zeroizing<String>>,
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -760,10 +856,35 @@ impl WalletRoot {
             amount,
             self_broadcast_public_account_uuid,
             self_broadcast_gas_payer_display,
+            self_broadcast_gas_payer_source,
             fee_rows,
             fee_policy,
             favorites_only_broadcasters,
         } = draft;
+
+        let self_broadcast_vault_password = if delivery_mode == DeliveryMode::SelfBroadcast {
+            if self_broadcast_gas_payer_source == Some(PublicAccountSource::HardwareDerived) {
+                None
+            } else if let Some(password) = gas_payer_password {
+                Some(password)
+            } else {
+                match &spend_authorization {
+                    DesktopPrivateSpendAuthorization::VaultPassword(password) => {
+                        Some(password.clone())
+                    }
+                    DesktopPrivateSpendAuthorization::PreauthorizedSigner(_) => {
+                        self.set_unshield_form_error(
+                            key,
+                            SOFTWARE_SELF_BROADCAST_GAS_PAYER_PASSWORD_REQUIRED,
+                            cx,
+                        );
+                        return;
+                    }
+                }
+            }
+        } else {
+            None
+        };
 
         self.unshield_generation_seq = self.unshield_generation_seq.wrapping_add(1);
         let generation_id = self.unshield_generation_seq;
@@ -838,7 +959,7 @@ impl WalletRoot {
                     view_session,
                     session,
                     vault_store,
-                    vault_password,
+                    spend_authorization,
                     token,
                     fee_token,
                     amount,
@@ -861,7 +982,7 @@ impl WalletRoot {
                     view_session,
                     session,
                     vault_store,
-                    vault_password,
+                    spend_authorization,
                     token,
                     fee_token,
                     amount,
@@ -895,7 +1016,8 @@ impl WalletRoot {
                     view_session,
                     session,
                     vault_store,
-                    vault_password,
+                    spend_authorization,
+                    vault_password: self_broadcast_vault_password,
                     public_account_uuid: self_broadcast_public_account_uuid
                         .expect("self-broadcast gas payer was validated"),
                     token,

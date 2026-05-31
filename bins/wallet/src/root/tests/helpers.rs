@@ -238,5 +238,6 @@ pub(super) fn wallet_metadata(
         source,
         status,
         display_order,
+        hardware_descriptor: None,
     }
 }

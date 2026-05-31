@@ -18,11 +18,6 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
         return Err(eyre!("selected token does not support unwrap-to-native"));
     }
 
-    let mut grant = request
-        .vault_store
-        .create_spend_grant(request.vault_password.as_str())
-        .wrap_err("authorize public broadcaster unshield spend")?;
-
     let PublicBroadcasterSetup {
         chain,
         broadcaster,
@@ -147,10 +142,11 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
         .as_ref()
         .map_or(U256::ZERO, |estimate| estimate.fee_amount);
 
-    let signer = request
-        .vault_store
-        .railgun_spend_signer(&mut grant, request.view_session.wallet_id())
-        .wrap_err("load public broadcaster unshield spend signer")?;
+    let signer = request.spend_authorization.into_signer(
+        request.vault_store.as_ref(),
+        request.view_session.wallet_id(),
+        "public broadcaster unshield",
+    )?;
 
     let mode = if request.unwrap {
         UnshieldMode::UnwrapBase
@@ -358,11 +354,6 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
         ));
     }
 
-    let mut grant = request
-        .vault_store
-        .create_spend_grant(request.vault_password.as_str())
-        .wrap_err("authorize public broadcaster send spend")?;
-
     let recipient = parse_railgun_recipient(&request.recipient)?;
     let PublicBroadcasterSetup {
         chain,
@@ -473,10 +464,11 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
         .as_ref()
         .map_or(U256::ZERO, |estimate| estimate.fee_amount);
 
-    let signer = request
-        .vault_store
-        .railgun_spend_signer(&mut grant, request.view_session.wallet_id())
-        .wrap_err("load public broadcaster send spend signer")?;
+    let signer = request.spend_authorization.into_signer(
+        request.vault_store.as_ref(),
+        request.view_session.wallet_id(),
+        "public broadcaster send",
+    )?;
 
     let tx_builder = TransactionBuilder {
         chain_type: 0,

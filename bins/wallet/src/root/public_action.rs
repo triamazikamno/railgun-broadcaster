@@ -27,7 +27,7 @@ use wallet_ops::{
     PublicSendRequest, PublicShieldRequest, estimate_public_native_action_gas_reserve,
     parse_send_amount, public_action_replacement_bumped_fee, quote_public_action_gas_fee,
     submit_public_send_with_progress, submit_public_shield_with_progress,
-    vault::{DesktopVaultStore, DesktopViewSession, PublicAccountStatus},
+    vault::{DesktopVaultStore, DesktopViewSession, PublicAccountSource, PublicAccountStatus},
 };
 use zeroize::Zeroizing;
 
