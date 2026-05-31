@@ -60,6 +60,7 @@ sol! {
 }
 
 pub const API_VERSION: &str = "8.2.3";
+const RAILGUN_EVM_CHAIN_TYPE: u8 = 0;
 
 #[derive(Debug, Error)]
 pub enum HandleTransactError {
@@ -190,6 +191,17 @@ const fn fee_note_assurance_required(
     poi_enabled && (!required_poi_list.is_empty() || has_pending_jobs)
 }
 
+const fn advertised_railgun_address_scope(
+    chain_scoped: bool,
+    chain_id: ChainId,
+) -> Option<(u8, ChainId)> {
+    if chain_scoped {
+        Some((RAILGUN_EVM_CHAIN_TYPE, chain_id))
+    } else {
+        None
+    }
+}
+
 impl BroadcasterService {
     pub async fn new(
         chain_cfg: Chain,
@@ -277,6 +289,10 @@ impl BroadcasterService {
             multicall_contract,
             chain_cfg.wrapped_native_token,
         ));
+        let advertised_address_scope = advertised_railgun_address_scope(
+            chain_cfg.chain_scoped_railgun_address,
+            chain_cfg.chain_id,
+        );
 
         let (key, master_public_key, addr) = match &chain_cfg.key {
             Key::ViewingPrivkey(key) => {
@@ -284,7 +300,7 @@ impl BroadcasterService {
                 let viewing_key_data = viewing_key
                     .decode_viewing_key_data()
                     .map_err(|_| BroadcasterServiceError::InvalidViewingPrivkey)?;
-                let addr = viewing_key_data.derive_address(None)?;
+                let addr = viewing_key_data.derive_address(advertised_address_scope)?;
                 (
                     viewing_key_data.viewing_private_key,
                     viewing_key_data.master_public_key,
@@ -303,7 +319,7 @@ impl BroadcasterService {
                 let wallet = WalletKeys::from_mnemonic(seed_phrase, 0)?;
                 let key = wallet.viewing.viewing_private_key;
                 let master_public_key = wallet.viewing.master_public_key;
-                let addr = wallet.viewing.derive_address(None)?;
+                let addr = wallet.viewing.derive_address(advertised_address_scope)?;
                 let railgun_contract = resolved_railgun_contract
                     .ok_or(BroadcasterServiceError::RailgunContractMissing)?;
                 let finality_depth =
@@ -1009,9 +1025,10 @@ const fn should_remove_fee_note_assurance_fallback(
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_pending_fee_note_assurance_records, fee_note_assurance_required,
-        queue_fee_note_assurance_fallback, remove_fee_note_assurance_fallback,
-        should_remove_fee_note_assurance_fallback, snapshot_fee_note_assurance_fallback,
+        advertised_railgun_address_scope, collect_pending_fee_note_assurance_records,
+        fee_note_assurance_required, queue_fee_note_assurance_fallback,
+        remove_fee_note_assurance_fallback, should_remove_fee_note_assurance_fallback,
+        snapshot_fee_note_assurance_fallback,
     };
     use crate::fee_note_assurance::FeeNoteAssuranceRecordOutcome;
     use alloy::primitives::{FixedBytes, U256};
@@ -1046,6 +1063,19 @@ mod tests {
     #[test]
     fn fee_note_assurance_is_required_with_pending_jobs() {
         assert!(fee_note_assurance_required(true, &[], true));
+    }
+
+    #[test]
+    fn advertised_railgun_address_scope_defaults_to_all_chains() {
+        assert_eq!(advertised_railgun_address_scope(false, 1), None);
+    }
+
+    #[test]
+    fn advertised_railgun_address_scope_uses_chain_id_when_enabled() {
+        assert_eq!(
+            advertised_railgun_address_scope(true, 42161),
+            Some((0, 42161))
+        );
     }
 
     fn sample_record(chain_id: u64, tx_hash: [u8; 32]) -> PendingFeeNoteAssuranceRecord {
