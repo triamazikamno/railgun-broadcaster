@@ -14,6 +14,8 @@ impl WalletRoot {
         self.clear_public_action_dialog_inputs(window, cx);
         let root = cx.entity();
         let dialog_width = (window.viewport_size().width * 0.92).min(PUBLIC_ACTION_DIALOG_WIDTH);
+        let dialog_max_height = dialog_max_height(window);
+        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         let asset_label = public_asset_label(
             self.selected_chain,
@@ -30,6 +32,7 @@ impl WalletRoot {
             let content_root = root.clone();
             dialog
                 .w(dialog_width)
+                .max_h(dialog_max_height)
                 .title(public_action_title_row(
                     asset_label.clone(),
                     icon_path.clone(),
@@ -39,11 +42,12 @@ impl WalletRoot {
                         root.clear_public_action_dialog_inputs(window, cx);
                     });
                 })
-                .child(
+                .child(scrollable_dialog_content(
+                    content_max_height,
                     content_root
                         .read(cx)
                         .render_public_action_dialog_content(content_root.clone(), content_width),
-                )
+                ))
         });
         self.refresh_public_action_gas_fee_quote(PublicActionMode::Shield, cx);
         cx.defer_in(window, |root, window, cx| {
@@ -262,6 +266,8 @@ impl WalletRoot {
         ] {
             input.update(cx, |input, cx| input.set_value("", window, cx));
         }
+        self.clear_trezor_app_passphrase_input(window, cx);
+        self.clear_trezor_pin_matrix_prompt(cx);
         self.public_form.send_error = None;
         self.public_form.shield_error = None;
         if !self.public_form.sending && !self.public_form.shielding {
@@ -297,6 +303,7 @@ impl WalletRoot {
         if let Some(handle) = self.public_form.action_task_abort_handle.take() {
             handle.abort();
         }
+        self.drop_trezor_pin_matrix_prompt();
         self.public_form.action_progress.clear();
         self.public_form.expanded_action_error_steps.clear();
         self.public_form.action_progress_dialog_open = false;
@@ -597,6 +604,7 @@ impl WalletRoot {
         }
         match event {
             PublicActionSessionEvent::StepFailed { step, message } => {
+                self.discard_active_trezor_session_if_stale(&message, cx);
                 self.public_form.action_action_error = None;
                 if let Some(progress_step) = self
                     .public_form
@@ -623,7 +631,14 @@ impl WalletRoot {
                 self.public_form.action_attempts.push(attempt);
             }
             PublicActionSessionEvent::AttemptRejected { message, .. } => {
+                self.discard_active_trezor_session_if_stale(&message, cx);
                 self.public_form.action_action_error = Some(Arc::from(message));
+            }
+            PublicActionSessionEvent::HardwareProfileSessionRefreshed { session } => {
+                #[cfg(feature = "hardware")]
+                self.refresh_active_hardware_profile_session(session, cx);
+                #[cfg(not(feature = "hardware"))]
+                let _ = session;
             }
         }
         cx.notify();
@@ -646,6 +661,7 @@ impl WalletRoot {
         let viewport_size = window.viewport_size();
         let dialog_width = (viewport_size.width * 0.92).min(PUBLIC_ACTION_DIALOG_WIDTH);
         let dialog_max_height = viewport_size.height * 0.84;
+        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         window.open_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
@@ -665,11 +681,12 @@ impl WalletRoot {
                         }
                     });
                 })
-                .child(
+                .child(scrollable_dialog_content(
+                    content_max_height,
                     content_root
                         .read(cx)
                         .render_public_action_progress_dialog_content(&content_root, content_width),
-                )
+                ))
         });
     }
 
@@ -693,6 +710,7 @@ impl WalletRoot {
         if let Some(handle) = self.public_form.action_task_abort_handle.take() {
             handle.abort();
         }
+        self.clear_trezor_pin_matrix_prompt(cx);
         self.public_form.action_command_tx = None;
         self.public_form.action_action_error = None;
         self.public_form.action_stop_available = false;
@@ -751,6 +769,7 @@ impl WalletRoot {
                 }
             }
             ProgressDialogCloseBehavior::TopOnly => {
+                self.clear_trezor_pin_matrix_prompt(cx);
                 self.public_form.action_progress_dialog_open = false;
                 if close_top_dialog {
                     window.close_dialog(cx);
@@ -809,6 +828,16 @@ impl WalletRoot {
                     )),
             );
         }
+        #[cfg(feature = "hardware")]
+        if let Some(prompt) = self
+            .hardware_profile_unlock
+            .trezor_pin_matrix_prompt
+            .as_ref()
+        {
+            content = content.child(super::super::vault_ui::render_trezor_pin_matrix_prompt(
+                root, prompt,
+            ));
+        }
         content = content.child(render_public_action_progress_footer(
             root.clone(),
             public_action_progress_footer_action(
@@ -846,8 +875,16 @@ impl WalletRoot {
             )
         });
         let dialog_width = (window.viewport_size().width * 0.92).min(px(460.0));
+        let dialog_max_height = dialog_max_height(window);
+        let content_max_height = dialog_content_max_height(window);
         window.open_dialog(cx, move |dialog, _window, _cx| {
-            dialog.w(dialog_width).child(content.clone())
+            dialog
+                .w(dialog_width)
+                .max_h(dialog_max_height)
+                .child(scrollable_dialog_content(
+                    content_max_height,
+                    content.clone(),
+                ))
         });
     }
 
@@ -1213,7 +1250,7 @@ impl WalletRoot {
     pub(in crate::root) fn submit_public_send_authorized(
         &mut self,
         vault_password: Zeroizing<String>,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
         if self.public_form.sending {
@@ -1235,6 +1272,21 @@ impl WalletRoot {
             gas_fee,
             ..
         } = draft;
+        #[cfg(feature = "hardware")]
+        let trezor_app_passphrase = view_session.hardware_profile_session().and_then(|session| {
+            self.read_trezor_app_passphrase_for_hardware_session(session, window, cx)
+        });
+        #[cfg(not(feature = "hardware"))]
+        let trezor_app_passphrase = None;
+        #[cfg(feature = "hardware")]
+        let trezor_pin_matrix_provider =
+            if matches!(&public_account_source, PublicAccountSource::HardwareDerived) {
+                Some(self.trezor_pin_matrix_provider_for_operation(window, cx))
+            } else {
+                None
+            };
+        #[cfg(not(feature = "hardware"))]
+        let trezor_pin_matrix_provider = None;
         self.public_form.sending = true;
         self.public_form.send_error = None;
         let http = self.http.clone();
@@ -1276,6 +1328,8 @@ impl WalletRoot {
             view_session,
             vault_store,
             vault_password,
+            trezor_app_passphrase,
+            trezor_pin_matrix_provider,
             public_account_uuid: public_account_uuid.to_string(),
             asset,
             amount,
@@ -1322,10 +1376,11 @@ impl WalletRoot {
                         }
                     }
                     Ok(Err(error)) => {
-                        let message = error.to_string();
+                        let message = format_report_chain(&error);
                         if is_spend_authorization_failure_error(&message) {
                             root.clear_spend_authorization(cx);
                         }
+                        root.discard_active_trezor_session_if_stale(&message, cx);
                         root.public_form.action_command_tx = None;
                         root.fail_public_action_progress(generation, message.clone(), cx);
                         root.public_form.send_error = Some(Arc::from(message));
@@ -1461,7 +1516,7 @@ impl WalletRoot {
     pub(in crate::root) fn submit_public_shield_authorized(
         &mut self,
         vault_password: Zeroizing<String>,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
         if self.public_form.shielding {
@@ -1482,6 +1537,21 @@ impl WalletRoot {
             gas_fee,
             ..
         } = draft;
+        #[cfg(feature = "hardware")]
+        let trezor_app_passphrase = view_session.hardware_profile_session().and_then(|session| {
+            self.read_trezor_app_passphrase_for_hardware_session(session, window, cx)
+        });
+        #[cfg(not(feature = "hardware"))]
+        let trezor_app_passphrase = None;
+        #[cfg(feature = "hardware")]
+        let trezor_pin_matrix_provider =
+            if matches!(&public_account_source, PublicAccountSource::HardwareDerived) {
+                Some(self.trezor_pin_matrix_provider_for_operation(window, cx))
+            } else {
+                None
+            };
+        #[cfg(not(feature = "hardware"))]
+        let trezor_pin_matrix_provider = None;
         self.public_form.shielding = true;
         self.public_form.shield_error = None;
         let http = self.http.clone();
@@ -1523,6 +1593,8 @@ impl WalletRoot {
             view_session,
             vault_store,
             vault_password,
+            trezor_app_passphrase,
+            trezor_pin_matrix_provider,
             public_account_uuid: public_account_uuid.to_string(),
             asset,
             amount,
@@ -1568,10 +1640,11 @@ impl WalletRoot {
                         }
                     }
                     Ok(Err(error)) => {
-                        let message = error.to_string();
+                        let message = format_report_chain(&error);
                         if is_spend_authorization_failure_error(&message) {
                             root.clear_spend_authorization(cx);
                         }
+                        root.discard_active_trezor_session_if_stale(&message, cx);
                         root.public_form.action_command_tx = None;
                         root.fail_public_action_progress(generation, message.clone(), cx);
                         root.public_form.shield_error = Some(Arc::from(message));

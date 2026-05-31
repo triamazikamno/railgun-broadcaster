@@ -3,7 +3,7 @@ use std::sync::Arc;
 use gpui::{
     App, AppContext, Context, ElementId, Entity, Focusable, FontWeight, InteractiveElement,
     IntoElement, ParentElement, Pixels, Point, Render, SharedString, StatefulInteractiveElement,
-    Styled, Window, div, px, rgb,
+    Styled, Window, div, prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
     Icon, IconName, Sizable, WindowExt,
@@ -14,14 +14,17 @@ use gpui_component::{
 use ui::controls::{app_button, app_input, app_muted_text, app_strong_text};
 use ui::theme;
 use wallet_ops::vault::{
-    DesktopVaultStore, DesktopViewSession, VaultError, WalletMetadataBundle, WalletSource,
-    WalletStatus, sort_wallet_metadata,
+    DesktopVaultStore, VaultError, ViewUnlock, WalletMetadataBundle, WalletSource, WalletStatus,
+    sort_wallet_metadata,
 };
 
 use crate::assets::RailgunActionIcon;
 
 use super::vault::{WalletOption, vault_error_kind, wallet_options_from_metadata};
-use super::{APP_TEXT_SIZE, WalletRoot, secondary_dialog_content_width};
+use super::{
+    APP_TEXT_SIZE, WalletRoot, dialog_content_max_height, dialog_max_height,
+    scrollable_dialog_content, secondary_dialog_content_width,
+};
 
 #[derive(Default)]
 pub(super) struct ManageWalletsState {
@@ -131,6 +134,15 @@ pub(super) fn selected_wallet_after_metadata_refresh(
         })
 }
 
+pub(super) fn wallet_management_switch_requires_device(
+    wallet_id: &str,
+    options: &[WalletOption],
+) -> bool {
+    options
+        .iter()
+        .any(|option| option.wallet_id.as_ref() == wallet_id && option.source.is_hardware_derived())
+}
+
 impl WalletRoot {
     pub(super) fn open_manage_wallets_dialog(
         &mut self,
@@ -144,17 +156,21 @@ impl WalletRoot {
         self.manage_wallets = ManageWalletsState::default();
         let root = cx.entity();
         let dialog_width = (window.viewport_size().width * 0.92).min(px(680.0));
+        let dialog_max_height = dialog_max_height(window);
+        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         window.open_dialog(cx, move |dialog, _window, cx| {
             let content_root = root.clone();
             dialog
                 .w(dialog_width)
+                .max_h(dialog_max_height)
                 .title(app_strong_text("Manage wallets"))
-                .child(
+                .child(scrollable_dialog_content(
+                    content_max_height,
                     content_root
                         .read(cx)
                         .render_manage_wallets_dialog_content(&content_root, content_width),
-                )
+                ))
         });
     }
 
@@ -167,9 +183,9 @@ impl WalletRoot {
             return;
         };
         let label = self.manage_wallet_label_input.read(cx).value().to_string();
-        self.run_wallet_management_mutation(window, cx, move |store, session| {
+        self.run_wallet_management_mutation(window, cx, move |store, view| {
             store
-                .update_wallet_label_for_session(session, wallet_id.as_ref(), &label)
+                .update_wallet_label_with_view_unlock(view, wallet_id.as_ref(), &label)
                 .map(|_| ())
         });
         if self.manage_wallets.error.is_none() {
@@ -210,9 +226,9 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        self.run_wallet_management_mutation(window, cx, move |store, session| {
+        self.run_wallet_management_mutation(window, cx, move |store, view| {
             store
-                .set_wallet_active_for_session(session, wallet_id.as_ref(), active)
+                .set_wallet_active_with_view_unlock(view, wallet_id.as_ref(), active)
                 .map(|_| ())
         });
     }
@@ -230,9 +246,9 @@ impl WalletRoot {
             return;
         }
 
-        self.run_wallet_management_mutation(window, cx, move |store, session| {
+        self.run_wallet_management_mutation(window, cx, move |store, view| {
             store
-                .delete_wallet_for_session(session, wallet_id.as_ref())
+                .delete_wallet_with_view_unlock(view, wallet_id.as_ref())
                 .map(|_| ())
         });
     }
@@ -253,9 +269,9 @@ impl WalletRoot {
         else {
             return;
         };
-        self.run_wallet_management_mutation(window, cx, move |store, session| {
+        self.run_wallet_management_mutation(window, cx, move |store, view| {
             store
-                .reorder_active_wallets_for_session(session, &ordered_wallet_ids)
+                .reorder_active_wallets_with_view_unlock(view, &ordered_wallet_ids)
                 .map(|_| ())
         });
     }
@@ -264,16 +280,16 @@ impl WalletRoot {
         &mut self,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
-        mutate: impl FnOnce(&DesktopVaultStore, &DesktopViewSession) -> Result<(), VaultError>,
+        mutate: impl FnOnce(&DesktopVaultStore, &ViewUnlock) -> Result<(), VaultError>,
     ) {
-        let (store, session) = match self.wallet_management_context() {
+        let (store, view) = match self.wallet_management_context() {
             Ok(context) => context,
             Err(message) => {
                 self.set_wallet_management_error(message, cx);
                 return;
             }
         };
-        match mutate(store.as_ref(), session.as_ref()) {
+        match mutate(store.as_ref(), view.as_ref()) {
             Ok(()) => {
                 self.manage_wallets.pending_delete_wallet_id = None;
                 self.manage_wallets.error = None;
@@ -288,14 +304,14 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> bool {
-        let (store, session) = match self.wallet_management_context() {
+        let (store, view) = match self.wallet_management_context() {
             Ok(context) => context,
             Err(message) => {
                 self.set_vault_error(message, cx);
                 return false;
             }
         };
-        match store.list_wallet_metadata_for_session(session.as_ref(), true) {
+        match store.list_wallet_metadata_with_view_unlock(view.as_ref(), true) {
             Ok(metadata) => self.apply_wallet_management_metadata(metadata, window, cx),
             Err(error) => {
                 self.handle_vault_error(&error, cx);
@@ -323,15 +339,23 @@ impl WalletRoot {
                 true
             }
             WalletManagementSelection::SwitchTo(next_wallet_id) => {
-                let (store, session) = match self.wallet_management_context() {
+                let next_requires_device = wallet_management_switch_requires_device(
+                    next_wallet_id.as_ref(),
+                    &self.wallet_options,
+                );
+                let (store, view) = match self.wallet_management_context() {
                     Ok(context) => context,
                     Err(message) => {
                         self.set_wallet_management_error(message, cx);
                         return false;
                     }
                 };
+                if next_requires_device {
+                    self.enter_password_metadata_unlocked(metadata, view, None, window, cx);
+                    return true;
+                }
                 match store
-                    .load_view_session_with_view_session(session.as_ref(), next_wallet_id.as_ref())
+                    .load_view_session_with_view_unlock(view.as_ref(), next_wallet_id.as_ref())
                 {
                     Ok(session) => {
                         self.install_view_session_after_management(session, metadata, window, cx);
@@ -355,16 +379,16 @@ impl WalletRoot {
 
     fn wallet_management_context(
         &self,
-    ) -> Result<(Arc<DesktopVaultStore>, Arc<DesktopViewSession>), Arc<str>> {
+    ) -> Result<(Arc<DesktopVaultStore>, Arc<ViewUnlock>), Arc<str>> {
         let store = self
             .vault_store
             .clone()
             .ok_or_else(|| Arc::from("Wallet vault storage is unavailable"))?;
-        let session = self
-            .view_session
+        let view = self
+            .vault_view_unlock
             .clone()
             .ok_or_else(|| Arc::from("Unlock the wallet vault before managing wallets"))?;
-        Ok((store, session))
+        Ok((store, view))
     }
 
     fn handle_wallet_management_error(&mut self, error: &VaultError, cx: &mut Context<'_, Self>) {
@@ -544,6 +568,7 @@ impl WalletRoot {
                 root,
                 &wallet_id,
                 &label,
+                wallet.source,
                 active,
                 confirming_delete,
             ))
@@ -588,14 +613,19 @@ impl WalletRoot {
         root: Entity<Self>,
         wallet_id: &Arc<str>,
         label: &Arc<str>,
+        source: WalletSource,
         active: bool,
         confirming_delete: bool,
     ) -> gpui::Div {
         let edit_root = root.clone();
+        #[cfg(feature = "hardware")]
+        let unlock_root = root.clone();
         let visibility_root = root.clone();
         let delete_root = root.clone();
         let cancel_delete_root = root;
         let edit_wallet_id = Arc::clone(wallet_id);
+        #[cfg(feature = "hardware")]
+        let unlock_wallet_id = Arc::clone(wallet_id);
         let edit_label = Arc::clone(label);
         let visibility_wallet_id = Arc::clone(wallet_id);
         let delete_wallet_id = Arc::clone(wallet_id);
@@ -618,6 +648,32 @@ impl WalletRoot {
                         });
                     }),
                 )
+                .when(source.is_hardware_derived(), |actions| {
+                    #[cfg(feature = "hardware")]
+                    {
+                        actions.child(
+                            wallet_management_icon_button(
+                                SharedString::from(format!(
+                                    "wallet-management-unlock-profile-{wallet_id}"
+                                )),
+                                IconName::Eye,
+                                "Connect hardware wallet",
+                            )
+                            .on_click(move |_event, window, cx| {
+                                let wallet_id = Arc::clone(&unlock_wallet_id);
+                                unlock_root.update(cx, |root, cx| {
+                                    root.open_hardware_profile_unlock_dialog_for_wallet(
+                                        wallet_id, window, cx,
+                                    );
+                                });
+                            }),
+                        )
+                    }
+                    #[cfg(not(feature = "hardware"))]
+                    {
+                        actions
+                    }
+                })
                 .child(
                     wallet_management_icon_button(
                         SharedString::from(format!("wallet-management-hide-{wallet_id}")),
@@ -748,7 +804,7 @@ pub(super) fn wallet_source_label(wallet: &WalletMetadataBundle) -> String {
 }
 
 fn hardware_wallet_source_label(device_label: &str, wallet: &WalletMetadataBundle) -> String {
-    wallet.hardware_descriptor.as_ref().map_or_else(
+    wallet.hardware_derivation_descriptor().map_or_else(
         || format!("{device_label}-derived wallet"),
         |descriptor| {
             format!(
@@ -768,6 +824,9 @@ fn wallet_management_error_message(error: &VaultError) -> Arc<str> {
             "At least one active wallet is required. Show another wallet before hiding or deleting this one.",
         ),
         VaultError::WalletNotFound => Arc::from("Wallet not found. Refresh and try again."),
+        VaultError::HardwareWalletViewRequiresDevice => {
+            Arc::from("Unlock and select the matching hardware wallet before deleting it.")
+        }
         _ => Arc::from(format!("Wallet management failed: {error}")),
     }
 }

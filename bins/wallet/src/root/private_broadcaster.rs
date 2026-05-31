@@ -31,7 +31,8 @@ use super::public_broadcaster_cost::{
 use super::spend_authorization::spend_authorization_recipient_display;
 use super::{
     DeliveryFormKind, PRIVATE_BROADCASTER_PROGRESS_DIALOG_WIDTH, UnshieldAssetKey, WalletRoot,
-    format_native_token_amount_for_display, secondary_dialog_content_width,
+    dialog_content_max_height, dialog_max_height, format_native_token_amount_for_display,
+    scrollable_dialog_content, secondary_dialog_content_width,
 };
 
 use crate::assets::{RailgunActionIcon, WalletIconSource};
@@ -519,6 +520,7 @@ impl WalletRoot {
         {
             handle.abort();
         }
+        self.drop_trezor_pin_matrix_prompt();
     }
 
     pub(super) fn set_private_broadcaster_task_abort_handle(
@@ -651,6 +653,7 @@ impl WalletRoot {
         let dialog_width =
             (viewport_size.width * 0.92).min(PRIVATE_BROADCASTER_PROGRESS_DIALOG_WIDTH);
         let dialog_max_height = viewport_size.height * 0.84;
+        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         window.open_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
@@ -682,36 +685,41 @@ impl WalletRoot {
                         cx.notify();
                     });
                 })
-                .child(
+                .child(scrollable_dialog_content(
+                    content_max_height,
                     content_root
                         .read(cx)
                         .render_private_broadcaster_progress_dialog_content(
                             &content_root,
                             content_width,
                         ),
-                )
+                ))
         });
     }
 
     fn stop_private_broadcaster_progress(&mut self, cx: &mut Context<'_, Self>) {
-        let Some(progress) = self.private_broadcaster_progress.as_mut() else {
-            return;
+        let (kind, key, generation_id) = {
+            let Some(progress) = self.private_broadcaster_progress.as_mut() else {
+                return;
+            };
+            if private_broadcaster_progress_footer_action(progress) != ProgressFooterAction::Stop {
+                return;
+            }
+            let kind = progress.kind;
+            let key = progress.key;
+            let generation_id = progress.generation_id;
+            if let Some(handle) = progress.task_abort_handle.take() {
+                handle.abort();
+            }
+            progress.self_broadcast_command_tx = None;
+            progress.self_broadcast_action_error = None;
+            progress.stop_available = false;
+            progress.stopped = true;
+            progress.error = None;
+            mark_private_broadcaster_active_step_stopped(&mut progress.steps);
+            (kind, key, generation_id)
         };
-        if private_broadcaster_progress_footer_action(progress) != ProgressFooterAction::Stop {
-            return;
-        }
-        let kind = progress.kind;
-        let key = progress.key;
-        let generation_id = progress.generation_id;
-        if let Some(handle) = progress.task_abort_handle.take() {
-            handle.abort();
-        }
-        progress.self_broadcast_command_tx = None;
-        progress.self_broadcast_action_error = None;
-        progress.stop_available = false;
-        progress.stopped = true;
-        progress.error = None;
-        mark_private_broadcaster_active_step_stopped(&mut progress.steps);
+        self.clear_trezor_pin_matrix_prompt(cx);
 
         match kind {
             DeliveryFormKind::Send => {
@@ -820,6 +828,7 @@ impl WalletRoot {
                 }
             }
             ProgressDialogCloseBehavior::TopOnly => {
+                self.clear_trezor_pin_matrix_prompt(cx);
                 if let Some(progress) = self.private_broadcaster_progress.as_mut() {
                     progress.dialog_open = false;
                 }
@@ -1086,8 +1095,16 @@ impl WalletRoot {
         });
         let dialog_width =
             (window.viewport_size().width * 0.92).min(SELF_BROADCAST_GAS_RETRY_DIALOG_WIDTH);
+        let dialog_max_height = dialog_max_height(window);
+        let content_max_height = dialog_content_max_height(window);
         window.open_dialog(cx, move |dialog, _window, _cx| {
-            dialog.w(dialog_width).child(content.clone())
+            dialog
+                .w(dialog_width)
+                .max_h(dialog_max_height)
+                .child(scrollable_dialog_content(
+                    content_max_height,
+                    content.clone(),
+                ))
         });
     }
 
@@ -1215,6 +1232,16 @@ impl WalletRoot {
             content = content.child(render_public_broadcaster_tx_hash_row(
                 result.tx.tx_hash.clone(),
                 delivery_element_id(progress.key, progress.kind, "progress-copy-self-tx"),
+            ));
+        }
+        #[cfg(feature = "hardware")]
+        if let Some(prompt) = self
+            .hardware_profile_unlock
+            .trezor_pin_matrix_prompt
+            .as_ref()
+        {
+            content = content.child(super::vault_ui::render_trezor_pin_matrix_prompt(
+                root, prompt,
             ));
         }
         content = content.child(render_private_broadcaster_progress_footer(

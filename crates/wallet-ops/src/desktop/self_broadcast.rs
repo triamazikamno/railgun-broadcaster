@@ -1,12 +1,17 @@
 use super::*;
 use eyre::eyre;
 
+const TREZOR_APP_PASSPHRASE_ERROR_TEXT: &str =
+    "Trezor requested an app-entered passphrase but none was provided";
+const TREZOR_SELF_BROADCAST_RESTART_GUIDANCE: &str = "Trezor app passphrase is required again. Re-unlock the hardware profile with the app passphrase, then restart this self-broadcast.";
+
 pub(super) async fn submit_self_broadcast_plan(
     chain_id: u64,
     effective_chain: Option<&settings::EffectiveChainConfig>,
     view_session: &vault::DesktopViewSession,
     vault_store: &vault::DesktopVaultStore,
     vault_password: Option<&str>,
+    trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     public_account_uuid: String,
     session: Arc<WalletSession>,
     to: Address,
@@ -26,6 +31,8 @@ pub(super) async fn submit_self_broadcast_plan(
         view_session,
         vault_password,
         &public_account_uuid,
+        None,
+        trezor_pin_matrix_provider,
     )?;
     if signer.address() != gas_payer {
         return Err(eyre!(
@@ -90,6 +97,9 @@ pub(super) async fn submit_self_broadcast_plan(
         {
             Ok(attempt) => attempt,
             Err(error) => {
+                if is_trezor_app_passphrase_required_error(&error) {
+                    return Err(error.wrap_err(TREZOR_SELF_BROADCAST_RESTART_GUIDANCE));
+                }
                 let message = report_chain_string(&error);
                 emit_self_broadcast_event(
                     event_tx.as_ref(),
@@ -191,13 +201,16 @@ pub(super) async fn submit_self_broadcast_plan(
                     .await
                     {
                         Ok(attempt) => submitted_attempts.push(attempt),
-                        Err(error) => emit_self_broadcast_event(
-                            event_tx.as_ref(),
-                            SelfBroadcastSessionEvent::AttemptRejected {
-                                stage: TransactionGenerationStage::SigningSelfBroadcast,
-                                message: report_chain_string(&error),
-                            },
-                        ),
+                        Err(error) => {
+                            let message = self_broadcast_signing_error_message(&error);
+                            emit_self_broadcast_event(
+                                event_tx.as_ref(),
+                                SelfBroadcastSessionEvent::AttemptRejected {
+                                    stage: TransactionGenerationStage::SigningSelfBroadcast,
+                                    message,
+                                },
+                            );
+                        }
                     }
                     update_transaction_generation_stage(
                         progress_tx.as_ref(),
@@ -218,12 +231,45 @@ pub(super) fn emit_self_broadcast_event(
     }
 }
 
+fn emit_refreshed_self_broadcast_hardware_session(
+    event_tx: Option<&SelfBroadcastSessionEventSender>,
+    signer: &VaultedPublicSigner,
+) {
+    match signer.refreshed_trezor_hardware_session() {
+        Ok(Some(session)) => emit_self_broadcast_event(
+            event_tx,
+            SelfBroadcastSessionEvent::HardwareProfileSessionRefreshed { session },
+        ),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(%error, "failed to read refreshed self-broadcast signer session");
+        }
+    }
+}
+
 pub(crate) fn report_chain_string(error: &Report) -> String {
     error
         .chain()
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(": ")
+}
+
+fn self_broadcast_signing_error_message(error: &Report) -> String {
+    let message = report_chain_string(error);
+    if is_trezor_app_passphrase_required_error_message(&message) {
+        format!("{message}: {TREZOR_SELF_BROADCAST_RESTART_GUIDANCE}")
+    } else {
+        message
+    }
+}
+
+fn is_trezor_app_passphrase_required_error(error: &Report) -> bool {
+    is_trezor_app_passphrase_required_error_message(&report_chain_string(error))
+}
+
+fn is_trezor_app_passphrase_required_error_message(message: &str) -> bool {
+    message.contains(TREZOR_APP_PASSPHRASE_ERROR_TEXT)
 }
 
 pub(super) async fn recv_self_broadcast_command(
@@ -249,6 +295,7 @@ pub(super) async fn submit_self_broadcast_attempt(
         preflight.tx_req,
         session,
         pending_spent_inputs,
+        event_tx,
     )
     .await?;
     let info = SelfBroadcastAttemptInfo {
@@ -929,6 +976,7 @@ pub(super) async fn sign_send_self_broadcast_transaction(
     tx_req: TransactionRequest,
     session: &WalletSession,
     pending_spent_inputs: &[Utxo],
+    event_tx: Option<&SelfBroadcastSessionEventSender>,
 ) -> Result<SelfBroadcastSentTx> {
     tracing::info!(
         from = %tx_req.from.unwrap_or_default(),
@@ -939,6 +987,7 @@ pub(super) async fn sign_send_self_broadcast_transaction(
     let signed_tx = signer
         .sign_transaction_request(tx_req, "self-broadcast")
         .await?;
+    emit_refreshed_self_broadcast_hardware_session(event_tx, signer);
     let tx_hash = keccak256(&signed_tx);
     let provider_handles = self_broadcast_send_raw_transaction_to_rpc_pool(
         query_rpc_pool,
@@ -1144,4 +1193,18 @@ pub(super) async fn mark_submitted_inputs_pending_spent(
 
 pub(crate) fn parse_submitted_tx_hash(tx_hash: &str) -> Option<FixedBytes<32>> {
     tx_hash.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trezor_app_passphrase_self_broadcast_error_adds_restart_guidance() {
+        let error = eyre!(TREZOR_APP_PASSPHRASE_ERROR_TEXT);
+        let message = self_broadcast_signing_error_message(&error);
+
+        assert!(is_trezor_app_passphrase_required_error(&error));
+        assert!(message.contains(TREZOR_SELF_BROADCAST_RESTART_GUIDANCE));
+    }
 }

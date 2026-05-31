@@ -68,7 +68,7 @@ impl BroadcasterPreferenceListKind {
         }
     }
 
-    fn input(self, root: &WalletRoot) -> &Entity<InputState> {
+    const fn input(self, root: &WalletRoot) -> &Entity<InputState> {
         match self {
             Self::Favorite => &root.favorite_broadcaster_input,
             Self::Banned => &root.banned_broadcaster_input,
@@ -85,7 +85,7 @@ impl WalletRoot {
             .flex()
             .flex_col()
             .bg(rgb(theme::SURFACE_ELEVATED))
-            .child(self.render_broadcaster_header())
+            .child(Self::render_broadcaster_header())
             .child(self.render_broadcaster_tabs(root))
             .children(self.broadcaster_preference_error.as_ref().map(|message| {
                 div().flex_none().px(px(14.0)).pt(px(10.0)).child(
@@ -113,7 +113,7 @@ impl WalletRoot {
             })
     }
 
-    fn render_broadcaster_header(&self) -> gpui::Div {
+    fn render_broadcaster_header() -> gpui::Div {
         div()
             .flex_none()
             .px(px(16.0))
@@ -181,7 +181,7 @@ impl WalletRoot {
             list = list.child(broadcaster_preference_empty_state(kind));
         } else {
             for (ix, entry) in entries.iter().enumerate() {
-                list = list.child(self.render_broadcaster_preference_row(
+                list = list.child(Self::render_broadcaster_preference_row(
                     root,
                     kind,
                     ix,
@@ -214,8 +214,7 @@ impl WalletRoot {
                             .child(
                                 app_button(
                                     SharedString::from(format!(
-                                        "wallet-broadcaster-preference-add-{:?}",
-                                        kind
+                                        "wallet-broadcaster-preference-add-{kind:?}"
                                     )),
                                     kind.add_label(),
                                 )
@@ -238,7 +237,6 @@ impl WalletRoot {
     }
 
     fn render_broadcaster_preference_row(
-        &self,
         root: &Entity<Self>,
         kind: BroadcasterPreferenceListKind,
         ix: usize,

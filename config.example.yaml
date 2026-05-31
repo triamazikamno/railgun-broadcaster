@@ -56,6 +56,10 @@ chains:
     # Optional identifier for this broadcaster. Wallets may or may not display it.
     identifier: rust-broadcaster
 
+    # Advertise a chain-scoped 0zk address in fee announcements instead of the default all-chains address.
+    # Fee notes still route to the same underlying RAILGUN keys.
+    chain_scoped_railgun_address: false
+
     # RPC endpoints for querying the chain
     query_rpcs:
       - https://eth.llamarpc.com

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use alloy::consensus::SignableTransaction;
@@ -21,9 +21,13 @@ use zeroize::Zeroizing;
 
 use crate::amounts::wrapped_native_token_for_chain;
 use crate::hardware::HardwarePublicAccountDescriptor;
+#[cfg(feature = "hardware")]
+use crate::hardware::{DEFAULT_HARDWARE_DERIVATION_PATH, parse_bip32_path};
 use crate::settings::{EffectiveChainConfig, EffectiveChainGasSettings, EffectiveTokenRegistry};
 use crate::signer::{EvmMessageSigner, EvmTransactionSigner, SoftwareEvmSigner};
-use crate::vault::{DesktopVaultStore, DesktopViewSession, PublicAccountMetadata};
+use crate::vault::{
+    DesktopVaultStore, DesktopViewSession, HardwareProfileSession, PublicAccountMetadata,
+};
 use crate::{
     GAS_LIMIT_BUFFER, HttpContext, SelfBroadcastTipFallback, ShieldSendOutput, TxReceiptOutput,
     WETH_DEPOSIT_SELECTOR, chain_defaults_for_chain, effective_rpc_urls_for_chain,
@@ -42,6 +46,10 @@ pub type PublicActionCommandReceiver = tokio::sync::mpsc::UnboundedReceiver<Publ
 pub type PublicActionAttemptInfo = crate::SelfBroadcastAttemptInfo;
 pub type PublicActionSessionEventSender =
     tokio::sync::mpsc::UnboundedSender<PublicActionSessionEvent>;
+#[cfg(feature = "hardware")]
+pub type HardwareTrezorPinMatrixProvider = crate::hardware::trezor::TrezorPinMatrixProvider;
+#[cfg(not(feature = "hardware"))]
+pub type HardwareTrezorPinMatrixProvider = ();
 
 sol! {
     interface PublicErc20 {
@@ -176,6 +184,8 @@ pub struct PublicSendRequest {
     pub view_session: Arc<DesktopViewSession>,
     pub vault_store: Arc<DesktopVaultStore>,
     pub vault_password: Zeroizing<String>,
+    pub trezor_app_passphrase: Option<Zeroizing<String>>,
+    pub trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     pub public_account_uuid: String,
     pub asset: PublicAssetId,
     pub amount: U256,
@@ -196,6 +206,8 @@ pub struct PublicShieldRequest {
     pub view_session: Arc<DesktopViewSession>,
     pub vault_store: Arc<DesktopVaultStore>,
     pub vault_password: Zeroizing<String>,
+    pub trezor_app_passphrase: Option<Zeroizing<String>>,
+    pub trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     pub public_account_uuid: String,
     pub asset: PublicAssetId,
     pub amount: U256,
@@ -244,6 +256,9 @@ pub enum PublicActionSessionEvent {
     AttemptRejected {
         step: PublicActionProgressStep,
         message: String,
+    },
+    HardwareProfileSessionRefreshed {
+        session: HardwareProfileSession,
     },
 }
 
@@ -522,6 +537,8 @@ pub async fn submit_public_send_with_progress(
         &request.view_session,
         Some(request.vault_password.as_str()),
         &request.public_account_uuid,
+        request.trezor_app_passphrase,
+        request.trezor_pin_matrix_provider,
     )?;
     let from_address = signer.address();
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_urls, http);
@@ -586,6 +603,8 @@ pub async fn submit_public_shield_with_progress(
         &request.view_session,
         Some(request.vault_password.as_str()),
         &request.public_account_uuid,
+        request.trezor_app_passphrase,
+        request.trezor_pin_matrix_provider,
     )?;
     let mut nonce = None;
     let mut gas_fee = request.gas_fee;
@@ -634,6 +653,7 @@ pub async fn submit_public_shield_with_progress(
     } else {
         signer.derive_shield_private_key().await?
     };
+    emit_refreshed_public_action_hardware_session(event_tx.as_ref(), &signer);
     let approve_data = broadcaster_core::contracts::shield::build_approve_calldata(
         chain.railgun_contract,
         request.amount,
@@ -800,6 +820,9 @@ pub(crate) enum VaultedPublicSigner {
 pub(crate) struct HardwarePublicEvmSigner {
     address: Address,
     descriptor: HardwarePublicAccountDescriptor,
+    hardware_session: Mutex<HardwareProfileSession>,
+    trezor_app_passphrase: Mutex<Option<Zeroizing<String>>>,
+    trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
 }
 
 impl VaultedPublicSigner {
@@ -836,6 +859,15 @@ impl VaultedPublicSigner {
         match self {
             Self::Software(signer) => Ok(Zeroizing::new(signer.derive_shield_private_key()?)),
             Self::Hardware(signer) => signer.derive_shield_private_key().await,
+        }
+    }
+
+    pub(crate) fn refreshed_trezor_hardware_session(
+        &self,
+    ) -> Result<Option<HardwareProfileSession>> {
+        match self {
+            Self::Software(_) => Ok(None),
+            Self::Hardware(signer) => signer.refreshed_trezor_hardware_session(),
         }
     }
 }
@@ -889,55 +921,144 @@ impl HardwarePublicEvmSigner {
     }
 
     async fn sign_transaction(&self, tx: &dyn SignableTransaction<Signature>) -> Result<Signature> {
-        sign_hardware_public_transaction(&self.descriptor, self.address, tx).await
+        let hardware_session = self.hardware_session()?;
+        let (signature, trezor_session_id) = sign_hardware_public_transaction(
+            &self.descriptor,
+            &hardware_session,
+            self.take_trezor_app_passphrase(),
+            self.trezor_pin_matrix_provider.clone(),
+            self.address,
+            tx,
+        )
+        .await?;
+        self.replace_trezor_session_id_if_trezor(trezor_session_id)?;
+        Ok(signature)
     }
 
     async fn sign_message(&self, message: &[u8]) -> Result<Signature> {
-        sign_hardware_public_message(&self.descriptor, self.address, message).await
+        let hardware_session = self.hardware_session()?;
+        let (signature, trezor_session_id) = sign_hardware_public_message(
+            &self.descriptor,
+            &hardware_session,
+            self.take_trezor_app_passphrase(),
+            self.trezor_pin_matrix_provider.clone(),
+            self.address,
+            message,
+        )
+        .await?;
+        self.replace_trezor_session_id_if_trezor(trezor_session_id)?;
+        Ok(signature)
+    }
+
+    fn hardware_session(&self) -> Result<HardwareProfileSession> {
+        let session = self
+            .hardware_session
+            .lock()
+            .map_err(|_| eyre!("hardware public signer session lock poisoned"))?;
+        Ok(session.clone())
+    }
+
+    fn replace_trezor_session_id_if_trezor(&self, session_id: Option<Vec<u8>>) -> Result<()> {
+        if self.descriptor.device_kind != crate::hardware::HardwareDeviceKind::Trezor {
+            return Ok(());
+        }
+        let mut session = self
+            .hardware_session
+            .lock()
+            .map_err(|_| eyre!("hardware public signer session lock poisoned"))?;
+        session.trezor_session_id = session_id;
+        Ok(())
+    }
+
+    fn refreshed_trezor_hardware_session(&self) -> Result<Option<HardwareProfileSession>> {
+        if self.descriptor.device_kind != crate::hardware::HardwareDeviceKind::Trezor {
+            return Ok(None);
+        }
+        self.hardware_session().map(Some)
+    }
+
+    fn take_trezor_app_passphrase(&self) -> Option<Zeroizing<String>> {
+        self.trezor_app_passphrase
+            .lock()
+            .ok()
+            .and_then(|mut passphrase| passphrase.take())
     }
 }
 
 #[cfg(feature = "hardware")]
 async fn sign_hardware_public_transaction(
     descriptor: &HardwarePublicAccountDescriptor,
+    hardware_session: &HardwareProfileSession,
+    trezor_app_passphrase: Option<Zeroizing<String>>,
+    trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     expected_address: Address,
     tx: &dyn SignableTransaction<Signature>,
-) -> Result<Signature> {
+) -> Result<(Signature, Option<Vec<u8>>)> {
     match descriptor.device_kind {
         crate::hardware::HardwareDeviceKind::Ledger => {
             let client = crate::hardware::ledger::LedgerHardwareDerivationClient::connect()
                 .await
                 .wrap_err("connect Ledger for public transaction signing")?;
+            let profile_path = parse_bip32_path(DEFAULT_HARDWARE_DERIVATION_PATH)
+                .wrap_err("parse hardware profile path")?;
+            let active = client
+                .active_profile_session(&profile_path)
+                .await
+                .wrap_err("verify Ledger hardware profile")?;
+            ensure_hardware_public_profile_session(hardware_session, &active)?;
             let address = client
                 .public_ethereum_address(descriptor)
                 .await
                 .wrap_err("verify Ledger public account address")?;
             ensure_hardware_public_address(expected_address, address)?;
-            client
+            let signature = client
                 .sign_transaction_rlp(descriptor, &tx.encoded_for_signing())
                 .await
-                .wrap_err("sign public transaction on Ledger")
+                .wrap_err("sign public transaction on Ledger")?;
+            Ok((signature, None))
         }
         crate::hardware::HardwareDeviceKind::Trezor => {
-            let mut client = crate::hardware::trezor::TrezorHardwareDerivationClient::connect()
+            let mut client =
+                crate::hardware::trezor::TrezorHardwareDerivationClient::connect_with_session(
+                    hardware_session.trezor_session_id.clone(),
+                )
                 .wrap_err("connect Trezor for public transaction signing")?;
+            client.set_passphrase_mode(hardware_session.trezor_passphrase_mode());
+            if let Some(passphrase) = trezor_app_passphrase {
+                client.set_app_passphrase_zeroizing(passphrase);
+            }
+            if let Some(provider) = trezor_pin_matrix_provider {
+                client.set_pin_matrix_provider(provider);
+            }
+            let profile_path = parse_bip32_path(DEFAULT_HARDWARE_DERIVATION_PATH)
+                .wrap_err("parse hardware profile path")?;
+            let active = client
+                .active_profile_session(&profile_path)
+                .wrap_err("verify Trezor hardware profile")?;
+            let trezor_session_id = active.trezor_session_id.clone();
+            ensure_hardware_public_profile_session(hardware_session, &active)?;
             let address = client
                 .public_ethereum_address(descriptor)
                 .wrap_err("verify Trezor public account address")?;
             ensure_hardware_public_address(expected_address, address)?;
-            client
+            let signature = client
                 .sign_transaction(descriptor, tx)
-                .wrap_err("sign public transaction on Trezor")
+                .wrap_err("sign public transaction on Trezor")?;
+            Ok((signature, trezor_session_id))
         }
     }
 }
 
 #[cfg(not(feature = "hardware"))]
+#[allow(clippy::unused_async)]
 async fn sign_hardware_public_transaction(
     _descriptor: &HardwarePublicAccountDescriptor,
+    _hardware_session: &HardwareProfileSession,
+    _trezor_app_passphrase: Option<Zeroizing<String>>,
+    _trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     _expected_address: Address,
     _tx: &dyn SignableTransaction<Signature>,
-) -> Result<Signature> {
+) -> Result<(Signature, Option<Vec<u8>>)> {
     Err(eyre!(
         "hardware public signing is not enabled in this build"
     ))
@@ -946,47 +1067,94 @@ async fn sign_hardware_public_transaction(
 #[cfg(feature = "hardware")]
 async fn sign_hardware_public_message(
     descriptor: &HardwarePublicAccountDescriptor,
+    hardware_session: &HardwareProfileSession,
+    trezor_app_passphrase: Option<Zeroizing<String>>,
+    trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     expected_address: Address,
     message: &[u8],
-) -> Result<Signature> {
+) -> Result<(Signature, Option<Vec<u8>>)> {
     match descriptor.device_kind {
         crate::hardware::HardwareDeviceKind::Ledger => {
             let client = crate::hardware::ledger::LedgerHardwareDerivationClient::connect()
                 .await
                 .wrap_err("connect Ledger for public message signing")?;
+            let profile_path = parse_bip32_path(DEFAULT_HARDWARE_DERIVATION_PATH)
+                .wrap_err("parse hardware profile path")?;
+            let active = client
+                .active_profile_session(&profile_path)
+                .await
+                .wrap_err("verify Ledger hardware profile")?;
+            ensure_hardware_public_profile_session(hardware_session, &active)?;
             let address = client
                 .public_ethereum_address(descriptor)
                 .await
                 .wrap_err("verify Ledger public account address")?;
             ensure_hardware_public_address(expected_address, address)?;
-            client
+            let signature = client
                 .sign_message(descriptor, message)
                 .await
-                .wrap_err("sign public message on Ledger")
+                .wrap_err("sign public message on Ledger")?;
+            Ok((signature, None))
         }
         crate::hardware::HardwareDeviceKind::Trezor => {
-            let mut client = crate::hardware::trezor::TrezorHardwareDerivationClient::connect()
+            let mut client =
+                crate::hardware::trezor::TrezorHardwareDerivationClient::connect_with_session(
+                    hardware_session.trezor_session_id.clone(),
+                )
                 .wrap_err("connect Trezor for public message signing")?;
+            client.set_passphrase_mode(hardware_session.trezor_passphrase_mode());
+            if let Some(passphrase) = trezor_app_passphrase {
+                client.set_app_passphrase_zeroizing(passphrase);
+            }
+            if let Some(provider) = trezor_pin_matrix_provider {
+                client.set_pin_matrix_provider(provider);
+            }
+            let profile_path = parse_bip32_path(DEFAULT_HARDWARE_DERIVATION_PATH)
+                .wrap_err("parse hardware profile path")?;
+            let active = client
+                .active_profile_session(&profile_path)
+                .wrap_err("verify Trezor hardware profile")?;
+            let trezor_session_id = active.trezor_session_id.clone();
+            ensure_hardware_public_profile_session(hardware_session, &active)?;
             let address = client
                 .public_ethereum_address(descriptor)
                 .wrap_err("verify Trezor public account address")?;
             ensure_hardware_public_address(expected_address, address)?;
-            client
+            let signature = client
                 .sign_message(descriptor, message)
-                .wrap_err("sign public message on Trezor")
+                .wrap_err("sign public message on Trezor")?;
+            Ok((signature, trezor_session_id))
         }
     }
 }
 
 #[cfg(not(feature = "hardware"))]
+#[allow(clippy::unused_async)]
 async fn sign_hardware_public_message(
     _descriptor: &HardwarePublicAccountDescriptor,
+    _hardware_session: &HardwareProfileSession,
+    _trezor_app_passphrase: Option<Zeroizing<String>>,
+    _trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     _expected_address: Address,
     _message: &[u8],
-) -> Result<Signature> {
+) -> Result<(Signature, Option<Vec<u8>>)> {
     Err(eyre!(
         "hardware public signing is not enabled in this build"
     ))
+}
+
+#[cfg_attr(not(feature = "hardware"), allow(dead_code))]
+fn ensure_hardware_public_profile_session(
+    expected: &HardwareProfileSession,
+    actual: &HardwareProfileSession,
+) -> Result<()> {
+    if expected.device_kind == actual.device_kind && expected.binding == actual.binding {
+        Ok(())
+    } else {
+        Err(eyre!(
+            "hardware public signer profile mismatch: wrong device or passphrase context is active"
+        ))
+    }
 }
 
 #[cfg_attr(not(feature = "hardware"), allow(dead_code))]
@@ -1263,6 +1431,7 @@ async fn submit_public_action_attempt(
         signer,
         preflight.tx_req,
         label,
+        event_tx,
     )
     .await?;
     let info = PublicActionAttemptInfo {
@@ -1438,6 +1607,7 @@ async fn sign_send_public_action_transaction(
     signer: &VaultedPublicSigner,
     tx_req: TransactionRequest,
     label: &str,
+    event_tx: Option<&PublicActionSessionEventSender>,
 ) -> Result<PublicActionSentTx, PublicActionAttemptError> {
     tracing::info!(
         from = %tx_req.from.unwrap_or_default(),
@@ -1450,6 +1620,7 @@ async fn sign_send_public_action_transaction(
         .sign_transaction_request(tx_req, label)
         .await
         .map_err(PublicActionAttemptError::Signing)?;
+    emit_refreshed_public_action_hardware_session(event_tx, signer);
     // Stop/abort requested during synchronous hardware approval is observed here before RPC broadcast.
     public_action_before_raw_broadcast_checkpoint().await;
     let tx_hash = keccak256(&signed_tx);
@@ -1539,6 +1710,22 @@ fn emit_public_action_event(
 ) {
     if let Some(event_tx) = event_tx {
         let _ = event_tx.send(event);
+    }
+}
+
+fn emit_refreshed_public_action_hardware_session(
+    event_tx: Option<&PublicActionSessionEventSender>,
+    signer: &VaultedPublicSigner,
+) {
+    match signer.refreshed_trezor_hardware_session() {
+        Ok(Some(session)) => emit_public_action_event(
+            event_tx,
+            PublicActionSessionEvent::HardwareProfileSessionRefreshed { session },
+        ),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(%error, "failed to read refreshed hardware public signer session")
+        }
     }
 }
 
@@ -1706,6 +1893,8 @@ pub(crate) fn vaulted_public_signer(
     view_session: &DesktopViewSession,
     vault_password: Option<&str>,
     public_account_uuid: &str,
+    trezor_app_passphrase: Option<Zeroizing<String>>,
+    trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
 ) -> Result<VaultedPublicSigner> {
     let accounts = vault_store
         .list_public_accounts_for_session(view_session, true)
@@ -1726,6 +1915,14 @@ pub(crate) fn vaulted_public_signer(
         return Ok(VaultedPublicSigner::Hardware(HardwarePublicEvmSigner {
             address: account.address,
             descriptor,
+            hardware_session: Mutex::new(
+                view_session
+                    .hardware_profile_session()
+                    .cloned()
+                    .ok_or_else(|| eyre!("hardware profile session required for public signer"))?,
+            ),
+            trezor_app_passphrase: Mutex::new(trezor_app_passphrase),
+            trezor_pin_matrix_provider,
         }));
     }
 
@@ -1781,9 +1978,15 @@ mod tests {
     use local_db::{DbConfig, DbStore};
 
     use super::*;
-    use crate::hardware::{HardwareDeviceKind, HardwarePublicAccountDescriptor};
+    use crate::hardware::{
+        ConfirmedHardwarePublicAccount, HardwareDerivationDescriptor, HardwareDeviceKind,
+        HardwareOperationOutput, HardwarePublicAccountDescriptor, HardwareWalletSyncIntent,
+        hardware_view_access_key_from_hardware_output, parse_bip32_path,
+        synthetic_entropy_from_hardware_output,
+    };
     use crate::vault::{
-        KdfParams, PublicAccountScope, PublicAccountSource, PublicAccountStatus, WalletSource,
+        HardwareProfileBinding, KdfParams, PublicAccountScope, PublicAccountSource,
+        PublicAccountStatus, TrezorPassphraseMode, VaultError, WalletSource,
     };
 
     const TEST_PASSWORD: &str = "correct horse battery staple";
@@ -2220,6 +2423,8 @@ mod tests {
                 view_session: Arc::clone(&view_session),
                 vault_store: Arc::clone(&store),
                 vault_password: Zeroizing::new(TEST_PASSWORD.to_string()),
+                trezor_app_passphrase: None,
+                trezor_pin_matrix_provider: None,
                 public_account_uuid: "unused".to_string(),
                 asset: PublicAssetId::Native,
                 amount: U256::ZERO,
@@ -2242,6 +2447,8 @@ mod tests {
                 view_session,
                 vault_store: store,
                 vault_password: Zeroizing::new(TEST_PASSWORD.to_string()),
+                trezor_app_passphrase: None,
+                trezor_pin_matrix_provider: None,
                 public_account_uuid: "unused".to_string(),
                 asset: PublicAssetId::Native,
                 amount: U256::ZERO,
@@ -2281,12 +2488,19 @@ mod tests {
             &view_session,
             Some(TEST_PASSWORD),
             &derived.public_account_uuid,
+            None,
+            None,
         )
         .expect("derived signer");
         assert_eq!(derived_signer.address(), derived.address);
-        let Err(missing_password) =
-            vaulted_public_signer(&store, &view_session, None, &derived.public_account_uuid)
-        else {
+        let Err(missing_password) = vaulted_public_signer(
+            &store,
+            &view_session,
+            None,
+            &derived.public_account_uuid,
+            None,
+            None,
+        ) else {
             panic!("software public signer without password unexpectedly succeeded");
         };
         assert!(
@@ -2305,18 +2519,86 @@ mod tests {
         )
         .expect("hardware descriptor");
         let hardware_address = address!("0x2222222222222222222222222222222222222222");
-        let hardware = store
-            .add_hardware_public_account(
-                &view_session,
-                hardware_descriptor,
-                hardware_address,
-                Some("Ledger Gas"),
+        let confirmed =
+            ConfirmedHardwarePublicAccount::new_for_tests(hardware_descriptor, hardware_address);
+        assert!(matches!(
+            store.add_hardware_public_account(&view_session, confirmed, Some("Ledger Gas")),
+            Err(VaultError::HardwareWalletViewRequiresDevice)
+        ));
+
+        let hardware_wallet_id = "hardware-public-action-wallet";
+        let hardware_private_descriptor = HardwareDerivationDescriptor::ledger_eip1024_v1(
+            parse_bip32_path("m/44'/60'/0'/0/0").expect("hardware path"),
+            0,
+            "ledger:evm:0x1111111111111111111111111111111111111111".to_string(),
+            HardwareWalletSyncIntent::CreateNew,
+        );
+        let output = HardwareOperationOutput::new([42; 32]);
+        let view_access_key =
+            hardware_view_access_key_from_hardware_output(&hardware_private_descriptor, &output)
+                .expect("hardware view key");
+        let entropy = synthetic_entropy_from_hardware_output(&hardware_private_descriptor, output)
+            .expect("hardware entropy");
+        let hardware_metadata = store
+            .new_hardware_wallet_metadata(
+                TEST_PASSWORD,
+                hardware_wallet_id,
+                "Hardware public action",
+                hardware_private_descriptor.clone(),
             )
-            .expect("hardware public account");
-        let hardware_signer =
-            vaulted_public_signer(&store, &view_session, None, &hardware.public_account_uuid)
-                .expect("hardware signer without password");
-        assert_eq!(hardware_signer.address(), hardware.address);
+            .expect("hardware wallet metadata");
+        store
+            .store_hardware_derived_wallet_from_entropy_with_metadata(
+                TEST_PASSWORD,
+                hardware_wallet_id,
+                hardware_private_descriptor.account_index,
+                entropy.expose_secret(),
+                &hardware_metadata,
+                &view_access_key,
+            )
+            .expect("store hardware wallet");
+        let hardware_session = store
+            .hardware_profile_session_for_fingerprint(
+                TEST_PASSWORD,
+                HardwareDeviceKind::Ledger,
+                &hardware_private_descriptor.profile_fingerprint,
+                None,
+            )
+            .expect("hardware profile session");
+        let hardware_view_session = store
+            .load_hardware_view_session(
+                TEST_PASSWORD,
+                &hardware_session,
+                hardware_wallet_id,
+                &view_access_key,
+            )
+            .expect("hardware view session");
+        let hardware_public_descriptor = HardwarePublicAccountDescriptor::for_wallet_public_index(
+            HardwareDeviceKind::Ledger,
+            hardware_view_session.derivation_index(),
+            0,
+        )
+        .expect("hardware public descriptor");
+        let hardware_public = store
+            .add_hardware_public_account(
+                &hardware_view_session,
+                ConfirmedHardwarePublicAccount::new_for_tests(
+                    hardware_public_descriptor,
+                    address!("0x3333333333333333333333333333333333333333"),
+                ),
+                Some("Hardware Ledger Gas"),
+            )
+            .expect("hardware public account under hardware view");
+        let hardware_signer = vaulted_public_signer(
+            &store,
+            &hardware_view_session,
+            None,
+            &hardware_public.public_account_uuid,
+            None,
+            None,
+        )
+        .expect("hardware signer with profile session");
+        assert_eq!(hardware_signer.address(), hardware_public.address);
         assert!(hardware_signer.requires_device_approval());
 
         let imported = store
@@ -2333,6 +2615,8 @@ mod tests {
             &view_session,
             Some(TEST_PASSWORD),
             &imported.public_account_uuid,
+            None,
+            None,
         )
         .expect("imported signer");
         assert_eq!(imported_signer.address(), imported.address);
@@ -2340,5 +2624,82 @@ mod tests {
         drop(store);
         drop(db);
         fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    }
+
+    #[test]
+    fn hardware_public_signer_consumes_trezor_app_passphrase_once() {
+        let mut hardware_session = HardwareProfileSession::unmatched(
+            HardwareDeviceKind::Trezor,
+            HardwareProfileBinding::evm_address_fingerprint(
+                "trezor:evm:0x1111111111111111111111111111111111111111",
+            ),
+            Some(vec![1, 2, 3]),
+        );
+        hardware_session.set_trezor_passphrase_mode(TrezorPassphraseMode::EnterInApp);
+        let signer = HardwarePublicEvmSigner {
+            address: address!("0x1111111111111111111111111111111111111111"),
+            descriptor: HardwarePublicAccountDescriptor::for_wallet_public_index(
+                HardwareDeviceKind::Trezor,
+                0,
+                0,
+            )
+            .expect("trezor descriptor"),
+            hardware_session: std::sync::Mutex::new(hardware_session),
+            trezor_app_passphrase: std::sync::Mutex::new(Some(Zeroizing::new(
+                "app secret".to_owned(),
+            ))),
+            trezor_pin_matrix_provider: None,
+        };
+
+        let passphrase = signer
+            .take_trezor_app_passphrase()
+            .expect("first passphrase take");
+        assert_eq!(passphrase.as_str(), "app secret");
+        assert!(signer.take_trezor_app_passphrase().is_none());
+    }
+
+    #[test]
+    fn hardware_public_signer_updates_in_memory_trezor_session_id() {
+        let mut hardware_session = HardwareProfileSession::unmatched(
+            HardwareDeviceKind::Trezor,
+            HardwareProfileBinding::evm_address_fingerprint(
+                "trezor:evm:0x1111111111111111111111111111111111111111",
+            ),
+            Some(vec![1, 2, 3]),
+        );
+        hardware_session.set_trezor_passphrase_mode(TrezorPassphraseMode::EnterInApp);
+        let signer = HardwarePublicEvmSigner {
+            address: address!("0x1111111111111111111111111111111111111111"),
+            descriptor: HardwarePublicAccountDescriptor::for_wallet_public_index(
+                HardwareDeviceKind::Trezor,
+                0,
+                0,
+            )
+            .expect("trezor descriptor"),
+            hardware_session: std::sync::Mutex::new(hardware_session),
+            trezor_app_passphrase: std::sync::Mutex::new(None),
+            trezor_pin_matrix_provider: None,
+        };
+
+        signer
+            .replace_trezor_session_id_if_trezor(Some(vec![4, 5, 6]))
+            .expect("replace Trezor session id");
+        assert_eq!(
+            signer
+                .hardware_session()
+                .expect("hardware session")
+                .trezor_session_id,
+            Some(vec![4, 5, 6])
+        );
+        signer
+            .replace_trezor_session_id_if_trezor(None)
+            .expect("clear Trezor session id");
+        assert_eq!(
+            signer
+                .hardware_session()
+                .expect("hardware session")
+                .trezor_session_id,
+            None
+        );
     }
 }

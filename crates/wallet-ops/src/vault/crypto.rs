@@ -11,6 +11,11 @@ pub const fn current_vault_version() -> u32 {
     VAULT_VERSION
 }
 
+#[must_use]
+pub const fn legacy_vault_version() -> u32 {
+    1
+}
+
 pub fn create(password: &str) -> Result<CreatedVault, VaultError> {
     create_with_params(password, KdfParams::default())
 }
@@ -118,7 +123,7 @@ fn disable_core_dumps() {
 const fn disable_core_dumps() {}
 
 const fn validate_version(version: u32) -> Result<(), VaultError> {
-    if version == VAULT_VERSION {
+    if version == VAULT_VERSION || version == legacy_vault_version() {
         Ok(())
     } else {
         Err(VaultError::UnsupportedVersion(version))

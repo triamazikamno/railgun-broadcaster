@@ -1,43 +1,49 @@
 use super::{
-    Address, Arc, BROADCASTER_BANNED_PREFIX, BROADCASTER_FAVORITE_PREFIX, BTreeSet,
-    BroadcasterAddressIdentity, BroadcasterPreferenceEntry, BroadcasterPreferences, CreatedVault,
-    DbConfig, DbStore, DesktopVaultStore, DesktopViewSession, EncryptedRecord,
-    GeneratedSeedMaterial, HARDWARE_WALLET_ACCOUNT_INDEX_PREFIX, HardwareDerivationDescriptor,
-    HardwarePublicAccountDescriptor, HardwareWalletAccountIndexReservation, HardwareWalletProfile,
-    KEY_LEN, KdfParams, LoadedWalletMetadata, PRIVATE_ADDRESS_BOOK_PREFIX,
-    PUBLIC_ACCOUNT_METADATA_PREFIX, PUBLIC_ADDRESS_BOOK_PREFIX, PathBuf, PrivateAddressBookEntry,
-    PublicAccountMetadata, PublicAccountScope, PublicAccountSecret, PublicAccountSource,
-    PublicAccountStatus, PublicAddressBookEntry, RecordKind, SoftwareRailgunSpendSigner,
-    SpendGrant, StoredHardwareWalletRecord, StoredWalletRecord, VAULT_METADATA_KEY, VaultError,
-    VaultMetadata, VaultRecordEntries, ViewUnlock, WALLET_CHAIN_METADATA_PREFIX,
-    WALLET_VIEW_PREFIX, WalletChainMetadataBundle, WalletKeys, WalletMetadataBundle, WalletSource,
-    WalletSpendBundle, WalletSpendSource, WalletStatus, WalletViewBundle, Zeroizing,
-    assign_missing_display_orders, bip39_entropy_from_mnemonic, broadcaster_banned_record_entry,
-    broadcaster_banned_record_key, broadcaster_favorite_record_entry,
-    broadcaster_favorite_record_key, broadcaster_preference_entry_identity, create_spend_grant,
-    create_with_params, default_wallet_label_for_metadata, derive_public_evm_address_from_entropy,
-    derive_public_evm_private_key_from_entropy, deserialize_wallet_utxo,
-    ensure_private_address_book_address_available,
+    Arc, BROADCASTER_BANNED_PREFIX, BROADCASTER_FAVORITE_PREFIX, BTreeSet,
+    BroadcasterAddressIdentity, BroadcasterPreferenceEntry, BroadcasterPreferences,
+    ConfirmedHardwarePublicAccount, CreatedVault, DbConfig, DbStore, DesktopVaultStore,
+    DesktopViewSession, EncryptedRecord, GeneratedSeedMaterial, HARDWARE_PROFILE_PREFIX,
+    HARDWARE_WALLET_ACCOUNT_INDEX_PREFIX, HardwareDerivationDescriptor, HardwareDeviceKind,
+    HardwareProfileBinding, HardwareProfileBindingKind, HardwareProfileMetadata,
+    HardwareProfileSession, HardwareRailgunAccountIdentity, HardwareRailgunAccountMetadata,
+    HardwareViewAccessKey, HardwareWalletAccountIndexReservation, HardwareWalletProfile, KEY_LEN,
+    KdfParams, LoadedWalletMetadata, MAX_HARDWARE_RECOVERY_RANGE_COUNT,
+    PRIVATE_ADDRESS_BOOK_PREFIX, PUBLIC_ACCOUNT_METADATA_PREFIX, PUBLIC_ADDRESS_BOOK_PREFIX,
+    PathBuf, PrivateAddressBookEntry, PublicAccountMetadata, PublicAccountScope,
+    PublicAccountSecret, PublicAccountSource, PublicAccountStatus, PublicAddressBookEntry,
+    RecordKind, SoftwareRailgunSpendSigner, SpendGrant, StoredHardwareWalletRecord,
+    StoredWalletRecord, VAULT_METADATA_KEY, VaultError, VaultMetadata, VaultRecordEntries,
+    ViewUnlock, WALLET_CHAIN_METADATA_PREFIX, WALLET_VIEW_PREFIX, WalletChainMetadataBundle,
+    WalletKeys, WalletMetadataBundle, WalletSource, WalletSpendBundle, WalletSpendSource,
+    WalletStatus, WalletViewBundle, Zeroizing, assign_missing_display_orders,
+    bip39_entropy_from_mnemonic, broadcaster_banned_record_entry, broadcaster_banned_record_key,
+    broadcaster_favorite_record_entry, broadcaster_favorite_record_key,
+    broadcaster_preference_entry_identity, create_spend_grant, create_with_params,
+    current_vault_version, default_wallet_label_for_metadata,
+    derive_public_evm_address_from_entropy, derive_public_evm_private_key_from_entropy,
+    deserialize_wallet_utxo, ensure_private_address_book_address_available,
     ensure_private_address_book_address_available_for_update,
     ensure_public_account_address_available, ensure_public_address_book_address_available,
     ensure_public_address_book_address_available_for_update, generate_opaque_id,
-    hardware_wallet_account_index_record_entry, initial_derived_public_account,
-    next_derived_public_account_index, next_private_address_book_display_order,
-    next_public_account_display_order, next_public_address_book_display_order,
-    next_wallet_display_order, normalize_public_account_label, parse_public_evm_private_key,
+    hardware_profile_record_entry, hardware_wallet_account_index_record_entry,
+    initial_derived_public_account, next_derived_public_account_index,
+    next_private_address_book_display_order, next_public_account_display_order,
+    next_public_address_book_display_order, next_wallet_display_order,
+    normalize_public_account_label, parse_public_evm_private_key,
     private_address_book_record_entry, private_address_book_record_key,
     public_account_metadata_record_entry, public_account_metadata_record_key,
     public_account_secret_record_entry, public_account_secret_record_key,
     public_address_book_record_entry, public_address_book_record_key,
     public_evm_address_from_private_key, serialize_wallet_utxo,
-    sort_broadcaster_preference_entries, sort_private_address_book_entries,
-    sort_public_account_metadata, sort_public_address_book_entries, sort_wallet_metadata,
-    unlock_spend, unlock_view, validate_address_book_label,
-    validate_broadcaster_preference_address, validate_private_address_book_address,
-    validate_public_address_book_address, validate_wallet_label, vault_error_from_wallet_cache,
-    wallet_cache_row_prefix, wallet_cache_row_record_key, wallet_chain_metadata_record_key,
-    wallet_metadata_record_entry, wallet_metadata_record_key, wallet_spend_record_key,
-    wallet_utxo_stable_identity, wallet_view_record_key,
+    sort_broadcaster_preference_entries, sort_hardware_profile_metadata,
+    sort_private_address_book_entries, sort_public_account_metadata,
+    sort_public_address_book_entries, sort_wallet_metadata, unlock_spend, unlock_view,
+    validate_address_book_label, validate_broadcaster_preference_address,
+    validate_private_address_book_address, validate_public_address_book_address,
+    validate_wallet_label, vault_error_from_wallet_cache, wallet_cache_row_prefix,
+    wallet_cache_row_record_key, wallet_chain_metadata_record_key, wallet_metadata_record_entry,
+    wallet_metadata_record_key, wallet_spend_record_key, wallet_utxo_stable_identity,
+    wallet_view_record_key,
 };
 
 #[derive(Clone)]
@@ -45,6 +51,14 @@ struct LoadedBroadcasterPreferenceEntry {
     entry_uuid: String,
     entry: BroadcasterPreferenceEntry,
     identity: BroadcasterAddressIdentity,
+}
+
+fn hardware_wallet_receive_address(wallet: &WalletKeys) -> Result<String, VaultError> {
+    wallet
+        .viewing
+        .derive_address(None)
+        .map(|address| address.to_string())
+        .map_err(|_| VaultError::HardwareWalletReceiveAddress)
 }
 
 impl DesktopVaultStore {
@@ -106,13 +120,17 @@ impl DesktopVaultStore {
     }
 
     pub fn unlock_view(&self, password: &str) -> Result<ViewUnlock, VaultError> {
-        let metadata = self.metadata()?;
-        unlock_view(&metadata, password)
+        let mut metadata = self.metadata()?;
+        let view = unlock_view(&metadata, password)?;
+        self.upgrade_vault_metadata_version_if_legacy(&mut metadata)?;
+        Ok(view)
     }
 
     pub fn create_spend_grant(&self, password: &str) -> Result<SpendGrant, VaultError> {
-        let metadata = self.metadata()?;
-        create_spend_grant(&metadata, password)
+        let mut metadata = self.metadata()?;
+        let grant = create_spend_grant(&metadata, password)?;
+        self.upgrade_vault_metadata_version_if_legacy(&mut metadata)?;
+        Ok(grant)
     }
 
     pub fn store_wallet_from_entropy(
@@ -237,6 +255,7 @@ impl DesktopVaultStore {
         derivation_index: u32,
         wallet: &WalletKeys,
         metadata: &WalletMetadataBundle,
+        view_access_key: &HardwareViewAccessKey,
     ) -> Result<StoredHardwareWalletRecord, VaultError> {
         let (stored, records) = self.encrypted_hardware_wallet_records(
             password,
@@ -244,6 +263,7 @@ impl DesktopVaultStore {
             derivation_index,
             wallet,
             metadata,
+            view_access_key,
         )?;
         self.db.put_desktop_wallet_vault_records(&records)?;
         Ok(stored)
@@ -256,6 +276,7 @@ impl DesktopVaultStore {
         derivation_index: u32,
         entropy: &[u8],
         metadata: &WalletMetadataBundle,
+        view_access_key: &HardwareViewAccessKey,
     ) -> Result<StoredHardwareWalletRecord, VaultError> {
         let wallet = WalletKeys::from_bip39_entropy(entropy, derivation_index)?;
         self.store_hardware_derived_wallet_with_metadata(
@@ -264,7 +285,30 @@ impl DesktopVaultStore {
             derivation_index,
             &wallet,
             metadata,
+            view_access_key,
         )
+    }
+
+    pub fn store_hardware_derived_wallet_from_entropy_with_metadata_for_view(
+        &self,
+        view: &ViewUnlock,
+        wallet_id: &str,
+        derivation_index: u32,
+        entropy: &[u8],
+        metadata: &WalletMetadataBundle,
+        view_access_key: &HardwareViewAccessKey,
+    ) -> Result<StoredHardwareWalletRecord, VaultError> {
+        let wallet = WalletKeys::from_bip39_entropy(entropy, derivation_index)?;
+        let (stored, records) = self.encrypted_hardware_wallet_records_with_view(
+            view,
+            wallet_id,
+            derivation_index,
+            &wallet,
+            metadata,
+            view_access_key,
+        )?;
+        self.db.put_desktop_wallet_vault_records(&records)?;
+        Ok(stored)
     }
 
     pub fn load_view_bundle(
@@ -273,8 +317,74 @@ impl DesktopVaultStore {
         wallet_id: &str,
     ) -> Result<WalletViewBundle, VaultError> {
         let view = self.unlock_view(password)?;
+        self.ensure_password_view_allowed(&view, wallet_id)?;
         let record = self.encrypted_record(&wallet_view_record_key(wallet_id))?;
         view.decrypt_view_bundle(wallet_id, &record)
+    }
+
+    pub fn load_hardware_view_session(
+        &self,
+        password: &str,
+        hardware_session: &HardwareProfileSession,
+        wallet_id: &str,
+        view_access_key: &HardwareViewAccessKey,
+    ) -> Result<DesktopViewSession, VaultError> {
+        let password_view = self.unlock_view(password)?;
+        self.load_hardware_view_session_with_view_unlock(
+            &password_view,
+            hardware_session,
+            wallet_id,
+            view_access_key,
+        )
+    }
+
+    pub fn load_hardware_view_session_with_view_unlock(
+        &self,
+        password_view: &ViewUnlock,
+        hardware_session: &HardwareProfileSession,
+        wallet_id: &str,
+        view_access_key: &HardwareViewAccessKey,
+    ) -> Result<DesktopViewSession, VaultError> {
+        let mut metadata = self.load_wallet_metadata_with_view(password_view, wallet_id)?;
+        {
+            let account = metadata
+                .hardware_account
+                .as_ref()
+                .ok_or(VaultError::HardwareWalletIdentityMismatch)?;
+            Self::ensure_supported_hardware_account(account)?;
+            hardware_session.verify_account(account)?;
+        }
+        let hardware_view = ViewUnlock::from_hardware_view_access_key(view_access_key)?;
+        let record = self.encrypted_record(&wallet_view_record_key(wallet_id))?;
+        let bundle = hardware_view.decrypt_view_bundle(wallet_id, &record)?;
+        let account = metadata
+            .hardware_account
+            .as_ref()
+            .ok_or(VaultError::HardwareWalletIdentityMismatch)?;
+        if HardwareRailgunAccountIdentity::from_view_bundle(&bundle) != account.account_identity {
+            return Err(VaultError::HardwareWalletIdentityMismatch);
+        }
+        let session = DesktopViewSession::from_hardware_bundle(
+            wallet_id.to_owned(),
+            &bundle,
+            password_view.clone_unlock(),
+            hardware_view,
+            hardware_session.clone(),
+        );
+        let receive_address = session
+            .receive_address()
+            .map_err(|_| VaultError::HardwareWalletReceiveAddress)?;
+        let needs_receive_address_update =
+            metadata.hardware_account.as_ref().is_some_and(|account| {
+                account.receive_address.as_deref() != Some(receive_address.as_str())
+            });
+        if needs_receive_address_update {
+            if let Some(account) = metadata.hardware_account.as_mut() {
+                account.receive_address = Some(receive_address);
+            }
+            self.store_wallet_metadata_with_view(password_view, &metadata)?;
+        }
+        Ok(session)
     }
 
     pub fn list_wallet_ids(&self) -> Result<Vec<String>, VaultError> {
@@ -298,6 +408,7 @@ impl DesktopVaultStore {
         wallet_id: &str,
     ) -> Result<DesktopViewSession, VaultError> {
         let view = self.unlock_view(password)?;
+        self.ensure_password_view_allowed(&view, wallet_id)?;
         let record = self.encrypted_record(&wallet_view_record_key(wallet_id))?;
         let bundle = view.decrypt_view_bundle(wallet_id, &record)?;
         Ok(DesktopViewSession::from_bundle(
@@ -312,6 +423,7 @@ impl DesktopVaultStore {
         view_session: &DesktopViewSession,
         wallet_id: &str,
     ) -> Result<DesktopViewSession, VaultError> {
+        self.ensure_password_view_allowed(&view_session.view, wallet_id)?;
         let record = self.encrypted_record(&wallet_view_record_key(wallet_id))?;
         let bundle = view_session.view.decrypt_view_bundle(wallet_id, &record)?;
         Ok(DesktopViewSession::from_bundle(
@@ -321,19 +433,59 @@ impl DesktopVaultStore {
         ))
     }
 
+    pub fn load_view_session_with_view_unlock(
+        &self,
+        view: &ViewUnlock,
+        wallet_id: &str,
+    ) -> Result<DesktopViewSession, VaultError> {
+        self.ensure_password_view_allowed(view, wallet_id)?;
+        let record = self.encrypted_record(&wallet_view_record_key(wallet_id))?;
+        let bundle = view.decrypt_view_bundle(wallet_id, &record)?;
+        Ok(DesktopViewSession::from_bundle(
+            wallet_id.to_owned(),
+            &bundle,
+            view.clone_unlock(),
+        ))
+    }
+
     pub fn unlock_first_view_session(
         &self,
         password: &str,
     ) -> Result<Option<DesktopViewSession>, VaultError> {
         let view = self.unlock_view(password)?;
-        let Some(wallet_id) = self.list_wallet_ids()?.into_iter().next() else {
+        let wallet_ids = self.list_wallet_ids()?;
+        if wallet_ids.is_empty() {
             return Ok(None);
-        };
-        let record = self.encrypted_record(&wallet_view_record_key(&wallet_id))?;
-        let bundle = view.decrypt_view_bundle(&wallet_id, &record)?;
-        Ok(Some(DesktopViewSession::from_bundle(
-            wallet_id, &bundle, view,
-        )))
+        }
+        for wallet_id in wallet_ids {
+            match self.ensure_password_view_allowed(&view, &wallet_id) {
+                Ok(()) => {
+                    let record = self.encrypted_record(&wallet_view_record_key(&wallet_id))?;
+                    let bundle = view.decrypt_view_bundle(&wallet_id, &record)?;
+                    return Ok(Some(DesktopViewSession::from_bundle(
+                        wallet_id, &bundle, view,
+                    )));
+                }
+                Err(
+                    VaultError::HardwareWalletViewRequiresDevice
+                    | VaultError::UnsupportedHardwareCustodyBackend(_),
+                ) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(None)
+    }
+
+    fn upgrade_vault_metadata_version_if_legacy(
+        &self,
+        metadata: &mut VaultMetadata,
+    ) -> Result<(), VaultError> {
+        let current_version = current_vault_version();
+        if metadata.version == current_version {
+            return Ok(());
+        }
+        metadata.version = current_version;
+        self.put_metadata(metadata)
     }
 
     pub fn load_spend_bundle(
@@ -717,7 +869,24 @@ impl DesktopVaultStore {
         let mut metadata = self.list_wallet_metadata_with_view(&view_session.view)?;
         metadata.retain(|metadata| metadata.status == WalletStatus::Active);
         let mut addresses = Vec::with_capacity(metadata.len());
+        if let Ok(address) = view_session.receive_address() {
+            addresses.push(address);
+        }
         for metadata in metadata {
+            if metadata.wallet_uuid == view_session.wallet_id() {
+                continue;
+            }
+            if let Some(address) = metadata
+                .hardware_account
+                .as_ref()
+                .and_then(|account| account.receive_address.as_ref())
+            {
+                addresses.push(address.clone());
+                continue;
+            }
+            if metadata.source.is_hardware_derived() {
+                continue;
+            }
             let session =
                 self.load_view_session_with_view_session(view_session, &metadata.wallet_uuid)?;
             addresses.push(
@@ -775,15 +944,29 @@ impl DesktopVaultStore {
     pub fn add_hardware_public_account(
         &self,
         view_session: &DesktopViewSession,
-        descriptor: HardwarePublicAccountDescriptor,
-        address: Address,
+        confirmed_account: ConfirmedHardwarePublicAccount,
         label: Option<&str>,
     ) -> Result<PublicAccountMetadata, VaultError> {
+        let descriptor = confirmed_account.descriptor().clone();
+        let address = confirmed_account.address();
         descriptor
             .validate()
             .map_err(|_| VaultError::InvalidHardwareWalletDescriptor)?;
         let accounts = self.list_public_account_metadata_with_view(&view_session.view)?;
         let wallet_id = view_session.wallet_id();
+        let hardware_session = view_session
+            .hardware_profile_session()
+            .ok_or(VaultError::HardwareWalletViewRequiresDevice)?;
+        let wallet_metadata = self.load_wallet_metadata_with_view(&view_session.view, wallet_id)?;
+        let hardware_account = wallet_metadata
+            .hardware_account
+            .as_ref()
+            .ok_or(VaultError::HardwareWalletViewRequiresDevice)?;
+        Self::ensure_supported_hardware_account(hardware_account)?;
+        hardware_session.verify_account(hardware_account)?;
+        if descriptor.device_kind != hardware_account.descriptor.device_kind {
+            return Err(VaultError::InvalidHardwareWalletDescriptor);
+        }
         let derivation_index = next_derived_public_account_index(&accounts, wallet_id)?;
         if descriptor.wallet_account_index != view_session.derivation_index()
             || descriptor.public_account_index != derivation_index
@@ -1067,12 +1250,74 @@ impl DesktopVaultStore {
         view.decrypt_wallet_metadata(wallet_uuid, &record)
     }
 
+    fn load_wallet_metadata_optional_with_view(
+        &self,
+        view: &ViewUnlock,
+        wallet_uuid: &str,
+    ) -> Result<Option<WalletMetadataBundle>, VaultError> {
+        let Some(record) =
+            self.encrypted_record_optional(&wallet_metadata_record_key(wallet_uuid))?
+        else {
+            return Ok(None);
+        };
+        view.decrypt_wallet_metadata(wallet_uuid, &record).map(Some)
+    }
+
+    fn ensure_password_view_allowed(
+        &self,
+        view: &ViewUnlock,
+        wallet_uuid: &str,
+    ) -> Result<(), VaultError> {
+        let Some(metadata) = self.load_wallet_metadata_optional_with_view(view, wallet_uuid)?
+        else {
+            return Ok(());
+        };
+        if let Some(account) = metadata.hardware_account {
+            if account.custody_backend.is_supported() {
+                Err(VaultError::HardwareWalletViewRequiresDevice)
+            } else {
+                Err(VaultError::UnsupportedHardwareCustodyBackend(
+                    account.custody_backend.as_str().to_owned(),
+                ))
+            }
+        } else if metadata.hardware_descriptor.is_some() {
+            Err(VaultError::HardwareWalletViewRequiresDevice)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn ensure_supported_hardware_account(
+        account: &HardwareRailgunAccountMetadata,
+    ) -> Result<(), VaultError> {
+        if account.custody_backend.is_supported() {
+            Ok(())
+        } else {
+            Err(VaultError::UnsupportedHardwareCustodyBackend(
+                account.custody_backend.as_str().to_owned(),
+            ))
+        }
+    }
+
     pub fn list_wallet_metadata(
         &self,
         password: &str,
     ) -> Result<Vec<WalletMetadataBundle>, VaultError> {
         let view = self.unlock_view(password)?;
         self.list_wallet_metadata_with_view(&view)
+    }
+
+    pub fn list_wallet_metadata_with_view_unlock(
+        &self,
+        view: &ViewUnlock,
+        include_inactive: bool,
+    ) -> Result<Vec<WalletMetadataBundle>, VaultError> {
+        let mut metadata = self.list_wallet_metadata_with_view(view)?;
+        if !include_inactive {
+            metadata.retain(|metadata| metadata.status == WalletStatus::Active);
+        }
+        sort_wallet_metadata(&mut metadata);
+        Ok(metadata)
     }
 
     pub fn list_wallet_metadata_for_session(
@@ -1094,6 +1339,10 @@ impl DesktopVaultStore {
         wallet_uuid: &str,
     ) -> Result<WalletSpendSource, VaultError> {
         let metadata = self.load_wallet_metadata_with_view(&view_session.view, wallet_uuid)?;
+        if let Some(account) = metadata.hardware_account {
+            Self::ensure_supported_hardware_account(&account)?;
+            return Ok(WalletSpendSource::HardwareDerived(account.descriptor));
+        }
         if let Some(descriptor) = metadata.hardware_descriptor {
             return Ok(WalletSpendSource::HardwareDerived(descriptor));
         }
@@ -1115,6 +1364,115 @@ impl DesktopVaultStore {
         self.list_hardware_wallet_profiles_with_view(&view_session.view)
     }
 
+    pub fn list_hardware_profile_metadata(
+        &self,
+        password: &str,
+    ) -> Result<Vec<HardwareProfileMetadata>, VaultError> {
+        let view = self.unlock_view(password)?;
+        self.list_hardware_profile_metadata_with_view(&view)
+    }
+
+    pub fn list_hardware_profile_metadata_for_session(
+        &self,
+        view_session: &DesktopViewSession,
+    ) -> Result<Vec<HardwareProfileMetadata>, VaultError> {
+        self.list_hardware_profile_metadata_with_view(&view_session.view)
+    }
+
+    pub fn list_hardware_profile_metadata_with_view_unlock(
+        &self,
+        view: &ViewUnlock,
+    ) -> Result<Vec<HardwareProfileMetadata>, VaultError> {
+        self.list_hardware_profile_metadata_with_view(view)
+    }
+
+    pub fn store_hardware_profile_metadata(
+        &self,
+        password: &str,
+        profile: &HardwareProfileMetadata,
+    ) -> Result<(), VaultError> {
+        let view = self.unlock_view(password)?;
+        self.store_hardware_profile_metadata_with_view(&view, profile)
+    }
+
+    pub fn store_hardware_profile_metadata_with_view_unlock(
+        &self,
+        view: &ViewUnlock,
+        profile: &HardwareProfileMetadata,
+    ) -> Result<(), VaultError> {
+        self.store_hardware_profile_metadata_with_view(view, profile)
+    }
+
+    pub fn list_hardware_accounts_for_profile(
+        &self,
+        password: &str,
+        profile_id: &str,
+    ) -> Result<Vec<HardwareRailgunAccountMetadata>, VaultError> {
+        let view = self.unlock_view(password)?;
+        self.list_hardware_accounts_for_profile_with_view(&view, profile_id)
+    }
+
+    pub fn list_hardware_accounts_for_profile_for_session(
+        &self,
+        view_session: &DesktopViewSession,
+        profile_id: &str,
+    ) -> Result<Vec<HardwareRailgunAccountMetadata>, VaultError> {
+        self.list_hardware_accounts_for_profile_with_view(&view_session.view, profile_id)
+    }
+
+    pub fn hardware_profile_session_for_fingerprint(
+        &self,
+        password: &str,
+        device_kind: HardwareDeviceKind,
+        profile_fingerprint: &str,
+        trezor_session_id: Option<&[u8]>,
+    ) -> Result<HardwareProfileSession, VaultError> {
+        let view = self.unlock_view(password)?;
+        self.hardware_profile_session_for_fingerprint_with_view(
+            &view,
+            device_kind,
+            profile_fingerprint,
+            trezor_session_id,
+        )
+    }
+
+    pub fn hardware_profile_session_for_fingerprint_for_session(
+        &self,
+        view_session: &DesktopViewSession,
+        device_kind: HardwareDeviceKind,
+        profile_fingerprint: &str,
+        trezor_session_id: Option<&[u8]>,
+    ) -> Result<HardwareProfileSession, VaultError> {
+        self.hardware_profile_session_for_fingerprint_with_view(
+            &view_session.view,
+            device_kind,
+            profile_fingerprint,
+            trezor_session_id,
+        )
+    }
+
+    pub fn hardware_profile_session_for_fingerprint_with_view_unlock(
+        &self,
+        view: &ViewUnlock,
+        device_kind: HardwareDeviceKind,
+        profile_fingerprint: &str,
+        trezor_session_id: Option<&[u8]>,
+    ) -> Result<HardwareProfileSession, VaultError> {
+        self.hardware_profile_session_for_fingerprint_with_view(
+            view,
+            device_kind,
+            profile_fingerprint,
+            trezor_session_id,
+        )
+    }
+
+    pub fn verify_hardware_profile_session_for_account(
+        session: &HardwareProfileSession,
+        account: &HardwareRailgunAccountMetadata,
+    ) -> Result<(), VaultError> {
+        session.verify_account(account)
+    }
+
     pub fn next_hardware_account_index_for_profile(
         &self,
         password: &str,
@@ -1132,22 +1490,174 @@ impl DesktopVaultStore {
         self.next_hardware_account_index_for_profile_with_view(&view_session.view, profile)
     }
 
+    pub fn next_hardware_account_index_for_profile_with_view_unlock(
+        &self,
+        view: &ViewUnlock,
+        profile: &HardwareWalletProfile,
+    ) -> Result<u32, VaultError> {
+        self.next_hardware_account_index_for_profile_with_view(view, profile)
+    }
+
+    #[must_use]
+    pub const fn default_hardware_recovery_account_index() -> u32 {
+        0
+    }
+
+    pub const fn exact_hardware_recovery_account_index(
+        account_index: u32,
+    ) -> Result<u32, VaultError> {
+        if account_index >= crate::hardware::HARDENED_BIP32_INDEX {
+            Err(VaultError::InvalidHardwareAccountRecoveryRange)
+        } else {
+            Ok(account_index)
+        }
+    }
+
+    pub fn bounded_hardware_recovery_account_indices(
+        start_index: u32,
+        count: u32,
+    ) -> Result<Vec<u32>, VaultError> {
+        if count == 0 || count > MAX_HARDWARE_RECOVERY_RANGE_COUNT {
+            return Err(VaultError::InvalidHardwareAccountRecoveryRange);
+        }
+        let end_exclusive = start_index
+            .checked_add(count)
+            .ok_or(VaultError::InvalidHardwareAccountRecoveryRange)?;
+        if end_exclusive > crate::hardware::HARDENED_BIP32_INDEX {
+            return Err(VaultError::InvalidHardwareAccountRecoveryRange);
+        }
+        Ok((start_index..end_exclusive).collect())
+    }
+
     fn list_hardware_wallet_profiles_with_view(
         &self,
         view: &ViewUnlock,
     ) -> Result<Vec<HardwareWalletProfile>, VaultError> {
+        let mut profiles =
+            self.list_hardware_profile_metadata_with_view(view)?
+                .into_iter()
+                .flat_map(|profile| {
+                    let device_kind = profile.device_kind;
+                    profile.bindings.into_iter().filter_map(move |binding| {
+                        (binding.kind == HardwareProfileBindingKind::EvmAddressFingerprint)
+                            .then_some(HardwareWalletProfile {
+                                device_kind,
+                                profile_fingerprint: binding.fingerprint,
+                            })
+                    })
+                })
+                .collect::<BTreeSet<_>>();
         let metadata = self.list_wallet_metadata_with_view(view)?;
-        let profiles = metadata
-            .into_iter()
-            .filter_map(|metadata| metadata.hardware_descriptor)
-            .map(|descriptor| HardwareWalletProfile {
-                device_kind: descriptor.device_kind,
-                profile_fingerprint: descriptor.profile_fingerprint,
-            })
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
+        profiles.extend(
+            metadata
+                .into_iter()
+                .filter_map(|metadata| metadata.hardware_derivation_descriptor().cloned())
+                .map(|descriptor| HardwareWalletProfile {
+                    device_kind: descriptor.device_kind,
+                    profile_fingerprint: descriptor.profile_fingerprint,
+                }),
+        );
+        Ok(profiles.into_iter().collect())
+    }
+
+    fn list_hardware_profile_metadata_with_view(
+        &self,
+        view: &ViewUnlock,
+    ) -> Result<Vec<HardwareProfileMetadata>, VaultError> {
+        let records = self
+            .db
+            .list_desktop_wallet_vault_records(HARDWARE_PROFILE_PREFIX)?;
+        let mut profiles = Vec::with_capacity(records.len());
+        for stored in records {
+            let Some(profile_id) = stored.key.strip_prefix(HARDWARE_PROFILE_PREFIX) else {
+                continue;
+            };
+            let record: EncryptedRecord = rmp_serde::from_slice(&stored.payload)?;
+            profiles.push(view.decrypt_hardware_profile_metadata(profile_id, &record)?);
+        }
+
+        let mut known_ids = profiles
+            .iter()
+            .map(|profile| profile.profile_id.clone())
+            .collect::<BTreeSet<_>>();
+        for metadata in self.list_wallet_metadata_with_view(view)? {
+            let Some(descriptor) = metadata.hardware_derivation_descriptor() else {
+                continue;
+            };
+            let profile = HardwareProfileMetadata::from_descriptor(descriptor);
+            if known_ids.insert(profile.profile_id.clone()) {
+                profiles.push(profile);
+            }
+        }
+        sort_hardware_profile_metadata(&mut profiles);
         Ok(profiles)
+    }
+
+    fn hardware_profile_session_for_fingerprint_with_view(
+        &self,
+        view: &ViewUnlock,
+        device_kind: HardwareDeviceKind,
+        profile_fingerprint: &str,
+        trezor_session_id: Option<&[u8]>,
+    ) -> Result<HardwareProfileSession, VaultError> {
+        let binding = HardwareProfileBinding::evm_address_fingerprint(profile_fingerprint);
+        let session = self
+            .list_hardware_profile_metadata_with_view(view)?
+            .into_iter()
+            .find(|profile| {
+                profile.device_kind == device_kind
+                    && profile
+                        .bindings
+                        .iter()
+                        .any(|candidate| candidate == &binding)
+            })
+            .map_or_else(
+                || {
+                    HardwareProfileSession::unmatched(
+                        device_kind,
+                        binding.clone(),
+                        trezor_session_id.map(<[u8]>::to_vec),
+                    )
+                },
+                |profile| {
+                    HardwareProfileSession::matched(
+                        device_kind,
+                        profile.profile_id,
+                        binding.clone(),
+                        trezor_session_id.map(<[u8]>::to_vec),
+                    )
+                },
+            );
+        Ok(session)
+    }
+
+    fn store_hardware_profile_metadata_with_view(
+        &self,
+        view: &ViewUnlock,
+        profile: &HardwareProfileMetadata,
+    ) -> Result<(), VaultError> {
+        let record = hardware_profile_record_entry(view, profile)?;
+        self.db.put_desktop_wallet_vault_records(&[record])?;
+        Ok(())
+    }
+
+    fn list_hardware_accounts_for_profile_with_view(
+        &self,
+        view: &ViewUnlock,
+        profile_id: &str,
+    ) -> Result<Vec<HardwareRailgunAccountMetadata>, VaultError> {
+        let mut accounts = self
+            .list_wallet_metadata_with_view(view)?
+            .into_iter()
+            .filter_map(|metadata| metadata.hardware_account)
+            .filter(|account| account.profile_id == profile_id)
+            .collect::<Vec<_>>();
+        accounts.sort_by(|left, right| {
+            left.account_index
+                .cmp(&right.account_index)
+                .then_with(|| left.label.cmp(&right.label))
+        });
+        Ok(accounts)
     }
 
     fn next_hardware_account_index_for_profile_with_view(
@@ -1159,7 +1669,7 @@ impl DesktopVaultStore {
         let reserved = self.list_hardware_wallet_account_index_reservations_with_view(view)?;
         metadata
             .into_iter()
-            .filter_map(|metadata| metadata.hardware_descriptor)
+            .filter_map(|metadata| metadata.hardware_derivation_descriptor().cloned())
             .filter(|descriptor| {
                 descriptor.device_kind == profile.device_kind
                     && descriptor.profile_fingerprint == profile.profile_fingerprint
@@ -1248,6 +1758,7 @@ impl DesktopVaultStore {
                     status: WalletStatus::Active,
                     display_order: 0,
                     hardware_descriptor: None,
+                    hardware_account: None,
                 },
                 needs_persist: true,
                 missing_display_order: true,
@@ -1323,6 +1834,7 @@ impl DesktopVaultStore {
             status: WalletStatus::Active,
             display_order,
             hardware_descriptor: None,
+            hardware_account: None,
         })
     }
 
@@ -1333,10 +1845,31 @@ impl DesktopVaultStore {
         label: &str,
         descriptor: HardwareDerivationDescriptor,
     ) -> Result<WalletMetadataBundle, VaultError> {
+        let view = self.unlock_view(password)?;
+        self.new_hardware_wallet_metadata_with_view(&view, wallet_uuid, label, descriptor)
+    }
+
+    pub fn new_hardware_wallet_metadata_with_view_unlock(
+        &self,
+        view: &ViewUnlock,
+        wallet_uuid: &str,
+        label: &str,
+        descriptor: HardwareDerivationDescriptor,
+    ) -> Result<WalletMetadataBundle, VaultError> {
+        self.new_hardware_wallet_metadata_with_view(view, wallet_uuid, label, descriptor)
+    }
+
+    fn new_hardware_wallet_metadata_with_view(
+        &self,
+        view: &ViewUnlock,
+        wallet_uuid: &str,
+        label: &str,
+        descriptor: HardwareDerivationDescriptor,
+    ) -> Result<WalletMetadataBundle, VaultError> {
         descriptor
             .validate()
             .map_err(|_| VaultError::InvalidHardwareWalletDescriptor)?;
-        let existing = self.list_wallet_metadata(password)?;
+        let existing = self.list_wallet_metadata_with_view(view)?;
         Self::ensure_hardware_wallet_account_index_available(&existing, &descriptor)?;
         let label = validate_wallet_label(label, &existing, None)?;
         let display_order = next_wallet_display_order(&existing)?;
@@ -1348,6 +1881,7 @@ impl DesktopVaultStore {
             status: WalletStatus::Active,
             display_order,
             hardware_descriptor: Some(descriptor),
+            hardware_account: None,
         })
     }
 
@@ -1368,6 +1902,15 @@ impl DesktopVaultStore {
         label: &str,
     ) -> Result<WalletMetadataBundle, VaultError> {
         self.update_wallet_label_with_view(&view_session.view, wallet_uuid, label)
+    }
+
+    pub fn update_wallet_label_with_view_unlock(
+        &self,
+        view: &ViewUnlock,
+        wallet_uuid: &str,
+        label: &str,
+    ) -> Result<WalletMetadataBundle, VaultError> {
+        self.update_wallet_label_with_view(view, wallet_uuid, label)
     }
 
     fn update_wallet_label_with_view(
@@ -1405,6 +1948,14 @@ impl DesktopVaultStore {
         ordered_wallet_uuids: &[String],
     ) -> Result<Vec<WalletMetadataBundle>, VaultError> {
         self.reorder_active_wallets_with_view(&view_session.view, ordered_wallet_uuids)
+    }
+
+    pub fn reorder_active_wallets_with_view_unlock(
+        &self,
+        view: &ViewUnlock,
+        ordered_wallet_uuids: &[String],
+    ) -> Result<Vec<WalletMetadataBundle>, VaultError> {
+        self.reorder_active_wallets_with_view(view, ordered_wallet_uuids)
     }
 
     fn reorder_active_wallets_with_view(
@@ -1462,6 +2013,15 @@ impl DesktopVaultStore {
         self.set_wallet_active_with_view(&view_session.view, wallet_uuid, active)
     }
 
+    pub fn set_wallet_active_with_view_unlock(
+        &self,
+        view: &ViewUnlock,
+        wallet_uuid: &str,
+        active: bool,
+    ) -> Result<WalletMetadataBundle, VaultError> {
+        self.set_wallet_active_with_view(view, wallet_uuid, active)
+    }
+
     fn set_wallet_active_with_view(
         &self,
         view: &ViewUnlock,
@@ -1507,12 +2067,21 @@ impl DesktopVaultStore {
         view_session: &DesktopViewSession,
         wallet_uuid: &str,
     ) -> Result<WalletMetadataBundle, VaultError> {
-        self.delete_wallet_with_view(&view_session.view, wallet_uuid)
+        self.delete_wallet_with_view(&view_session.view, Some(view_session), wallet_uuid)
+    }
+
+    pub fn delete_wallet_with_view_unlock(
+        &self,
+        view: &ViewUnlock,
+        wallet_uuid: &str,
+    ) -> Result<WalletMetadataBundle, VaultError> {
+        self.delete_wallet_with_view(view, None, wallet_uuid)
     }
 
     fn delete_wallet_with_view(
         &self,
         view: &ViewUnlock,
+        view_session: Option<&DesktopViewSession>,
         wallet_uuid: &str,
     ) -> Result<WalletMetadataBundle, VaultError> {
         let metadata = self.list_wallet_metadata_with_view(view)?;
@@ -1530,7 +2099,6 @@ impl DesktopVaultStore {
         if target.status == WalletStatus::Active && active_count <= 1 {
             return Err(VaultError::LastActiveWallet);
         }
-
         let mut keys_to_delete = vec![
             wallet_metadata_record_key(wallet_uuid),
             wallet_view_record_key(wallet_uuid),
@@ -1545,8 +2113,25 @@ impl DesktopVaultStore {
             else {
                 continue;
             };
-            let record: EncryptedRecord = rmp_serde::from_slice(&stored.payload)?;
-            let metadata = view.decrypt_wallet_chain_metadata(wallet_chain_uuid, &record)?;
+            let Ok(record) = rmp_serde::from_slice::<EncryptedRecord>(&stored.payload) else {
+                tracing::warn!(
+                    "ignoring invalid wallet chain metadata record during wallet delete"
+                );
+                continue;
+            };
+            let metadata = view_session
+                .and_then(|session| {
+                    session
+                        .decrypt_wallet_chain_metadata(wallet_chain_uuid, &record)
+                        .ok()
+                })
+                .or_else(|| {
+                    view.decrypt_wallet_chain_metadata(wallet_chain_uuid, &record)
+                        .ok()
+                });
+            let Some(metadata) = metadata else {
+                continue;
+            };
             if metadata.wallet_uuid != wallet_uuid {
                 continue;
             }
@@ -1653,9 +2238,15 @@ impl DesktopVaultStore {
             else {
                 continue;
             };
-            let record: EncryptedRecord = rmp_serde::from_slice(&stored.payload)?;
-            let metadata =
-                view_session.decrypt_wallet_chain_metadata(wallet_chain_uuid, &record)?;
+            let Ok(record) = rmp_serde::from_slice::<EncryptedRecord>(&stored.payload) else {
+                tracing::warn!("ignoring invalid wallet chain metadata record during lookup");
+                continue;
+            };
+            let Ok(metadata) =
+                view_session.decrypt_wallet_chain_metadata(wallet_chain_uuid, &record)
+            else {
+                continue;
+            };
             if metadata.wallet_uuid == view_session.wallet_id()
                 && metadata.chain_type == chain_type
                 && metadata.chain_id == chain_id
@@ -1990,13 +2581,29 @@ impl DesktopVaultStore {
         }
     }
 
+    fn hardware_profile_metadata_for_descriptor_with_view(
+        &self,
+        view: &ViewUnlock,
+        descriptor: &HardwareDerivationDescriptor,
+    ) -> Result<HardwareProfileMetadata, VaultError> {
+        let wallet_profile = HardwareWalletProfile {
+            device_kind: descriptor.device_kind,
+            profile_fingerprint: descriptor.profile_fingerprint.clone(),
+        };
+        let existing = self.list_hardware_profile_metadata_with_view(view)?;
+        Ok(existing
+            .into_iter()
+            .find(|profile| profile.matches_wallet_profile(&wallet_profile))
+            .unwrap_or_else(|| HardwareProfileMetadata::from_descriptor(descriptor)))
+    }
+
     fn ensure_hardware_wallet_account_index_available(
         metadata: &[WalletMetadataBundle],
         descriptor: &HardwareDerivationDescriptor,
     ) -> Result<(), VaultError> {
         let duplicate = metadata
             .iter()
-            .filter_map(|metadata| metadata.hardware_descriptor.as_ref())
+            .filter_map(WalletMetadataBundle::hardware_derivation_descriptor)
             .any(|existing| {
                 existing.device_kind == descriptor.device_kind
                     && existing.profile_fingerprint == descriptor.profile_fingerprint
@@ -2016,6 +2623,28 @@ impl DesktopVaultStore {
         derivation_index: u32,
         wallet: &WalletKeys,
         metadata: &WalletMetadataBundle,
+        view_access_key: &HardwareViewAccessKey,
+    ) -> Result<(StoredHardwareWalletRecord, VaultRecordEntries), VaultError> {
+        let vault_metadata = self.metadata()?;
+        let view = unlock_view(&vault_metadata, password)?;
+        self.encrypted_hardware_wallet_records_with_view(
+            &view,
+            wallet_id,
+            derivation_index,
+            wallet,
+            metadata,
+            view_access_key,
+        )
+    }
+
+    fn encrypted_hardware_wallet_records_with_view(
+        &self,
+        view: &ViewUnlock,
+        wallet_id: &str,
+        derivation_index: u32,
+        wallet: &WalletKeys,
+        metadata: &WalletMetadataBundle,
+        view_access_key: &HardwareViewAccessKey,
     ) -> Result<(StoredHardwareWalletRecord, VaultRecordEntries), VaultError> {
         let descriptor = metadata
             .hardware_descriptor
@@ -2033,23 +2662,32 @@ impl DesktopVaultStore {
             return Err(VaultError::InvalidHardwareWalletDescriptor);
         }
 
-        let vault_metadata = self.metadata()?;
-        let view = unlock_view(&vault_metadata, password)?;
-        let existing = self.list_wallet_metadata_with_view(&view)?;
+        let existing = self.list_wallet_metadata_with_view(view)?;
         Self::ensure_hardware_wallet_account_index_available(&existing, descriptor)?;
+        let profile = self.hardware_profile_metadata_for_descriptor_with_view(view, descriptor)?;
+        let hardware_view = ViewUnlock::from_hardware_view_access_key(view_access_key)?;
         let view_bundle = WalletViewBundle::from_wallet_keys(derivation_index, wallet);
-        let view_record = view.encrypt_view_bundle(wallet_id, &view_bundle)?;
+        let receive_address = hardware_wallet_receive_address(wallet)?;
+        let view_record = hardware_view.encrypt_view_bundle(wallet_id, &view_bundle)?;
         let view_record_key = wallet_view_record_key(wallet_id);
-        let metadata_record_key = wallet_metadata_record_key(&metadata.wallet_uuid);
+        let mut stored_metadata = metadata.clone();
+        stored_metadata.hardware_account = Some(
+            HardwareRailgunAccountMetadata::synthetic_software_v1(
+                profile.profile_id.clone(),
+                descriptor.account_index,
+                metadata.label.clone(),
+                descriptor.clone(),
+                HardwareRailgunAccountIdentity::from_wallet_keys(wallet),
+            )
+            .with_receive_address(receive_address),
+        );
+        let metadata_record_key = wallet_metadata_record_key(&stored_metadata.wallet_uuid);
         let reservation = Self::hardware_wallet_account_index_reservation(descriptor);
         let records = vec![
             view_record.to_record_entry(view_record_key.clone())?,
-            wallet_metadata_record_entry(&view, metadata)?,
-            hardware_wallet_account_index_record_entry(
-                &view,
-                &generate_opaque_id()?,
-                &reservation,
-            )?,
+            wallet_metadata_record_entry(view, &stored_metadata)?,
+            hardware_profile_record_entry(view, &profile)?,
+            hardware_wallet_account_index_record_entry(view, &generate_opaque_id()?, &reservation)?,
         ];
 
         Ok((

@@ -25,7 +25,7 @@ use crate::{HttpContext, effective_rpc_urls_for_chain, query_rpc_pool_with_http_
 
 const ANCHOR_OUTLIER_THRESHOLD_BPS: U256 = alloy::uint!(5_000_U256);
 const BPS_DENOMINATOR: U256 = alloy::uint!(10_000_U256);
-const TOKEN_ANCHOR_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
+const TOKEN_ANCHOR_REFRESH_INTERVAL: Duration = Duration::from_mins(5);
 const TOKEN_ANCHOR_WAKE_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
 sol! {

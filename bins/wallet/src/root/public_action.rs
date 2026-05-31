@@ -43,9 +43,10 @@ use super::spend_authorization::{
 };
 use super::utxo::short_hash;
 use super::{
-    PUBLIC_ACTION_DIALOG_WIDTH, WalletRoot, format_report_chain, format_send_amount_input,
-    native_token_display_label, parse_address, public_asset_decimals, public_asset_label,
-    public_balance_amount_label, secondary_dialog_content_width, token_label_row,
+    PUBLIC_ACTION_DIALOG_WIDTH, WalletRoot, dialog_content_max_height, dialog_max_height,
+    format_report_chain, format_send_amount_input, native_token_display_label, parse_address,
+    public_asset_decimals, public_asset_label, public_balance_amount_label,
+    scrollable_dialog_content, secondary_dialog_content_width, token_label_row,
 };
 
 use crate::assets::{RailgunActionIcon, WalletIconSource};

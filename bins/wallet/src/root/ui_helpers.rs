@@ -1,4 +1,5 @@
-use gpui::{IntoElement, ParentElement, Pixels, SharedString, Styled, div, img, px, rgb};
+use gpui::{IntoElement, ParentElement, Pixels, SharedString, Styled, Window, div, img, px, rgb};
+use gpui_component::scroll::ScrollableElement;
 use ui::controls::app_muted_text;
 use ui::theme;
 
@@ -25,6 +26,25 @@ pub(super) fn centered_message(message: impl Into<SharedString>) -> gpui::Div {
 
 pub(super) fn secondary_dialog_content_width(dialog_width: Pixels) -> Pixels {
     (dialog_width - DIALOG_CONTENT_HORIZONTAL_INSET).max(px(0.0))
+}
+
+pub(super) fn dialog_max_height(window: &Window) -> Pixels {
+    window.viewport_size().height * 0.84
+}
+
+pub(super) fn dialog_content_max_height(window: &Window) -> Pixels {
+    window.viewport_size().height * 0.74
+}
+
+pub(super) fn scrollable_dialog_content(
+    max_height: Pixels,
+    content: impl IntoElement,
+) -> impl IntoElement {
+    div()
+        .max_h(max_height)
+        .min_h(px(0.0))
+        .overflow_y_scrollbar()
+        .child(content)
 }
 
 pub(super) fn labeled_field(

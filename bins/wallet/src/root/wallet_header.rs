@@ -16,11 +16,19 @@ use railgun_ui::{chain_icon_asset_path, chain_name};
 use ui::clipboard::clipboard_with_toast;
 use ui::controls::{app_button_base, app_input, app_muted_text, app_strong_text};
 use ui::{icons, theme};
-use wallet_ops::vault::WalletSource;
+use wallet_ops::hardware::HardwareDeviceKind;
+use wallet_ops::vault::{HardwareProfileMetadata, WalletMetadataBundle, WalletSource};
+
+use crate::assets::{LEDGER_LOGO_SHORT_WHITE_ICON_PATH, TREZOR_SYMBOL_WHITE_ICON_PATH};
 
 use super::utxo::short_hash;
+use super::vault::{
+    HardwareWalletDisplayInfo, hardware_device_kind_from_wallet_select_value,
+    hardware_wallet_display_info,
+};
 use super::{
-    APP_TEXT_SIZE, ChainUtxoState, WalletRoot, chain_load_overrides, secondary_dialog_content_width,
+    APP_TEXT_SIZE, ChainUtxoState, WalletRoot, chain_load_overrides, dialog_content_max_height,
+    dialog_max_height, scrollable_dialog_content, secondary_dialog_content_width,
 };
 
 #[derive(Clone)]
@@ -37,11 +45,20 @@ impl SelectItem for WalletSelectItem {
     }
 
     fn display_title(&self) -> Option<gpui::AnyElement> {
-        Some(wallet_label_row(SharedString::from(self.label.to_string())).into_any_element())
+        Some(
+            wallet_label_row(
+                SharedString::from(self.label.to_string()),
+                hardware_device_kind_from_wallet_select_value(self.wallet_id.as_ref()),
+            )
+            .into_any_element(),
+        )
     }
 
     fn render(&self, _: &mut Window, _: &mut App) -> impl IntoElement {
-        wallet_label_row(SharedString::from(self.label.to_string()))
+        wallet_label_row(
+            SharedString::from(self.label.to_string()),
+            hardware_device_kind_from_wallet_select_value(self.wallet_id.as_ref()),
+        )
     }
 
     fn value(&self) -> &Self::Value {
@@ -118,23 +135,27 @@ impl WalletRoot {
     fn open_repair_cache_dialog(window: &mut Window, cx: &mut Context<'_, Self>) {
         let root = cx.entity();
         let dialog_width = (window.viewport_size().width * 0.92).min(px(420.0));
+        let dialog_max_height = dialog_max_height(window);
+        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         window.open_dialog(cx, move |dialog, _window, cx| {
             let submit_root = root.clone();
             let content_root = root.clone();
             dialog
                 .w(dialog_width)
+                .max_h(dialog_max_height)
                 .title(app_strong_text("Repair wallet cache"))
                 .button_props(DialogButtonProps::default().ok_text("Repair"))
                 .footer(|ok, _, window, cx| vec![ok(window, cx)])
                 .on_ok(move |_event, _window, cx| {
                     submit_root.update(cx, Self::repair_wallet_cache_from_input)
                 })
-                .child(
+                .child(scrollable_dialog_content(
+                    content_max_height,
                     content_root
                         .read(cx)
                         .render_repair_cache_dialog_content(content_width),
-                )
+                ))
         });
     }
 
@@ -144,6 +165,7 @@ impl WalletRoot {
             .view_session
             .as_ref()
             .and_then(|session| session.receive_address().ok());
+        let hardware_wallet_info = self.active_hardware_wallet_display_info();
 
         div()
             .h(px(52.0))
@@ -159,8 +181,9 @@ impl WalletRoot {
                 div()
                     .flex()
                     .items_center()
-                    .gap_1()
+                    .gap_2()
                     .child(self.render_wallet_selector())
+                    .children(hardware_wallet_info.map(render_hardware_wallet_chip))
                     .child(self.render_wallet_actions_menu(root.clone())),
             )
             .child(self.render_chain_selector())
@@ -316,6 +339,42 @@ impl WalletRoot {
     }
 }
 
+impl WalletRoot {
+    fn active_hardware_wallet_display_info(&self) -> Option<HardwareWalletDisplayInfo> {
+        let selected_wallet_id = self.selected_wallet_id.as_deref()?;
+        let wallet = self
+            .wallet_metadata
+            .iter()
+            .find(|wallet| wallet.wallet_uuid == selected_wallet_id)?;
+        hardware_wallet_display_info(wallet, self.active_hardware_profile_metadata(wallet))
+    }
+
+    fn active_hardware_profile_metadata(
+        &self,
+        wallet: &WalletMetadataBundle,
+    ) -> Option<&HardwareProfileMetadata> {
+        #[cfg(feature = "hardware")]
+        {
+            let account = wallet.hardware_account.as_ref()?;
+            self.hardware_profile_unlock
+                .profile
+                .as_ref()
+                .filter(|profile| profile.profile_id == account.profile_id)
+                .or_else(|| {
+                    self.active_hardware_profile
+                        .as_ref()
+                        .filter(|profile| profile.profile_id == account.profile_id)
+                })
+        }
+
+        #[cfg(not(feature = "hardware"))]
+        {
+            let _ = wallet;
+            None
+        }
+    }
+}
+
 fn chain_label_row(chain_id: u64) -> impl IntoElement {
     let label = chain_name(chain_id).map_or_else(|| chain_id.to_string(), str::to_owned);
     let mut row = div()
@@ -330,15 +389,62 @@ fn chain_label_row(chain_id: u64) -> impl IntoElement {
     row.child(SharedString::from(label))
 }
 
-fn wallet_label_row(label: SharedString) -> gpui::Div {
-    div()
+fn wallet_label_row(label: SharedString, device_kind: Option<HardwareDeviceKind>) -> gpui::Div {
+    let row = div()
         .flex()
         .items_center()
         .gap_2()
         .text_color(rgb(theme::TEXT))
         .text_size(APP_TEXT_SIZE)
-        .child(img(icons::wallet_icon_path()).size(px(16.0)).flex_none())
-        .child(label)
+        .child(wallet_label_icon(device_kind));
+
+    row.child(label)
+}
+
+fn wallet_label_icon(device_kind: Option<HardwareDeviceKind>) -> impl IntoElement {
+    let icon = match device_kind {
+        Some(HardwareDeviceKind::Ledger) => img(LEDGER_LOGO_SHORT_WHITE_ICON_PATH)
+            .h(px(19.0))
+            .flex_none()
+            .into_any_element(),
+        Some(HardwareDeviceKind::Trezor) => img(TREZOR_SYMBOL_WHITE_ICON_PATH)
+            .h(px(22.0))
+            .flex_none()
+            .into_any_element(),
+        _ => img(icons::wallet_icon_path())
+            .size(px(22.0))
+            .flex_none()
+            .into_any_element(),
+    };
+
+    div()
+        .size(px(22.0))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(icon)
+}
+
+fn render_hardware_wallet_chip(info: HardwareWalletDisplayInfo) -> impl IntoElement {
+    let label = SharedString::from(info.chip_label);
+    let tooltip = SharedString::from(info.detail_label);
+
+    div()
+        .id("active-hardware-wallet-detail")
+        .h(px(24.0))
+        .max_w(px(190.0))
+        .flex()
+        .items_center()
+        .px(px(7.0))
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(theme::PRIMARY))
+        .bg(rgb(theme::SURFACE))
+        .text_size(px(11.0))
+        .text_color(rgb(theme::PRIMARY))
+        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+        .child(div().min_w(px(0.0)).truncate().child(label))
 }
 
 fn header_divider() -> impl IntoElement {

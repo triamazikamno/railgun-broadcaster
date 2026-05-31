@@ -270,6 +270,9 @@ pub enum SelfBroadcastSessionEvent {
         stage: TransactionGenerationStage,
         message: String,
     },
+    HardwareProfileSessionRefreshed {
+        session: vault::HardwareProfileSession,
+    },
 }
 
 pub type SelfBroadcastCommandSender = mpsc::UnboundedSender<SelfBroadcastCommand>;
@@ -325,6 +328,7 @@ pub struct DesktopUnshieldSelfBroadcastRequest {
     pub vault_store: Arc<vault::DesktopVaultStore>,
     pub spend_authorization: DesktopPrivateSpendAuthorization,
     pub vault_password: Option<Zeroizing<String>>,
+    pub trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     pub public_account_uuid: String,
     pub token: Address,
     pub fee_token: Address,
@@ -347,6 +351,7 @@ pub struct DesktopSendSelfBroadcastRequest {
     pub vault_store: Arc<vault::DesktopVaultStore>,
     pub spend_authorization: DesktopPrivateSpendAuthorization,
     pub vault_password: Option<Zeroizing<String>>,
+    pub trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     pub public_account_uuid: String,
     pub token: Address,
     pub fee_token: Address,
@@ -414,6 +419,7 @@ pub struct BlockedShieldRescueSelfBroadcastRequest {
     pub vault_store: Arc<vault::DesktopVaultStore>,
     pub spend_authorization: DesktopPrivateSpendAuthorization,
     pub vault_password: Zeroizing<String>,
+    pub trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     pub utxo_id: BlockedShieldRescueUtxoId,
     pub requested_public_account_uuid: Option<String>,
     pub verify_proof: bool,

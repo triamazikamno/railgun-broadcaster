@@ -1,10 +1,13 @@
 use gpui::{App, Entity, ParentElement, Styled, Window, div, px, rgb};
-use gpui_component::{Disableable, Sizable, checkbox::Checkbox, list::List};
+use gpui_component::{Disableable, Icon, Sizable, checkbox::Checkbox, list::List};
 use ui::controls::app_input;
 use ui::theme;
 
+use crate::assets::CHEVRONS_DOWN_ICON_PATH;
+
 use super::WalletRoot;
 use super::broadcaster_picker::{
+    BROADCASTER_PICKER_LIST_PADDING_HEIGHT, BROADCASTER_PICKER_ROW_HEIGHT,
     BroadcasterPickerContent, BroadcasterPickerDialogSnapshot, render_broadcaster_picker_header,
 };
 use super::private_action::delivery_element_id;
@@ -49,6 +52,7 @@ pub(super) fn render_broadcaster_picker_dialog_content(
         kind,
         key,
     } = snapshot;
+    let hidden_row_count = hidden_broadcaster_picker_row_count(rows.len(), list_height);
     list.update(cx, |list, cx| {
         let content = BroadcasterPickerContent {
             rows,
@@ -112,4 +116,44 @@ pub(super) fn render_broadcaster_picker_dialog_content(
                 .w_full()
                 .bg(rgb(theme::SURFACE)),
         )
+        .children(render_broadcaster_picker_scroll_hint(hidden_row_count))
+}
+
+fn hidden_broadcaster_picker_row_count(row_count: usize, list_height: gpui::Pixels) -> usize {
+    let visible_row_count = visible_broadcaster_picker_row_count(list_height);
+    row_count.saturating_sub(visible_row_count)
+}
+
+fn visible_broadcaster_picker_row_count(list_height: gpui::Pixels) -> usize {
+    let mut visible_row_count = 0;
+    let mut content_height = BROADCASTER_PICKER_LIST_PADDING_HEIGHT;
+
+    loop {
+        let next_height = content_height + BROADCASTER_PICKER_ROW_HEIGHT;
+        if next_height > list_height {
+            break visible_row_count;
+        }
+        visible_row_count += 1;
+        content_height = next_height;
+    }
+}
+
+fn render_broadcaster_picker_scroll_hint(hidden_row_count: usize) -> Option<gpui::Div> {
+    if hidden_row_count == 0 {
+        return None;
+    }
+
+    Some(
+        div()
+            .w_full()
+            .flex()
+            .items_center()
+            .gap_1()
+            .px(px(8.0))
+            .pt(px(3.0))
+            .text_size(px(11.0))
+            .text_color(rgb(theme::TEXT_MUTED))
+            .child(Icon::empty().path(CHEVRONS_DOWN_ICON_PATH).size(px(15.0)))
+            .child("Scroll for more"),
+    )
 }

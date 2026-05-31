@@ -1,15 +1,15 @@
 use super::{
     ADDITIONAL_WALLET_LABEL_PREFIX, Address, BROADCASTER_BANNED_PREFIX,
     BROADCASTER_FAVORITE_PREFIX, BTreeSet, BroadcasterPreferenceEntry, CacheKeys,
-    HARDWARE_WALLET_ACCOUNT_INDEX_PREFIX, HardwareWalletAccountIndexReservation, KEY_LEN,
-    MnemonicBuilder, PRIMARY_WALLET_LABEL, PRIVATE_ADDRESS_BOOK_PREFIX,
-    PUBLIC_ACCOUNT_METADATA_PREFIX, PUBLIC_ACCOUNT_SECRET_PREFIX, PUBLIC_ADDRESS_BOOK_PREFIX,
-    PrivateAddressBookEntry, PrivateKeySigner, PublicAccountMetadata, PublicAccountScope,
-    PublicAccountSecret, PublicAccountSource, PublicAccountStatus, PublicAddressBookEntry,
-    RecordKind, SigningKey, SpendUnlock, U256, VaultError, ViewUnlock, WALLET_CACHE_ROW_PREFIX,
-    WALLET_CHAIN_METADATA_PREFIX, WALLET_METADATA_PREFIX, WALLET_SPEND_PREFIX, WALLET_VIEW_PREFIX,
-    WalletCacheError, WalletMetadataBundle, WalletUtxo, Zeroizing, bip39_mnemonic_from_entropy,
-    generate_opaque_id,
+    HARDWARE_PROFILE_PREFIX, HARDWARE_WALLET_ACCOUNT_INDEX_PREFIX, HardwareProfileMetadata,
+    HardwareWalletAccountIndexReservation, KEY_LEN, MnemonicBuilder, PRIMARY_WALLET_LABEL,
+    PRIVATE_ADDRESS_BOOK_PREFIX, PUBLIC_ACCOUNT_METADATA_PREFIX, PUBLIC_ACCOUNT_SECRET_PREFIX,
+    PUBLIC_ADDRESS_BOOK_PREFIX, PrivateAddressBookEntry, PrivateKeySigner, PublicAccountMetadata,
+    PublicAccountScope, PublicAccountSecret, PublicAccountSource, PublicAccountStatus,
+    PublicAddressBookEntry, RecordKind, SigningKey, SpendUnlock, U256, VaultError, ViewUnlock,
+    WALLET_CACHE_ROW_PREFIX, WALLET_CHAIN_METADATA_PREFIX, WALLET_METADATA_PREFIX,
+    WALLET_SPEND_PREFIX, WALLET_VIEW_PREFIX, WalletCacheError, WalletMetadataBundle, WalletUtxo,
+    Zeroizing, bip39_mnemonic_from_entropy, generate_opaque_id,
 };
 use crate::parse_railgun_recipient;
 
@@ -31,6 +31,10 @@ pub(super) fn wallet_chain_metadata_record_key(wallet_chain_uuid: &str) -> Strin
 
 pub(super) fn hardware_wallet_account_index_record_key(reservation_uuid: &str) -> String {
     format!("{HARDWARE_WALLET_ACCOUNT_INDEX_PREFIX}{reservation_uuid}")
+}
+
+pub(super) fn hardware_profile_record_key(profile_id: &str) -> String {
+    format!("{HARDWARE_PROFILE_PREFIX}{profile_id}")
 }
 
 pub(super) fn wallet_cache_row_prefix(wallet_chain_uuid: &str) -> String {
@@ -110,6 +114,15 @@ pub(super) fn hardware_wallet_account_index_record_entry(
     let key = hardware_wallet_account_index_record_key(reservation_uuid);
     let record =
         view.encrypt_hardware_wallet_account_index_reservation(reservation_uuid, reservation)?;
+    record.to_record_entry(key)
+}
+
+pub(super) fn hardware_profile_record_entry(
+    view: &ViewUnlock,
+    profile: &HardwareProfileMetadata,
+) -> Result<(String, Vec<u8>), VaultError> {
+    let key = hardware_profile_record_key(&profile.profile_id);
+    let record = view.encrypt_hardware_profile_metadata(&profile.profile_id, profile)?;
     record.to_record_entry(key)
 }
 
@@ -287,6 +300,15 @@ pub fn sort_wallet_metadata(metadata: &mut [WalletMetadataBundle]) {
             .cmp(&right.display_order)
             .then_with(|| left.label.cmp(&right.label))
             .then_with(|| left.wallet_uuid.cmp(&right.wallet_uuid))
+    });
+}
+
+pub fn sort_hardware_profile_metadata(metadata: &mut [HardwareProfileMetadata]) {
+    metadata.sort_by(|left, right| {
+        left.label
+            .cmp(&right.label)
+            .then_with(|| left.device_kind.cmp(&right.device_kind))
+            .then_with(|| left.profile_id.cmp(&right.profile_id))
     });
 }
 

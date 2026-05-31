@@ -111,7 +111,7 @@ impl Default for WakuConfig {
             network: WakuNetworkConfig::default(),
             cluster_id: 1,
             shard_id: 1,
-            peer_exchange_cooldown: Duration::from_secs(60),
+            peer_exchange_cooldown: Duration::from_mins(1),
         }
     }
 }

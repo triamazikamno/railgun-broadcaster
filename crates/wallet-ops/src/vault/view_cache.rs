@@ -1,17 +1,34 @@
 use super::{
     Arc, CacheKeys, DbStore, DesktopEncryptedWalletCacheStore, DesktopViewSession, EncryptedRecord,
-    Instant, KEY_LEN, Mutex, RailgunError, U256, VaultError, ViewUnlock, ViewingKeyData,
-    WalletCacheError, WalletChainMetadataBundle, WalletMeta, WalletUtxo, WalletViewBundle,
-    deserialize_wallet_utxo, serialize_wallet_utxo, wallet_cache_counts, wallet_cache_row_prefix,
-    wallet_cache_row_record_key, wallet_chain_metadata_record_key, wallet_utxo_stable_identity,
+    HardwareProfileSession, Instant, KEY_LEN, Mutex, RailgunError, U256, VaultError, ViewUnlock,
+    ViewingKeyData, WalletCacheError, WalletChainMetadataBundle, WalletMeta, WalletUtxo,
+    WalletViewBundle, deserialize_wallet_utxo, serialize_wallet_utxo, wallet_cache_counts,
+    wallet_cache_row_prefix, wallet_cache_row_record_key, wallet_chain_metadata_record_key,
+    wallet_utxo_stable_identity,
 };
 
 impl DesktopViewSession {
     #[must_use]
-    pub const fn from_bundle(
+    pub fn from_bundle(wallet_id: String, bundle: &WalletViewBundle, view: ViewUnlock) -> Self {
+        let private_view = view.clone_unlock();
+        Self {
+            wallet_id,
+            derivation_index: bundle.derivation_index,
+            spending_public_key: bundle.spending_public_key(),
+            scan_keys: bundle.scan_keys(),
+            view,
+            private_view,
+            hardware_profile_session: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn from_hardware_bundle(
         wallet_id: String,
         bundle: &WalletViewBundle,
         view: ViewUnlock,
+        private_view: ViewUnlock,
+        hardware_profile_session: HardwareProfileSession,
     ) -> Self {
         Self {
             wallet_id,
@@ -19,6 +36,8 @@ impl DesktopViewSession {
             spending_public_key: bundle.spending_public_key(),
             scan_keys: bundle.scan_keys(),
             view,
+            private_view,
+            hardware_profile_session: Some(hardware_profile_session),
         }
     }
 
@@ -42,6 +61,32 @@ impl DesktopViewSession {
         self.spending_public_key
     }
 
+    #[must_use]
+    pub const fn hardware_profile_session(&self) -> Option<&HardwareProfileSession> {
+        self.hardware_profile_session.as_ref()
+    }
+
+    #[must_use]
+    pub fn clone_vault_view_unlock(&self) -> ViewUnlock {
+        self.view.clone_unlock()
+    }
+
+    #[must_use]
+    pub fn clone_with_hardware_profile_session(
+        &self,
+        hardware_profile_session: HardwareProfileSession,
+    ) -> Self {
+        Self {
+            wallet_id: self.wallet_id.clone(),
+            derivation_index: self.derivation_index,
+            spending_public_key: self.spending_public_key,
+            scan_keys: self.scan_keys,
+            view: self.view.clone_unlock(),
+            private_view: self.private_view.clone_unlock(),
+            hardware_profile_session: Some(hardware_profile_session),
+        }
+    }
+
     pub fn receive_address(&self) -> Result<String, RailgunError> {
         Ok(self.scan_keys.derive_address(None)?.to_string())
     }
@@ -51,7 +96,7 @@ impl DesktopViewSession {
         wallet_chain_uuid: &str,
         metadata: &WalletChainMetadataBundle,
     ) -> Result<EncryptedRecord, VaultError> {
-        self.view
+        self.private_view
             .encrypt_wallet_chain_metadata(wallet_chain_uuid, metadata)
     }
 
@@ -60,12 +105,12 @@ impl DesktopViewSession {
         wallet_chain_uuid: &str,
         record: &EncryptedRecord,
     ) -> Result<WalletChainMetadataBundle, VaultError> {
-        self.view
+        self.private_view
             .decrypt_wallet_chain_metadata(wallet_chain_uuid, record)
     }
 
     pub fn derive_cache_keys(&self, wallet_chain_uuid: &str) -> Result<CacheKeys, VaultError> {
-        self.view.derive_cache_keys(wallet_chain_uuid)
+        self.private_view.derive_cache_keys(wallet_chain_uuid)
     }
 }
 

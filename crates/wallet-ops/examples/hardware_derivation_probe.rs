@@ -54,7 +54,6 @@ async fn ledger_eip1024() -> Result<()> {
         parse_bip32_path(DEFAULT_HARDWARE_DERIVATION_PATH)?,
         0,
         profile_fingerprint,
-        None,
         HardwareWalletSyncIntent::CreateNew,
     );
     println!("Approve the Ledger EIP-1024 shared-secret request on the device.");
@@ -90,7 +89,6 @@ async fn trezor_cipher() -> Result<()> {
         parse_bip32_path(DEFAULT_HARDWARE_DERIVATION_PATH)?,
         0,
         profile_fingerprint,
-        None,
         HardwareWalletSyncIntent::CreateNew,
     );
     println!("Approve the Trezor CipherKeyValue request on the device.");

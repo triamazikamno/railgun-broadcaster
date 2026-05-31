@@ -22,18 +22,25 @@ use ui::theme::{self, APP_MONO_FONT_FAMILY};
 use wallet_ops::hardware::{HardwareDerivationDescriptor, HardwareDeviceKind};
 #[cfg(feature = "hardware")]
 use wallet_ops::hardware::{
-    HardwareDerivationError, ledger::LedgerHardwareDerivationClient,
-    synthetic_entropy_from_hardware_output, trezor::TrezorHardwareDerivationClient,
+    HardwareDerivationError,
+    ledger::LedgerHardwareDerivationClient,
+    synthetic_entropy_from_hardware_output,
+    trezor::{TrezorHardwareDerivationClient, TrezorPinMatrixProvider},
 };
 #[cfg(feature = "hardware")]
-use wallet_ops::vault::{DesktopVaultStore, DesktopViewSession, VaultError};
+use wallet_ops::vault::{
+    DesktopVaultStore, DesktopViewSession, HardwareProfileSession, VaultError,
+};
 use wallet_ops::{BlockedShieldRescueUtxoId, DesktopPrivateSpendAuthorization};
 use zeroize::Zeroizing;
 
 use crate::assets::WalletIconSource;
 
 use super::private_action::UnshieldAssetKey;
-use super::{WalletRoot, new_masked_input, secondary_dialog_content_width, token_label_row};
+use super::{
+    WalletRoot, dialog_content_max_height, dialog_max_height, new_masked_input,
+    scrollable_dialog_content, secondary_dialog_content_width, token_label_row,
+};
 
 const SPEND_AUTHORIZATION_DIALOG_WIDTH: gpui::Pixels = px(560.0);
 const SPEND_AUTHORIZATION_SESSION_WARNING: &str = "This will allow on-chain spending from this vault without re-entering the password until you lock the vault or close the app. Only use this on a trusted device.";
@@ -62,8 +69,8 @@ impl SpendAuthorizationLifetime {
     const fn duration(self) -> Option<Duration> {
         match self {
             Self::Once | Self::UntilVaultLock => None,
-            Self::FiveMinutes => Some(Duration::from_secs(5 * 60)),
-            Self::FifteenMinutes => Some(Duration::from_secs(15 * 60)),
+            Self::FiveMinutes => Some(Duration::from_mins(5)),
+            Self::FifteenMinutes => Some(Duration::from_mins(15)),
         }
     }
 }
@@ -144,6 +151,12 @@ enum HardwareSpendAuthorizationError {
     Hardware(HardwareDerivationError),
     Vault(VaultError),
 }
+
+#[cfg(feature = "hardware")]
+type HardwareSpendAuthorizationTaskOutput = Result<
+    (DesktopPrivateSpendAuthorization, HardwareProfileSession),
+    HardwareSpendAuthorizationError,
+>;
 
 #[cfg(feature = "hardware")]
 impl From<HardwareDerivationError> for HardwareSpendAuthorizationError {
@@ -246,7 +259,7 @@ impl HardwareSpendAuthorizationDialogContent {
         cx.notify();
     }
 
-    fn start(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
+    fn start(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         if self.pending {
             return;
         }
@@ -269,8 +282,8 @@ impl HardwareSpendAuthorizationDialogContent {
         {
             let root = self.root.clone();
             let completion = self.completion.clone();
-            let task = root.update(cx, |root, _cx| {
-                root.start_hardware_spend_authorization_task()
+            let task = root.update(cx, |root, cx| {
+                root.start_hardware_spend_authorization_task(window, cx)
             });
             match task {
                 Ok(join) => {
@@ -282,60 +295,69 @@ impl HardwareSpendAuthorizationDialogContent {
                             }
                             dialog.pending = false;
                             match result {
-                                Ok(Ok(authorization)) => {
+                                Ok(Ok((authorization, hardware_session))) => {
                                     let root = dialog.root.clone();
                                     window.close_dialog(cx);
-                                    root.update(cx, |root, cx| match completion {
-                                        HardwareSpendAuthorizationCompletion::Continue(intent) => {
-                                            root.continue_authorized_spend(
-                                                intent,
-                                                authorization,
-                                                window,
-                                                cx,
-                                            );
-                                        }
-                                        HardwareSpendAuthorizationCompletion::PrivateSendSelfBroadcast {
-                                            key,
-                                            vault_password,
-                                        } => {
-                                            root.generate_send_calldata_authorized_with_gas_password(
+                                    root.update(cx, |root, cx| {
+                                        root.refresh_active_hardware_profile_session(
+                                            hardware_session,
+                                            cx,
+                                        );
+                                        match completion {
+                                            HardwareSpendAuthorizationCompletion::Continue(intent) => {
+                                                root.continue_authorized_spend(
+                                                    intent,
+                                                    authorization,
+                                                    window,
+                                                    cx,
+                                                );
+                                            }
+                                            HardwareSpendAuthorizationCompletion::PrivateSendSelfBroadcast {
                                                 key,
-                                                authorization,
-                                                Some(vault_password),
-                                                window,
-                                                cx,
-                                            );
-                                        }
-                                        HardwareSpendAuthorizationCompletion::PrivateUnshieldSelfBroadcast {
-                                            key,
-                                            vault_password,
-                                        } => {
-                                            root.generate_unshield_calldata_authorized_with_gas_password(
+                                                vault_password,
+                                            } => {
+                                                root.generate_send_calldata_authorized_with_gas_password(
+                                                    key,
+                                                    authorization,
+                                                    Some(vault_password),
+                                                    window,
+                                                    cx,
+                                                );
+                                            }
+                                            HardwareSpendAuthorizationCompletion::PrivateUnshieldSelfBroadcast {
                                                 key,
-                                                authorization,
-                                                Some(vault_password),
-                                                window,
-                                                cx,
-                                            );
-                                        }
-                                        HardwareSpendAuthorizationCompletion::BlockedShieldRefund {
-                                            utxo_id,
-                                            vault_password,
-                                        } => {
-                                            root.submit_blocked_shield_refund_authorized(
+                                                vault_password,
+                                            } => {
+                                                root.generate_unshield_calldata_authorized_with_gas_password(
+                                                    key,
+                                                    authorization,
+                                                    Some(vault_password),
+                                                    window,
+                                                    cx,
+                                                );
+                                            }
+                                            HardwareSpendAuthorizationCompletion::BlockedShieldRefund {
                                                 utxo_id,
-                                                authorization,
-                                                Some(vault_password),
-                                                window,
-                                                cx,
-                                            );
+                                                vault_password,
+                                            } => {
+                                                root.submit_blocked_shield_refund_authorized(
+                                                    utxo_id,
+                                                    authorization,
+                                                    Some(vault_password),
+                                                    window,
+                                                    cx,
+                                                );
+                                            }
                                         }
                                     });
                                 }
                                 Ok(Err(error)) => {
-                                    dialog.error = Some(Arc::from(
-                                        hardware_spend_authorization_error_message(&error),
-                                    ));
+                                    let message = hardware_spend_authorization_error_message(&error);
+                                    let root = dialog.root.clone();
+                                    root.update(cx, |root, cx| {
+                                        root.discard_active_trezor_session_if_stale(&message, cx);
+                                    });
+                                    dialog.error = Some(Arc::from(message));
                                     cx.notify();
                                 }
                                 Err(error) => {
@@ -494,6 +516,25 @@ impl gpui::Render for HardwareSpendAuthorizationDialogContent {
         } else {
             "Approve on device"
         };
+        let show_trezor_app_passphrase = self
+            .root
+            .read(cx)
+            .current_session_needs_trezor_app_passphrase();
+        #[cfg(feature = "hardware")]
+        let trezor_app_passphrase_input = self.root.read(cx).trezor_app_passphrase_input.clone();
+        #[cfg(feature = "hardware")]
+        let trezor_pin_matrix_prompt = {
+            let root = self.root.read(cx);
+            root.hardware_profile_unlock
+                .trezor_pin_matrix_prompt
+                .as_ref()
+                .map(|prompt| {
+                    super::vault_ui::render_trezor_pin_matrix_prompt(&self.root, prompt)
+                        .into_any_element()
+                })
+        };
+        #[cfg(not(feature = "hardware"))]
+        let trezor_pin_matrix_prompt: Option<AnyElement> = None;
 
         div()
             .w_full()
@@ -511,6 +552,36 @@ impl gpui::Render for HardwareSpendAuthorizationDialogContent {
                 app_muted_text(hardware_spend_authorization_instruction(self.device_label))
                     .whitespace_normal(),
             )
+            .when(show_trezor_app_passphrase, |this| {
+                #[cfg(feature = "hardware")]
+                {
+                    this.child(
+                        div()
+                            .w_full()
+                            .p(px(12.0))
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(theme::BORDER))
+                            .bg(rgb(theme::SURFACE))
+                            .child(app_strong_text("Trezor app passphrase"))
+                            .child(
+                                app_muted_text(
+                                    "If the Trezor session expired, enter the app passphrase for this request.",
+                                )
+                                .whitespace_normal(),
+                            )
+                            .child(app_input(&trezor_app_passphrase_input).disabled(pending)),
+                    )
+                }
+                #[cfg(not(feature = "hardware"))]
+                {
+                    this
+                }
+            })
+            .children(trezor_pin_matrix_prompt)
             .when(pending, |this| {
                 this.child(
                     div()
@@ -746,12 +817,18 @@ impl WalletRoot {
         let focus_content = content.clone();
         let dialog_width =
             (window.viewport_size().width * 0.92).min(SPEND_AUTHORIZATION_DIALOG_WIDTH);
+        let dialog_max_height = dialog_max_height(window);
+        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         window.open_dialog(cx, move |dialog, _window, _cx| {
             dialog
                 .w(dialog_width)
+                .max_h(dialog_max_height)
                 .title(app_strong_text("Authorize spend"))
-                .child(div().w(content_width).child(content.clone()))
+                .child(scrollable_dialog_content(
+                    content_max_height,
+                    div().w(content_width).child(content.clone()),
+                ))
         });
         cx.defer_in(window, move |_root, window, cx| {
             focus_content.update(cx, |content, cx| content.focus_password(window, cx));
@@ -767,14 +844,28 @@ impl WalletRoot {
         let root = cx.entity();
         let dialog_width =
             (window.viewport_size().width * 0.92).min(SPEND_AUTHORIZATION_DIALOG_WIDTH);
+        let dialog_max_height = dialog_max_height(window);
+        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
-        window.open_dialog(cx, move |dialog, _window, _cx| {
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            let close_root = root.clone();
             let submit_root = root.clone();
+            let show_trezor_app_passphrase = root
+                .read(cx)
+                .current_session_needs_trezor_app_passphrase();
+            #[cfg(feature = "hardware")]
+            let trezor_app_passphrase_input = root.read(cx).trezor_app_passphrase_input.clone();
             dialog
                 .w(dialog_width)
+                .max_h(dialog_max_height)
                 .title(app_strong_text("Authorize hardware public action"))
                 .button_props(DialogButtonProps::default().ok_text("Approve on device"))
                 .footer(|ok, cancel, window, cx| vec![cancel(window, cx), ok(window, cx)])
+                .on_close(move |_event, window, cx| {
+                    close_root.update(cx, |root, cx| {
+                        root.clear_trezor_app_passphrase_input(window, cx);
+                    });
+                })
                 .on_ok(move |_event, window, cx| {
                     submit_root.update(cx, |root, cx| {
                         root.continue_authorized_spend(
@@ -788,7 +879,8 @@ impl WalletRoot {
                     });
                     true
                 })
-                .child(
+                .child(scrollable_dialog_content(
+                    content_max_height,
                     div()
                         .w(content_width)
                         .flex()
@@ -797,11 +889,40 @@ impl WalletRoot {
                         .child(app_strong_text(summary.title.to_string()))
                         .child(app_muted_text(summary.detail.to_string()).whitespace_normal())
                         .child(render_spend_authorization_summary(&summary))
+                        .when(show_trezor_app_passphrase, |this| {
+                            #[cfg(feature = "hardware")]
+                            {
+                                this.child(
+                                    div()
+                                        .w_full()
+                                        .p(px(12.0))
+                                        .flex()
+                                        .flex_col()
+                                        .gap_2()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(theme::BORDER))
+                                        .bg(rgb(theme::SURFACE))
+                                        .child(app_strong_text("Trezor app passphrase"))
+                                        .child(
+                                            app_muted_text(
+                                                "If the Trezor session expired, enter the app passphrase for this public account request.",
+                                            )
+                                            .whitespace_normal(),
+                                        )
+                                        .child(app_input(&trezor_app_passphrase_input)),
+                                )
+                            }
+                            #[cfg(not(feature = "hardware"))]
+                            {
+                                this
+                            }
+                        })
                         .child(
                             app_muted_text("The app will verify the stored public account address against the connected device before signing.")
                                 .whitespace_normal(),
                         ),
-                )
+                ))
         });
     }
 
@@ -823,6 +944,8 @@ impl WalletRoot {
         let device_label = hardware_device_label(descriptor.device_kind);
         let dialog_width =
             (window.viewport_size().width * 0.92).min(SPEND_AUTHORIZATION_DIALOG_WIDTH);
+        let dialog_max_height = dialog_max_height(window);
+        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         let content = cx.new(|_cx| {
             HardwareSpendAuthorizationDialogContent::new(
@@ -834,13 +957,22 @@ impl WalletRoot {
         });
         window.open_dialog(cx, move |dialog, _window, _cx| {
             let close_content = content.clone();
+            let close_root = root.clone();
             dialog
                 .w(dialog_width)
+                .max_h(dialog_max_height)
                 .title(app_strong_text("Authorize hardware spend"))
-                .on_close(move |_event, _window, cx| {
+                .on_close(move |_event, window, cx| {
                     close_content.update(cx, HardwareSpendAuthorizationDialogContent::cancel);
+                    close_root.update(cx, |root, cx| {
+                        root.clear_trezor_app_passphrase_input(window, cx);
+                        root.clear_trezor_pin_matrix_prompt(cx);
+                    });
                 })
-                .child(div().w(content_width).child(content.clone()))
+                .child(scrollable_dialog_content(
+                    content_max_height,
+                    div().w(content_width).child(content.clone()),
+                ))
         });
     }
 
@@ -849,18 +981,15 @@ impl WalletRoot {
         self.wallet_metadata
             .iter()
             .find(|metadata| metadata.wallet_uuid == selected_wallet_id.as_ref())
-            .and_then(|metadata| metadata.hardware_descriptor.clone())
+            .and_then(|metadata| metadata.hardware_derivation_descriptor().cloned())
     }
 
     #[cfg(feature = "hardware")]
     fn start_hardware_spend_authorization_task(
-        &self,
-    ) -> Result<
-        tokio::task::JoinHandle<
-            Result<DesktopPrivateSpendAuthorization, HardwareSpendAuthorizationError>,
-        >,
-        Arc<str>,
-    > {
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Result<tokio::task::JoinHandle<HardwareSpendAuthorizationTaskOutput>, Arc<str>> {
         let Some(descriptor) = self.selected_hardware_descriptor() else {
             return Err(Arc::from(
                 "Selected wallet is missing its hardware derivation descriptor",
@@ -874,10 +1003,26 @@ impl WalletRoot {
                 "Unlock the wallet vault before authorizing a spend",
             ));
         };
+        let Some(hardware_session) = view_session.hardware_profile_session().cloned() else {
+            return Err(Arc::from(
+                "Unlock the matching hardware profile before authorizing a spend",
+            ));
+        };
+        let trezor_app_passphrase =
+            self.read_trezor_app_passphrase_for_hardware_session(&hardware_session, window, cx);
+        let trezor_pin_matrix_provider =
+            if hardware_session.device_kind == HardwareDeviceKind::Trezor {
+                Some(self.trezor_pin_matrix_provider_for_operation(window, cx))
+            } else {
+                None
+            };
         Ok(self.runtime.spawn(derive_hardware_spend_authorization(
             store,
             view_session,
+            hardware_session,
             descriptor,
+            trezor_app_passphrase,
+            trezor_pin_matrix_provider,
         )))
     }
 
@@ -1015,6 +1160,24 @@ impl WalletRoot {
         }
     }
 
+    #[cfg(feature = "hardware")]
+    pub(super) fn refresh_active_hardware_profile_session(
+        &mut self,
+        hardware_session: HardwareProfileSession,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(view_session) = self.view_session.as_ref() else {
+            return;
+        };
+        if view_session.hardware_profile_session().is_none() {
+            return;
+        }
+        self.view_session = Some(Arc::new(
+            view_session.clone_with_hardware_profile_session(hardware_session),
+        ));
+        cx.notify();
+    }
+
     fn request_private_send_hardware_authorization_with_gas_password(
         &mut self,
         key: UnshieldAssetKey,
@@ -1089,16 +1252,40 @@ fn hardware_spend_authorization_error_message(error: &HardwareSpendAuthorization
 async fn derive_hardware_spend_authorization(
     store: Arc<DesktopVaultStore>,
     view_session: Arc<DesktopViewSession>,
+    mut hardware_session: HardwareProfileSession,
     descriptor: HardwareDerivationDescriptor,
-) -> Result<DesktopPrivateSpendAuthorization, HardwareSpendAuthorizationError> {
+    trezor_app_passphrase: Option<Zeroizing<String>>,
+    trezor_pin_matrix_provider: Option<TrezorPinMatrixProvider>,
+) -> Result<
+    (DesktopPrivateSpendAuthorization, HardwareProfileSession),
+    HardwareSpendAuthorizationError,
+> {
+    hardware_session.verify_descriptor(&descriptor)?;
     let entropy = match descriptor.device_kind {
         HardwareDeviceKind::Ledger => {
             let client = LedgerHardwareDerivationClient::connect().await?;
+            let active = client.active_profile_session(&descriptor.path).await?;
+            active.verify_descriptor(&descriptor)?;
             let output = client.eip1024_shared_secret(&descriptor.path, true).await?;
             synthetic_entropy_from_hardware_output(&descriptor, output)?
         }
         HardwareDeviceKind::Trezor => {
-            let mut client = TrezorHardwareDerivationClient::connect()?;
+            let mut client = TrezorHardwareDerivationClient::connect_with_session(
+                hardware_session.trezor_session_id.clone(),
+            )?;
+            client.set_passphrase_mode(hardware_session.trezor_passphrase_mode());
+            if let Some(passphrase) = trezor_app_passphrase {
+                client.set_app_passphrase_zeroizing(passphrase);
+            }
+            if let Some(provider) = trezor_pin_matrix_provider {
+                client.set_pin_matrix_provider(provider);
+            }
+            let active = client.active_profile_session(&descriptor.path)?;
+            active.verify_descriptor(&descriptor)?;
+            hardware_session
+                .trezor_session_id
+                .clone_from(&active.trezor_session_id);
+            hardware_session.set_trezor_passphrase_mode(active.trezor_passphrase_mode());
             let output = client.cipher_key_value(&descriptor)?;
             synthetic_entropy_from_hardware_output(&descriptor, output)?
         }
@@ -1108,8 +1295,9 @@ async fn derive_hardware_spend_authorization(
         &descriptor,
         entropy.expose_secret(),
     )?;
-    Ok(DesktopPrivateSpendAuthorization::PreauthorizedSigner(
-        signer,
+    Ok((
+        DesktopPrivateSpendAuthorization::PreauthorizedSigner(signer),
+        hardware_session,
     ))
 }
 

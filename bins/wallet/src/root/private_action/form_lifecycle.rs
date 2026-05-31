@@ -63,6 +63,7 @@ impl WalletRoot {
             let dialog_width = (window.viewport_size().width * 0.92).min(PRIVATE_ASSET_LIST_WIDTH);
             let max_height =
                 (window.viewport_size().height * 0.88).min(PRIVATE_ACTION_FORM_MAX_HEIGHT);
+            let content_max_height = dialog_content_max_height(window);
             let close_root = root.clone();
             let content_root = root.clone();
             root.update(cx, |root, cx| {
@@ -84,7 +85,7 @@ impl WalletRoot {
             };
             dialog
                 .w(dialog_width)
-                .h(max_height)
+                .max_h(max_height)
                 .title(private_action_title_row(
                     title_action,
                     &asset_label,
@@ -98,7 +99,7 @@ impl WalletRoot {
                         DeliveryFormKind::Unshield => root.close_unshield_form(key, cx),
                     });
                 })
-                .child(child)
+                .child(scrollable_dialog_content(content_max_height, child))
         });
     }
 

@@ -17,6 +17,7 @@ use gpui_component::{
     input::InputState,
     menu::{DropdownMenu, PopupMenuItem},
     scroll::ScrollableElement,
+    spinner::Spinner,
     tooltip::Tooltip,
 };
 use qrcodegen::{QrCode, QrCodeEcc};
@@ -33,6 +34,13 @@ use wallet_ops::{
         PublicAccountStatus, WalletSource, public_account_default_label,
     },
 };
+#[cfg(feature = "hardware")]
+use wallet_ops::{
+    hardware::trezor::TrezorPinMatrixProvider,
+    hardware::{DEFAULT_HARDWARE_DERIVATION_PATH, parse_bip32_path},
+    vault::HardwareProfileSession,
+};
+use zeroize::Zeroizing;
 
 use crate::assets::{RailgunActionIcon, RailgunPublicAccountIcon, WalletIconSource};
 
@@ -44,8 +52,8 @@ use super::public_balances::{
 };
 use super::{
     PUBLIC_ACCOUNT_DIALOG_WIDTH, PUBLIC_ADDRESS_QR_DIALOG_WIDTH, WalletRoot,
-    public_account_visible_balances_for_chain, rgb_with_alpha, secondary_dialog_content_width,
-    vault_error_kind,
+    dialog_content_max_height, dialog_max_height, public_account_visible_balances_for_chain,
+    rgb_with_alpha, scrollable_dialog_content, secondary_dialog_content_width, vault_error_kind,
 };
 
 pub(super) const PUBLIC_ACCOUNT_IDENTICON_SIZE: Pixels = px(40.0);
@@ -71,6 +79,20 @@ pub(super) const PUBLIC_ACCOUNT_IDENTICON_COLORS: [u32; 8] = [
 const PUBLIC_BALANCE_CHIP_MIN_WIDTH: Pixels = px(184.0);
 const PUBLIC_BALANCE_CHIP_ACTION_SLOT_SIZE: Pixels = px(24.0);
 const PUBLIC_BALANCE_CHIP_ACTION_ICON_SIZE: Pixels = px(20.0);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum HardwarePublicAccountDerivationStatus {
+    Idle,
+    CheckingDevice,
+    AwaitingAddressConfirmation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(feature = "hardware")]
+enum HardwarePublicAccountDerivationProgress {
+    CheckingDevice,
+    AwaitingAddressConfirmation(Address),
+}
 
 pub(super) struct PublicAccountFormState {
     pub(super) add_label_input: Entity<InputState>,
@@ -111,6 +133,8 @@ pub(super) struct PublicAccountFormState {
     pub(super) send_error: Option<Arc<str>>,
     pub(super) shield_error: Option<Arc<str>>,
     pub(super) adding_account: bool,
+    pub(super) hardware_derivation_status: HardwarePublicAccountDerivationStatus,
+    pub(super) hardware_confirmation_address: Option<Address>,
     pub(super) importing_account: bool,
     pub(super) sending: bool,
     pub(super) shielding: bool,
@@ -131,12 +155,15 @@ impl WalletRoot {
         self.clear_public_account_dialog_inputs(kind, window, cx);
         let root = cx.entity();
         let dialog_width = (window.viewport_size().width * 0.92).min(PUBLIC_ACCOUNT_DIALOG_WIDTH);
+        let dialog_max_height = dialog_max_height(window);
+        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         window.open_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
             let content_root = root.clone();
             dialog
                 .w(dialog_width)
+                .max_h(dialog_max_height)
                 .title(app_strong_text(kind.title()))
                 .on_close(move |_event, window, cx| {
                     close_root.update(cx, |root, cx| {
@@ -144,10 +171,13 @@ impl WalletRoot {
                         root.clear_public_account_dialog_inputs(kind, window, cx);
                     });
                 })
-                .child(content_root.read(cx).render_public_account_dialog_content(
-                    content_root.clone(),
-                    kind,
-                    content_width,
+                .child(scrollable_dialog_content(
+                    content_max_height,
+                    content_root.read(cx).render_public_account_dialog_content(
+                        content_root.clone(),
+                        kind,
+                        content_width,
+                    ),
                 ))
         });
         cx.defer_in(window, move |root, window, cx| {
@@ -167,12 +197,15 @@ impl WalletRoot {
         self.sync_public_edit_label_input(window, cx);
         let root = cx.entity();
         let dialog_width = (window.viewport_size().width * 0.92).min(PUBLIC_ACCOUNT_DIALOG_WIDTH);
+        let dialog_max_height = dialog_max_height(window);
+        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         window.open_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
             let content_root = root.clone();
             dialog
                 .w(dialog_width)
+                .max_h(dialog_max_height)
                 .title(app_strong_text(PublicAccountDialogKind::EditLabel.title()))
                 .on_close(move |_event, window, cx| {
                     close_root.update(cx, |root, cx| {
@@ -184,10 +217,13 @@ impl WalletRoot {
                         );
                     });
                 })
-                .child(content_root.read(cx).render_public_account_dialog_content(
-                    content_root.clone(),
-                    PublicAccountDialogKind::EditLabel,
-                    content_width,
+                .child(scrollable_dialog_content(
+                    content_max_height,
+                    content_root.read(cx).render_public_account_dialog_content(
+                        content_root.clone(),
+                        PublicAccountDialogKind::EditLabel,
+                        content_width,
+                    ),
                 ))
         });
         cx.defer_in(window, |root, window, cx| {
@@ -206,6 +242,8 @@ impl WalletRoot {
         window.close_all_dialogs(cx);
         let dialog_width =
             (window.viewport_size().width * 0.92).min(PUBLIC_ADDRESS_QR_DIALOG_WIDTH);
+        let dialog_max_height = dialog_max_height(window);
+        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         let address_text = SharedString::from(public_address_qr_payload(address));
         let account_label = label.map(SharedString::from);
@@ -220,13 +258,17 @@ impl WalletRoot {
         window.open_dialog(cx, move |dialog, _window, _cx| {
             dialog
                 .w(dialog_width)
+                .max_h(dialog_max_height)
                 .title(app_strong_text("Public account address"))
-                .child(render_public_address_qr_dialog_content(
-                    account_label.clone(),
-                    address_text.clone(),
-                    Some(receive_warning.clone()),
-                    copy_id.clone(),
-                    content_width,
+                .child(scrollable_dialog_content(
+                    content_max_height,
+                    render_public_address_qr_dialog_content(
+                        account_label.clone(),
+                        address_text.clone(),
+                        Some(receive_warning.clone()),
+                        copy_id.clone(),
+                        content_width,
+                    ),
                 ))
         });
     }
@@ -340,6 +382,8 @@ impl WalletRoot {
         self.public_form.send_error = None;
         self.public_form.shield_error = None;
         self.public_form.adding_account = false;
+        self.public_form.hardware_derivation_status = HardwarePublicAccountDerivationStatus::Idle;
+        self.public_form.hardware_confirmation_address = None;
         self.public_form.importing_account = false;
         self.public_form.sending = false;
         self.public_form.shielding = false;
@@ -381,12 +425,18 @@ impl WalletRoot {
             public_account_default_label(self.public_form.next_account_label_number);
         match kind {
             PublicAccountDialogKind::Derive => {
+                self.public_form.adding_account = false;
+                self.public_form.hardware_derivation_status =
+                    HardwarePublicAccountDerivationStatus::Idle;
+                self.public_form.hardware_confirmation_address = None;
                 self.public_form
                     .add_label_input
                     .update(cx, |input, cx| input.set_value(&default_label, window, cx));
                 self.public_form
                     .add_password_input
                     .update(cx, |input, cx| input.set_value("", window, cx));
+                self.clear_trezor_app_passphrase_input(window, cx);
+                self.clear_trezor_pin_matrix_prompt(cx);
             }
             PublicAccountDialogKind::Import => {
                 self.public_form
@@ -571,11 +621,19 @@ impl WalletRoot {
             return;
         }
         if let Some(device_kind) = self.selected_hardware_public_device_kind() {
+            #[cfg(feature = "hardware")]
+            let trezor_app_passphrase =
+                view_session.hardware_profile_session().and_then(|session| {
+                    self.read_trezor_app_passphrase_for_hardware_session(session, window, cx)
+                });
+            #[cfg(not(feature = "hardware"))]
+            let trezor_app_passphrase = None;
             self.add_hardware_public_account_from_input(
                 store,
                 view_session,
                 device_kind,
                 label,
+                trezor_app_passphrase,
                 window,
                 cx,
             );
@@ -619,29 +677,107 @@ impl WalletRoot {
         view_session: Arc<DesktopViewSession>,
         device_kind: HardwareDeviceKind,
         label: String,
+        trezor_app_passphrase: Option<Zeroizing<String>>,
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
         self.public_form.adding_account = true;
+        self.public_form.hardware_derivation_status =
+            HardwarePublicAccountDerivationStatus::CheckingDevice;
+        self.public_form.hardware_confirmation_address = None;
         self.public_form.error = None;
 
         #[cfg(feature = "hardware")]
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        #[cfg(feature = "hardware")]
+        let trezor_pin_matrix_provider = if device_kind == HardwareDeviceKind::Trezor {
+            Some(self.trezor_pin_matrix_provider_for_operation(window, cx))
+        } else {
+            None
+        };
+
+        #[cfg(feature = "hardware")]
         let join = self.runtime.spawn(async move {
-            create_hardware_public_account(store, view_session, device_kind, label).await
+            create_hardware_public_account(
+                store,
+                view_session,
+                device_kind,
+                label,
+                trezor_app_passphrase,
+                trezor_pin_matrix_provider,
+                progress_tx,
+            )
+            .await
         });
 
         #[cfg(not(feature = "hardware"))]
         let join: tokio::task::JoinHandle<Result<PublicAccountMetadata, String>> =
             self.runtime.spawn(async move {
-                let _ = (store, view_session, device_kind, label);
+                let _ = (
+                    store,
+                    view_session,
+                    device_kind,
+                    label,
+                    trezor_app_passphrase,
+                );
                 Err("hardware public account support is not enabled in this build".to_owned())
             });
+
+        #[cfg(feature = "hardware")]
+        cx.spawn_in(window, async move |this, cx| {
+            while let Some(progress) = progress_rx.recv().await {
+                let Ok(active) = this.update(cx, |root, cx| {
+                    if !root.public_form.adding_account {
+                        return false;
+                    }
+                    match progress {
+                        HardwarePublicAccountDerivationProgress::CheckingDevice => {
+                            root.public_form.hardware_derivation_status =
+                                HardwarePublicAccountDerivationStatus::CheckingDevice;
+                            root.public_form.hardware_confirmation_address = None;
+                        }
+                        HardwarePublicAccountDerivationProgress::AwaitingAddressConfirmation(
+                            address,
+                        ) => {
+                            root.public_form.hardware_derivation_status =
+                                HardwarePublicAccountDerivationStatus::AwaitingAddressConfirmation;
+                            root.public_form.hardware_confirmation_address = Some(address);
+                        }
+                    }
+                    cx.notify();
+                    true
+                }) else {
+                    break;
+                };
+                if !active {
+                    break;
+                }
+            }
+        })
+        .detach();
 
         cx.spawn_in(window, async move |this, cx| {
             let result = join.await;
             let _ = this.update_in(cx, |root, window, cx| {
                 root.public_form.adding_account = false;
+                root.public_form.hardware_derivation_status =
+                    HardwarePublicAccountDerivationStatus::Idle;
+                root.public_form.hardware_confirmation_address = None;
                 match result {
+                    #[cfg(feature = "hardware")]
+                    Ok(Ok((account, hardware_session))) => {
+                        root.refresh_active_hardware_profile_session(hardware_session, cx);
+                        root.public_form.selected_account_uuid =
+                            Some(Arc::from(account.public_account_uuid.as_str()));
+                        root.public_form
+                            .add_label_input
+                            .update(cx, |input, cx| input.set_value("", window, cx));
+                        root.reload_public_accounts(window, cx);
+                        root.schedule_public_balance_refresh(cx);
+                        root.clear_trezor_pin_matrix_prompt(cx);
+                        window.close_all_dialogs(cx);
+                    }
+                    #[cfg(not(feature = "hardware"))]
                     Ok(Ok(account)) => {
                         root.public_form.selected_account_uuid =
                             Some(Arc::from(account.public_account_uuid.as_str()));
@@ -653,6 +789,7 @@ impl WalletRoot {
                         window.close_all_dialogs(cx);
                     }
                     Ok(Err(error)) => {
+                        root.discard_active_trezor_session_if_stale(&error, cx);
                         root.public_form.error = Some(Arc::from(error));
                     }
                     Err(error) => {
@@ -955,12 +1092,26 @@ impl WalletRoot {
     ) -> gpui::Div {
         match kind {
             PublicAccountDialogKind::Derive => {
-                let add_root = root;
+                let add_root = root.clone();
                 let next_index = self.public_form.next_derived_index.map_or_else(
                     || "Next index unavailable".to_string(),
                     |index| format!("Next derived index: {index}"),
                 );
                 if let Some(device_kind) = self.selected_hardware_public_device_kind() {
+                    let hardware_status = self.public_form.hardware_derivation_status;
+                    let show_trezor_app_passphrase =
+                        self.current_session_needs_trezor_app_passphrase();
+                    #[cfg(feature = "hardware")]
+                    let trezor_pin_matrix_prompt = self
+                        .hardware_profile_unlock
+                        .trezor_pin_matrix_prompt
+                        .as_ref()
+                        .map(|prompt| {
+                            super::vault_ui::render_trezor_pin_matrix_prompt(&root, prompt)
+                                .into_any_element()
+                        });
+                    #[cfg(not(feature = "hardware"))]
+                    let trezor_pin_matrix_prompt: Option<gpui::AnyElement> = None;
                     let path = self
                         .public_form
                         .next_derived_index
@@ -989,29 +1140,92 @@ impl WalletRoot {
                         )))
                         .child(app_muted_text(next_index))
                         .child(app_muted_text(path))
-                        .child(app_input(&self.public_form.add_label_input))
+                        .when(show_trezor_app_passphrase, |this| {
+                            #[cfg(feature = "hardware")]
+                            {
+                                this.child(
+                                    div()
+                                        .w_full()
+                                        .p(px(12.0))
+                                        .flex()
+                                        .flex_col()
+                                        .gap_2()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(theme::BORDER))
+                                        .bg(rgb(theme::SURFACE))
+                                        .child(app_strong_text("Trezor app passphrase"))
+                                        .child(
+                                            app_muted_text(
+                                                "If the Trezor session expired, enter the app passphrase for this account request.",
+                                            )
+                                            .whitespace_normal(),
+                                        )
+                                        .child(
+                                            app_input(&self.trezor_app_passphrase_input)
+                                                .disabled(self.public_form.adding_account),
+                                        ),
+                                )
+                            }
+                            #[cfg(not(feature = "hardware"))]
+                            {
+                                this
+                            }
+                        })
+                        .children(trezor_pin_matrix_prompt)
+                        .child(
+                            app_input(&self.public_form.add_label_input)
+                                .disabled(self.public_form.adding_account),
+                        )
                         .children(self.public_form.error.as_ref().map(|message| {
                             Alert::error("wallet-public-add-derived-error", message.to_string())
                                 .small()
                         }))
-                        .child(
-                            app_button(
-                                "wallet-public-add-derived-submit",
-                                if self.public_form.adding_account {
-                                    "Deriving..."
-                                } else {
-                                    "Add hardware account"
-                                },
-                            )
-                            .primary()
-                            .small()
-                            .loading(self.public_form.adding_account)
-                            .disabled(self.public_form.adding_account)
-                            .on_click(move |_event, window, cx| {
-                                add_root.update(cx, |root, cx| {
-                                    root.add_public_derived_account_from_input(window, cx);
-                                });
-                            }),
+                        .when(
+                            hardware_status == HardwarePublicAccountDerivationStatus::CheckingDevice,
+                            |this| this.child(render_hardware_public_account_checking(device_kind)),
+                        )
+                        .when(
+                            hardware_status == HardwarePublicAccountDerivationStatus::AwaitingAddressConfirmation,
+                            |this| {
+                                this.child(render_hardware_public_account_confirmation_wait(
+                                    device_kind,
+                                    self.public_form.hardware_confirmation_address,
+                                ))
+                            },
+                        )
+                        .when(
+                            hardware_status
+                                != HardwarePublicAccountDerivationStatus::AwaitingAddressConfirmation,
+                            |this| {
+                                this.child(
+                                    app_button(
+                                        "wallet-public-add-derived-submit",
+                                        if self.public_form.adding_account {
+                                            match hardware_status {
+                                                HardwarePublicAccountDerivationStatus::CheckingDevice => {
+                                                    format!(
+                                                        "Checking {}...",
+                                                        hardware_public_device_label(device_kind)
+                                                    )
+                                                }
+                                                _ => "Deriving...".to_owned(),
+                                            }
+                                        } else {
+                                            "Add hardware account".to_owned()
+                                        },
+                                    )
+                                    .primary()
+                                    .small()
+                                    .loading(self.public_form.adding_account)
+                                    .disabled(self.public_form.adding_account)
+                                    .on_click(move |_event, window, cx| {
+                                        add_root.update(cx, |root, cx| {
+                                            root.add_public_derived_account_from_input(window, cx);
+                                        });
+                                    }),
+                                )
+                            },
                         );
                 }
                 div()
@@ -2008,11 +2222,92 @@ pub(super) fn next_public_account_label_number(account_count: usize) -> u32 {
         .unwrap_or(u32::MAX)
 }
 
-pub(super) fn hardware_public_account_setup_copy(device_kind: HardwareDeviceKind) -> String {
-    let device_label = match device_kind {
+const fn hardware_public_device_label(device_kind: HardwareDeviceKind) -> &'static str {
+    match device_kind {
         HardwareDeviceKind::Ledger => "Ledger",
         HardwareDeviceKind::Trezor => "Trezor",
-    };
+    }
+}
+
+fn render_hardware_public_account_checking(device_kind: HardwareDeviceKind) -> gpui::Div {
+    let device_label = hardware_public_device_label(device_kind);
+    div()
+        .w_full()
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(
+            Spinner::new()
+                .icon(IconName::LoaderCircle)
+                .color(rgb(theme::TEXT_MUTED).into())
+                .with_size(px(14.0)),
+        )
+        .child(app_muted_text(format!("Checking {device_label}...")))
+}
+
+fn render_hardware_public_account_confirmation_wait(
+    device_kind: HardwareDeviceKind,
+    preview_address: Option<Address>,
+) -> gpui::Div {
+    let device_label = hardware_public_device_label(device_kind);
+    div()
+        .w_full()
+        .p(px(12.0))
+        .flex()
+        .flex_col()
+        .gap_2()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .bg(rgb_with_alpha(theme::SURFACE, 0.72))
+        .child(app_strong_text(format!("Confirm on {device_label}")))
+        .child(
+            app_muted_text(format!(
+                "Compare this address with the one shown on your {device_label}:"
+            ))
+            .whitespace_normal(),
+        )
+        .child(render_hardware_public_confirmation_address(preview_address))
+        .child(app_muted_text("Only approve if the addresses match.").whitespace_normal())
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    Spinner::new()
+                        .icon(IconName::LoaderCircle)
+                        .color(rgb(theme::SUCCESS).into())
+                        .with_size(px(14.0)),
+                )
+                .child(
+                    app_muted_text(format!("Waiting for {device_label} approval..."))
+                        .text_color(rgb(theme::SUCCESS)),
+                ),
+        )
+}
+
+fn render_hardware_public_confirmation_address(preview_address: Option<Address>) -> gpui::Div {
+    div()
+        .w_full()
+        .p(px(10.0))
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .bg(rgb(theme::SURFACE))
+        .child(
+            app_muted_text(preview_address.map_or_else(
+                || "Preparing address preview...".to_owned(),
+                |address| format!("{address:#x}"),
+            ))
+            .font_family(APP_MONO_FONT_FAMILY)
+            .text_size(APP_TEXT_SIZE)
+            .whitespace_normal(),
+        )
+}
+
+pub(super) fn hardware_public_account_setup_copy(device_kind: HardwareDeviceKind) -> String {
+    let device_label = hardware_public_device_label(device_kind);
     format!(
         "Add a hardware-native Public EVM account from your {device_label}. The path is partitioned by the selected Private wallet account index. Confirm the receive address on your device before it is saved, and public transactions will require device approval."
     )
@@ -2024,7 +2319,18 @@ async fn create_hardware_public_account(
     view_session: Arc<DesktopViewSession>,
     device_kind: HardwareDeviceKind,
     label: String,
-) -> Result<PublicAccountMetadata, String> {
+    trezor_app_passphrase: Option<Zeroizing<String>>,
+    trezor_pin_matrix_provider: Option<TrezorPinMatrixProvider>,
+    progress_tx: tokio::sync::mpsc::UnboundedSender<HardwarePublicAccountDerivationProgress>,
+) -> Result<(PublicAccountMetadata, HardwareProfileSession), String> {
+    let _ = progress_tx.send(HardwarePublicAccountDerivationProgress::CheckingDevice);
+    let mut hardware_session = view_session
+        .hardware_profile_session()
+        .cloned()
+        .ok_or_else(|| {
+            "unlock the matching hardware profile before adding a hardware public account"
+                .to_owned()
+        })?;
     let account_index = store
         .next_derived_public_account_index_for_session(view_session.as_ref())
         .map_err(|error| error.to_string())?;
@@ -2034,28 +2340,99 @@ async fn create_hardware_public_account(
         account_index,
     )
     .map_err(|error| error.to_string())?;
-    let address = match device_kind {
+    let confirmed_account = match device_kind {
         HardwareDeviceKind::Ledger => {
             let client = wallet_ops::hardware::ledger::LedgerHardwareDerivationClient::connect()
                 .await
                 .map_err(|error| error.to_string())?;
-            client
-                .confirmed_public_ethereum_address(&descriptor)
+            let profile_path = parse_bip32_path(DEFAULT_HARDWARE_DERIVATION_PATH)
+                .map_err(|error| error.to_string())?;
+            let active = client
+                .active_profile_session(&profile_path)
                 .await
-                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())?;
+            ensure_hardware_public_profile_session(&hardware_session, &active)?;
+            let preview = client
+                .public_ethereum_address(&descriptor)
+                .await
+                .map_err(|error| error.to_string())?;
+            let _ = progress_tx.send(
+                HardwarePublicAccountDerivationProgress::AwaitingAddressConfirmation(preview),
+            );
+            let confirmed = client
+                .confirmed_public_ethereum_account(&descriptor)
+                .await
+                .map_err(|error| error.to_string())?;
+            ensure_hardware_public_confirmation_matches(preview, confirmed.address())?;
+            confirmed
         }
         HardwareDeviceKind::Trezor => {
             let mut client =
-                wallet_ops::hardware::trezor::TrezorHardwareDerivationClient::connect()
-                    .map_err(|error| error.to_string())?;
-            client
-                .confirmed_public_ethereum_address(&descriptor)
-                .map_err(|error| error.to_string())?
+                wallet_ops::hardware::trezor::TrezorHardwareDerivationClient::connect_with_session(
+                    hardware_session.trezor_session_id.clone(),
+                )
+                .map_err(|error| error.to_string())?;
+            client.set_passphrase_mode(hardware_session.trezor_passphrase_mode());
+            if let Some(passphrase) = trezor_app_passphrase {
+                client.set_app_passphrase_zeroizing(passphrase);
+            }
+            if let Some(provider) = trezor_pin_matrix_provider {
+                client.set_pin_matrix_provider(provider);
+            }
+            let profile_path = parse_bip32_path(DEFAULT_HARDWARE_DERIVATION_PATH)
+                .map_err(|error| error.to_string())?;
+            let active = client
+                .active_profile_session(&profile_path)
+                .map_err(|error| error.to_string())?;
+            ensure_hardware_public_profile_session(&hardware_session, &active)?;
+            hardware_session
+                .trezor_session_id
+                .clone_from(&active.trezor_session_id);
+            hardware_session.set_trezor_passphrase_mode(active.trezor_passphrase_mode());
+            let preview = client
+                .public_ethereum_address(&descriptor)
+                .map_err(|error| error.to_string())?;
+            let _ = progress_tx.send(
+                HardwarePublicAccountDerivationProgress::AwaitingAddressConfirmation(preview),
+            );
+            let confirmed = client
+                .confirmed_public_ethereum_account(&descriptor)
+                .map_err(|error| error.to_string())?;
+            ensure_hardware_public_confirmation_matches(preview, confirmed.address())?;
+            confirmed
         }
     };
-    store
-        .add_hardware_public_account(view_session.as_ref(), descriptor, address, Some(&label))
-        .map_err(|error| error.to_string())
+    let account = store
+        .add_hardware_public_account(view_session.as_ref(), confirmed_account, Some(&label))
+        .map_err(|error| error.to_string())?;
+    Ok((account, hardware_session))
+}
+
+#[cfg(feature = "hardware")]
+fn ensure_hardware_public_profile_session(
+    expected: &HardwareProfileSession,
+    actual: &HardwareProfileSession,
+) -> Result<(), String> {
+    if expected.device_kind == actual.device_kind && expected.binding == actual.binding {
+        Ok(())
+    } else {
+        Err("wrong hardware device or passphrase context is active".to_owned())
+    }
+}
+
+#[cfg(feature = "hardware")]
+fn ensure_hardware_public_confirmation_matches(
+    preview: Address,
+    confirmed: Address,
+) -> Result<(), String> {
+    if preview == confirmed {
+        Ok(())
+    } else {
+        Err(
+            "Hardware wallet returned a different address than the preview. Account was not saved."
+                .to_owned(),
+        )
+    }
 }
 
 pub(super) const fn public_account_source_label(source: PublicAccountSource) -> &'static str {

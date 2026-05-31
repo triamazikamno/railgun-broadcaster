@@ -11,7 +11,7 @@ use gpui::{
     prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
-    Disableable, Icon, IconName, Sizable, StyledExt,
+    Disableable, Icon, IconName, Sizable, StyledExt, WindowExt,
     button::ButtonVariants,
     checkbox::Checkbox,
     input::InputState,
@@ -22,13 +22,16 @@ use gpui_component::{
 };
 use railgun_ui::{format_token_amount, lookup_token, short_address, token_icon_asset_path};
 use ui::clipboard::clipboard_with_toast;
-use ui::controls::{app_button, app_button_base, app_input, app_muted_text};
+use ui::controls::{app_button, app_button_base, app_input, app_muted_text, app_strong_text};
 use ui::icons;
 use ui::theme::{self, APP_MONO_FONT_FAMILY};
+#[cfg(feature = "hardware")]
+use wallet_ops::hardware::HardwareDeviceKind;
 use wallet_ops::{
     BlockedShieldRescueEligibilityRequest, BlockedShieldRescueInfo,
     BlockedShieldRescueSelfBroadcastRequest, BlockedShieldRescueUtxoId,
-    DesktopPrivateSpendAuthorization, ListUtxosOutput, SelfBroadcastGasFeeSelection, UtxoOutput,
+    DesktopPrivateSpendAuthorization, ListUtxosOutput, SelfBroadcastGasFeeSelection,
+    SelfBroadcastSessionEvent, UtxoOutput,
 };
 
 use super::actions::{UtxoEnd, UtxoHome, UtxoPageDown, UtxoPageUp};
@@ -42,7 +45,8 @@ use super::spend_authorization::{
 use super::tokens::parse_address;
 use super::{
     SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_MINUTE, SECONDS_PER_MONTH, SECONDS_PER_YEAR,
-    WalletRoot, centered_message, rgb_with_alpha, token_label_row,
+    WalletRoot, centered_message, dialog_content_max_height, dialog_max_height, rgb_with_alpha,
+    scrollable_dialog_content, secondary_dialog_content_width, token_label_row,
 };
 
 use crate::assets::WalletIconSource;
@@ -354,7 +358,7 @@ impl WalletRoot {
         utxo_id: BlockedShieldRescueUtxoId,
         spend_authorization: DesktopPrivateSpendAuthorization,
         vault_password: Option<zeroize::Zeroizing<String>>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
         let password = if let Some(password) = vault_password {
@@ -405,6 +409,16 @@ impl WalletRoot {
         self.blocked_shield_refunds_in_flight.insert(utxo_id);
         self.sync_utxo_table(cx);
         let http = self.http.clone();
+        #[cfg(feature = "hardware")]
+        let trezor_pin_matrix_provider = view_session
+            .hardware_profile_session()
+            .filter(|session| session.device_kind == HardwareDeviceKind::Trezor)
+            .map(|_| self.trezor_pin_matrix_provider_for_operation(window, cx));
+        #[cfg(not(feature = "hardware"))]
+        let trezor_pin_matrix_provider = None;
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        Self::watch_blocked_shield_refund_events(utxo_id, event_rx, window, cx);
+        self.show_blocked_shield_refund_progress_dialog(utxo_id, window, cx);
         let request = BlockedShieldRescueSelfBroadcastRequest {
             chain_id: self.selected_chain,
             effective_chain: self
@@ -416,13 +430,14 @@ impl WalletRoot {
             vault_store,
             spend_authorization,
             vault_password: password,
+            trezor_pin_matrix_provider,
             utxo_id,
             requested_public_account_uuid: Some(public_account_uuid),
             verify_proof: true,
             gas_fee: SelfBroadcastGasFeeSelection::Auto,
             progress_tx: None,
             command_rx: None,
-            event_tx: None,
+            event_tx: Some(event_tx),
         };
         let submit = self.runtime.spawn(async move {
             wallet_ops::submit_blocked_shield_rescue_self_broadcast(request, &http).await
@@ -447,6 +462,13 @@ impl WalletRoot {
                         ) {
                             root.clear_spend_authorization(cx);
                         }
+                        root.discard_active_trezor_session_if_stale(&message, cx);
+                        root.blocked_shield_rescue_rows.insert(
+                            utxo_id,
+                            BlockedShieldRescueRowState::from_info(
+                                blocked_shield_rescue_error_info(message.clone()),
+                            ),
+                        );
                         tracing::warn!(%message, "blocked Shield refund submission failed");
                     }
                     Err(error) => {
@@ -459,6 +481,141 @@ impl WalletRoot {
         })
         .detach();
         cx.notify();
+    }
+
+    fn watch_blocked_shield_refund_events(
+        utxo_id: BlockedShieldRescueUtxoId,
+        mut event_rx: tokio::sync::mpsc::UnboundedReceiver<SelfBroadcastSessionEvent>,
+        window: &Window,
+        cx: &Context<'_, Self>,
+    ) {
+        cx.spawn_in(window, async move |this, cx| {
+            while let Some(event) = event_rx.recv().await {
+                let _ = this.update_in(cx, |root, _window, cx| {
+                    if !root.blocked_shield_refunds_in_flight.contains(&utxo_id) {
+                        return;
+                    }
+                    match event {
+                        SelfBroadcastSessionEvent::HardwareProfileSessionRefreshed { session } => {
+                            #[cfg(feature = "hardware")]
+                            root.refresh_active_hardware_profile_session(session, cx);
+                            #[cfg(not(feature = "hardware"))]
+                            let _ = session;
+                        }
+                        SelfBroadcastSessionEvent::StepFailed { message, .. }
+                        | SelfBroadcastSessionEvent::AttemptRejected { message, .. } => {
+                            root.discard_active_trezor_session_if_stale(&message, cx);
+                            root.blocked_shield_rescue_rows.insert(
+                                utxo_id,
+                                BlockedShieldRescueRowState::from_info(
+                                    blocked_shield_rescue_error_info(message),
+                                ),
+                            );
+                        }
+                        SelfBroadcastSessionEvent::PendingOutputPoiProofsRequired { .. }
+                        | SelfBroadcastSessionEvent::AttemptSubmitted(_) => {}
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn show_blocked_shield_refund_progress_dialog(
+        &mut self,
+        utxo_id: BlockedShieldRescueUtxoId,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let root = cx.entity();
+        let dialog_width = (window.viewport_size().width * 0.92).min(px(460.0));
+        let dialog_max_height = dialog_max_height(window);
+        let content_max_height = dialog_content_max_height(window);
+        let content_width = secondary_dialog_content_width(dialog_width);
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            let close_root = root.clone();
+            let content_root = root.clone();
+            dialog
+                .w(dialog_width)
+                .max_h(dialog_max_height)
+                .title(app_strong_text("Blocked Shield refund"))
+                .on_close(move |_event, _window, cx| {
+                    close_root.update(cx, |root, cx| {
+                        root.clear_trezor_pin_matrix_prompt(cx);
+                    });
+                })
+                .child(scrollable_dialog_content(
+                    content_max_height,
+                    content_root
+                        .read(cx)
+                        .render_blocked_shield_refund_progress_dialog_content(
+                            &content_root,
+                            utxo_id,
+                            content_width,
+                        ),
+                ))
+        });
+    }
+
+    fn render_blocked_shield_refund_progress_dialog_content(
+        &self,
+        root: &Entity<Self>,
+        utxo_id: BlockedShieldRescueUtxoId,
+        content_width: Pixels,
+    ) -> gpui::Div {
+        let in_flight = self.blocked_shield_refunds_in_flight.contains(&utxo_id);
+        let status = self
+            .blocked_shield_rescue_rows
+            .get(&utxo_id)
+            .and_then(|state| state.info().disabled_reason.as_deref())
+            .map_or_else(
+                || {
+                    if in_flight {
+                        "Submitting the blocked Shield refund. Keep this window open for hardware prompts."
+                    } else {
+                        "No blocked Shield refund is currently in progress."
+                    }
+                    .to_owned()
+                },
+                ToOwned::to_owned,
+            );
+        let content = div()
+            .w(content_width)
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(app_muted_text(status).whitespace_normal())
+            .when(in_flight, |this| {
+                this.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            Spinner::new()
+                                .icon(IconName::LoaderCircle)
+                                .color(rgb(theme::TEXT_MUTED).into())
+                                .with_size(px(14.0)),
+                        )
+                        .child(app_muted_text("Waiting for self-broadcast confirmation...")),
+                )
+            });
+        #[cfg(feature = "hardware")]
+        let mut content = content;
+        #[cfg(feature = "hardware")]
+        if let Some(prompt) = self
+            .hardware_profile_unlock
+            .trezor_pin_matrix_prompt
+            .as_ref()
+        {
+            content = content.child(super::vault_ui::render_trezor_pin_matrix_prompt(
+                root, prompt,
+            ));
+        }
+        #[cfg(not(feature = "hardware"))]
+        let _ = root;
+        content
     }
 
     fn selected_chain_session(&self) -> Option<Arc<wallet_ops::WalletSession>> {

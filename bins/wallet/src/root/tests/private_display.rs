@@ -1,6 +1,7 @@
 use super::*;
 use crate::root::private_action::{
-    RecipientSuggestionDirection, filtered_recipient_options, recipient_option_display_address,
+    RecipientSuggestionDirection, filtered_recipient_options,
+    hardware_wallet_recipient_source_from_metadata, recipient_option_display_address,
     recipient_query_is_valid, recipient_suggestion_index_after_move,
 };
 
@@ -337,15 +338,15 @@ fn remembered_spend_authorization_expires_by_lifetime() {
     ));
     assert!(remembered_spend_authorization_valid_for_test(
         SpendAuthorizationLifetime::FiveMinutes,
-        Duration::from_secs(60),
+        Duration::from_mins(1),
     ));
     assert!(!remembered_spend_authorization_valid_for_test(
         SpendAuthorizationLifetime::FiveMinutes,
-        Duration::from_secs(5 * 60),
+        Duration::from_mins(5),
     ));
     assert!(remembered_spend_authorization_valid_for_test(
         SpendAuthorizationLifetime::UntilVaultLock,
-        Duration::from_secs(60 * 60 * 24),
+        Duration::from_hours(24),
     ));
 }
 
@@ -513,6 +514,68 @@ fn recipient_options_filter_inactive_app_accounts_and_include_address_books() {
             .iter()
             .all(|option| option.label.as_ref() != "Inactive public")
     );
+}
+
+#[test]
+fn hardware_wallet_recipient_source_uses_stored_receive_address() {
+    use wallet_ops::hardware::{
+        HardwareDerivationDescriptor, HardwareWalletSyncIntent, parse_bip32_path,
+    };
+    use wallet_ops::vault::{HardwareProfileMetadata, HardwareRailgunAccountMetadata};
+
+    const RAILGUN_ADDRESS: &str = "0zk1qy4v02p5zkq0zfpaxhz79j5tslrv8c44d80d8jr2fuecrtxlp8lemrv7j6fe3z53ll0jm7u592n0hr8elesd0xzv6y9jpdvsyln80m95jcxhvnmagfqg5p6e9mp";
+
+    let descriptor = HardwareDerivationDescriptor::ledger_eip1024_v1(
+        parse_bip32_path("m/44'/60'/0'/0/0").expect("valid path"),
+        0,
+        "ledger-profile".to_string(),
+        HardwareWalletSyncIntent::CreateNew,
+    );
+    let profile = HardwareProfileMetadata::from_descriptor(&descriptor);
+    let mut metadata = wallet_metadata(
+        "hardware-wallet",
+        "Ledger hardware",
+        WalletSource::LedgerDerived,
+        WalletStatus::Active,
+        0,
+    );
+    metadata.hardware_account = Some(
+        HardwareRailgunAccountMetadata::synthetic_software_v1(
+            profile.profile_id,
+            0,
+            "Ledger hardware",
+            descriptor,
+            wallet_ops::vault::HardwareRailgunAccountIdentity {
+                spending_public_key: [[0; 32]; 2],
+                viewing_public_key: [0; 32],
+            },
+        )
+        .with_receive_address(RAILGUN_ADDRESS),
+    );
+
+    let source = hardware_wallet_recipient_source_from_metadata(&metadata)
+        .expect("hardware recipient source");
+    let options = private_send_recipient_options(std::slice::from_ref(&source), &[]);
+
+    assert_eq!(source.label.as_ref(), "Ledger hardware");
+    assert_eq!(source.address.as_ref(), RAILGUN_ADDRESS);
+    assert!(source.active);
+    assert_eq!(options.len(), 1);
+    assert_eq!(options[0].source, RecipientOptionSource::PrivateWallet);
+
+    let mut inactive_metadata = metadata.clone();
+    inactive_metadata.status = WalletStatus::Inactive;
+    let inactive_source = hardware_wallet_recipient_source_from_metadata(&inactive_metadata)
+        .expect("inactive hardware recipient source");
+    assert!(private_send_recipient_options(std::slice::from_ref(&inactive_source), &[]).is_empty());
+
+    let mut missing_address_metadata = metadata;
+    missing_address_metadata
+        .hardware_account
+        .as_mut()
+        .expect("hardware account")
+        .receive_address = None;
+    assert!(hardware_wallet_recipient_source_from_metadata(&missing_address_metadata).is_none());
 }
 
 #[test]

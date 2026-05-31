@@ -1,10 +1,10 @@
 use super::{
-    Arc, CacheKeys, DbStore, Deserialize, Error, Hmac, KeyError, Mutex, RailgunSpendSigner,
-    Serialize, Sha256, SpendUnlock, U256, ViewUnlock, ViewingKeyData, WalletChainMetadataBundle,
-    WalletKeys, Zeroize, Zeroizing, fill,
+    Arc, CacheKeys, DbStore, Deserialize, Error, HardwareProfileSession, Hmac, KeyError, Mutex,
+    RailgunSpendSigner, Serialize, Sha256, SpendUnlock, U256, ViewUnlock, ViewingKeyData,
+    WalletChainMetadataBundle, WalletKeys, Zeroize, Zeroizing, fill,
 };
 
-pub(super) const VAULT_VERSION: u32 = 1;
+pub(super) const VAULT_VERSION: u32 = 2;
 pub(super) const KEY_LEN: usize = 32;
 pub(super) const SALT_LEN: usize = 16;
 pub(super) const NONCE_LEN: usize = 24;
@@ -18,7 +18,9 @@ pub(super) const WALLET_VIEW_PREFIX: &str = "wallet-view|";
 pub(super) const WALLET_SPEND_PREFIX: &str = "wallet-spend|";
 pub(super) const WALLET_CHAIN_METADATA_PREFIX: &str = "wallet-chain-meta|";
 pub(super) const WALLET_CACHE_ROW_PREFIX: &str = "wallet-cache-row|";
+pub(super) const HARDWARE_PROFILE_PREFIX: &str = "hardware-profile|";
 pub(super) const HARDWARE_WALLET_ACCOUNT_INDEX_PREFIX: &str = "hardware-wallet-account-index|";
+pub const MAX_HARDWARE_RECOVERY_RANGE_COUNT: u32 = 255;
 pub(super) const PUBLIC_ACCOUNT_METADATA_PREFIX: &str = "public-account-meta|";
 pub(super) const PUBLIC_ACCOUNT_SECRET_PREFIX: &str = "public-account-secret|";
 pub(super) const PRIVATE_ADDRESS_BOOK_PREFIX: &str = "private-address-book|";
@@ -116,6 +118,14 @@ pub enum VaultError {
     DuplicateHardwareWalletAccountIndex,
     #[error("derived hardware wallet key does not match the stored wallet")]
     HardwareWalletIdentityMismatch,
+    #[error("hardware wallet view requires device unlock")]
+    HardwareWalletViewRequiresDevice,
+    #[error("unsupported hardware custody backend {0}")]
+    UnsupportedHardwareCustodyBackend(String),
+    #[error("invalid hardware account recovery range")]
+    InvalidHardwareAccountRecoveryRange,
+    #[error("derive hardware wallet receive address failed")]
+    HardwareWalletReceiveAddress,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -176,6 +186,7 @@ pub enum RecordKind {
     WalletMetadata,
     WalletChainMetadata,
     WalletCacheRow,
+    HardwareProfileMetadata,
     HardwareWalletAccountIndexReservation,
     PublicAccountMetadata,
     PublicAccountSecret,
@@ -196,6 +207,7 @@ impl RecordKind {
             Self::WalletMetadata => "wallet-metadata",
             Self::WalletChainMetadata => "wallet-chain-metadata",
             Self::WalletCacheRow => "wallet-cache-row",
+            Self::HardwareProfileMetadata => "hardware-profile-metadata",
             Self::HardwareWalletAccountIndexReservation => {
                 "hardware-wallet-account-index-reservation"
             }
@@ -287,6 +299,8 @@ pub struct DesktopViewSession {
     pub(super) spending_public_key: [U256; 2],
     pub(super) scan_keys: ViewingKeyData,
     pub(super) view: ViewUnlock,
+    pub(super) private_view: ViewUnlock,
+    pub(super) hardware_profile_session: Option<HardwareProfileSession>,
 }
 
 pub struct SoftwareRailgunSpendSigner {

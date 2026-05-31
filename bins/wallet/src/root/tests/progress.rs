@@ -660,7 +660,7 @@ fn closed_private_broadcaster_progress_exposes_active_stage() {
         self_broadcast_attempts: Vec::new(),
         self_broadcast_current_gas_fee: None,
         self_broadcast_action_error: None,
-        public_broadcaster_response_timeout: Some(Duration::from_secs(120)),
+        public_broadcaster_response_timeout: Some(Duration::from_mins(2)),
         public_broadcaster_republish_interval: Some(Duration::from_secs(5)),
         public_broadcaster_wait_started_at: None,
         task_abort_handle: None,

@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 
+use alloy::primitives::Address;
 use async_trait::async_trait;
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
@@ -13,6 +14,8 @@ pub const DEFAULT_HARDWARE_DERIVATION_PATH: &str = "m/44'/60'/0'/0/0";
 const HARDWARE_DERIVED_KDF_VERSION_V1: u16 = 1;
 const HARDWARE_DERIVED_KDF_SALT_V1: &[u8] = b"railgun:hardware-derived-wallet:kdf:v1";
 const HARDWARE_DERIVED_KDF_INFO_PREFIX_V1: &[u8] = b"railgun:hardware-derived-wallet:entropy:v1";
+const HARDWARE_VIEW_ACCESS_KDF_INFO_PREFIX_V1: &[u8] =
+    b"railgun:hardware-derived-wallet:view-access:v1";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -254,6 +257,38 @@ impl HardwarePublicAccountDescriptor {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmedHardwarePublicAccount {
+    descriptor: HardwarePublicAccountDescriptor,
+    address: Address,
+}
+
+impl ConfirmedHardwarePublicAccount {
+    #[cfg(any(feature = "hardware", test))]
+    fn new(descriptor: HardwarePublicAccountDescriptor, address: Address) -> Self {
+        Self {
+            descriptor,
+            address,
+        }
+    }
+
+    #[must_use]
+    pub const fn descriptor(&self) -> &HardwarePublicAccountDescriptor {
+        &self.descriptor
+    }
+
+    #[must_use]
+    pub const fn address(&self) -> Address {
+        self.address
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn new_for_tests(descriptor: HardwarePublicAccountDescriptor, address: Address) -> Self {
+        Self::new(descriptor, address)
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HardwareDerivationDescriptor {
     pub device_kind: HardwareDeviceKind,
@@ -262,8 +297,6 @@ pub struct HardwareDerivationDescriptor {
     pub account_index: u32,
     pub profile_fingerprint: String,
     pub kdf_version: u16,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub passphrase_hint: Option<String>,
     pub sync_intent: HardwareWalletSyncIntent,
 }
 
@@ -276,10 +309,6 @@ impl fmt::Debug for HardwareDerivationDescriptor {
             .field("account_index", &self.account_index)
             .field("profile_fingerprint", &"<redacted>")
             .field("kdf_version", &self.kdf_version)
-            .field(
-                "passphrase_hint",
-                &self.passphrase_hint.as_ref().map(|_| "<present>"),
-            )
             .field("sync_intent", &self.sync_intent)
             .finish()
     }
@@ -291,7 +320,6 @@ impl HardwareDerivationDescriptor {
         path: Vec<u32>,
         account_index: u32,
         profile_fingerprint: String,
-        passphrase_hint: Option<String>,
         sync_intent: HardwareWalletSyncIntent,
     ) -> Self {
         Self {
@@ -301,7 +329,6 @@ impl HardwareDerivationDescriptor {
             account_index,
             profile_fingerprint,
             kdf_version: HARDWARE_DERIVED_KDF_VERSION_V1,
-            passphrase_hint,
             sync_intent,
         }
     }
@@ -311,7 +338,6 @@ impl HardwareDerivationDescriptor {
         path: Vec<u32>,
         account_index: u32,
         profile_fingerprint: String,
-        passphrase_hint: Option<String>,
         sync_intent: HardwareWalletSyncIntent,
     ) -> Self {
         Self {
@@ -321,7 +347,6 @@ impl HardwareDerivationDescriptor {
             account_index,
             profile_fingerprint,
             kdf_version: HARDWARE_DERIVED_KDF_VERSION_V1,
-            passphrase_hint,
             sync_intent,
         }
     }
@@ -428,6 +453,26 @@ impl SyntheticRailgunEntropy {
     }
 }
 
+pub struct HardwareViewAccessKey(Zeroizing<[u8; 32]>);
+
+impl HardwareViewAccessKey {
+    #[must_use]
+    pub fn new(bytes: [u8; 32]) -> Self {
+        Self(Zeroizing::new(bytes))
+    }
+
+    #[must_use]
+    pub fn expose_secret(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for HardwareViewAccessKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("HardwareViewAccessKey(<redacted>)")
+    }
+}
+
 impl fmt::Debug for SyntheticRailgunEntropy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("SyntheticRailgunEntropy(<redacted>)")
@@ -445,6 +490,20 @@ pub fn synthetic_entropy_from_hardware_output(
     hkdf.expand(&descriptor.kdf_info(), &mut entropy)
         .map_err(|_| HardwareDerivationError::KdfExpand)?;
     Ok(SyntheticRailgunEntropy(Zeroizing::new(entropy)))
+}
+
+pub fn hardware_view_access_key_from_hardware_output(
+    descriptor: &HardwareDerivationDescriptor,
+    output: &HardwareOperationOutput,
+) -> Result<HardwareViewAccessKey, HardwareDerivationError> {
+    descriptor.validate()?;
+    let hkdf = Hkdf::<Sha256>::new(Some(HARDWARE_DERIVED_KDF_SALT_V1), output.expose_secret());
+    let mut info = descriptor.kdf_info();
+    info.extend_from_slice(HARDWARE_VIEW_ACCESS_KDF_INFO_PREFIX_V1);
+    let mut key = [0u8; 32];
+    hkdf.expand(&info, &mut key)
+        .map_err(|_| HardwareDerivationError::KdfExpand)?;
+    Ok(HardwareViewAccessKey::new(key))
 }
 
 pub fn parse_bip32_path(path: &str) -> Result<Vec<u32>, HardwareDerivationError> {
@@ -564,6 +623,18 @@ pub enum HardwareDerivationError {
     #[cfg(feature = "hardware")]
     #[error("Trezor Bridge transport failed: {0}")]
     TrezorBridge(String),
+    #[cfg(feature = "hardware")]
+    #[error("Trezor requested an app-entered passphrase but none was provided")]
+    MissingTrezorAppPassphrase,
+    #[cfg(feature = "hardware")]
+    #[error("Trezor PIN matrix requests are not supported by this flow")]
+    UnsupportedTrezorPinMatrix,
+    #[cfg(feature = "hardware")]
+    #[error("Trezor is locked")]
+    TrezorLocked,
+    #[cfg(feature = "hardware")]
+    #[error("Trezor PIN entry was cancelled")]
+    TrezorPinEntryCancelled,
 }
 
 impl HardwareDerivationError {
@@ -572,6 +643,8 @@ impl HardwareDerivationError {
         match self {
             #[cfg(feature = "hardware")]
             Self::LedgerUnavailable(_) | Self::TrezorBridge(_) => true,
+            #[cfg(feature = "hardware")]
+            Self::TrezorLocked | Self::UnsupportedTrezorPinMatrix => true,
             #[cfg(feature = "hardware")]
             Self::LedgerStatus { status, .. } => {
                 matches!(*status, 0x6511 | 0x6a15 | 0x6d00 | 0x6e00 | 0x6804 | 0x6b0c)
@@ -584,6 +657,17 @@ impl HardwareDerivationError {
             )) => true,
             _ => false,
         }
+    }
+
+    #[must_use]
+    #[cfg(feature = "hardware")]
+    pub const fn is_ledger_busy_error(&self) -> bool {
+        matches!(
+            self,
+            Self::Ledger(coins_ledger::LedgerError::NativeTransportError(
+                coins_ledger::transports::native::NativeTransportError::CantOpen(_),
+            ))
+        )
     }
 }
 
@@ -634,23 +718,25 @@ impl HardwareDerivationClient for MockHardwareDerivationClient {
 
 #[cfg(feature = "hardware")]
 pub mod ledger {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::io::Cursor;
 
     use super::{
-        HardwareAppVersion, HardwareDerivationClient, HardwareDerivationDescriptor,
-        HardwareDerivationError, HardwareDerivationMethod, HardwareDeviceKind,
-        HardwareOperationOutput, HardwarePublicAccountDescriptor, hardware_profile_fingerprint,
+        ConfirmedHardwarePublicAccount, HardwareAppVersion, HardwareDerivationClient,
+        HardwareDerivationDescriptor, HardwareDerivationError, HardwareDerivationMethod,
+        HardwareDeviceKind, HardwareOperationOutput, HardwarePublicAccountDescriptor,
+        hardware_profile_fingerprint,
     };
+    use crate::vault::{HardwareProfileBinding, HardwareProfileSession};
     use alloy::hex;
     use alloy::primitives::{Address, Signature, normalize_v};
     use async_trait::async_trait;
     use coins_ledger::{
         LedgerError,
         common::{APDUAnswer, APDUCommand, APDUData},
-        transports::{Ledger, LedgerAsync, native::NativeTransportError},
+        transports::native::NativeTransportError,
     };
-    use hidapi_rusb::HidApi;
-    use tokio::sync::Mutex as AsyncMutex;
+    use hidapi_rusb::{DeviceInfo, HidApi, HidDevice};
+    use tokio::{sync::Mutex as AsyncMutex, task};
 
     pub const LEDGER_ETHEREUM_EIP1024_MIN_APP_VERSION: HardwareAppVersion =
         HardwareAppVersion::new(1, 9, 17);
@@ -660,8 +746,11 @@ pub mod ledger {
     const LEDGER_VID: u16 = 0x2c97;
     #[cfg(not(target_os = "linux"))]
     const LEDGER_USAGE_PAGE: u16 = 0xffa0;
-    static LEDGER_CONNECT_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
-    static LEDGER_COINS_HIDAPI_TOUCHED: AtomicBool = AtomicBool::new(false);
+    const LEDGER_CHANNEL: u16 = 0x0101;
+    const LEDGER_PACKET_WRITE_SIZE: usize = 65;
+    const LEDGER_PACKET_READ_SIZE: usize = 64;
+    const LEDGER_TIMEOUT_MS: i32 = 10_000_000;
+    static LEDGER_IO_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 
     pub const RAILGUN_LEDGER_EIP1024_REMOTE_PUBLIC_KEY_V1: [u8; 32] = [
         0xeb, 0x88, 0xd6, 0xa7, 0xb6, 0x92, 0x83, 0xd0, 0x58, 0x22, 0x98, 0xe6, 0x04, 0xe1, 0x3e,
@@ -669,20 +758,13 @@ pub mod ledger {
         0x0f, 0x51,
     ];
 
-    pub struct LedgerHardwareDerivationClient {
-        ledger: Ledger,
-    }
+    pub struct LedgerHardwareDerivationClient;
 
     impl LedgerHardwareDerivationClient {
         pub async fn connect() -> Result<Self, HardwareDerivationError> {
-            let _guard = LEDGER_CONNECT_LOCK.lock().await;
-            if !LEDGER_COINS_HIDAPI_TOUCHED.load(Ordering::SeqCst) {
-                ledger_hid_preflight()?;
-            }
-
-            let ledger = Ledger::init().await.map_err(ledger_connect_error);
-            LEDGER_COINS_HIDAPI_TOUCHED.store(true, Ordering::SeqCst);
-            Ok(Self { ledger: ledger? })
+            let _guard = LEDGER_IO_LOCK.lock().await;
+            ledger_hid_preflight()?;
+            Ok(Self)
         }
 
         pub async fn ethereum_app_version(
@@ -696,9 +778,7 @@ pub mod ledger {
                 data: APDUData::new(&[]),
                 response_len: Some(0),
             };
-            let answer = self
-                .ledger
-                .exchange(&command)
+            let answer = ledger_exchange(&command)
                 .await
                 .map_err(|error| ledger_exchange_error(error, "get Ethereum app version"))?;
             let data = ledger_response_data(&answer, "get Ethereum app version")?;
@@ -736,9 +816,7 @@ pub mod ledger {
                 data: APDUData::new(&data),
                 response_len: None,
             };
-            let answer = self
-                .ledger
-                .exchange(&command)
+            let answer = ledger_exchange(&command)
                 .await
                 .map_err(|error| ledger_exchange_error(error, "get Ethereum address"))?;
             let data = ledger_response_data(&answer, "get Ethereum address")?;
@@ -760,6 +838,17 @@ pub mod ledger {
         ) -> Result<Address, HardwareDerivationError> {
             self.public_ethereum_address_with_confirmation(descriptor, true)
                 .await
+        }
+
+        pub async fn confirmed_public_ethereum_account(
+            &self,
+            descriptor: &HardwarePublicAccountDescriptor,
+        ) -> Result<ConfirmedHardwarePublicAccount, HardwareDerivationError> {
+            let address = self.confirmed_public_ethereum_address(descriptor).await?;
+            Ok(ConfirmedHardwarePublicAccount::new(
+                descriptor.clone(),
+                address,
+            ))
         }
 
         async fn public_ethereum_address_with_confirmation(
@@ -840,9 +929,7 @@ pub mod ledger {
             let mut answer = None;
             for chunk in payload.chunks(chunk_size) {
                 command.data = APDUData::new(chunk);
-                let response = self
-                    .ledger
-                    .exchange(&command)
+                let response = ledger_exchange(&command)
                     .await
                     .map_err(|error| ledger_exchange_error(error, operation))?;
                 ledger_ensure_success(&response, operation)?;
@@ -878,6 +965,18 @@ pub mod ledger {
             ))
         }
 
+        pub async fn active_profile_session(
+            &self,
+            path: &[u32],
+        ) -> Result<HardwareProfileSession, HardwareDerivationError> {
+            let fingerprint = self.profile_fingerprint(path).await?;
+            Ok(HardwareProfileSession::unmatched(
+                HardwareDeviceKind::Ledger,
+                HardwareProfileBinding::evm_address_fingerprint(fingerprint),
+                None,
+            ))
+        }
+
         pub async fn eip1024_shared_secret(
             &self,
             path: &[u32],
@@ -904,9 +1003,7 @@ pub mod ledger {
                 data: APDUData::new(&data),
                 response_len: None,
             };
-            let answer = self
-                .ledger
-                .exchange(&command)
+            let answer = ledger_exchange(&command)
                 .await
                 .map_err(|error| ledger_exchange_error(error, "derive Railgun secret"))?;
             let data = ledger_response_data(&answer, "derive Railgun secret")?;
@@ -954,13 +1051,153 @@ pub mod ledger {
         }
     }
 
-    fn ledger_connect_error(error: LedgerError) -> HardwareDerivationError {
-        match error {
-            LedgerError::NativeTransportError(NativeTransportError::DeviceNotFound) => {
-                HardwareDerivationError::LedgerUnavailable(LEDGER_READY_MESSAGE)
+    async fn ledger_exchange(command: &APDUCommand) -> Result<APDUAnswer, LedgerError> {
+        let _guard = LEDGER_IO_LOCK.lock().await;
+        let command = command.clone();
+        task::spawn_blocking(move || ledger_exchange_blocking(&command))
+            .await
+            .map_err(|_| LedgerError::BackendGone)?
+    }
+
+    fn ledger_exchange_blocking(command: &APDUCommand) -> Result<APDUAnswer, LedgerError> {
+        let api = HidApi::new().map_err(NativeTransportError::Hid)?;
+        let device = first_ledger(&api)?;
+        let data = ledger_write_read_apdu(&device, command)?;
+        APDUAnswer::from_answer(data)
+    }
+
+    fn first_ledger(api: &HidApi) -> Result<HidDevice, NativeTransportError> {
+        let device = api
+            .device_list()
+            .find(|device| ledger_hid_device_matches(device.vendor_id(), device.usage_page()))
+            .ok_or(NativeTransportError::DeviceNotFound)?;
+        open_ledger_device(api, device)
+    }
+
+    fn open_ledger_device(
+        api: &HidApi,
+        device: &DeviceInfo,
+    ) -> Result<HidDevice, NativeTransportError> {
+        let device = device
+            .open_device(api)
+            .map_err(NativeTransportError::CantOpen)?;
+        let _ = device.set_blocking_mode(true);
+        Ok(device)
+    }
+
+    fn ledger_write_read_apdu(
+        device: &HidDevice,
+        command: &APDUCommand,
+    ) -> Result<Vec<u8>, NativeTransportError> {
+        ledger_write_apdu(device, &command.serialize())?;
+        ledger_read_response_apdu(device)
+    }
+
+    fn ledger_write_apdu(
+        device: &HidDevice,
+        apdu_command: &[u8],
+    ) -> Result<(), NativeTransportError> {
+        let command_length = apdu_command.len();
+        let mut in_data = Vec::with_capacity(command_length + 2);
+        in_data.push(((command_length >> 8) & 0xff) as u8);
+        in_data.push((command_length & 0xff) as u8);
+        in_data.extend_from_slice(apdu_command);
+
+        let mut buffer = [0u8; LEDGER_PACKET_WRITE_SIZE];
+        buffer[1] = ((LEDGER_CHANNEL >> 8) & 0xff) as u8;
+        buffer[2] = (LEDGER_CHANNEL & 0xff) as u8;
+        buffer[3] = 0x05;
+
+        for (sequence_idx, chunk) in in_data.chunks(LEDGER_PACKET_WRITE_SIZE - 6).enumerate() {
+            buffer[4] = ((sequence_idx >> 8) & 0xff) as u8;
+            buffer[5] = (sequence_idx & 0xff) as u8;
+            buffer[6..6 + chunk.len()].copy_from_slice(chunk);
+
+            let written = device.write(&buffer).map_err(NativeTransportError::Hid)?;
+            if written < buffer.len() {
+                return Err(NativeTransportError::Comm(
+                    "USB write error. Could not send whole message",
+                ));
             }
-            error => HardwareDerivationError::Ledger(error),
         }
+        Ok(())
+    }
+
+    fn ledger_read_response_apdu(device: &HidDevice) -> Result<Vec<u8>, NativeTransportError> {
+        let mut response_buffer = [0u8; LEDGER_PACKET_READ_SIZE];
+        let mut sequence_idx = 0u16;
+        let mut expected_response_len = 0usize;
+        let mut offset = 0usize;
+        let mut answer_buf = vec![];
+
+        loop {
+            let read = device
+                .read_timeout(&mut response_buffer, LEDGER_TIMEOUT_MS)
+                .map_err(NativeTransportError::Hid)?;
+            if (sequence_idx == 0 && read < 7) || read < 5 {
+                return Err(NativeTransportError::Comm("Read error. Incomplete header"));
+            }
+
+            let mut cursor = Cursor::new(&response_buffer[..read]);
+            let (_, _, response_sequence_idx) = ledger_read_response_header(&mut cursor)?;
+            if response_sequence_idx != sequence_idx {
+                return Err(NativeTransportError::SequenceMismatch {
+                    got: response_sequence_idx,
+                    expected: sequence_idx,
+                });
+            }
+
+            if sequence_idx == 0 {
+                expected_response_len = ledger_read_u16_be(&mut cursor)? as usize;
+            }
+
+            let cursor_position = usize::try_from(cursor.position()).map_err(|_| {
+                NativeTransportError::Comm("Read error. Invalid response cursor position")
+            })?;
+            let remaining_in_buf = read.saturating_sub(cursor_position);
+            let missing = expected_response_len.saturating_sub(offset);
+            let chunk_len = remaining_in_buf.min(missing);
+            let chunk_end = cursor_position + chunk_len;
+            answer_buf.extend_from_slice(&response_buffer[cursor_position..chunk_end]);
+            offset += chunk_len;
+
+            if offset >= expected_response_len {
+                return Ok(answer_buf);
+            }
+            sequence_idx = sequence_idx
+                .checked_add(1)
+                .ok_or(NativeTransportError::Comm(
+                    "Read error. Response sequence overflow",
+                ))?;
+        }
+    }
+
+    fn ledger_read_response_header(
+        cursor: &mut Cursor<&[u8]>,
+    ) -> Result<(u16, u8, u16), NativeTransportError> {
+        let channel = ledger_read_u16_be(cursor)?;
+        let tag = ledger_read_u8(cursor)?;
+        let sequence_idx = ledger_read_u16_be(cursor)?;
+        Ok((channel, tag, sequence_idx))
+    }
+
+    fn ledger_read_u16_be(cursor: &mut Cursor<&[u8]>) -> Result<u16, NativeTransportError> {
+        let hi = u16::from(ledger_read_u8(cursor)?);
+        let lo = u16::from(ledger_read_u8(cursor)?);
+        Ok((hi << 8) | lo)
+    }
+
+    fn ledger_read_u8(cursor: &mut Cursor<&[u8]>) -> Result<u8, NativeTransportError> {
+        let position = usize::try_from(cursor.position()).map_err(|_| {
+            NativeTransportError::Comm("Read error. Invalid response cursor position")
+        })?;
+        let byte = cursor
+            .get_ref()
+            .get(position)
+            .copied()
+            .ok_or(NativeTransportError::Comm("Read error. Incomplete header"))?;
+        cursor.set_position(cursor.position() + 1);
+        Ok(byte)
     }
 
     fn ledger_exchange_error(
@@ -1121,9 +1358,7 @@ pub mod ledger {
 
         #[test]
         fn ledger_connect_device_not_found_preserves_retry_guidance() {
-            let error = ledger_connect_error(LedgerError::NativeTransportError(
-                NativeTransportError::DeviceNotFound,
-            ));
+            let error = HardwareDerivationError::LedgerUnavailable(LEDGER_READY_MESSAGE);
 
             assert!(matches!(
                 error,
@@ -1198,13 +1433,16 @@ pub mod trezor {
     use std::fmt;
     use std::io::{Read as _, Write as _};
     use std::net::{SocketAddr, TcpStream};
+    use std::sync::Arc;
     use std::time::Duration;
 
     use super::{
-        HardwareAppVersion, HardwareDerivationClient, HardwareDerivationDescriptor,
-        HardwareDerivationError, HardwareDerivationMethod, HardwareDeviceKind,
-        HardwareOperationOutput, HardwarePublicAccountDescriptor, hardware_profile_fingerprint,
+        ConfirmedHardwarePublicAccount, HardwareAppVersion, HardwareDerivationClient,
+        HardwareDerivationDescriptor, HardwareDerivationError, HardwareDerivationMethod,
+        HardwareDeviceKind, HardwareOperationOutput, HardwarePublicAccountDescriptor,
+        hardware_profile_fingerprint,
     };
+    use crate::vault::{HardwareProfileBinding, HardwareProfileSession, TrezorPassphraseMode};
     use alloy::consensus::SignableTransaction;
     use alloy::hex;
     use alloy::primitives::{Address, Signature, TxKind, U256, normalize_v};
@@ -1212,9 +1450,9 @@ pub mod trezor {
     use protobuf::Enum as _;
     use serde::Deserialize;
     use trezor_client::TrezorMessage;
-    use trezor_client::client::handle_interaction;
+    use trezor_client::client::TrezorResponse;
     use trezor_client::transport::{ProtoMessage, Transport, error::Error as TrezorTransportError};
-    use zeroize::Zeroize;
+    use zeroize::{Zeroize, Zeroizing};
 
     const TREZOR_CIPHER_INPUT_V1: [u8; 32] = [0u8; 32];
     const TREZOR_BRIDGE_ADDR: &str = "127.0.0.1:21325";
@@ -1224,6 +1462,35 @@ pub mod trezor {
     const TREZOR_BRIDGE_READ_TIMEOUT: Duration = Duration::from_mins(5);
     const TREZOR_BRIDGE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
     const TREZOR_ETHEREUM_TX_CHUNK_SIZE: usize = 1024;
+
+    pub type TrezorPinMatrixProvider = Arc<
+        dyn Fn(TrezorPinMatrixRequestKind) -> Result<Zeroizing<String>, HardwareDerivationError>
+            + Send
+            + Sync,
+    >;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum TrezorPinMatrixRequestKind {
+        Current,
+        NewFirst,
+        NewSecond,
+        WipeCodeFirst,
+        WipeCodeSecond,
+    }
+
+    impl From<trezor_client::protos::pin_matrix_request::PinMatrixRequestType>
+        for TrezorPinMatrixRequestKind
+    {
+        fn from(value: trezor_client::protos::pin_matrix_request::PinMatrixRequestType) -> Self {
+            match value {
+                trezor_client::protos::pin_matrix_request::PinMatrixRequestType::PinMatrixRequestType_Current => Self::Current,
+                trezor_client::protos::pin_matrix_request::PinMatrixRequestType::PinMatrixRequestType_NewFirst => Self::NewFirst,
+                trezor_client::protos::pin_matrix_request::PinMatrixRequestType::PinMatrixRequestType_NewSecond => Self::NewSecond,
+                trezor_client::protos::pin_matrix_request::PinMatrixRequestType::PinMatrixRequestType_WipeCodeFirst => Self::WipeCodeFirst,
+                trezor_client::protos::pin_matrix_request::PinMatrixRequestType::PinMatrixRequestType_WipeCodeSecond => Self::WipeCodeSecond,
+            }
+        }
+    }
 
     #[derive(Debug, Clone, Deserialize)]
     pub(super) struct BridgeDevice {
@@ -1529,6 +1796,218 @@ pub mod trezor {
 
     pub struct TrezorHardwareDerivationClient {
         client: trezor_client::Trezor,
+        passphrase: TrezorPassphraseState,
+        pin_matrix_provider: Option<TrezorPinMatrixProvider>,
+    }
+
+    struct TrezorPassphraseState {
+        mode: TrezorPassphraseMode,
+        app_passphrase: Option<Zeroizing<String>>,
+    }
+
+    #[derive(Clone, Default, PartialEq)]
+    struct ZeroizingPassphraseAck {
+        inner: trezor_client::protos::PassphraseAck,
+    }
+
+    impl ZeroizingPassphraseAck {
+        fn new() -> Self {
+            Self {
+                inner: trezor_client::protos::PassphraseAck::new(),
+            }
+        }
+
+        fn set_on_device(&mut self, value: bool) {
+            self.inner.set_on_device(value);
+        }
+
+        fn set_passphrase(&mut self, passphrase: String) {
+            self.inner.set_passphrase(passphrase);
+        }
+
+        #[cfg(test)]
+        fn has_on_device(&self) -> bool {
+            self.inner.has_on_device()
+        }
+
+        #[cfg(test)]
+        fn on_device(&self) -> bool {
+            self.inner.on_device()
+        }
+
+        #[cfg(test)]
+        fn has_passphrase(&self) -> bool {
+            self.inner.has_passphrase()
+        }
+
+        #[cfg(test)]
+        fn passphrase(&self) -> &str {
+            self.inner.passphrase()
+        }
+    }
+
+    impl fmt::Debug for ZeroizingPassphraseAck {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("PassphraseAck")
+                .field(
+                    "passphrase",
+                    &self.inner.passphrase.as_ref().map(|_| "<redacted>"),
+                )
+                .field("on_device", &self.inner.on_device)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl Drop for ZeroizingPassphraseAck {
+        fn drop(&mut self) {
+            if let Some(passphrase) = self.inner.passphrase.as_mut() {
+                passphrase.zeroize();
+            }
+            self.inner.clear_passphrase();
+        }
+    }
+
+    impl protobuf::Message for ZeroizingPassphraseAck {
+        const NAME: &'static str =
+            <trezor_client::protos::PassphraseAck as protobuf::Message>::NAME;
+
+        fn is_initialized(&self) -> bool {
+            self.inner.is_initialized()
+        }
+
+        fn merge_from(&mut self, is: &mut protobuf::CodedInputStream<'_>) -> protobuf::Result<()> {
+            self.inner.merge_from(is)
+        }
+
+        fn write_to_with_cached_sizes(
+            &self,
+            os: &mut protobuf::CodedOutputStream<'_>,
+        ) -> protobuf::Result<()> {
+            self.inner.write_to_with_cached_sizes(os)
+        }
+
+        fn compute_size(&self) -> u64 {
+            self.inner.compute_size()
+        }
+
+        fn cached_size(&self) -> u32 {
+            self.inner.cached_size()
+        }
+
+        fn special_fields(&self) -> &protobuf::SpecialFields {
+            self.inner.special_fields()
+        }
+
+        fn mut_special_fields(&mut self) -> &mut protobuf::SpecialFields {
+            self.inner.mut_special_fields()
+        }
+
+        fn new() -> Self {
+            Self {
+                inner: trezor_client::protos::PassphraseAck::new(),
+            }
+        }
+
+        fn default_instance() -> &'static Self {
+            static INSTANCE: std::sync::OnceLock<ZeroizingPassphraseAck> =
+                std::sync::OnceLock::new();
+            INSTANCE.get_or_init(Self::new)
+        }
+    }
+
+    impl TrezorMessage for ZeroizingPassphraseAck {
+        const MESSAGE_TYPE: trezor_client::protos::MessageType =
+            trezor_client::protos::MessageType::MessageType_PassphraseAck;
+    }
+
+    impl Default for TrezorPassphraseState {
+        fn default() -> Self {
+            Self {
+                mode: TrezorPassphraseMode::NoPassphrase,
+                app_passphrase: None,
+            }
+        }
+    }
+
+    impl TrezorPassphraseState {
+        fn set_mode(&mut self, mode: TrezorPassphraseMode) {
+            self.mode = mode;
+            if mode != TrezorPassphraseMode::EnterInApp {
+                self.clear_app_passphrase();
+            }
+        }
+
+        fn set_app_passphrase(&mut self, passphrase: String) {
+            self.set_app_passphrase_zeroizing(Zeroizing::new(passphrase));
+        }
+
+        fn set_app_passphrase_zeroizing(&mut self, passphrase: Zeroizing<String>) {
+            self.mode = TrezorPassphraseMode::EnterInApp;
+            self.app_passphrase = Some(passphrase);
+        }
+
+        fn clear_app_passphrase(&mut self) {
+            if let Some(mut passphrase) = self.app_passphrase.take() {
+                passphrase.zeroize();
+            }
+        }
+
+        fn next_passphrase_ack(
+            &mut self,
+            device_requires_on_device: bool,
+        ) -> Result<ZeroizingPassphraseAck, HardwareDerivationError> {
+            let mut ack = ZeroizingPassphraseAck::new();
+            if device_requires_on_device {
+                self.clear_app_passphrase();
+                return Ok(ack);
+            }
+            match self.mode {
+                TrezorPassphraseMode::NoPassphrase => ack.set_passphrase(String::new()),
+                TrezorPassphraseMode::EnterOnTrezor => ack.set_on_device(true),
+                TrezorPassphraseMode::EnterInApp => {
+                    let Some(mut passphrase) = self.app_passphrase.take() else {
+                        return Err(HardwareDerivationError::MissingTrezorAppPassphrase);
+                    };
+                    ack.set_passphrase(passphrase.as_str().to_owned());
+                    passphrase.zeroize();
+                }
+            }
+            Ok(ack)
+        }
+    }
+
+    fn handle_trezor_interaction<T, R: TrezorMessage>(
+        response: TrezorResponse<'_, T, R>,
+        passphrase: &mut TrezorPassphraseState,
+        pin_matrix_provider: Option<&TrezorPinMatrixProvider>,
+    ) -> Result<T, HardwareDerivationError> {
+        match response {
+            TrezorResponse::Ok(value) => Ok(value),
+            TrezorResponse::Failure(failure) => {
+                Err(trezor_client::Error::FailureResponse(failure).into())
+            }
+            TrezorResponse::ButtonRequest(request) => {
+                handle_trezor_interaction(request.ack()?, passphrase, pin_matrix_provider)
+            }
+            TrezorResponse::PinMatrixRequest(request) => {
+                let Some(provider) = pin_matrix_provider else {
+                    return Err(HardwareDerivationError::UnsupportedTrezorPinMatrix);
+                };
+                let mut pin = provider(request.request_type().into())?;
+                let next = request.ack_pin(pin.as_str().to_owned())?;
+                pin.zeroize();
+                handle_trezor_interaction(next, passphrase, pin_matrix_provider)
+            }
+            TrezorResponse::PassphraseRequest(request) => {
+                let ack = passphrase.next_passphrase_ack(request.on_device())?;
+                handle_trezor_interaction(
+                    request.client.call(ack, request.result_handler)?,
+                    passphrase,
+                    pin_matrix_provider,
+                )
+            }
+        }
     }
 
     #[derive(Debug, Clone)]
@@ -1537,7 +2016,9 @@ pub mod trezor {
         pub vendor: String,
         pub version: HardwareAppVersion,
         pub initialized: bool,
+        pub unlocked: Option<bool>,
         pub passphrase_protection: bool,
+        pub passphrase_always_on_device: bool,
         pub bootloader_mode: bool,
     }
 
@@ -1550,7 +2031,11 @@ pub mod trezor {
                         Box::new(transport),
                     );
                     client.init_device(None)?;
-                    Ok(Self { client })
+                    Ok(Self {
+                        client,
+                        passphrase: TrezorPassphraseState::default(),
+                        pin_matrix_provider: None,
+                    })
                 }
                 Err(error) if error.should_fallback() => {
                     tracing::debug!(%error, "Trezor Bridge unavailable; falling back to direct WebUSB transport");
@@ -1563,7 +2048,57 @@ pub mod trezor {
         fn connect_direct() -> Result<Self, HardwareDerivationError> {
             let mut client = trezor_client::unique(false)?;
             client.init_device(None)?;
-            Ok(Self { client })
+            Ok(Self {
+                client,
+                passphrase: TrezorPassphraseState::default(),
+                pin_matrix_provider: None,
+            })
+        }
+
+        pub fn connect_with_session(
+            session_id: Option<Vec<u8>>,
+        ) -> Result<Self, HardwareDerivationError> {
+            match BridgeTransport::connect_unique() {
+                Ok(transport) => {
+                    let mut client = trezor_client::client::trezor_with_transport(
+                        trezor_client::Model::Trezor,
+                        Box::new(transport),
+                    );
+                    client.init_device(session_id)?;
+                    Ok(Self {
+                        client,
+                        passphrase: TrezorPassphraseState::default(),
+                        pin_matrix_provider: None,
+                    })
+                }
+                Err(error) if error.should_fallback() => {
+                    tracing::debug!(%error, "Trezor Bridge unavailable; falling back to direct WebUSB transport");
+                    let mut client = trezor_client::unique(false)?;
+                    client.init_device(session_id)?;
+                    Ok(Self {
+                        client,
+                        passphrase: TrezorPassphraseState::default(),
+                        pin_matrix_provider: None,
+                    })
+                }
+                Err(error) => Err(error.into_hardware_error()),
+            }
+        }
+
+        pub fn set_passphrase_mode(&mut self, mode: TrezorPassphraseMode) {
+            self.passphrase.set_mode(mode);
+        }
+
+        pub fn set_app_passphrase(&mut self, passphrase: String) {
+            self.passphrase.set_app_passphrase(passphrase);
+        }
+
+        pub fn set_app_passphrase_zeroizing(&mut self, passphrase: Zeroizing<String>) {
+            self.passphrase.set_app_passphrase_zeroizing(passphrase);
+        }
+
+        pub fn set_pin_matrix_provider(&mut self, provider: TrezorPinMatrixProvider) {
+            self.pin_matrix_provider = Some(provider);
         }
 
         pub fn device_info(&self) -> Result<TrezorDeviceInfo, HardwareDerivationError> {
@@ -1582,8 +2117,20 @@ pub mod trezor {
                     u16::try_from(features.patch_version()).unwrap_or(u16::MAX),
                 ),
                 initialized: features.initialized(),
+                unlocked: features.has_unlocked().then(|| features.unlocked()),
                 passphrase_protection: features.passphrase_protection(),
+                passphrase_always_on_device: features.passphrase_always_on_device(),
                 bootloader_mode: features.bootloader_mode(),
+            })
+        }
+
+        #[must_use]
+        pub fn session_id(&self) -> Option<Vec<u8>> {
+            self.client.features().and_then(|features| {
+                features
+                    .has_session_id()
+                    .then(|| features.session_id().to_vec())
+                    .filter(|session_id| !session_id.is_empty())
             })
         }
 
@@ -1600,12 +2147,21 @@ pub mod trezor {
             display_and_confirm: bool,
         ) -> Result<String, HardwareDerivationError> {
             let request = trezor_ethereum_get_address_request(path, display_and_confirm);
-            let address = handle_interaction(self.client.call(
+            let Self {
+                client,
+                passphrase,
+                pin_matrix_provider,
+            } = self;
+            let response = client.call(
                 request,
                 Box::new(|_, message: trezor_client::protos::EthereumAddress| {
                     Ok(message.address().to_owned())
                 }),
-            )?)?;
+            )?;
+            let address =
+                handle_trezor_interaction(response, passphrase, pin_matrix_provider.as_ref());
+            passphrase.clear_app_passphrase();
+            let address = address?;
             Ok(address.to_ascii_lowercase())
         }
 
@@ -1621,6 +2177,17 @@ pub mod trezor {
             descriptor: &HardwarePublicAccountDescriptor,
         ) -> Result<Address, HardwareDerivationError> {
             self.public_ethereum_address_with_confirmation(descriptor, true)
+        }
+
+        pub fn confirmed_public_ethereum_account(
+            &mut self,
+            descriptor: &HardwarePublicAccountDescriptor,
+        ) -> Result<ConfirmedHardwarePublicAccount, HardwareDerivationError> {
+            let address = self.confirmed_public_ethereum_address(descriptor)?;
+            Ok(ConfirmedHardwarePublicAccount::new(
+                descriptor.clone(),
+                address,
+            ))
         }
 
         fn public_ethereum_address_with_confirmation(
@@ -1735,18 +2302,30 @@ pub mod trezor {
             message: S,
             data: &mut Vec<u8>,
         ) -> Result<trezor_client::protos::EthereumTxRequest, HardwareDerivationError> {
-            let mut response = handle_interaction(self.client.call(
+            let Self {
+                client,
+                passphrase,
+                pin_matrix_provider,
+            } = self;
+            let response = client.call(
                 message,
                 Box::new(|_, message: trezor_client::protos::EthereumTxRequest| Ok(message)),
-            )?)?;
+            )?;
+            let response =
+                handle_trezor_interaction(response, passphrase, pin_matrix_provider.as_ref());
+            passphrase.clear_app_passphrase();
+            let mut response = response?;
             while response.data_length() > 0 {
                 let mut ack = trezor_client::protos::EthereumTxAck::new();
                 ack.set_data_chunk(trezor_ethereum_next_data_chunk(data));
-                response = handle_interaction(self.client.call(
+                let next = client.call(
                     ack,
                     Box::new(|_, message: trezor_client::protos::EthereumTxRequest| Ok(message)),
-                )?)?;
+                )?;
+                response =
+                    handle_trezor_interaction(next, passphrase, pin_matrix_provider.as_ref())?;
             }
+            passphrase.clear_app_passphrase();
             Ok(response)
         }
 
@@ -1761,9 +2340,45 @@ pub mod trezor {
                     "Trezor message signing requires a Trezor descriptor",
                 ));
             }
-            let signature = self
-                .client
-                .ethereum_sign_message(message.to_vec(), descriptor.path.clone())?;
+            let mut request = trezor_client::protos::EthereumSignMessage::new();
+            request.address_n.clone_from(&descriptor.path);
+            request.set_message(message.to_vec());
+            let Self {
+                client,
+                passphrase,
+                pin_matrix_provider,
+            } = self;
+            let response = client.call(
+                request,
+                Box::new(
+                    |_, message: trezor_client::protos::EthereumMessageSignature| {
+                        let signature = message.signature();
+                        if signature.len() != 65 {
+                            return Err(trezor_client::Error::MalformedSignature);
+                        }
+                        let r: [u8; 32] = signature
+                            .get(0..32)
+                            .and_then(|bytes| bytes.try_into().ok())
+                            .ok_or(trezor_client::Error::MalformedSignature)?;
+                        let s: [u8; 32] = signature
+                            .get(32..64)
+                            .and_then(|bytes| bytes.try_into().ok())
+                            .ok_or(trezor_client::Error::MalformedSignature)?;
+                        let v = *signature
+                            .get(64)
+                            .ok_or(trezor_client::Error::MalformedSignature)?;
+                        Ok(trezor_client::client::Signature {
+                            r,
+                            s,
+                            v: u64::from(v),
+                        })
+                    },
+                ),
+            )?;
+            let signature =
+                handle_trezor_interaction(response, passphrase, pin_matrix_provider.as_ref());
+            passphrase.clear_app_passphrase();
+            let signature = signature?;
             trezor_signature_to_alloy(signature)
         }
 
@@ -1778,6 +2393,20 @@ pub mod trezor {
             ))
         }
 
+        pub fn active_profile_session(
+            &mut self,
+            path: &[u32],
+        ) -> Result<HardwareProfileSession, HardwareDerivationError> {
+            let fingerprint = self.profile_fingerprint(path)?;
+            let mut session = HardwareProfileSession::unmatched(
+                HardwareDeviceKind::Trezor,
+                HardwareProfileBinding::evm_address_fingerprint(fingerprint),
+                self.session_id(),
+            );
+            session.set_trezor_passphrase_mode(self.passphrase.mode);
+            Ok(session)
+        }
+
         pub fn cipher_key_value(
             &mut self,
             descriptor: &HardwareDerivationDescriptor,
@@ -1790,13 +2419,21 @@ pub mod trezor {
             request.set_ask_on_encrypt(true);
             request.set_ask_on_decrypt(true);
 
-            let response = self.client.call(
+            let Self {
+                client,
+                passphrase,
+                pin_matrix_provider,
+            } = self;
+            let response = client.call(
                 request,
                 Box::new(|_, mut message: trezor_client::protos::CipheredKeyValue| {
                     Ok(message.take_value())
                 }),
             )?;
-            let mut data = handle_interaction(response)?;
+            let data =
+                handle_trezor_interaction(response, passphrase, pin_matrix_provider.as_ref());
+            passphrase.clear_app_passphrase();
+            let mut data = data?;
             if data.len() != 32 {
                 return Err(HardwareDerivationError::UnexpectedResponseLength {
                     got: data.len(),
@@ -1810,8 +2447,13 @@ pub mod trezor {
         }
     }
 
+    #[must_use]
+    pub fn trezor_cipher_key_label(account_index: u32) -> String {
+        format!("Railgun wallet v1 account {account_index}")
+    }
+
     fn trezor_cipher_label(descriptor: &HardwareDerivationDescriptor) -> String {
-        format!("Railgun wallet v1 account {}", descriptor.account_index)
+        trezor_cipher_key_label(descriptor.account_index)
     }
 
     fn trezor_ethereum_get_address_request(
@@ -2033,6 +2675,19 @@ pub mod trezor {
             )
         }
 
+        fn test_features(session_id: Option<Vec<u8>>) -> trezor_client::protos::Features {
+            let mut features = trezor_client::protos::Features::new();
+            features.set_vendor("trezor.io".to_owned());
+            features.set_major_version(2);
+            features.set_minor_version(8);
+            features.set_patch_version(0);
+            features.set_initialized(true);
+            if let Some(session_id) = session_id {
+                features.set_session_id(session_id);
+            }
+            features
+        }
+
         #[test]
         fn ethereum_signing_flow_handles_button_request_after_data_ack() {
             let mut chunk_request = trezor_client::protos::EthereumTxRequest::new();
@@ -2056,7 +2711,11 @@ pub mod trezor {
                 trezor_client::Model::Trezor,
                 Box::new(transport),
             );
-            let mut client = TrezorHardwareDerivationClient { client };
+            let mut client = TrezorHardwareDerivationClient {
+                client,
+                passphrase: TrezorPassphraseState::default(),
+                pin_matrix_provider: None,
+            };
             let signature = client
                 .sign_legacy_transaction(
                     &[0x8000_002c, 0x8000_003c, 0x8000_0000, 0, 0],
@@ -2085,6 +2744,193 @@ pub mod trezor {
         }
 
         #[test]
+        fn trezor_pin_matrix_provider_continues_active_request() {
+            let path = [0x8000_002c, 0x8000_003c, 0x8000_0000, 0, 0];
+            let mut pin_request = trezor_client::protos::PinMatrixRequest::new();
+            pin_request.set_type(
+                trezor_client::protos::pin_matrix_request::PinMatrixRequestType::PinMatrixRequestType_Current,
+            );
+            let mut address = trezor_client::protos::EthereumAddress::new();
+            address.set_address("0x1111111111111111111111111111111111111111".to_owned());
+
+            let writes = Arc::new(Mutex::new(Vec::new()));
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let transport = QueuedTransport {
+                responses: VecDeque::from([queued_message(&pin_request), queued_message(&address)]),
+                writes: Arc::clone(&writes),
+            };
+            let client = trezor_client::client::trezor_with_transport(
+                trezor_client::Model::Trezor,
+                Box::new(transport),
+            );
+            let mut client = TrezorHardwareDerivationClient {
+                client,
+                passphrase: TrezorPassphraseState::default(),
+                pin_matrix_provider: None,
+            };
+            let provider_requests = Arc::clone(&requests);
+            client.set_pin_matrix_provider(Arc::new(move |kind| {
+                provider_requests
+                    .lock()
+                    .expect("provider requests lock")
+                    .push(kind);
+                Ok(Zeroizing::new("123".to_owned()))
+            }));
+
+            let got = client
+                .ethereum_address(&path)
+                .expect("PIN matrix request is acknowledged");
+
+            assert_eq!(got, "0x1111111111111111111111111111111111111111");
+            assert_eq!(
+                requests.lock().expect("requests lock").as_slice(),
+                &[TrezorPinMatrixRequestKind::Current]
+            );
+            assert_eq!(
+                writes.lock().expect("writes lock").as_slice(),
+                &[
+                    MessageType::MessageType_EthereumGetAddress,
+                    MessageType::MessageType_PinMatrixAck,
+                ]
+            );
+        }
+
+        #[test]
+        fn trezor_passphrase_ack_defaults_to_no_passphrase() {
+            let mut state = TrezorPassphraseState::default();
+
+            let ack = state
+                .next_passphrase_ack(false)
+                .expect("standard wallet passphrase ack");
+
+            assert!(ack.has_passphrase());
+            assert_eq!(ack.passphrase(), "");
+            assert!(!ack.has_on_device());
+        }
+
+        #[test]
+        fn trezor_passphrase_ack_uses_on_device_mode() {
+            let mut state = TrezorPassphraseState::default();
+            state.set_mode(TrezorPassphraseMode::EnterOnTrezor);
+
+            let ack = state
+                .next_passphrase_ack(false)
+                .expect("on-device passphrase ack");
+
+            assert!(ack.has_on_device());
+            assert!(ack.on_device());
+            assert!(!ack.has_passphrase());
+        }
+
+        #[test]
+        fn trezor_passphrase_ack_uses_app_passphrase_once() {
+            let mut state = TrezorPassphraseState::default();
+            state.set_app_passphrase("app secret".to_owned());
+
+            let ack = state
+                .next_passphrase_ack(false)
+                .expect("app passphrase ack");
+
+            assert!(ack.has_passphrase());
+            assert_eq!(ack.passphrase(), "app secret");
+            assert!(!format!("{ack:?}").contains("app secret"));
+            assert!(!ack.has_on_device());
+            assert!(state.app_passphrase.is_none());
+            assert!(matches!(
+                state.next_passphrase_ack(false),
+                Err(HardwareDerivationError::MissingTrezorAppPassphrase)
+            ));
+        }
+
+        #[test]
+        fn trezor_passphrase_ack_respects_device_required_on_device_entry() {
+            let mut state = TrezorPassphraseState::default();
+            state.set_app_passphrase("unused secret".to_owned());
+
+            let ack = state
+                .next_passphrase_ack(true)
+                .expect("device-required on-device passphrase ack");
+
+            assert!(!ack.has_on_device());
+            assert!(!ack.has_passphrase());
+            assert!(state.app_passphrase.is_none());
+        }
+
+        #[test]
+        fn trezor_initialize_captures_and_expires_session_id() {
+            let writes = Arc::new(Mutex::new(Vec::new()));
+            let features = test_features(Some(vec![9, 8, 7]));
+            let transport = QueuedTransport {
+                responses: VecDeque::from([queued_message(&features)]),
+                writes: Arc::clone(&writes),
+            };
+            let mut raw = trezor_client::client::trezor_with_transport(
+                trezor_client::Model::Trezor,
+                Box::new(transport),
+            );
+            raw.init_device(Some(vec![1, 2, 3]))
+                .expect("resume Trezor session");
+            let client = TrezorHardwareDerivationClient {
+                client: raw,
+                passphrase: TrezorPassphraseState::default(),
+                pin_matrix_provider: None,
+            };
+            assert_eq!(client.session_id(), Some(vec![9, 8, 7]));
+            assert_eq!(
+                writes.lock().expect("writes lock").as_slice(),
+                &[MessageType::MessageType_Initialize]
+            );
+
+            let transport = QueuedTransport {
+                responses: VecDeque::from([queued_message(&test_features(None))]),
+                writes: Arc::new(Mutex::new(Vec::new())),
+            };
+            let mut raw = trezor_client::client::trezor_with_transport(
+                trezor_client::Model::Trezor,
+                Box::new(transport),
+            );
+            raw.init_device(Some(vec![1, 2, 3]))
+                .expect("expired Trezor session initializes without id");
+            let client = TrezorHardwareDerivationClient {
+                client: raw,
+                passphrase: TrezorPassphraseState::default(),
+                pin_matrix_provider: None,
+            };
+            assert_eq!(client.session_id(), None);
+        }
+
+        #[test]
+        fn trezor_device_info_preserves_unlocked_feature() {
+            let writes = Arc::new(Mutex::new(Vec::new()));
+            let mut features = test_features(None);
+            features.set_unlocked(false);
+            features.set_passphrase_always_on_device(true);
+            let transport = QueuedTransport {
+                responses: VecDeque::from([queued_message(&features)]),
+                writes: Arc::clone(&writes),
+            };
+            let mut raw = trezor_client::client::trezor_with_transport(
+                trezor_client::Model::Trezor,
+                Box::new(transport),
+            );
+            raw.init_device(None).expect("initialize Trezor");
+            let client = TrezorHardwareDerivationClient {
+                client: raw,
+                passphrase: TrezorPassphraseState::default(),
+                pin_matrix_provider: None,
+            };
+
+            let info = client.device_info().expect("device info");
+
+            assert_eq!(info.unlocked, Some(false));
+            assert!(info.passphrase_always_on_device);
+            assert_eq!(
+                writes.lock().expect("writes lock").as_slice(),
+                &[MessageType::MessageType_Initialize]
+            );
+        }
+
+        #[test]
         fn trezor_address_confirmation_sets_display_flag() {
             let path = [0x8000_002c, 0x8000_003c, 0x8000_0000, 0, 0];
 
@@ -2108,7 +2954,6 @@ mod tests {
             parse_bip32_path("m/44'/60'/0'/0/0").expect("valid path"),
             0,
             "0x0123456789abcdef".to_owned(),
-            None,
             HardwareWalletSyncIntent::CreateNew,
         )
     }
@@ -2189,6 +3034,10 @@ mod tests {
             HardwareDerivationError::Trezor(trezor_client::Error::NoDeviceFound)
                 .is_early_device_readiness_error()
         );
+        assert!(HardwareDerivationError::TrezorLocked.is_early_device_readiness_error());
+        assert!(
+            HardwareDerivationError::UnsupportedTrezorPinMatrix.is_early_device_readiness_error()
+        );
         assert!(
             HardwareDerivationError::Trezor(trezor_client::Error::TransportConnect(
                 trezor_client::transport::error::Error::DeviceNotFound,
@@ -2204,14 +3053,11 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_debug_redacts_fingerprint_and_passphrase_hint() {
-        let mut descriptor = test_descriptor();
-        descriptor.passphrase_hint = Some("passphrase wallet".to_owned());
+    fn descriptor_debug_redacts_fingerprint() {
+        let descriptor = test_descriptor();
         let debug = format!("{descriptor:?}");
         assert!(!debug.contains("0123456789abcdef"));
-        assert!(!debug.contains("passphrase wallet"));
         assert!(debug.contains("<redacted>"));
-        assert!(debug.contains("<present>"));
     }
 
     #[test]

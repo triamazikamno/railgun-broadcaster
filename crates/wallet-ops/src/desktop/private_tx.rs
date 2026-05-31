@@ -977,6 +977,7 @@ pub async fn submit_desktop_unshield_self_broadcast(
             .vault_password
             .as_ref()
             .map(|password| password.as_str()),
+        request.trezor_pin_matrix_provider,
         request.public_account_uuid,
         Arc::clone(&request.session),
         prepared.plan.call.to,
@@ -1021,6 +1022,7 @@ pub async fn submit_blocked_shield_rescue_self_broadcast(
         request.view_session.as_ref(),
         request.vault_store.as_ref(),
         Some(request.vault_password.as_str()),
+        request.trezor_pin_matrix_provider,
         prepared.public_account_uuid,
         Arc::clone(&request.session),
         prepared.plan.call.to,
@@ -1087,6 +1089,7 @@ pub async fn submit_desktop_send_self_broadcast(
             .vault_password
             .as_ref()
             .map(|password| password.as_str()),
+        request.trezor_pin_matrix_provider,
         request.public_account_uuid,
         Arc::clone(&request.session),
         prepared.plan.call.to,

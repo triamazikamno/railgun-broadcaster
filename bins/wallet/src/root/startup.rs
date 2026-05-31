@@ -39,7 +39,7 @@ use super::settings::{
     startup_settings_action_state,
 };
 use super::shell::{WalletAppOptions, render_wallet_hero_screen, render_wallet_window_frame};
-use super::{WalletRoot, format_report_chain, rgb_with_alpha};
+use super::{WalletRoot, format_report_chain, rgb_with_alpha, scrollable_dialog_content};
 
 struct WalletStartupReady {
     http: HttpContext,
@@ -449,7 +449,7 @@ impl WalletStartupRoot {
                 .max_h(dialog_max_height)
                 .margin_top(px(16.0))
                 .title(app_strong_text("Startup Settings"))
-                .child(content)
+                .child(scrollable_dialog_content(content_height, content))
         });
     }
 

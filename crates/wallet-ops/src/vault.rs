@@ -29,7 +29,8 @@ use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::hardware::{
-    HardwareDerivationDescriptor, HardwareDeviceKind, HardwarePublicAccountDescriptor,
+    ConfirmedHardwarePublicAccount, HardwareDerivationDescriptor, HardwareDeviceKind,
+    HardwarePublicAccountDescriptor, HardwareViewAccessKey,
 };
 
 mod core;

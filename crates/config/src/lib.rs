@@ -71,6 +71,8 @@ pub struct Chain {
     pub relay_adapt_7702_contract: Option<Address>,
     pub evm_wallets: Vec<Bytes>,
     pub identifier: Option<String>,
+    #[serde(default)]
+    pub chain_scoped_railgun_address: bool,
     pub sync: Option<SyncChainConfig>,
 }
 

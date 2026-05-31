@@ -74,7 +74,7 @@ pub(in crate::root) const fn broadcaster_anchor_bps_range(settings: &WalletSetti
     }
 }
 
-pub(in crate::root) fn set_broadcaster_anchor_bps_range(
+pub(in crate::root) const fn set_broadcaster_anchor_bps_range(
     settings: &mut WalletSettings,
     start: f32,
     end: f32,
@@ -91,7 +91,7 @@ pub(in crate::root) fn anchor_bps_to_slider_value(bps: u64) -> f32 {
 }
 
 #[allow(clippy::cast_sign_loss)]
-pub(in crate::root) fn anchor_slider_value_to_bps(value: f32) -> u64 {
+pub(in crate::root) const fn anchor_slider_value_to_bps(value: f32) -> u64 {
     value
         .round()
         .clamp(ANCHOR_BPS_SLIDER_MIN, ANCHOR_BPS_SLIDER_MAX) as u64

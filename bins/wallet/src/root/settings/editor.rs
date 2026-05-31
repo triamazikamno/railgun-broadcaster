@@ -762,6 +762,8 @@ impl WalletSettingsEditor {
         let help = kind.dialog_help();
         let action_label = SharedString::from(if index.is_some() { "Save" } else { "Add" });
         let dialog_width = (window.viewport_size().width * 0.92).min(px(560.0));
+        let dialog_max_height = dialog_max_height(window);
+        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         let editor = cx.entity();
         let dialog_input = input.clone();
@@ -772,6 +774,7 @@ impl WalletSettingsEditor {
             let save_kind = save_kind.clone();
             dialog
                 .w(dialog_width)
+                .max_h(dialog_max_height)
                 .title(app_strong_text(title.clone()))
                 .button_props(DialogButtonProps::default().ok_text(action_label.clone()))
                 .footer(|ok, cancel, window, cx| vec![cancel(window, cx), ok(window, cx)])
@@ -787,10 +790,9 @@ impl WalletSettingsEditor {
                     });
                     true
                 })
-                .child(render_settings_url_dialog_content(
-                    &dialog_input,
-                    content_width,
-                    help,
+                .child(scrollable_dialog_content(
+                    content_max_height,
+                    render_settings_url_dialog_content(&dialog_input, content_width, help),
                 ))
         });
         let focus_input = input;
@@ -940,6 +942,8 @@ impl WalletSettingsEditor {
         };
         let action_label = SharedString::from(if index.is_some() { "Save" } else { "Add" });
         let dialog_width = (window.viewport_size().width * 0.92).min(px(620.0));
+        let dialog_max_height = dialog_max_height(window);
+        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         let editor = cx.entity();
         let dialog_inputs = inputs.clone();
@@ -949,6 +953,7 @@ impl WalletSettingsEditor {
             let save_inputs = save_inputs.clone();
             dialog
                 .w(dialog_width)
+                .max_h(dialog_max_height)
                 .title(app_strong_text(title))
                 .button_props(DialogButtonProps::default().ok_text(action_label.clone()))
                 .footer(|ok, cancel, window, cx| vec![cancel(window, cx), ok(window, cx)])
@@ -963,9 +968,9 @@ impl WalletSettingsEditor {
                     });
                     true
                 })
-                .child(render_waku_direct_peer_dialog_content(
-                    &dialog_inputs,
-                    content_width,
+                .child(scrollable_dialog_content(
+                    content_max_height,
+                    render_waku_direct_peer_dialog_content(&dialog_inputs, content_width),
                 ))
         });
         let focus_input = inputs.peer_id;
@@ -1140,6 +1145,8 @@ impl WalletSettingsEditor {
         });
         let readonly_identity = matches!(target, TokenEditTarget::BuiltIn(_));
         let dialog_width = (window.viewport_size().width * 0.92).min(px(620.0));
+        let dialog_max_height = dialog_max_height(window);
+        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         let editor = cx.entity();
         let save_inputs = inputs.clone();
@@ -1151,6 +1158,7 @@ impl WalletSettingsEditor {
             let save_target = save_target.clone();
             dialog
                 .w(dialog_width)
+                .max_h(dialog_max_height)
                 .title(app_strong_text(title.clone()))
                 .button_props(DialogButtonProps::default().ok_text(action_label.clone()))
                 .footer(|ok, cancel, window, cx| vec![cancel(window, cx), ok(window, cx)])
@@ -1172,10 +1180,9 @@ impl WalletSettingsEditor {
                     });
                     true
                 })
-                .child(render_token_dialog_content(
-                    &render_inputs,
-                    content_width,
-                    readonly_identity,
+                .child(scrollable_dialog_content(
+                    content_max_height,
+                    render_token_dialog_content(&render_inputs, content_width, readonly_identity),
                 ))
         });
         let focus_input = if readonly_identity {
@@ -1266,7 +1273,8 @@ impl WalletSettingsEditor {
         }
         let viewport_size = window.viewport_size();
         let dialog_width = (viewport_size.width * 0.92).min(px(620.0));
-        let dialog_max_height = viewport_size.height * 0.84;
+        let dialog_max_height = dialog_max_height(window);
+        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         let editor = cx.entity();
         let save_inputs = inputs.clone();
@@ -1309,10 +1317,9 @@ impl WalletSettingsEditor {
                     });
                     true
                 })
-                .child(render_price_anchor_dialog_content(
-                    &render_inputs,
-                    content_width,
-                    cx,
+                .child(scrollable_dialog_content(
+                    content_max_height,
+                    render_price_anchor_dialog_content(&render_inputs, content_width, cx),
                 ))
         });
         let focus_input = inputs.chain_id;

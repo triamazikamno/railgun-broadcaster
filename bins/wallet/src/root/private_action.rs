@@ -48,7 +48,8 @@ use wallet_ops::{
     submit_desktop_unshield_self_broadcast,
     vault::{
         DesktopVaultStore, DesktopViewSession, PrivateAddressBookEntry, PublicAccountMetadata,
-        PublicAccountSource, PublicAccountStatus, PublicAddressBookEntry, WalletStatus,
+        PublicAccountSource, PublicAccountStatus, PublicAddressBookEntry, WalletMetadataBundle,
+        WalletStatus,
     },
 };
 
@@ -84,14 +85,15 @@ use super::spend_authorization::{
 use super::utxo::short_hash;
 use super::{
     ChainUtxoState, PRIVATE_ACTION_FORM_MAX_HEIGHT, PRIVATE_ASSET_LIST_WIDTH,
-    PublicBroadcasterFeeTokenOption, WalletRoot, effective_fee_handling_mode,
-    format_exact_token_amount_for_display, format_report_chain, format_send_amount_input,
-    format_unshield_amount_input, is_effective_wrapped_native_token, labeled_field,
-    native_token_display_label, native_wrapped_output_labels, new_prefilled_input, new_text_input,
-    parse_address, public_balance_amount_label, public_broadcaster_fee_token_warning,
-    public_broadcaster_submit_disabled_for_fee_token_options, secondary_dialog_content_width,
-    send_form_max_entered_amount, should_show_fee_mode_toggle, token_label_row,
-    unshield_form_max_entered_amount, unshield_max_entered_amount_for_mode, vault_error_kind,
+    PublicBroadcasterFeeTokenOption, WalletRoot, dialog_content_max_height, dialog_max_height,
+    effective_fee_handling_mode, format_exact_token_amount_for_display, format_report_chain,
+    format_send_amount_input, format_unshield_amount_input, is_effective_wrapped_native_token,
+    labeled_field, native_token_display_label, native_wrapped_output_labels, new_prefilled_input,
+    new_text_input, parse_address, public_balance_amount_label,
+    public_broadcaster_fee_token_warning, public_broadcaster_submit_disabled_for_fee_token_options,
+    scrollable_dialog_content, secondary_dialog_content_width, send_form_max_entered_amount,
+    should_show_fee_mode_toggle, token_label_row, unshield_form_max_entered_amount,
+    unshield_max_entered_amount_for_mode, vault_error_kind,
 };
 
 mod delivery;

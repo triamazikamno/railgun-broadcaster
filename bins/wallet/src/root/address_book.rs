@@ -24,7 +24,10 @@ use wallet_ops::{
 use crate::assets::RailgunActionIcon;
 
 use super::utxo::short_hash;
-use super::{WalletRoot, rgb_with_alpha, secondary_dialog_content_width, vault_error_kind};
+use super::{
+    WalletRoot, dialog_content_max_height, dialog_max_height, rgb_with_alpha,
+    scrollable_dialog_content, secondary_dialog_content_width, vault_error_kind,
+};
 
 const ADDRESS_BOOK_CONTENT_WIDTH: Pixels = px(980.0);
 const ADDRESS_BOOK_DIALOG_WIDTH: Pixels = px(500.0);
@@ -541,6 +544,8 @@ impl WalletRoot {
         let add_address_input = self.address_book.add_address_input.clone();
         let focus_label_input = add_label_input.clone();
         let dialog_width = (window.viewport_size().width * 0.92).min(ADDRESS_BOOK_DIALOG_WIDTH);
+        let dialog_max_height = dialog_max_height(window);
+        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         window.open_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
@@ -549,6 +554,7 @@ impl WalletRoot {
             let error = content_root.read(cx).address_book.error.clone();
             dialog
                 .w(dialog_width)
+                .max_h(dialog_max_height)
                 .title(app_strong_text(AddressBookDialogMode::Add.title()))
                 .button_props(
                     DialogButtonProps::default().ok_text(AddressBookDialogMode::Add.action_label()),
@@ -564,13 +570,16 @@ impl WalletRoot {
                         root.add_address_book_entry_from_dialog(window, cx)
                     })
                 })
-                .child(render_address_book_dialog_content(
-                    AddressBookDialogMode::Add,
-                    content_width,
-                    &add_label_input,
-                    &add_address_input,
-                    error.as_ref(),
-                    cx,
+                .child(scrollable_dialog_content(
+                    content_max_height,
+                    render_address_book_dialog_content(
+                        AddressBookDialogMode::Add,
+                        content_width,
+                        &add_label_input,
+                        &add_address_input,
+                        error.as_ref(),
+                        cx,
+                    ),
                 ))
         });
         cx.defer_in(window, move |_root, window, cx| {
@@ -605,6 +614,8 @@ impl WalletRoot {
         let edit_address_input = self.address_book.edit_address_input.clone();
         let focus_label_input = edit_label_input.clone();
         let dialog_width = (window.viewport_size().width * 0.92).min(ADDRESS_BOOK_DIALOG_WIDTH);
+        let dialog_max_height = dialog_max_height(window);
+        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         let mode = AddressBookDialogMode::Edit(target.kind);
         window.open_dialog(cx, move |dialog, _window, cx| {
@@ -614,6 +625,7 @@ impl WalletRoot {
             let error = content_root.read(cx).address_book.error.clone();
             dialog
                 .w(dialog_width)
+                .max_h(dialog_max_height)
                 .title(app_strong_text(mode.title()))
                 .button_props(DialogButtonProps::default().ok_text(mode.action_label()))
                 .footer(|ok, cancel, window, cx| vec![cancel(window, cx), ok(window, cx)])
@@ -627,13 +639,16 @@ impl WalletRoot {
                         root.update_address_book_entry_from_dialog(window, cx)
                     })
                 })
-                .child(render_address_book_dialog_content(
-                    mode,
-                    content_width,
-                    &edit_label_input,
-                    &edit_address_input,
-                    error.as_ref(),
-                    cx,
+                .child(scrollable_dialog_content(
+                    content_max_height,
+                    render_address_book_dialog_content(
+                        mode,
+                        content_width,
+                        &edit_label_input,
+                        &edit_address_input,
+                        error.as_ref(),
+                        cx,
+                    ),
                 ))
         });
         cx.defer_in(window, move |_root, window, cx| {

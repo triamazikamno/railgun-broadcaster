@@ -10,6 +10,9 @@ pub(crate) const SIDEBAR_WORDMARK_PATH: &str = "railgun/icons/wordmark.svg";
 pub(crate) const HERO_WORDMARK_PATH: &str = "railgun/icons/hero-wordmark.svg";
 pub(crate) const HEMATITE_HERO_PATH: &str = "railgun/backgrounds/hematite-hero.svg";
 pub(crate) const WARM_GLOW_PATH: &str = "railgun/backgrounds/warm-glow.svg";
+pub(crate) const LEDGER_LOGO_SHORT_WHITE_ICON_PATH: &str =
+    "railgun/icons/ledger-logo-short-white.svg";
+pub(crate) const TREZOR_SYMBOL_WHITE_ICON_PATH: &str = "railgun/icons/trezor-symbol-white-rgb.svg";
 const ARROW_BIG_RIGHT_DASH_ICON_PATH: &str = "railgun/icons/arrow-big-right-dash.svg";
 const SHIELD_ICON_PATH: &str = "railgun/icons/shield.svg";
 const WALLET_ICON_PATH: &str = "railgun/icons/wallet.svg";
@@ -23,6 +26,8 @@ const TRASH_2_ICON_PATH: &str = "railgun/icons/trash-2.svg";
 const CLOCK_ICON_PATH: &str = "railgun/icons/clock.svg";
 const BOOK_USER_ICON_PATH: &str = "railgun/icons/book-user.svg";
 const SAVE_ICON_PATH: &str = "railgun/icons/save.svg";
+pub(crate) const IMPORT_ICON_PATH: &str = "railgun/icons/import.svg";
+pub(crate) const CHEVRONS_DOWN_ICON_PATH: &str = "railgun/icons/chevrons-down.svg";
 const KEY_ROUND_ICON_PATH: &str = "railgun/icons/key-round.svg";
 const NETWORK_ICON_PATH: &str = "railgun/icons/network.svg";
 const PIN_ICON_PATH: &str = "railgun/icons/pin.svg";
@@ -36,6 +41,8 @@ const RAILGUN_ASSET_PATHS: &[&str] = &[
     HERO_WORDMARK_PATH,
     HEMATITE_HERO_PATH,
     WARM_GLOW_PATH,
+    LEDGER_LOGO_SHORT_WHITE_ICON_PATH,
+    TREZOR_SYMBOL_WHITE_ICON_PATH,
     ARROW_BIG_RIGHT_DASH_ICON_PATH,
     SHIELD_ICON_PATH,
     WALLET_ICON_PATH,
@@ -49,6 +56,8 @@ const RAILGUN_ASSET_PATHS: &[&str] = &[
     CLOCK_ICON_PATH,
     BOOK_USER_ICON_PATH,
     SAVE_ICON_PATH,
+    IMPORT_ICON_PATH,
+    CHEVRONS_DOWN_ICON_PATH,
     KEY_ROUND_ICON_PATH,
     NETWORK_ICON_PATH,
     PIN_ICON_PATH,
@@ -60,6 +69,10 @@ const SIDEBAR_WORDMARK_BYTES: &[u8] = include_bytes!("../assets/icons/wordmark.s
 const HERO_WORDMARK_BYTES: &[u8] = include_bytes!("../assets/icons/hero-wordmark.svg");
 const HEMATITE_HERO_BYTES: &[u8] = include_bytes!("../assets/backgrounds/hematite-hero.svg");
 const WARM_GLOW_BYTES: &[u8] = include_bytes!("../assets/backgrounds/warm-glow.svg");
+const LEDGER_LOGO_SHORT_WHITE_ICON_BYTES: &[u8] =
+    include_bytes!("../assets/icons/ledger-logo-short-white.svg");
+const TREZOR_SYMBOL_WHITE_ICON_BYTES: &[u8] =
+    include_bytes!("../assets/icons/trezor-symbol-white-rgb.svg");
 const ARROW_BIG_RIGHT_DASH_ICON_BYTES: &[u8] =
     include_bytes!("../assets/icons/arrow-big-right-dash.svg");
 const SHIELD_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/shield.svg");
@@ -74,6 +87,8 @@ const TRASH_2_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/trash-2.svg");
 const CLOCK_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/clock.svg");
 const BOOK_USER_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/book-user.svg");
 const SAVE_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/save.svg");
+const IMPORT_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/import.svg");
+const CHEVRONS_DOWN_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/chevrons-down.svg");
 const KEY_ROUND_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/key-round.svg");
 const NETWORK_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/network.svg");
 const PIN_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/pin.svg");
@@ -260,6 +275,8 @@ fn railgun_asset(path: &str) -> Option<&'static [u8]> {
         HERO_WORDMARK_PATH => Some(HERO_WORDMARK_BYTES),
         HEMATITE_HERO_PATH => Some(HEMATITE_HERO_BYTES),
         WARM_GLOW_PATH => Some(WARM_GLOW_BYTES),
+        LEDGER_LOGO_SHORT_WHITE_ICON_PATH => Some(LEDGER_LOGO_SHORT_WHITE_ICON_BYTES),
+        TREZOR_SYMBOL_WHITE_ICON_PATH => Some(TREZOR_SYMBOL_WHITE_ICON_BYTES),
         ARROW_BIG_RIGHT_DASH_ICON_PATH => Some(ARROW_BIG_RIGHT_DASH_ICON_BYTES),
         SHIELD_ICON_PATH => Some(SHIELD_ICON_BYTES),
         WALLET_ICON_PATH => Some(WALLET_ICON_BYTES),
@@ -273,6 +290,8 @@ fn railgun_asset(path: &str) -> Option<&'static [u8]> {
         CLOCK_ICON_PATH => Some(CLOCK_ICON_BYTES),
         BOOK_USER_ICON_PATH => Some(BOOK_USER_ICON_BYTES),
         SAVE_ICON_PATH => Some(SAVE_ICON_BYTES),
+        IMPORT_ICON_PATH => Some(IMPORT_ICON_BYTES),
+        CHEVRONS_DOWN_ICON_PATH => Some(CHEVRONS_DOWN_ICON_BYTES),
         KEY_ROUND_ICON_PATH => Some(KEY_ROUND_ICON_BYTES),
         NETWORK_ICON_PATH => Some(NETWORK_ICON_BYTES),
         PIN_ICON_PATH => Some(PIN_ICON_BYTES),
@@ -323,6 +342,30 @@ mod tests {
             assets
                 .load("railgun/icons/save.svg")
                 .expect("load save icon")
+                .is_some()
+        );
+        assert!(
+            assets
+                .load("railgun/icons/import.svg")
+                .expect("load import icon")
+                .is_some()
+        );
+        assert!(
+            assets
+                .load("railgun/icons/chevrons-down.svg")
+                .expect("load chevrons down icon")
+                .is_some()
+        );
+        assert!(
+            assets
+                .load("railgun/icons/ledger-logo-short-white.svg")
+                .expect("load ledger icon")
+                .is_some()
+        );
+        assert!(
+            assets
+                .load("railgun/icons/trezor-symbol-white-rgb.svg")
+                .expect("load trezor icon")
                 .is_some()
         );
     }

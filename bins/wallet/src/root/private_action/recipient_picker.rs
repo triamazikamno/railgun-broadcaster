@@ -51,6 +51,20 @@ pub(in crate::root) fn private_send_recipient_options(
         .collect()
 }
 
+pub(in crate::root) fn hardware_wallet_recipient_source_from_metadata(
+    metadata: &WalletMetadataBundle,
+) -> Option<PrivateWalletRecipientSource> {
+    let address = metadata
+        .hardware_account
+        .as_ref()
+        .and_then(|account| account.receive_address.as_ref())?;
+    Some(PrivateWalletRecipientSource {
+        label: Arc::from(metadata.label.as_str()),
+        address: Arc::from(address.as_str()),
+        active: metadata.status == WalletStatus::Active,
+    })
+}
+
 pub(in crate::root) fn private_unshield_recipient_options(
     accounts: &[PublicAccountMetadata],
     address_book: &[PublicAddressBookEntry],
@@ -463,7 +477,14 @@ impl WalletRoot {
             .iter()
             .filter_map(|metadata| {
                 let address = if metadata.wallet_uuid == view_session.wallet_id() {
-                    view_session.receive_address().ok()
+                    view_session.receive_address().ok().or_else(|| {
+                        metadata
+                            .hardware_account
+                            .as_ref()
+                            .and_then(|account| account.receive_address.clone())
+                    })
+                } else if metadata.source.is_hardware_derived() {
+                    return hardware_wallet_recipient_source_from_metadata(metadata);
                 } else {
                     store
                         .load_view_session_with_view_session(
@@ -795,6 +816,8 @@ impl WalletRoot {
         let save_label_input = label_input.clone();
         let save_recipient = recipient.clone();
         let dialog_width = (window.viewport_size().width * 0.92).min(px(460.0));
+        let dialog_max_height = dialog_max_height(window);
+        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         window.open_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
@@ -804,6 +827,7 @@ impl WalletRoot {
             let save_label_input = save_label_input.clone();
             dialog
                 .w(dialog_width)
+                .max_h(dialog_max_height)
                 .title(app_strong_text("Save recipient"))
                 .button_props(DialogButtonProps::default().ok_text("Save"))
                 .footer(|ok, cancel, window, cx| vec![cancel(window, cx), ok(window, cx)])
@@ -823,10 +847,13 @@ impl WalletRoot {
                         )
                     })
                 })
-                .child(content_root.read(cx).render_save_recipient_dialog_content(
-                    &dialog_label_input,
-                    &recipient,
-                    content_width,
+                .child(scrollable_dialog_content(
+                    content_max_height,
+                    content_root.read(cx).render_save_recipient_dialog_content(
+                        &dialog_label_input,
+                        &recipient,
+                        content_width,
+                    ),
                 ))
         });
         cx.defer_in(window, move |_root, window, cx| {

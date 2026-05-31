@@ -1,10 +1,10 @@
 use super::{
-    BroadcasterPreferenceEntry, DecodedWalletMetadata, EncryptedRecord,
-    HardwareWalletAccountIndexReservation, HmacKeyInit, HmacSha256, KEY_LEN, Mac,
-    PrivateAddressBookEntry, PublicAccountMetadata, PublicAccountSecret, PublicAddressBookEntry,
-    RecordKind, SecretKey, VaultError, WalletChainMetadataBundle, WalletMetadataBundle,
-    WalletMetadataWire, WalletSpendBundle, WalletViewBundle, Zeroizing, decrypt_payload,
-    decrypt_serialized, derive_context_key, encrypt_payload, encrypt_serialized,
+    BroadcasterPreferenceEntry, DecodedWalletMetadata, EncryptedRecord, HardwareProfileMetadata,
+    HardwareViewAccessKey, HardwareWalletAccountIndexReservation, HmacKeyInit, HmacSha256, KEY_LEN,
+    Mac, PrivateAddressBookEntry, PublicAccountMetadata, PublicAccountSecret,
+    PublicAddressBookEntry, RecordKind, SecretKey, VaultError, WalletChainMetadataBundle,
+    WalletMetadataBundle, WalletMetadataWire, WalletSpendBundle, WalletViewBundle, Zeroizing,
+    decrypt_payload, decrypt_serialized, derive_context_key, encrypt_payload, encrypt_serialized,
 };
 
 pub struct ViewUnlock {
@@ -12,12 +12,20 @@ pub struct ViewUnlock {
 }
 
 impl ViewUnlock {
+    pub fn from_hardware_view_access_key(
+        view_access_key: &HardwareViewAccessKey,
+    ) -> Result<Self, VaultError> {
+        SecretKey::from_zeroizing_vec(Zeroizing::new(view_access_key.expose_secret().to_vec()))
+            .map(|view_dek| Self { view_dek })
+    }
+
     #[must_use]
     pub const fn view_dek(&self) -> &SecretKey {
         &self.view_dek
     }
 
-    pub(super) fn clone_unlock(&self) -> Self {
+    #[must_use]
+    pub fn clone_unlock(&self) -> Self {
         Self {
             view_dek: self.view_dek.clone_secret(),
         }
@@ -113,6 +121,7 @@ impl ViewUnlock {
                 status: wire.status.unwrap_or_default(),
                 display_order: wire.display_order.unwrap_or_default(),
                 hardware_descriptor: wire.hardware_descriptor,
+                hardware_account: wire.hardware_account,
             },
             missing_lifecycle_fields,
             missing_display_order,
@@ -167,6 +176,32 @@ impl ViewUnlock {
             &self.view_dek,
             RecordKind::HardwareWalletAccountIndexReservation,
             reservation_uuid,
+            record,
+        )
+    }
+
+    pub(super) fn encrypt_hardware_profile_metadata(
+        &self,
+        profile_id: &str,
+        profile: &HardwareProfileMetadata,
+    ) -> Result<EncryptedRecord, VaultError> {
+        encrypt_serialized(
+            &self.view_dek,
+            RecordKind::HardwareProfileMetadata,
+            profile_id,
+            profile,
+        )
+    }
+
+    pub(super) fn decrypt_hardware_profile_metadata(
+        &self,
+        profile_id: &str,
+        record: &EncryptedRecord,
+    ) -> Result<HardwareProfileMetadata, VaultError> {
+        decrypt_serialized(
+            &self.view_dek,
+            RecordKind::HardwareProfileMetadata,
+            profile_id,
             record,
         )
     }

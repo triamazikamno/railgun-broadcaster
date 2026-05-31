@@ -102,18 +102,18 @@ pub use http::{
     resolve_wallet_network_mode,
 };
 pub use public_wallet::{
-    PublicAccountBalance, PublicActionAttemptInfo, PublicActionCommand, PublicActionCommandKind,
-    PublicActionCommandReceiver, PublicActionCommandSender, PublicActionGasFeeQuote,
-    PublicActionGasFeeSelection, PublicActionProgressStatus, PublicActionProgressStep,
-    PublicActionProgressUpdate, PublicActionSessionEvent, PublicActionSessionEventSender,
-    PublicAssetId, PublicBalanceAmount, PublicBalanceAsset, PublicBalanceEntry,
-    PublicBalanceRefreshCoordinator, PublicBalanceSnapshot, PublicSendRequest, PublicSendResult,
-    PublicShieldRequest, estimate_public_native_action_gas_reserve,
-    public_action_replacement_bumped_fee, public_balance_assets_for_chain,
-    public_balance_refresh_interval_secs, public_native_action_gas_reserve,
-    public_native_action_gas_units, quote_public_action_gas_fee, refresh_public_balances,
-    submit_public_send, submit_public_send_with_progress, submit_public_shield,
-    submit_public_shield_with_progress,
+    HardwareTrezorPinMatrixProvider, PublicAccountBalance, PublicActionAttemptInfo,
+    PublicActionCommand, PublicActionCommandKind, PublicActionCommandReceiver,
+    PublicActionCommandSender, PublicActionGasFeeQuote, PublicActionGasFeeSelection,
+    PublicActionProgressStatus, PublicActionProgressStep, PublicActionProgressUpdate,
+    PublicActionSessionEvent, PublicActionSessionEventSender, PublicAssetId, PublicBalanceAmount,
+    PublicBalanceAsset, PublicBalanceEntry, PublicBalanceRefreshCoordinator, PublicBalanceSnapshot,
+    PublicSendRequest, PublicSendResult, PublicShieldRequest,
+    estimate_public_native_action_gas_reserve, public_action_replacement_bumped_fee,
+    public_balance_assets_for_chain, public_balance_refresh_interval_secs,
+    public_native_action_gas_reserve, public_native_action_gas_units, quote_public_action_gas_fee,
+    refresh_public_balances, submit_public_send, submit_public_send_with_progress,
+    submit_public_shield, submit_public_shield_with_progress,
 };
 use public_wallet::{VaultedPublicSigner, vaulted_public_signer};
 use utxos::apply_pending_overlay_to_outputs;

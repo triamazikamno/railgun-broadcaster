@@ -406,6 +406,15 @@ impl WalletRoot {
                 })
             }
             DeliveryMode::SelfBroadcast => {
+                #[cfg(feature = "hardware")]
+                let trezor_pin_matrix_provider = view_session
+                    .hardware_profile_session()
+                    .filter(|session| {
+                        session.device_kind == wallet_ops::hardware::HardwareDeviceKind::Trezor
+                    })
+                    .map(|_| self.trezor_pin_matrix_provider_for_operation(window, cx));
+                #[cfg(not(feature = "hardware"))]
+                let trezor_pin_matrix_provider = None;
                 let request = DesktopSendSelfBroadcastRequest {
                     chain_id,
                     effective_chain: self.effective_chain_configs.get(&chain_id).cloned(),
@@ -414,6 +423,7 @@ impl WalletRoot {
                     vault_store,
                     spend_authorization,
                     vault_password: self_broadcast_vault_password,
+                    trezor_pin_matrix_provider,
                     public_account_uuid: self_broadcast_public_account_uuid
                         .expect("self-broadcast gas payer was validated"),
                     token,
@@ -1010,6 +1020,15 @@ impl WalletRoot {
                 })
             }
             DeliveryMode::SelfBroadcast => {
+                #[cfg(feature = "hardware")]
+                let trezor_pin_matrix_provider = view_session
+                    .hardware_profile_session()
+                    .filter(|session| {
+                        session.device_kind == wallet_ops::hardware::HardwareDeviceKind::Trezor
+                    })
+                    .map(|_| self.trezor_pin_matrix_provider_for_operation(window, cx));
+                #[cfg(not(feature = "hardware"))]
+                let trezor_pin_matrix_provider = None;
                 let request = DesktopUnshieldSelfBroadcastRequest {
                     chain_id,
                     effective_chain: self.effective_chain_configs.get(&chain_id).cloned(),
@@ -1018,6 +1037,7 @@ impl WalletRoot {
                     vault_store,
                     spend_authorization,
                     vault_password: self_broadcast_vault_password,
+                    trezor_pin_matrix_provider,
                     public_account_uuid: self_broadcast_public_account_uuid
                         .expect("self-broadcast gas payer was validated"),
                     token,
@@ -1255,6 +1275,12 @@ impl WalletRoot {
                             message,
                             cx,
                         );
+                    }
+                    SelfBroadcastSessionEvent::HardwareProfileSessionRefreshed { session } => {
+                        #[cfg(feature = "hardware")]
+                        root.refresh_active_hardware_profile_session(session, cx);
+                        #[cfg(not(feature = "hardware"))]
+                        let _ = session;
                     }
                 });
             }

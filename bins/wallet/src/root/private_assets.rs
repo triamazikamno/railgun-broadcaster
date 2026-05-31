@@ -22,7 +22,8 @@ use super::chain_load::loading_summary;
 use super::public_account::render_public_address_qr_dialog_content;
 use super::{
     ChainUtxoState, PUBLIC_ADDRESS_QR_DIALOG_WIDTH, UnshieldAsset, WalletRoot, centered_message,
-    parse_address, secondary_dialog_content_width, token_display_metadata,
+    dialog_content_max_height, dialog_max_height, parse_address, scrollable_dialog_content,
+    secondary_dialog_content_width, token_display_metadata,
 };
 
 #[cfg(test)]
@@ -339,24 +340,36 @@ impl WalletRoot {
         window.close_all_dialogs(cx);
         let dialog_width =
             (window.viewport_size().width * 0.92).min(PUBLIC_ADDRESS_QR_DIALOG_WIDTH);
+        let dialog_max_height = dialog_max_height(window);
+        let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         let address_text = SharedString::from(address);
         let copy_id = SharedString::from("wallet-private-receive-address-copy");
         window.open_dialog(cx, move |dialog, _window, _cx| {
             dialog
                 .w(dialog_width)
+                .max_h(dialog_max_height)
                 .title(app_strong_text("Private receive address"))
-                .child(render_public_address_qr_dialog_content(
-                    None,
-                    address_text.clone(),
-                    None,
-                    copy_id.clone(),
-                    content_width,
+                .child(scrollable_dialog_content(
+                    content_max_height,
+                    render_public_address_qr_dialog_content(
+                        None,
+                        address_text.clone(),
+                        None,
+                        copy_id.clone(),
+                        content_width,
+                    ),
                 ))
         });
     }
 
     pub(super) fn render_private_assets_body(&self, root: &Entity<Self>) -> gpui::AnyElement {
+        if self.view_session.is_none() {
+            return centered_message(
+                "Hardware-derived private data is locked. Select a hardware wallet from the picker and unlock the matching device profile.",
+            )
+            .into_any_element();
+        }
         match self.chain_states.get(&self.selected_chain) {
             Some(ChainUtxoState::Error { message, .. }) => self
                 .render_chain_error_body(root, message.as_ref())

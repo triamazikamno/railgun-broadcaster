@@ -145,7 +145,7 @@ pub(super) fn fee_row(chain_id: u64, token: Address, fees_id: &str) -> FeeRow {
         fee: uint!(10_U256),
         signature_valid: true,
         fees_id: Arc::from(fees_id),
-        fee_expiration: SystemTime::now() + Duration::from_secs(60),
+        fee_expiration: SystemTime::now() + Duration::from_mins(1),
         available_wallets: 1,
         version: Arc::from("8.2.3"),
         relay_adapt: Address::ZERO,
@@ -212,7 +212,7 @@ pub(super) fn private_progress_state(
         self_broadcast_attempts: Vec::new(),
         self_broadcast_current_gas_fee: None,
         self_broadcast_action_error: None,
-        public_broadcaster_response_timeout: Some(Duration::from_secs(120)),
+        public_broadcaster_response_timeout: Some(Duration::from_mins(2)),
         public_broadcaster_republish_interval: Some(Duration::from_secs(5)),
         public_broadcaster_wait_started_at: None,
         task_abort_handle: None,
@@ -239,5 +239,6 @@ pub(super) fn wallet_metadata(
         status,
         display_order,
         hardware_descriptor: None,
+        hardware_account: None,
     }
 }

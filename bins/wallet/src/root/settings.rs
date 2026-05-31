@@ -52,7 +52,10 @@ use crate::assets::RailgunActionIcon;
 
 use super::WalletRoot;
 use super::startup::WalletStartupRoot;
-use super::ui_helpers::{rgb_with_alpha, secondary_dialog_content_width};
+use super::ui_helpers::{
+    dialog_content_max_height, dialog_max_height, rgb_with_alpha, scrollable_dialog_content,
+    secondary_dialog_content_width,
+};
 use super::wallet_header::ChainSelectItem;
 
 mod apply_mode;

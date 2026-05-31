@@ -95,7 +95,6 @@ fn hardware_wallet_metadata(sync_intent: HardwareWalletSyncIntent) -> vault::Wal
         parse_bip32_path("m/44'/60'/0'/0/0").expect("valid path"),
         0,
         "ledger:evm:0x1111111111111111111111111111111111111111".to_string(),
-        None,
         sync_intent,
     );
     vault::WalletMetadataBundle {
@@ -106,6 +105,7 @@ fn hardware_wallet_metadata(sync_intent: HardwareWalletSyncIntent) -> vault::Wal
         status: vault::WalletStatus::Active,
         display_order: 0,
         hardware_descriptor: Some(descriptor),
+        hardware_account: None,
     }
 }
 
@@ -154,7 +154,7 @@ fn sample_public_broadcaster_candidate(seed: u8) -> (PublicBroadcasterCandidate,
             token: address(0x33),
             fee: uint!(10_U256),
             fees_id: "fees-id".to_string(),
-            fee_expiration: SystemTime::now() + Duration::from_secs(60),
+            fee_expiration: SystemTime::now() + Duration::from_mins(1),
             reliability: 0.9,
             available_wallets: 1,
             version: "8.2.3".to_string(),
@@ -537,7 +537,7 @@ fn fee_row_with_broadcaster_seed(
         fee: U256::from(fee),
         signature_valid: true,
         fees_id: Arc::from(fees_id),
-        fee_expiration: SystemTime::now() + Duration::from_secs(60),
+        fee_expiration: SystemTime::now() + Duration::from_mins(1),
         available_wallets: 1,
         version: Arc::from("8.2.3"),
         relay_adapt: address(0x44),

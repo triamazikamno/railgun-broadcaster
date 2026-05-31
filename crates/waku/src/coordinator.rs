@@ -349,8 +349,8 @@ const fn tor_discovery_retry_delay(failures: u32) -> Duration {
     match failures {
         0 => Duration::from_secs(10),
         1 => Duration::from_secs(30),
-        2 => Duration::from_secs(60),
-        _ => Duration::from_secs(300),
+        2 => Duration::from_mins(1),
+        _ => Duration::from_mins(5),
     }
 }
 

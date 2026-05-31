@@ -25,7 +25,7 @@ use wallet_ops::{
     subscribe_prover_cache_build,
     vault::{
         BroadcasterPreferences, DesktopVaultStore, DesktopViewSession, GeneratedSeedMaterial,
-        PrivateAddressBookEntry, PublicAccountMetadata, PublicAddressBookEntry,
+        PrivateAddressBookEntry, PublicAccountMetadata, PublicAddressBookEntry, ViewUnlock,
         WalletMetadataBundle,
     },
 };
@@ -82,7 +82,7 @@ use private_action::{
     UnshieldAssetKey, UnshieldFormState,
 };
 use private_broadcaster::PrivateBroadcasterProgressState;
-use public_account::PublicAccountFormState;
+use public_account::{HardwarePublicAccountDerivationStatus, PublicAccountFormState};
 use public_action::PublicActionMode;
 use public_balances::{
     public_account_visible_balances_for_chain, public_asset_decimals, public_asset_label,
@@ -107,8 +107,8 @@ use tokens::{
     token_display_metadata,
 };
 use ui_helpers::{
-    centered_message, labeled_field, rgb_with_alpha, secondary_dialog_content_width,
-    token_label_row,
+    centered_message, dialog_content_max_height, dialog_max_height, labeled_field, rgb_with_alpha,
+    scrollable_dialog_content, secondary_dialog_content_width, token_label_row,
 };
 use utxo::{BlockedShieldRescueRowState, UtxoDelegate, should_focus_utxo_table};
 use vault::{VaultState, WalletOption, WalletSetupMode, vault_error_kind};
@@ -229,8 +229,12 @@ use utxo::{
 };
 #[cfg(test)]
 use vault::{
-    default_hardware_wallet_setup_intent, hardware_wallet_creation_result_is_current,
-    parse_hardware_wallet_restore_account_index, wallet_options_from_metadata,
+    HARDWARE_PROFILE_ADD_SUBACCOUNT_BUTTON_ID, HARDWARE_PROFILE_RECOVER_EXACT_BUTTON_ID,
+    HARDWARE_PROFILE_RECOVER_RANGE_BUTTON_ID, default_hardware_wallet_setup_intent,
+    hardware_profile_label_warning, hardware_wallet_creation_result_is_current,
+    parse_hardware_exact_recovery_index, parse_hardware_recovery_range,
+    parse_hardware_wallet_restore_account_index, trezor_passphrase_mode_copy,
+    wallet_options_from_metadata,
 };
 #[cfg(test)]
 use vault_ui::should_show_pre_unlock_settings_action;
@@ -286,6 +290,7 @@ pub(crate) struct WalletRoot {
     unlock_in_progress: bool,
     repair_cache_error: Option<Arc<str>>,
     setup_password: Option<Zeroizing<String>>,
+    vault_view_unlock: Option<Arc<ViewUnlock>>,
     spend_authorization_cache: Option<SpendAuthorizationCache>,
     spend_authorization_lifetime: SpendAuthorizationLifetime,
     view_session: Option<Arc<DesktopViewSession>>,
@@ -295,6 +300,22 @@ pub(crate) struct WalletRoot {
     hardware_wallet_creation_intent: Option<HardwareWalletSyncIntent>,
     hardware_wallet_restore_account_index_input: Entity<InputState>,
     hardware_wallet_restore_account_index_set: bool,
+    #[cfg(feature = "hardware")]
+    hardware_profile_unlock: vault::HardwareProfileUnlockState,
+    #[cfg(feature = "hardware")]
+    active_hardware_profile: Option<wallet_ops::vault::HardwareProfileMetadata>,
+    #[cfg(feature = "hardware")]
+    hardware_profile_password_input: Entity<InputState>,
+    #[cfg(feature = "hardware")]
+    hardware_profile_label_input: Entity<InputState>,
+    #[cfg(feature = "hardware")]
+    hardware_profile_recovery_start_input: Entity<InputState>,
+    #[cfg(feature = "hardware")]
+    hardware_profile_recovery_count_input: Entity<InputState>,
+    #[cfg(feature = "hardware")]
+    hardware_profile_exact_index_input: Entity<InputState>,
+    #[cfg(feature = "hardware")]
+    trezor_app_passphrase_input: Entity<InputState>,
     http: HttpContext,
     network_health: WalletNetworkHealth,
     waku_worker_shutdown: watch::Sender<bool>,
@@ -595,6 +616,18 @@ impl WalletRoot {
         let add_wallet_password_input = new_masked_input(window, cx, "vault password");
         let hardware_wallet_restore_account_index_input =
             new_text_input(window, cx, "optional restore account index");
+        #[cfg(feature = "hardware")]
+        let hardware_profile_password_input = new_masked_input(window, cx, "vault password");
+        #[cfg(feature = "hardware")]
+        let hardware_profile_label_input = new_text_input(window, cx, "hardware profile label");
+        #[cfg(feature = "hardware")]
+        let hardware_profile_recovery_start_input = new_text_input(window, cx, "start index");
+        #[cfg(feature = "hardware")]
+        let hardware_profile_recovery_count_input = new_text_input(window, cx, "count");
+        #[cfg(feature = "hardware")]
+        let hardware_profile_exact_index_input = new_text_input(window, cx, "account index");
+        #[cfg(feature = "hardware")]
+        let trezor_app_passphrase_input = new_masked_input(window, cx, "Trezor passphrase");
         let import_mnemonic_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .auto_grow(3, 6)
@@ -656,6 +689,8 @@ impl WalletRoot {
             send_error: None,
             shield_error: None,
             adding_account: false,
+            hardware_derivation_status: HardwarePublicAccountDerivationStatus::Idle,
+            hardware_confirmation_address: None,
             importing_account: false,
             sending: false,
             shielding: false,
@@ -738,6 +773,7 @@ impl WalletRoot {
             unlock_in_progress: false,
             repair_cache_error: None,
             setup_password: None,
+            vault_view_unlock: None,
             spend_authorization_cache: None,
             spend_authorization_lifetime: SpendAuthorizationLifetime::Once,
             view_session: None,
@@ -745,9 +781,24 @@ impl WalletRoot {
             hardware_wallet_creation_in_progress: false,
             hardware_wallet_creation_generation: 0,
             hardware_wallet_creation_intent: None,
-            hardware_wallet_restore_account_index_input:
-                hardware_wallet_restore_account_index_input.clone(),
+            hardware_wallet_restore_account_index_input,
             hardware_wallet_restore_account_index_set: false,
+            #[cfg(feature = "hardware")]
+            hardware_profile_unlock: vault::HardwareProfileUnlockState::default(),
+            #[cfg(feature = "hardware")]
+            active_hardware_profile: None,
+            #[cfg(feature = "hardware")]
+            hardware_profile_password_input,
+            #[cfg(feature = "hardware")]
+            hardware_profile_label_input,
+            #[cfg(feature = "hardware")]
+            hardware_profile_recovery_start_input,
+            #[cfg(feature = "hardware")]
+            hardware_profile_recovery_count_input,
+            #[cfg(feature = "hardware")]
+            hardware_profile_exact_index_input,
+            #[cfg(feature = "hardware")]
+            trezor_app_passphrase_input,
             http,
             network_health,
             waku_worker_shutdown,
@@ -1015,6 +1066,48 @@ impl WalletRoot {
             },
         )
         .detach();
+        #[cfg(feature = "hardware")]
+        {
+            cx.subscribe_in(
+                &root.hardware_profile_password_input,
+                window,
+                |this, _input, event: &InputEvent, window, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. }) {
+                        this.unlock_hardware_profile_from_dialog(window, cx);
+                    }
+                },
+            )
+            .detach();
+            for input in [
+                root.hardware_profile_label_input.clone(),
+                root.hardware_profile_recovery_start_input.clone(),
+                root.hardware_profile_recovery_count_input.clone(),
+                root.hardware_profile_exact_index_input.clone(),
+            ] {
+                cx.subscribe(&input, |this, _input, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        this.hardware_profile_unlock.error = None;
+                        cx.notify();
+                    }
+                })
+                .detach();
+            }
+            cx.subscribe_in(
+                &root.trezor_app_passphrase_input,
+                window,
+                |this, _input, event: &InputEvent, window, cx| match event {
+                    InputEvent::PressEnter { .. } => {
+                        this.submit_trezor_profile_passphrase_input(window, cx);
+                    }
+                    InputEvent::Change => {
+                        this.hardware_profile_unlock.error = None;
+                        cx.notify();
+                    }
+                    _ => {}
+                },
+            )
+            .detach();
+        }
         cx.subscribe(
             &root.repair_cache_block_input,
             |this, _input, event: &InputEvent, cx| {

@@ -30,6 +30,10 @@ use super::{
 };
 
 const BROADCASTER_PICKER_LIVE_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
+const BROADCASTER_PICKER_DIALOG_CHROME_HEIGHT: Pixels = px(210.0);
+pub(super) const BROADCASTER_PICKER_ROW_HEIGHT: Pixels = px(64.0);
+pub(super) const BROADCASTER_PICKER_LIST_PADDING_HEIGHT: Pixels = px(16.0);
+const BROADCASTER_PICKER_MIN_LIST_HEIGHT: Pixels = px(120.0);
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(super) enum BroadcasterChoice {
@@ -43,7 +47,7 @@ pub(super) enum BroadcasterChoice {
 pub(super) struct BroadcasterPickerState {
     pub(super) kind: DeliveryFormKind,
     pub(super) key: UnshieldAssetKey,
-    pub(super) query_input: Entity<gpui_component::input::InputState>,
+    pub(super) query_input: Entity<InputState>,
     pub(super) list: Entity<ListState<BroadcasterPickerDelegate>>,
     pub(super) fee_bonus_popover_open: bool,
 }
@@ -67,7 +71,7 @@ pub(super) struct BroadcasterPickerContent {
 }
 
 pub(super) struct BroadcasterPickerDialogSnapshot {
-    pub(super) query_input: Entity<gpui_component::input::InputState>,
+    pub(super) query_input: Entity<InputState>,
     pub(super) list: Entity<ListState<BroadcasterPickerDelegate>>,
     pub(super) rows: Vec<BroadcasterPickerRow>,
     pub(super) empty_message: SharedString,
@@ -322,8 +326,7 @@ impl WalletRoot {
         let root = cx.entity();
         window.open_dialog(cx, move |dialog, window, cx| {
             let dialog_width = (window.viewport_size().width * 0.92).min(PRIVATE_ASSET_LIST_WIDTH);
-            let max_height =
-                (window.viewport_size().height * 0.82).min(BROADCASTER_PICKER_MAX_HEIGHT);
+            let max_height = broadcaster_picker_dialog_height(window);
             let close_root = root.clone();
             let content_root = root.clone();
             dialog
@@ -437,7 +440,6 @@ impl WalletRoot {
             .filter(|candidate| broadcaster_candidate_matches_query(candidate, &query))
             .collect();
         let filtered_count = candidates.len();
-        let list_height = (window.viewport_size().height * 0.52).min(px(440.0));
         let empty_message = SharedString::from(if total_count == 0 {
             "No eligible broadcaster currently advertises this token."
         } else {
@@ -460,6 +462,8 @@ impl WalletRoot {
                 ),
             })
             .collect::<Vec<_>>();
+        let list_height =
+            broadcaster_picker_list_height(rows.len(), broadcaster_picker_dialog_height(window));
         Some(BroadcasterPickerDialogSnapshot {
             query_input: picker.query_input.clone(),
             list: picker.list.clone(),
@@ -476,6 +480,23 @@ impl WalletRoot {
             key: picker.key,
         })
     }
+}
+
+fn broadcaster_picker_dialog_height(window: &Window) -> Pixels {
+    (window.viewport_size().height * 0.82).min(BROADCASTER_PICKER_MAX_HEIGHT)
+}
+
+fn broadcaster_picker_list_height(row_count: usize, dialog_height: Pixels) -> Pixels {
+    let target_height = (dialog_height - BROADCASTER_PICKER_DIALOG_CHROME_HEIGHT).max(px(0.0));
+    broadcaster_picker_list_content_height(row_count)
+        .max(BROADCASTER_PICKER_MIN_LIST_HEIGHT)
+        .min(target_height)
+}
+
+fn broadcaster_picker_list_content_height(row_count: usize) -> Pixels {
+    (0..row_count).fold(BROADCASTER_PICKER_LIST_PADDING_HEIGHT, |height, _row| {
+        height + BROADCASTER_PICKER_ROW_HEIGHT
+    })
 }
 
 impl ListDelegate for BroadcasterPickerDelegate {
@@ -503,7 +524,7 @@ impl ListDelegate for BroadcasterPickerDelegate {
                 "broadcaster-picker-list-row-{}",
                 stable_broadcaster_element_suffix(&row.railgun_address)
             )))
-            .h(px(64.0))
+            .h(BROADCASTER_PICKER_ROW_HEIGHT)
             .px(px(12.0))
             .py(px(0.0))
             .rounded_md()
@@ -713,7 +734,7 @@ pub(super) fn broadcaster_candidate_matches_query(
 
 pub(super) fn render_broadcaster_picker_header(
     root: &Entity<WalletRoot>,
-    query_input: &Entity<gpui_component::input::InputState>,
+    query_input: &Entity<InputState>,
     filtered_count: usize,
     total_count: usize,
     fee_bonus_popover_open: bool,
