@@ -160,7 +160,7 @@ async fn main() -> Result<()> {
             .update_prices()
             .await
             .wrap_err(eyre!("update prices failed for chain={chain_id}"))?;
-        info!(address=%service.addr(), chain_id, "spawning workers");
+        info!(address=%service.advertised_addr(), chain_id, "spawning workers");
         service.spawn_fees_publisher();
         service.spawn_tx_submitter();
         service.spawn_fee_note_assurance_worker();

@@ -56,9 +56,10 @@ chains:
     # Optional identifier for this broadcaster. Wallets may or may not display it.
     identifier: rust-broadcaster
 
-    # Advertise a chain-scoped 0zk address in fee announcements instead of the default all-chains address.
-    # Fee notes still route to the same underlying RAILGUN keys.
-    chain_scoped_railgun_address: false
+    # Optional advertised 0zk address scope. Defaults to !AllChains.
+    # !Evm uses one stable EVM-scoped address across EVM chains.
+    # !Chain uses a chain-specific address for this chain_id.
+    #advertised_railgun_address_scope: !Evm
 
     # RPC endpoints for querying the chain
     query_rpcs:
