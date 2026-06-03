@@ -4,15 +4,8 @@ members = [
     "bins/db-cli",
     "bins/poi-indexer",
     "bins/vanity-address",
-    "bins/wallet",
     "crates/config",
     "crates/fees",
-    "crates/ui",
-    "crates/wallet-ops",
-    "crates/railgun-ui",
-    "crates/broadcaster-monitor",
-    "crates/broadcaster-monitor-waku",
-    "crates/broadcaster-monitor-gpui",
     "crates/poi-indexer-core",
     "crates/tx-submit",
     "crates/service",
@@ -24,44 +17,20 @@ edition = "2024"
 rust-version = "1.91"
 
 [workspace.dependencies]
-aes = "0.8"
-aes-gcm = "0.10"
 alloy = { version = "2", features = ["serde", "signer-mnemonic"] }
-alloy-provider = "2"
 alloy-rpc-types-eth = "2"
-alloy-transport = "2"
-ark-bn254 = "0.6"
-ark-ed-on-bn254 = "0.6"
-ark-ff = "0.6"
-ark-groth16 = "0.6"
-argon2 = "0.5"
+async-trait = "0.1"
 axum = "0.8"
-base64 = "0.22"
 bech32 = "0.11"
-chacha20poly1305 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-coins-ledger = "0.13"
-curve25519-dalek = "4"
 ed25519-dalek = "2"
 eyre = "0.6"
 getrandom = "0.4"
-gpui = "=0.2.2"
-gpui-component = "=0.5.1"
-gpui-component-assets = "=0.5.1"
 hex = "0.4"
-hidapi-rusb = "1.3"
-hkdf = "0.13"
-hmac = "0.13"
-humantime = "2"
 humantime-serde = "1"
-k256 = { version = "0.13", features = ["ecdsa"] }
 libp2p = "0.56"
-lru = "0.18"
-parking_lot = "0.12"
-qrcodegen = "1.8"
 rand = "0.10"
 redb = "4.1"
-protobuf = "=3.7.2"
 reqwest = { version = "0.13", features = ["socks", "gzip", "deflate", "brotli", "json"] }
 rmp-serde = "1.3"
 ruint = { version = "1.17", features = ["num-bigint"] }
@@ -71,27 +40,17 @@ sha2 = "0.11"
 structopt = "0.3"
 thiserror = "2"
 tokio = "1"
-trezor-client = { version = "=0.1.5", default-features = false, features = ["ethereum"] }
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = "0.3"
 url = "2"
-bytes = { version = "1.11" }
-byteorder = "1"
-rayon = { version = "1.11" }
-async-trait = "0.1"
-zeroize = { version = "1", features = ["derive"] }
-arti-client = "0.42"
-tor-rtcompat = "0.42"
 
 broadcaster-core = { git = "https://github.com/triamazikamno/railgun-rust", rev = "4e53ac2444f6eb1728a494c469503b33b53040d6" }
 local-db = { git = "https://github.com/triamazikamno/railgun-rust", rev = "4e53ac2444f6eb1728a494c469503b33b53040d6" }
-merkletree = { git = "https://github.com/triamazikamno/railgun-rust", rev = "4e53ac2444f6eb1728a494c469503b33b53040d6" }
 poi = { git = "https://github.com/triamazikamno/railgun-rust", rev = "4e53ac2444f6eb1728a494c469503b33b53040d6" }
 public-broadcaster-protocol = { git = "https://github.com/triamazikamno/railgun-rust", rev = "4e53ac2444f6eb1728a494c469503b33b53040d6" }
 railgun-wallet = { git = "https://github.com/triamazikamno/railgun-rust", rev = "4e53ac2444f6eb1728a494c469503b33b53040d6" }
 sync-service = { git = "https://github.com/triamazikamno/railgun-rust", rev = "4e53ac2444f6eb1728a494c469503b33b53040d6" }
-waku = { git = "https://github.com/triamazikamno/railgun-rust", rev = "4e53ac2444f6eb1728a494c469503b33b53040d6" }
 waku-relay = { git = "https://github.com/triamazikamno/railgun-rust", rev = "4e53ac2444f6eb1728a494c469503b33b53040d6" }
 
 #[patch.crates-io]
