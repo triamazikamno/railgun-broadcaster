@@ -182,8 +182,7 @@ use public_action::{
 };
 #[cfg(test)]
 use public_balances::{
-    merge_public_balance_snapshot, public_asset_icon_path, public_balance_entry_for_chain,
-    public_balance_usd_label,
+    merge_public_balance_snapshot, public_asset_icon_path, public_balance_usd_label,
 };
 #[cfg(test)]
 use public_broadcaster::{

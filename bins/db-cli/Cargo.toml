@@ -13,4 +13,4 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 structopt = { workspace = true }
 
-local-db = { path = "../../crates/local-db" }
+local-db = { workspace = true }

@@ -7,12 +7,12 @@ rust-version.workspace = true
 [dependencies]
 broadcaster-monitor = { path = "../broadcaster-monitor" }
 eyre = { workspace = true }
-public-broadcaster-protocol = { path = "../public-broadcaster-protocol" }
+public-broadcaster-protocol = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "macros", "rt"] }
 tracing = { workspace = true }
-waku = { path = "../waku" }
-waku-relay = { path = "../waku-relay" }
+waku = { workspace = true }
+waku-relay = { workspace = true }
 
 [dev-dependencies]
 alloy = { workspace = true }

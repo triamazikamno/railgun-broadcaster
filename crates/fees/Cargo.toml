@@ -13,8 +13,8 @@ ruint = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 config = { path = "../config" }
-broadcaster-core = { path = "../core" }
-public-broadcaster-protocol = { path = "../public-broadcaster-protocol" }
+broadcaster-core = { workspace = true }
+public-broadcaster-protocol = { workspace = true }
 
 [lints]
 workspace = true

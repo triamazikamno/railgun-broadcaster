@@ -26,8 +26,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
-broadcaster-core = { path = "../core" }
-poi = { path = "../poi" }
+poi = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }

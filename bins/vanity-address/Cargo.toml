@@ -14,7 +14,7 @@ eyre = { workspace = true }
 getrandom = { workspace = true }
 structopt = { workspace = true }
 
-railgun-wallet = { path = "../../crates/railgun-wallet" }
+railgun-wallet = { workspace = true }
 
 [lints]
 workspace = true

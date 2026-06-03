@@ -6,23 +6,14 @@ members = [
     "bins/vanity-address",
     "bins/wallet",
     "crates/config",
-    "crates/core",
     "crates/fees",
-    "crates/public-broadcaster-protocol",
-    "crates/local-db",
     "crates/ui",
     "crates/wallet-ops",
     "crates/railgun-ui",
     "crates/broadcaster-monitor",
     "crates/broadcaster-monitor-waku",
     "crates/broadcaster-monitor-gpui",
-    "crates/railgun-wallet",
-    "crates/merkletree",
-    "crates/poi",
     "crates/poi-indexer-core",
-    "crates/sync-service",
-    "crates/waku",
-    "crates/waku-relay",
     "crates/tx-submit",
     "crates/service",
 ]
@@ -92,6 +83,16 @@ async-trait = "0.1"
 zeroize = { version = "1", features = ["derive"] }
 arti-client = "0.42"
 tor-rtcompat = "0.42"
+
+broadcaster-core = { git = "https://github.com/triamazikamno/railgun-rust", rev = "4e53ac2444f6eb1728a494c469503b33b53040d6" }
+local-db = { git = "https://github.com/triamazikamno/railgun-rust", rev = "4e53ac2444f6eb1728a494c469503b33b53040d6" }
+merkletree = { git = "https://github.com/triamazikamno/railgun-rust", rev = "4e53ac2444f6eb1728a494c469503b33b53040d6" }
+poi = { git = "https://github.com/triamazikamno/railgun-rust", rev = "4e53ac2444f6eb1728a494c469503b33b53040d6" }
+public-broadcaster-protocol = { git = "https://github.com/triamazikamno/railgun-rust", rev = "4e53ac2444f6eb1728a494c469503b33b53040d6" }
+railgun-wallet = { git = "https://github.com/triamazikamno/railgun-rust", rev = "4e53ac2444f6eb1728a494c469503b33b53040d6" }
+sync-service = { git = "https://github.com/triamazikamno/railgun-rust", rev = "4e53ac2444f6eb1728a494c469503b33b53040d6" }
+waku = { git = "https://github.com/triamazikamno/railgun-rust", rev = "4e53ac2444f6eb1728a494c469503b33b53040d6" }
+waku-relay = { git = "https://github.com/triamazikamno/railgun-rust", rev = "4e53ac2444f6eb1728a494c469503b33b53040d6" }
 
 #[patch.crates-io]
 #wasmer-vm = { git = "https://github.com/triamazikamno/wasmer", rev = "d94b171d85bb5ff2aa7c4954a1921c9fb482be0c" }

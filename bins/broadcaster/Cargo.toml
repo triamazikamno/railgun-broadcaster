@@ -18,13 +18,10 @@ tracing-logfmt = { version = "0.3" }
 axum = { workspace = true }
 
 config = { path = "../../crates/config" }
-broadcaster-core = { path = "../../crates/core" }
-poi = { path = "../../crates/poi" }
-fees = { path = "../../crates/fees" }
-waku-relay = { path = "../../crates/waku-relay" }
-waku = { path = "../../crates/waku" }
+broadcaster-core = { workspace = true }
+poi = { workspace = true }
+waku-relay = { workspace = true }
 broadcaster-service = { path = "../../crates/service" }
-railgun-wallet = { path = "../../crates/railgun-wallet" }
-sync-service = { path = "../../crates/sync-service" }
-local-db = { path = "../../crates/local-db" }
-merkletree = { path = "../../crates/merkletree" }
+railgun-wallet = { workspace = true }
+sync-service = { workspace = true }
+local-db = { workspace = true }
