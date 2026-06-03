@@ -108,7 +108,7 @@ impl UtxoConsolidationService {
 
         let utxos = unspent_utxos(&self.wallet_handle).await;
         if utxos.is_empty() {
-            warn!("no unspent utxos available for utxo consolidation");
+            debug!("no unspent utxos available for utxo consolidation");
             return;
         }
 
