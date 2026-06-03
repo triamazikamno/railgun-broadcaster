@@ -23,6 +23,25 @@ const CACHE_SIZE: NonZeroUsize = match NonZeroUsize::new(500) {
     None => panic!("cache size must be non-zero"),
 };
 
+#[derive(Debug, Clone, Default)]
+pub struct ClientConfig {
+    pub nwaku_url: Option<String>,
+    pub shard_id: Option<u32>,
+    pub direct_peers: Vec<AdditionalPeer>,
+    pub dns_enr_trees: Option<Vec<String>>,
+    pub doh_endpoint: Option<String>,
+    pub doh_fallback_endpoints: Option<Vec<String>>,
+    pub cluster_id: Option<u32>,
+    pub max_peers: Option<usize>,
+    pub peer_connection_timeout: Option<Duration>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdditionalPeer {
+    pub peer_id: String,
+    pub addrs: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum RelayNetworkMode {
     Direct,
@@ -149,12 +168,12 @@ impl Drop for Client {
 }
 
 impl Client {
-    pub fn new(cfg: &config::Waku) -> Result<Self, ClientError> {
+    pub fn new(cfg: &ClientConfig) -> Result<Self, ClientError> {
         Self::new_with_network(cfg, RelayNetworkConfig::direct())
     }
 
     pub fn new_with_network(
-        cfg: &config::Waku,
+        cfg: &ClientConfig,
         network: RelayNetworkConfig,
     ) -> Result<Self, ClientError> {
         let RelayNetworkConfig {
@@ -211,7 +230,7 @@ impl Client {
         })
     }
 
-    fn build_waku_config(cfg: &config::Waku) -> WakuConfig {
+    fn build_waku_config(cfg: &ClientConfig) -> WakuConfig {
         let mut config = WakuConfig::default();
         if let Some(dns_enr_trees) = &cfg.dns_enr_trees {
             config.discovery.enr_trees.clone_from(dns_enr_trees);
@@ -231,7 +250,7 @@ impl Client {
             config.node.connection_cap = max_peers;
         }
         if let Some(request_timeout) = cfg.peer_connection_timeout {
-            config.node.request_timeout = request_timeout.into_inner();
+            config.node.request_timeout = request_timeout;
         }
         config
     }
@@ -656,11 +675,11 @@ fn is_fee_content_topic(topic: &str) -> bool {
     matches!(ContentTopic::parse(topic), ContentTopic::Fees(_))
 }
 
-fn configured_cluster_id(cfg: &config::Waku) -> u32 {
+fn configured_cluster_id(cfg: &ClientConfig) -> u32 {
     cfg.cluster_id.unwrap_or(DEFAULT_CLUSTER_ID)
 }
 
-fn configured_shard_id(cfg: &config::Waku) -> u32 {
+fn configured_shard_id(cfg: &ClientConfig) -> u32 {
     cfg.shard_id.unwrap_or(DEFAULT_SHARD_ID)
 }
 
@@ -683,9 +702,9 @@ fn add_tor_doh_fallback(config: &mut WakuConfig, fallback_endpoints_configured: 
 #[cfg(test)]
 mod tests {
     use super::{
-        CACHE_SIZE, Client, DEFAULT_CLUSTER_ID, DEFAULT_SHARD_ID, RelayMessageOutcome,
-        add_tor_doh_fallback, handle_relay_message, is_fee_content_topic, relay_shard_pubsub_path,
-        relay_sink_is_closed, wait_for_relay_sink_closed,
+        CACHE_SIZE, Client, ClientConfig, DEFAULT_CLUSTER_ID, DEFAULT_SHARD_ID,
+        RelayMessageOutcome, add_tor_doh_fallback, handle_relay_message, is_fee_content_topic,
+        relay_shard_pubsub_path, relay_sink_is_closed, wait_for_relay_sink_closed,
     };
     use lru::LruCache;
     use std::sync::Arc;
@@ -745,8 +764,8 @@ mod tests {
     }
 
     #[test]
-    fn waku_config_from_config_applies_schema_fields() {
-        let cfg = config::Waku {
+    fn waku_client_config_applies_schema_fields() {
+        let cfg = ClientConfig {
             nwaku_url: None,
             shard_id: Some(3),
             direct_peers: Vec::new(),
@@ -757,7 +776,7 @@ mod tests {
             ]),
             cluster_id: Some(7),
             max_peers: Some(42),
-            peer_connection_timeout: None,
+            peer_connection_timeout: Some(Duration::from_secs(7)),
         };
 
         let waku = super::Client::build_waku_config(&cfg);
@@ -774,11 +793,12 @@ mod tests {
             vec!["https://fallback.example.invalid/dns-query".to_string()]
         );
         assert_eq!(waku.node.connection_cap, 42);
+        assert_eq!(waku.node.request_timeout, Duration::from_secs(7));
     }
 
     #[test]
-    fn waku_config_from_config_uses_relay_defaults() {
-        let cfg = config::Waku {
+    fn waku_client_config_uses_relay_defaults() {
+        let cfg = ClientConfig {
             nwaku_url: None,
             shard_id: None,
             direct_peers: Vec::new(),
@@ -822,7 +842,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_drop_shuts_down_embedded_waku_node() {
-        let cfg = config::Waku {
+        let cfg = ClientConfig {
             nwaku_url: None,
             shard_id: None,
             direct_peers: Vec::new(),

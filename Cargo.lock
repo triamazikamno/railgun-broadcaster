@@ -2669,11 +2669,9 @@ version = "0.1.0"
 dependencies = [
  "alloy",
  "broadcaster-monitor",
- "config",
  "eyre",
- "fees",
- "humantime-serde",
  "libp2p",
+ "public-broadcaster-protocol",
  "reqwest 0.13.4",
  "serde_json",
  "tokio",
@@ -5163,12 +5161,10 @@ dependencies = [
  "alloy",
  "broadcaster-core",
  "config",
- "ed25519-dalek",
  "moka",
+ "public-broadcaster-protocol",
  "rand 0.10.1",
  "ruint",
- "serde",
- "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -10212,6 +10208,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "public-broadcaster-protocol"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "broadcaster-core",
+ "ed25519-dalek",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -15515,7 +15523,6 @@ version = "0.1.0"
 dependencies = [
  "alloy",
  "base64 0.22.1",
- "config",
  "lru 0.18.0",
  "reqwest 0.13.4",
  "serde",

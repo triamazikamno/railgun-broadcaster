@@ -2,11 +2,14 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use eyre::{Result, WrapErr};
+use public_broadcaster_protocol::Payload as FeePayload;
 use tokio::sync::{mpsc, watch};
 use waku::PeerSnapshot;
 use waku::proto::WakuMessage;
 pub use waku::{DEFAULT_CLEARNET_DOH_ENDPOINT as DEFAULT_DOH_ENDPOINT, DEFAULT_TOR_DOH_ENDPOINT};
-use waku_relay::client::{Client, RelayNetworkConfig, RelayNetworkMode};
+use waku_relay::client::{
+    AdditionalPeer, Client, ClientConfig, RelayNetworkConfig, RelayNetworkMode,
+};
 pub use waku_relay::client::{DEFAULT_CLUSTER_ID, DEFAULT_SHARD_ID};
 use waku_relay::msg::ContentTopic;
 
@@ -37,10 +40,10 @@ pub struct WakuMonitorDirectPeer {
 }
 
 impl WakuMonitorConfig {
-    /// Build a `config::Waku` from explicit monitor settings. The standalone
+    /// Build a Waku relay client config from explicit monitor settings. The standalone
     /// wallet monitor fills these from the active wallet network context.
     #[must_use]
-    pub fn to_waku_config(&self) -> config::Waku {
+    pub fn to_waku_config(&self) -> ClientConfig {
         let doh = self
             .doh_endpoint
             .clone()
@@ -49,7 +52,7 @@ impl WakuMonitorConfig {
             .peer_connection_timeout
             .unwrap_or_else(|| Duration::from_secs(DEFAULT_PEER_CONNECTION_TIMEOUT_SECS));
 
-        config::Waku {
+        ClientConfig {
             nwaku_url: self.nwaku_url.clone(),
             direct_peers: grouped_direct_peers(&self.direct_peers),
             dns_enr_trees: self.dns_enr_trees.clone(),
@@ -58,7 +61,7 @@ impl WakuMonitorConfig {
             cluster_id: Some(self.cluster_id.unwrap_or(DEFAULT_CLUSTER_ID)),
             shard_id: Some(self.shard_id.unwrap_or(DEFAULT_SHARD_ID)),
             max_peers: Some(self.max_peers.unwrap_or(DEFAULT_MAX_PEERS)),
-            peer_connection_timeout: Some(humantime_serde::Serde::from(timeout)),
+            peer_connection_timeout: Some(timeout),
         }
     }
 
@@ -71,8 +74,8 @@ impl WakuMonitorConfig {
     }
 }
 
-fn grouped_direct_peers(peers: &[WakuMonitorDirectPeer]) -> Vec<config::AdditionalWakuPeer> {
-    let mut grouped: Vec<config::AdditionalWakuPeer> = Vec::new();
+fn grouped_direct_peers(peers: &[WakuMonitorDirectPeer]) -> Vec<AdditionalPeer> {
+    let mut grouped: Vec<AdditionalPeer> = Vec::new();
     for peer in peers {
         if let Some(existing) = grouped
             .iter_mut()
@@ -82,7 +85,7 @@ fn grouped_direct_peers(peers: &[WakuMonitorDirectPeer]) -> Vec<config::Addition
                 existing.addrs.push(peer.addr.clone());
             }
         } else {
-            grouped.push(config::AdditionalWakuPeer {
+            grouped.push(AdditionalPeer {
                 peer_id: peer.peer_id.clone(),
                 addrs: vec![peer.addr.clone()],
             });
@@ -234,7 +237,7 @@ pub fn handle_fees_message(
     shared: &Shared,
     events: &EventTx,
 ) -> usize {
-    let payload: fees::Payload = match serde_json::from_slice(payload) {
+    let payload: FeePayload = match serde_json::from_slice(payload) {
         Ok(p) => p,
         Err(error) => {
             tracing::warn!(%error, chain_id, "failed to decode fees envelope");
@@ -392,6 +395,7 @@ mod tests {
     use alloy::primitives::address;
     use alloy::uint;
     use broadcaster_monitor::{event_channel, shared};
+    use public_broadcaster_protocol::Body as FeeBody;
 
     #[test]
     fn extract_fees_chain_id_matches_valid_topic() {
@@ -443,8 +447,7 @@ mod tests {
         assert_eq!(cfg.doh_endpoint.as_deref(), Some(DEFAULT_DOH_ENDPOINT));
         assert!(cfg.doh_fallback_endpoints.is_none());
         assert_eq!(
-            cfg.peer_connection_timeout
-                .map(humantime_serde::Serde::into_inner),
+            cfg.peer_connection_timeout,
             Some(Duration::from_secs(DEFAULT_PEER_CONNECTION_TIMEOUT_SECS))
         );
         assert!(cfg.direct_peers.is_empty());
@@ -511,11 +514,7 @@ mod tests {
             cfg.doh_fallback_endpoints.as_deref(),
             Some(["https://fallback.example.invalid/dns-query".to_string()].as_slice())
         );
-        assert_eq!(
-            cfg.peer_connection_timeout
-                .map(humantime_serde::Serde::into_inner),
-            Some(Duration::from_secs(3))
-        );
+        assert_eq!(cfg.peer_connection_timeout, Some(Duration::from_secs(3)));
         assert_eq!(cfg.nwaku_url.as_deref(), Some("http://127.0.0.1:8645"));
     }
 
@@ -581,7 +580,7 @@ mod tests {
         let token = address!("0000000000000000000000000000000000000001");
         let relay_adapt = address!("0000000000000000000000000000000000000002");
         let relay_adapt_7702 = address!("0000000000000000000000000000000000000003");
-        let body = fees::Body {
+        let body = FeeBody {
             fees: HashMap::from([(token, uint!(42_U256))]),
             fee_expiration: 1_900_000_000_000,
             fees_id: "fees-id".to_string(),
@@ -594,7 +593,7 @@ mod tests {
             reliability: 0.91,
             identifier: Some("broadcaster-one".to_string()),
         };
-        let payload = fees::Payload {
+        let payload = FeePayload {
             data: serde_json::to_vec(&body).expect("serialize fees body"),
             signature: vec![0; 64],
         };

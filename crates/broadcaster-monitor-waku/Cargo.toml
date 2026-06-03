@@ -6,10 +6,8 @@ rust-version.workspace = true
 
 [dependencies]
 broadcaster-monitor = { path = "../broadcaster-monitor" }
-config = { path = "../config" }
 eyre = { workspace = true }
-fees = { path = "../fees" }
-humantime-serde = { workspace = true }
+public-broadcaster-protocol = { path = "../public-broadcaster-protocol" }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "macros", "rt"] }
 tracing = { workspace = true }

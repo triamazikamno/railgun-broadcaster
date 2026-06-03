@@ -8,6 +8,7 @@ members = [
     "crates/config",
     "crates/core",
     "crates/fees",
+    "crates/public-broadcaster-protocol",
     "crates/local-db",
     "crates/ui",
     "crates/wallet-ops",

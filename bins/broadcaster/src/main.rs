@@ -19,7 +19,7 @@ use tracing::{Instrument, error, info};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
-use waku_relay::client::Client;
+use waku_relay::client::{AdditionalPeer, Client, ClientConfig};
 
 #[derive(StructOpt)]
 #[structopt(name = "main")]
@@ -33,6 +33,29 @@ struct Options {
 }
 
 const DEFAULT_DEBUG_LEVEL: &str = "info,railgun=debug,waku_relay=debug,broadcaster_service=debug";
+
+fn waku_client_config(cfg: &config::Waku) -> ClientConfig {
+    ClientConfig {
+        nwaku_url: cfg.nwaku_url.clone(),
+        shard_id: cfg.shard_id,
+        direct_peers: cfg
+            .direct_peers
+            .iter()
+            .map(|peer| AdditionalPeer {
+                peer_id: peer.peer_id.clone(),
+                addrs: peer.addrs.clone(),
+            })
+            .collect(),
+        dns_enr_trees: cfg.dns_enr_trees.clone(),
+        doh_endpoint: cfg.doh_endpoint.clone(),
+        doh_fallback_endpoints: cfg.doh_fallback_endpoints.clone(),
+        cluster_id: cfg.cluster_id,
+        max_peers: cfg.max_peers,
+        peer_connection_timeout: cfg
+            .peer_connection_timeout
+            .map(|timeout| timeout.into_inner()),
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -132,7 +155,8 @@ async fn main() -> Result<()> {
     ));
     let poi_recovery_prover = Arc::new(ProverService::new_with_db(artifact_source, db.clone()));
 
-    let waku_client = Arc::new(Client::new(&cfg.waku).wrap_err("create waku relay client")?);
+    let waku_client =
+        Arc::new(Client::new(&waku_client_config(&cfg.waku)).wrap_err("create waku relay client")?);
     let snark_prover = Arc::new(Prover::new().await.wrap_err("create snark prover")?);
 
     let poi_verifier = cfg.poi_rpc.as_ref().map(|poi_rpc| {
