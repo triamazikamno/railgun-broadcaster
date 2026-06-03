@@ -2,103 +2,19 @@ use alloy::primitives::{Address, U256};
 use alloy::providers::{CallItem, Provider};
 use alloy::sol;
 use alloy::sol_types::SolCall;
-use broadcaster_core::crypto::railgun;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
-use broadcaster_core::serde_helpers;
 use broadcaster_core::transact::ParsedTransactCalldata;
 use config::FeeRate;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use rand::Rng;
+use rand::RngExt;
 use rand::distr::Alphanumeric;
 use ruint::uint;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::RwLock;
 
-#[derive(Debug, Error)]
-pub enum PayloadError {
-    #[error("serialize payload")]
-    Serialize(#[from] serde_json::Error),
-    #[error("invalid signature length: {len}")]
-    InvalidSignatureLen { len: usize },
-    #[error("invalid viewing key: {message}")]
-    PublicKey { message: String },
-    #[error("signature error")]
-    Signature(#[from] ed25519_dalek::SignatureError),
-    #[error("invalid signature bytes")]
-    SignatureBytes(#[from] std::array::TryFromSliceError),
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct Payload {
-    #[serde(with = "serde_helpers::hex_string")]
-    pub data: Vec<u8>,
-    #[serde(with = "serde_helpers::hex_string")]
-    pub signature: Vec<u8>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-#[serde(rename_all = "camelCase")]
-pub struct Body {
-    // #[serde(with = "serde_helpers::decimal_map")]
-    pub fees: HashMap<Address, U256>,
-    pub fee_expiration: u64,
-    #[serde(rename = "feesID")]
-    pub fees_id: String,
-    pub railgun_address: railgun::Address,
-    pub available_wallets: u32,
-    pub version: String,
-    #[serde(with = "serde_helpers::checksum_address")]
-    pub relay_adapt: Address,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub relay_adapt_7702: Option<Address>,
-    #[serde(rename = "requiredPOIListKeys")]
-    pub required_poi_list_keys: Vec<String>,
-    pub reliability: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub identifier: Option<String>,
-}
-
-impl Body {
-    pub fn into_signed_payload(
-        self,
-        viewing_priv_seed_32: [u8; 32],
-    ) -> Result<Payload, PayloadError> {
-        let data = serde_json::to_string(&self)?.into_bytes();
-        let sk = SigningKey::from_bytes(&viewing_priv_seed_32);
-        let signature = sk.sign(&data);
-        Ok(Payload {
-            data,
-            signature: signature.to_bytes().into(),
-        })
-    }
-}
-
-impl Payload {
-    pub fn decode_and_verify(&self) -> Result<(Body, bool), PayloadError> {
-        if self.signature.len() != 64 {
-            return Err(PayloadError::InvalidSignatureLen {
-                len: self.signature.len(),
-            });
-        }
-        let decoded_data: Body = serde_json::from_slice(self.data.as_ref())?;
-        let viewing_pk =
-            railgun::PublicKey::try_from(&decoded_data.railgun_address).map_err(|error| {
-                PayloadError::PublicKey {
-                    message: error.to_string(),
-                }
-            })?;
-
-        let vk = VerifyingKey::from_bytes(&viewing_pk)?;
-        let sig = Signature::from_bytes(self.signature.as_slice().try_into()?);
-
-        Ok((decoded_data, vk.verify(self.data.as_ref(), &sig).is_ok()))
-    }
-}
+pub use public_broadcaster_protocol::{Body, Payload, PayloadError};
 
 sol! {
     #[sol(rpc)]
@@ -143,6 +59,7 @@ impl Manager {
         rpcs: Arc<QueryRpcPool>,
         multicall_addr: Address,
         wrapped_native_token: Address,
+        fee_id_cache_ttl: Duration,
     ) -> Self {
         let mut oracle_instances = Vec::with_capacity(config.len());
         let mut prices = HashMap::with_capacity(config.len());
@@ -172,7 +89,7 @@ impl Manager {
         Self {
             prices: RwLock::new(prices),
             cache: moka::future::Cache::builder()
-                .time_to_live(Duration::from_secs(180))
+                .time_to_live(fee_id_cache_ttl)
                 .build(),
             oracle_instances,
             fee_bonus,
@@ -299,5 +216,28 @@ impl Manager {
             .map_or(calldata.fee_amount, |price| {
                 calldata.fee_amount * self.fee_bonus / price
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fee_id_cache_uses_configured_ttl() {
+        let manager = Manager::new(
+            &HashMap::new(),
+            uint!(1_U256),
+            Arc::new(QueryRpcPool::new(Vec::new(), Duration::from_secs(1))),
+            Address::ZERO,
+            Address::ZERO,
+            Duration::from_millis(10),
+        );
+
+        let (fees_id, _) = manager.create_fees().await;
+        assert!(manager.is_fees_id_valid(&fees_id));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!manager.is_fees_id_valid(&fees_id));
     }
 }

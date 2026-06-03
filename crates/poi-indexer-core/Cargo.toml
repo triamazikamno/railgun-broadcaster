@@ -1,0 +1,37 @@
+[package]
+name = "poi-indexer-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+alloy-primitives = { version = "1.6", features = ["serde"] }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+cid = "0.11"
+ed25519-dalek = { workspace = true }
+futures-util = "0.3"
+hex = { workspace = true }
+humantime-serde = { workspace = true }
+libp2p = { workspace = true, features = ["tokio", "tcp", "dns", "noise", "yamux", "kad", "ed25519", "rsa", "macros"] }
+multibase = "0.9"
+reqwest = { workspace = true }
+rust-ipns = { version = "0.8", default-features = false, features = ["libp2p", "ed25519"] }
+rust-s3 = { version = "0.37", default-features = false, features = ["tokio-rustls-tls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls"] }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+poi = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
+
+[lints]
+workspace = true

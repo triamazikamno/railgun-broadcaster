@@ -1,0 +1,20 @@
+[package]
+name = "vanity-address"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "vanity-address"
+path = "src/main.rs"
+
+[dependencies]
+bech32 = { workspace = true }
+eyre = { workspace = true }
+getrandom = { workspace = true }
+structopt = { workspace = true }
+
+railgun-wallet = { workspace = true }
+
+[lints]
+workspace = true

@@ -9,8 +9,7 @@ use axum::{
 use config::AdminConfig;
 use eyre::{Result, WrapErr};
 use serde::{Deserialize, Serialize};
-use sync_service::SyncManager;
-use sync_service::manager::SyncManagerError;
+use sync_service::{SyncManager, SyncManagerError};
 use tokio::net::TcpListener;
 use tracing::info;
 
@@ -18,6 +17,20 @@ use tracing::info;
 struct AdminState {
     token: String,
     sync_manager: Arc<SyncManager>,
+}
+
+impl AdminState {
+    fn is_authorized(&self, headers: &HeaderMap) -> bool {
+        let Some(value) = headers.get(header::AUTHORIZATION) else {
+            return false;
+        };
+        let Ok(value) = value.to_str() else {
+            return false;
+        };
+        value
+            .strip_prefix("Bearer ")
+            .is_some_and(|provided| provided == self.token)
+    }
 }
 
 #[derive(Deserialize)]
@@ -61,7 +74,7 @@ async fn reset_wallet(
     headers: HeaderMap,
     Json(payload): Json<ResetWalletRequest>,
 ) -> HandlerResult<Json<ResetWalletResponse>> {
-    if !is_authorized(&headers, &state.token) {
+    if !state.is_authorized(&headers) {
         return Err((
             StatusCode::UNAUTHORIZED,
             Json(ErrorResponse {
@@ -98,16 +111,4 @@ async fn reset_wallet(
             }),
         )),
     }
-}
-
-fn is_authorized(headers: &HeaderMap, token: &str) -> bool {
-    let Some(value) = headers.get(header::AUTHORIZATION) else {
-        return false;
-    };
-    let Ok(value) = value.to_str() else {
-        return false;
-    };
-    value
-        .strip_prefix("Bearer ")
-        .is_some_and(|provided| provided == token)
 }

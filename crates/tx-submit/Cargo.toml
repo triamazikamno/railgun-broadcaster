@@ -6,12 +6,12 @@ rust-version.workspace = true
 
 [dependencies]
 alloy = { workspace = true }
-broadcaster-core = { path = "../core" }
+broadcaster-core = { workspace = true }
 config = { path = "../config" }
-reqwest = { workspace = true, features = ["json"] }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-thiserror = { version = "2" }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [lints]

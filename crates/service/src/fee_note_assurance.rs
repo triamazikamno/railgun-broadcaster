@@ -4,6 +4,7 @@ use alloy_rpc_types_eth::Log;
 use broadcaster_core::contracts::railgun::Transact;
 use broadcaster_core::crypto::poseidon::poseidon;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
+use broadcaster_core::tree::TREE_LEAF_COUNT_U256;
 use local_db::{DbStore, FeeNoteAssuranceTerminalOutcome, PendingFeeNoteAssuranceRecord};
 use poi::poi::{Poi, PoiStatus};
 use std::collections::BTreeMap;
@@ -28,6 +29,69 @@ pub(crate) struct ReceiptObservation {
     pub logs: Vec<Log>,
 }
 
+impl ReceiptObservation {
+    pub(crate) fn evaluate(
+        &self,
+        safe_head: u64,
+        railgun_contract: Address,
+        fee_commitment: FixedBytes<32>,
+    ) -> ReceiptEvaluation {
+        if self.block_number > safe_head {
+            return ReceiptEvaluation::Pending;
+        }
+
+        if !self.status {
+            return ReceiptEvaluation::Terminal(FeeNoteAssuranceTerminalOutcome::RevertedReceipt);
+        }
+
+        match derive_fee_output_position_from_logs(&self.logs, railgun_contract, fee_commitment) {
+            Some(output) => ReceiptEvaluation::Ready(output),
+            None => {
+                ReceiptEvaluation::Terminal(FeeNoteAssuranceTerminalOutcome::CommitmentMismatch)
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct FeeNoteAssuranceSubmissionTracker {
+    logged_submissions: Mutex<HashSet<FixedBytes<32>>>,
+    submission_attempts: Mutex<HashMap<FixedBytes<32>, Instant>>,
+}
+
+impl FeeNoteAssuranceSubmissionTracker {
+    pub(crate) fn mark_logged(&self, public_tx_hash: FixedBytes<32>) -> bool {
+        let mut logged_submissions = self
+            .logged_submissions
+            .lock()
+            .expect("fee-note assurance submission log set poisoned");
+        logged_submissions.insert(public_tx_hash)
+    }
+
+    pub(crate) fn next_submit_in(
+        &self,
+        public_tx_hash: FixedBytes<32>,
+        now: Instant,
+        backoff: Duration,
+    ) -> Option<Duration> {
+        let submission_attempts = self
+            .submission_attempts
+            .lock()
+            .expect("fee-note assurance submission attempt map poisoned");
+        submission_attempts
+            .get(&public_tx_hash)
+            .and_then(|last_attempt| backoff.checked_sub(now.duration_since(*last_attempt)))
+    }
+
+    pub(crate) fn mark_attempt(&self, public_tx_hash: FixedBytes<32>, now: Instant) {
+        let mut submission_attempts = self
+            .submission_attempts
+            .lock()
+            .expect("fee-note assurance submission attempt map poisoned");
+        submission_attempts.insert(public_tx_hash, now);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReceiptEvaluation {
     Pending,
@@ -46,8 +110,7 @@ pub(crate) async fn process_fee_note_assurance_record(
     db: &DbStore,
     query_rpc_pool: &QueryRpcPool,
     poi: &Poi,
-    logged_submissions: &Mutex<HashSet<FixedBytes<32>>>,
-    submission_attempts: &Mutex<HashMap<FixedBytes<32>, Instant>>,
+    submission_tracker: &FeeNoteAssuranceSubmissionTracker,
     railgun_contract: Address,
     finality_depth: u64,
     record: PendingFeeNoteAssuranceRecord,
@@ -104,12 +167,11 @@ pub(crate) async fn process_fee_note_assurance_record(
         })
     });
 
-    match evaluate_receipt(
-        receipt_observation.as_ref(),
-        safe_head,
-        railgun_contract,
-        record.context.fee_commitment,
-    ) {
+    match receipt_observation
+        .as_ref()
+        .map_or(ReceiptEvaluation::Pending, |receipt| {
+            receipt.evaluate(safe_head, railgun_contract, record.context.fee_commitment)
+        }) {
         ReceiptEvaluation::Pending => FeeNoteAssuranceRecordOutcome::Pending,
         ReceiptEvaluation::Terminal(reason) => {
             if let Err(error) = db.mark_fee_note_assurance_terminal(&record, reason) {
@@ -170,8 +232,7 @@ pub(crate) async fn process_fee_note_assurance_record(
             }
 
             let now = Instant::now();
-            if let Some(next_submit_in) = next_fee_note_submit_in(
-                submission_attempts,
+            if let Some(next_submit_in) = submission_tracker.next_submit_in(
                 record.public_tx_hash,
                 now,
                 FEE_NOTE_ASSURANCE_SUBMIT_BACKOFF,
@@ -207,9 +268,9 @@ pub(crate) async fn process_fee_note_assurance_record(
                 return FeeNoteAssuranceRecordOutcome::Pending;
             }
 
-            mark_fee_note_submission_attempt(submission_attempts, record.public_tx_hash, now);
+            submission_tracker.mark_attempt(record.public_tx_hash, now);
 
-            if mark_fee_note_submission_logged(logged_submissions, record.public_tx_hash) {
+            if submission_tracker.mark_logged(record.public_tx_hash) {
                 info!(
                     chain_id = record.chain_id,
                     tx_hash = %record.public_tx_hash,
@@ -275,65 +336,6 @@ pub(crate) async fn process_fee_note_assurance_record(
     }
 }
 
-fn mark_fee_note_submission_logged(
-    logged_submissions: &Mutex<HashSet<FixedBytes<32>>>,
-    public_tx_hash: FixedBytes<32>,
-) -> bool {
-    let mut logged_submissions = logged_submissions
-        .lock()
-        .expect("fee-note assurance submission log set poisoned");
-    logged_submissions.insert(public_tx_hash)
-}
-
-fn next_fee_note_submit_in(
-    submission_attempts: &Mutex<HashMap<FixedBytes<32>, Instant>>,
-    public_tx_hash: FixedBytes<32>,
-    now: Instant,
-    backoff: Duration,
-) -> Option<Duration> {
-    let submission_attempts = submission_attempts
-        .lock()
-        .expect("fee-note assurance submission attempt map poisoned");
-    submission_attempts
-        .get(&public_tx_hash)
-        .and_then(|last_attempt| backoff.checked_sub(now.duration_since(*last_attempt)))
-}
-
-fn mark_fee_note_submission_attempt(
-    submission_attempts: &Mutex<HashMap<FixedBytes<32>, Instant>>,
-    public_tx_hash: FixedBytes<32>,
-    now: Instant,
-) {
-    let mut submission_attempts = submission_attempts
-        .lock()
-        .expect("fee-note assurance submission attempt map poisoned");
-    submission_attempts.insert(public_tx_hash, now);
-}
-
-pub(crate) fn evaluate_receipt(
-    receipt: Option<&ReceiptObservation>,
-    safe_head: u64,
-    railgun_contract: Address,
-    fee_commitment: FixedBytes<32>,
-) -> ReceiptEvaluation {
-    let Some(receipt) = receipt else {
-        return ReceiptEvaluation::Pending;
-    };
-
-    if receipt.block_number > safe_head {
-        return ReceiptEvaluation::Pending;
-    }
-
-    if !receipt.status {
-        return ReceiptEvaluation::Terminal(FeeNoteAssuranceTerminalOutcome::RevertedReceipt);
-    }
-
-    match derive_fee_output_position_from_logs(&receipt.logs, railgun_contract, fee_commitment) {
-        Some(output) => ReceiptEvaluation::Ready(output),
-        None => ReceiptEvaluation::Terminal(FeeNoteAssuranceTerminalOutcome::CommitmentMismatch),
-    }
-}
-
 pub(crate) fn required_list_statuses_valid(
     required_poi_list_keys: &[FixedBytes<32>],
     statuses: &BTreeMap<FixedBytes<32>, PoiStatus>,
@@ -351,10 +353,8 @@ fn derive_fee_note_blinded_commitment(
     utxo_tree_out: u64,
     utxo_position_out: u64,
 ) -> FixedBytes<32> {
-    const TREE_MAX_ITEMS: u64 = 65_536;
-
     let global_tree_position =
-        U256::from(utxo_tree_out) * U256::from(TREE_MAX_ITEMS) + U256::from(utxo_position_out);
+        U256::from(utxo_tree_out) * TREE_LEAF_COUNT_U256 + U256::from(utxo_position_out);
 
     poseidon(vec![
         fee_commitment.into(),
@@ -386,20 +386,18 @@ fn derive_fee_output_position_from_logs(
 #[cfg(test)]
 mod tests {
     use super::{
-        ReceiptEvaluation, ReceiptObservation, derive_fee_note_blinded_commitment,
-        evaluate_receipt, mark_fee_note_submission_attempt, mark_fee_note_submission_logged,
-        required_list_statuses_valid,
+        FeeNoteAssuranceSubmissionTracker, ReceiptEvaluation, ReceiptObservation,
+        derive_fee_note_blinded_commitment, required_list_statuses_valid,
     };
     use alloy::hex;
     use alloy::primitives::{Address, Bytes, FixedBytes, Log as PrimitiveLog, U256};
     use alloy::sol_types::SolEvent;
+    use alloy::uint;
     use alloy_rpc_types_eth::Log;
     use broadcaster_core::contracts::railgun::{CommitmentCiphertext, Transact};
     use local_db::FeeNoteAssuranceTerminalOutcome;
     use poi::poi::PoiStatus;
-    use std::collections::HashSet;
-    use std::collections::{BTreeMap, HashMap};
-    use std::sync::Mutex;
+    use std::collections::BTreeMap;
     use std::time::{Duration, Instant};
 
     fn railgun_contract() -> Address {
@@ -415,17 +413,19 @@ mod tests {
     }
 
     fn should_submit_fee_note_assurance(
-        submission_attempts: &Mutex<HashMap<FixedBytes<32>, Instant>>,
+        tracker: &FeeNoteAssuranceSubmissionTracker,
         public_tx_hash: FixedBytes<32>,
         now: Instant,
         backoff: Duration,
     ) -> bool {
-        super::next_fee_note_submit_in(submission_attempts, public_tx_hash, now, backoff).is_none()
+        tracker
+            .next_submit_in(public_tx_hash, now, backoff)
+            .is_none()
     }
 
     fn transact_log(fee_commitment: FixedBytes<32>, start_position: u64) -> Log {
         let event = Transact {
-            treeNumber: U256::from(7_u8),
+            treeNumber: uint!(7_U256),
             startPosition: U256::from(start_position),
             hash: vec![fee_commitment],
             ciphertext: vec![CommitmentCiphertext {
@@ -448,8 +448,11 @@ mod tests {
 
     #[test]
     fn missing_receipt_stays_pending() {
+        let receipt: Option<&ReceiptObservation> = None;
         assert_eq!(
-            evaluate_receipt(None, 100, railgun_contract(), FixedBytes::from([1u8; 32])),
+            receipt.map_or(ReceiptEvaluation::Pending, |receipt| {
+                receipt.evaluate(100, railgun_contract(), FixedBytes::from([1u8; 32]))
+            }),
             ReceiptEvaluation::Pending
         );
     }
@@ -463,12 +466,7 @@ mod tests {
         };
 
         assert_eq!(
-            evaluate_receipt(
-                Some(&receipt),
-                100,
-                railgun_contract(),
-                FixedBytes::from([1u8; 32])
-            ),
+            receipt.evaluate(100, railgun_contract(), FixedBytes::from([1u8; 32])),
             ReceiptEvaluation::Pending
         );
     }
@@ -482,12 +480,7 @@ mod tests {
         };
 
         assert_eq!(
-            evaluate_receipt(
-                Some(&receipt),
-                100,
-                railgun_contract(),
-                FixedBytes::from([1u8; 32])
-            ),
+            receipt.evaluate(100, railgun_contract(), FixedBytes::from([1u8; 32])),
             ReceiptEvaluation::Terminal(FeeNoteAssuranceTerminalOutcome::RevertedReceipt)
         );
     }
@@ -502,7 +495,7 @@ mod tests {
         };
 
         assert_eq!(
-            evaluate_receipt(Some(&receipt), 100, railgun_contract(), fee_commitment),
+            receipt.evaluate(100, railgun_contract(), fee_commitment),
             ReceiptEvaluation::Ready(super::DerivedFeeOutputPosition {
                 utxo_tree_out: 7,
                 utxo_position_out: 42,
@@ -519,12 +512,7 @@ mod tests {
         };
 
         assert_eq!(
-            evaluate_receipt(
-                Some(&receipt),
-                100,
-                railgun_contract(),
-                FixedBytes::from([0x99; 32])
-            ),
+            receipt.evaluate(100, railgun_contract(), FixedBytes::from([0x99; 32])),
             ReceiptEvaluation::Terminal(FeeNoteAssuranceTerminalOutcome::CommitmentMismatch)
         );
     }
@@ -569,25 +557,19 @@ mod tests {
 
     #[test]
     fn submission_log_is_emitted_once_per_process() {
-        let logged_submissions = Mutex::new(HashSet::new());
+        let tracker = FeeNoteAssuranceSubmissionTracker::default();
         let tx_hash = FixedBytes::from([0x11; 32]);
 
-        assert!(mark_fee_note_submission_logged(
-            &logged_submissions,
-            tx_hash
-        ));
-        assert!(!mark_fee_note_submission_logged(
-            &logged_submissions,
-            tx_hash
-        ));
+        assert!(tracker.mark_logged(tx_hash));
+        assert!(!tracker.mark_logged(tx_hash));
     }
 
     #[test]
     fn submission_backoff_allows_first_submit() {
-        let submission_attempts = Mutex::new(HashMap::new());
+        let tracker = FeeNoteAssuranceSubmissionTracker::default();
 
         assert!(should_submit_fee_note_assurance(
-            &submission_attempts,
+            &tracker,
             FixedBytes::from([0x11; 32]),
             Instant::now(),
             Duration::from_secs(900),
@@ -596,13 +578,13 @@ mod tests {
 
     #[test]
     fn submission_backoff_blocks_immediate_retry() {
-        let submission_attempts = Mutex::new(HashMap::new());
+        let tracker = FeeNoteAssuranceSubmissionTracker::default();
         let tx_hash = FixedBytes::from([0x11; 32]);
         let now = Instant::now();
-        mark_fee_note_submission_attempt(&submission_attempts, tx_hash, now);
+        tracker.mark_attempt(tx_hash, now);
 
         assert!(!should_submit_fee_note_assurance(
-            &submission_attempts,
+            &tracker,
             tx_hash,
             now + Duration::from_secs(60),
             Duration::from_secs(900),
@@ -611,13 +593,13 @@ mod tests {
 
     #[test]
     fn submission_backoff_allows_retry_after_elapsed_time() {
-        let submission_attempts = Mutex::new(HashMap::new());
+        let tracker = FeeNoteAssuranceSubmissionTracker::default();
         let tx_hash = FixedBytes::from([0x11; 32]);
         let now = Instant::now();
-        mark_fee_note_submission_attempt(&submission_attempts, tx_hash, now);
+        tracker.mark_attempt(tx_hash, now);
 
         assert!(should_submit_fee_note_assurance(
-            &submission_attempts,
+            &tracker,
             tx_hash,
             now + Duration::from_secs(901),
             Duration::from_secs(900),

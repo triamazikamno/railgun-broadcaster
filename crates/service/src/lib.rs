@@ -3,7 +3,7 @@ mod fee_note_assurance;
 mod utxo_consolidation;
 
 use alloy::eips::Encodable2718;
-use alloy::network::{EthereumWallet, TransactionBuilder};
+use alloy::network::{EthereumWallet, NetworkTransactionBuilder, TransactionBuilder};
 use alloy::primitives::{Address, Bytes, ChainId, FixedBytes, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::TransactionRequest;
@@ -16,12 +16,10 @@ use broadcaster_core::crypto::railgun::{
 };
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use broadcaster_core::transact::{
-    DecryptedTransact, ParsedTransactCalldata, TransactError, attach_fee_note_assurance_context,
-    parse_transact_calldata, try_decrypt_transact_request,
+    DecryptedTransact, ParsedTransactCalldata, TransactError, parse_transact_calldata,
+    try_decrypt_transact_request,
 };
-use broadcaster_core::transact_response::{
-    build_transact_response_error, build_transact_response_txhash,
-};
+use broadcaster_core::transact_response::DecryptedTransactResponse;
 use config::{Chain, Key};
 use fees::{FeesError, Manager as FeesManager};
 use local_db::{DbStore, PendingFeeNoteAssuranceRecord};
@@ -31,22 +29,38 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::{Instrument, debug, error, info, info_span, warn};
 use tx_submit::{Queue, TxBroadcaster};
-use waku_relay::client::{Client, PUBSUB_PATH};
+use waku_relay::client::Client;
 
 use crate::auto_refill::{AutoRefillConfig, AutoRefillService};
-use crate::fee_note_assurance::{FeeNoteAssuranceRecordOutcome, process_fee_note_assurance_record};
+use crate::fee_note_assurance::{
+    FeeNoteAssuranceRecordOutcome, FeeNoteAssuranceSubmissionTracker,
+    process_fee_note_assurance_record,
+};
 use crate::utxo_consolidation::{UtxoConsolidationConfig, UtxoConsolidationService};
 use poi::error::PoiError;
 use railgun_wallet::wallet_cache::wallet_cache_key;
-use railgun_wallet::{ProverService, WalletKeys};
+use railgun_wallet::{ProverService, Utxo, WalletKeys};
 use serde::{Deserialize, Serialize};
-use sync_service::manager::SyncManagerError;
-use sync_service::{ChainConfig, ChainConfigDefaults, ChainKey, SyncManager, WalletConfig};
+use sync_service::{
+    ChainConfig, ChainConfigDefaults, ChainKey, DEFAULT_INDEXED_WALLET_BLOCK_RANGE, PoiReadSource,
+    SyncManager, SyncManagerError, WalletConfig,
+};
 use waku_relay::msg::ContentTopic;
+
+async fn unspent_utxos(wallet_handle: &sync_service::WalletHandle) -> Vec<Utxo> {
+    wallet_handle
+        .utxos
+        .read()
+        .await
+        .iter()
+        .filter(|entry| !entry.is_spent())
+        .map(|entry| entry.utxo.clone())
+        .collect()
+}
 
 sol! {
     function balanceOf(address account) external view returns (uint256);
@@ -60,6 +74,9 @@ sol! {
 }
 
 pub const API_VERSION: &str = "8.2.3";
+
+const WAD: U256 = uint!(1_000_000_000_000_000_000_U256);
+const FEE_BONUS_BPS_DENOMINATOR: U256 = uint!(10_000_U256);
 
 #[derive(Debug, Error)]
 pub enum HandleTransactError {
@@ -125,6 +142,93 @@ pub enum SubmitTxError {
     MissingHash,
 }
 
+const GAS_PRICE_BPS_DENOMINATOR: u128 = 10_000;
+const USER_TRANSACT_GAS_PRICE_BUFFER_BPS: u128 = 10_100;
+const MAINTENANCE_GAS_PRICE_BUFFER_BPS: u128 = 10_500;
+const EVM_GAS_LIMIT_BUFFER: u64 = 100_000;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EvmGasPricePolicy {
+    pub gas_price_buffer_bps: u128,
+    pub min_gas_price: Option<u128>,
+    pub max_gas_price: Option<u128>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedEvmTransaction {
+    pub tx_req: TransactionRequest,
+    pub gas: u64,
+    pub gas_price: u128,
+    pub cost: U256,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum PrepareEvmTransactionError {
+    #[error("fetch gas price failed: {0}")]
+    FetchGasPrice(#[source] alloy::transports::RpcError<TransportErrorKind>),
+    #[error("gas price {gas_price} exceeds max {max_gas_price}")]
+    MaxGasPrice {
+        gas_price: u128,
+        max_gas_price: u128,
+    },
+    #[error("fetch nonce failed: {0}")]
+    FetchNonce(#[source] alloy::transports::RpcError<TransportErrorKind>),
+    #[error("estimate gas failed: {0}")]
+    EstimateGas(#[source] alloy::transports::RpcError<TransportErrorKind>),
+}
+
+pub(crate) async fn prepare_evm_transaction(
+    provider: &(impl Provider + Clone),
+    chain_id: ChainId,
+    from: Address,
+    to: Address,
+    input: Bytes,
+    policy: EvmGasPricePolicy,
+) -> Result<PreparedEvmTransaction, PrepareEvmTransactionError> {
+    let mut gas_price = provider
+        .get_gas_price()
+        .await
+        .map_err(PrepareEvmTransactionError::FetchGasPrice)?;
+    if let Some(min_gas_price) = policy.min_gas_price {
+        gas_price = gas_price.max(min_gas_price);
+    }
+    gas_price = gas_price * policy.gas_price_buffer_bps / GAS_PRICE_BPS_DENOMINATOR;
+    if let Some(max_gas_price) = policy.max_gas_price
+        && gas_price > max_gas_price
+    {
+        return Err(PrepareEvmTransactionError::MaxGasPrice {
+            gas_price,
+            max_gas_price,
+        });
+    }
+
+    let nonce = provider
+        .get_transaction_count(from)
+        .await
+        .map_err(PrepareEvmTransactionError::FetchNonce)?;
+    let tx_req = TransactionRequest::default()
+        .with_chain_id(chain_id)
+        .with_from(from)
+        .with_to(to)
+        .with_input(input)
+        .with_gas_price(gas_price)
+        .with_nonce(nonce);
+    let gas = provider
+        .estimate_gas(tx_req.clone())
+        .await
+        .map_err(PrepareEvmTransactionError::EstimateGas)?
+        + EVM_GAS_LIMIT_BUFFER;
+    let tx_req = tx_req.with_gas_limit(gas);
+    let cost = U256::from(gas) * U256::from(gas_price);
+
+    Ok(PreparedEvmTransaction {
+        tx_req,
+        gas,
+        gas_price,
+        cost,
+    })
+}
+
 #[derive(Debug, Error)]
 pub enum BroadcasterManagerError {
     #[error("waku subscribe failed: {0}")]
@@ -154,10 +258,8 @@ type ResponseReceiver = kanal::AsyncReceiver<(DecryptedTransact, ParsedTransactC
 pub struct BroadcasterService {
     chain_id: ChainId,
     db: Arc<DbStore>,
-    pending_fee_note_assurance_fallback:
-        Arc<Mutex<HashMap<FixedBytes<32>, PendingFeeNoteAssuranceRecord>>>,
-    logged_fee_note_assurance_submissions: Arc<Mutex<HashSet<FixedBytes<32>>>>,
-    fee_note_assurance_submission_attempts: Arc<Mutex<HashMap<FixedBytes<32>, Instant>>>,
+    pending_fee_note_assurance_fallback: Arc<FeeNoteAssuranceFallback>,
+    fee_note_assurance_submission_tracker: Arc<FeeNoteAssuranceSubmissionTracker>,
     key: [u8; 32],
     master_public_key: U256,
     addr: RailgunAddress,
@@ -200,12 +302,13 @@ impl BroadcasterService {
         required_poi_list: Vec<FixedBytes<32>>,
         sync_manager: Arc<SyncManager>,
         prover: Arc<ProverService>,
+        poi_recovery_prover: Arc<ProverService>,
         query_rpc_cooldown: Duration,
     ) -> Result<Self, BroadcasterServiceError> {
         let (tx, rx) = kanal::bounded_async::<(DecryptedTransact, ParsedTransactCalldata)>(20);
-        let pending_fee_note_assurance_fallback = Arc::new(Mutex::new(HashMap::new()));
-        let logged_fee_note_assurance_submissions = Arc::new(Mutex::new(HashSet::new()));
-        let fee_note_assurance_submission_attempts = Arc::new(Mutex::new(HashMap::new()));
+        let pending_fee_note_assurance_fallback = Arc::new(FeeNoteAssuranceFallback::default());
+        let fee_note_assurance_submission_tracker =
+            Arc::new(FeeNoteAssuranceSubmissionTracker::default());
         let count_transact_requests = Arc::new(AtomicU32::new(0));
         let count_txs_landed = Arc::new(AtomicU32::new(0));
         let defaults = ChainConfigDefaults::for_chain(chain_cfg.chain_id);
@@ -269,14 +372,16 @@ impl BroadcasterService {
         let multicall_contract = chain_cfg
             .multicall_contract
             .ok_or(BroadcasterServiceError::MissingMulticallContract)?;
-        let fee_bonus = uint!(1000000000000000000_U256)
-            + U256::from(chain_cfg.fee_bonus * 1000.0) * uint!(10000000000000_U256);
+        let fee_bonus =
+            WAD + U256::from(chain_cfg.fee_bonus.bps()) * WAD / FEE_BONUS_BPS_DENOMINATOR;
+        let fees_ttl = chain_cfg.fees_ttl.into_inner();
         let fees_manager = Arc::new(FeesManager::new(
             &chain_cfg.fees,
             fee_bonus,
             query_rpc_pool.clone(),
             multicall_contract,
             chain_cfg.wrapped_native_token,
+            fees_ttl.saturating_mul(5),
         ));
         let advertised_address_scope = chain_cfg
             .advertised_railgun_address_scope
@@ -373,6 +478,16 @@ impl BroadcasterService {
                     .as_ref()
                     .and_then(|sync| sync.block_range)
                     .unwrap_or(500);
+                let indexed_wallet_block_range = chain_cfg
+                    .sync
+                    .as_ref()
+                    .and_then(|sync| sync.indexed_wallet_block_range)
+                    .or_else(|| {
+                        defaults
+                            .as_ref()
+                            .map(|config| config.indexed_wallet_block_range)
+                    })
+                    .unwrap_or(DEFAULT_INDEXED_WALLET_BLOCK_RANGE);
                 let chain_config = ChainConfig {
                     chain_id,
                     contract: railgun_contract,
@@ -386,11 +501,14 @@ impl BroadcasterService {
                     v2_start_block,
                     legacy_shield_block,
                     block_range,
+                    indexed_wallet_block_range,
                     poll_interval: receipt_poll_interval,
                     finality_depth,
-                    quick_sync_endpoint,
+                    quick_sync_endpoint: quick_sync_endpoint.clone(),
                     anchor_interval,
                     anchor_retention,
+                    http_client: None,
+                    progress_tx: None,
                 };
                 let chain_service = sync_manager.add_chain(chain_config).await?;
                 let chain_key = ChainKey {
@@ -404,7 +522,17 @@ impl BroadcasterService {
                     chain: chain_key,
                     cache_key: cache_key.clone(),
                     start_block: Some(*init_block_number),
+                    sync_to_block: None,
+                    quick_sync_endpoint,
                     scan_keys,
+                    spending_public_key: Some(wallet.spending_public_key),
+                    progress_tx: None,
+                    cache_store: None,
+                    poi_recovery_prover: Some((*poi_recovery_prover).clone()),
+                    poi_read_source: PoiReadSource::PoiProxy,
+                    local_poi_caches: None,
+                    manage_local_poi_cache: false,
+                    use_indexed_wallet_catch_up: true,
                 };
                 let handle = sync_manager.add_wallet(wallet_cfg).await?;
                 if let Some(auto_refill) = auto_refill.clone() {
@@ -487,8 +615,7 @@ impl BroadcasterService {
             chain_id: chain_cfg.chain_id,
             db,
             pending_fee_note_assurance_fallback,
-            logged_fee_note_assurance_submissions,
-            fee_note_assurance_submission_attempts,
+            fee_note_assurance_submission_tracker,
             key,
             master_public_key,
             addr,
@@ -511,7 +638,7 @@ impl BroadcasterService {
             relay_adapt_7702_contract: chain_cfg.relay_adapt_7702_contract,
             identifier: chain_cfg.identifier,
             fees_refresh_interval: chain_cfg.fees_refresh_interval.into_inner(),
-            fees_ttl: chain_cfg.fees_ttl.into_inner(),
+            fees_ttl,
         })
     }
 
@@ -611,13 +738,9 @@ impl BroadcasterService {
                             if is_valid {
                                 match serde_json::to_string(&payload) {
                                     Ok(payload) => {
-                                        if let Err(error) = client
-                                            .publish(
-                                                PUBSUB_PATH,
-                                                &format!("/railgun/v2/0-{chain_id}-fees/json"),
-                                                payload.as_bytes(),
-                                            )
-                                            .await
+                                        let content_topic = ContentTopic::fees_topic(chain_id);
+                                        if let Err(error) =
+                                            client.publish(&content_topic, payload.as_bytes()).await
                                         {
                                             warn!(%error, "publish fees failed");
                                         }
@@ -666,12 +789,9 @@ impl BroadcasterService {
 
         if let Some(poi) = self.poi.as_ref() {
             poi.validate_all(&parsed_transact, &req.params).await?;
-            attach_fee_note_assurance_context(
-                &mut parsed_transact,
-                &req.params,
-                &self.required_poi_list,
-            )
-            .map_err(HandleTransactError::Parse)?;
+            parsed_transact
+                .attach_fee_note_assurance_context(&req.params, &self.required_poi_list)
+                .map_err(HandleTransactError::Parse)?;
         }
 
         self.tx.send((req, parsed_transact)).await?;
@@ -690,6 +810,7 @@ impl BroadcasterService {
         let evm_wallets = self.evm_wallets.clone();
         let broadcaster = self.broadcaster.clone();
         let client = self.client.clone();
+        let transact_response_topic = ContentTopic::transact_response_topic(chain_id);
 
         tokio::spawn(async move {
             loop {
@@ -727,52 +848,54 @@ impl BroadcasterService {
                     };
                     let rpc = provider_handle.provider.clone();
 
-                    let min_gas_price = decrypted_payload.params.min_gas_price.to();
-                    let gas_price = match rpc.get_gas_price().await {
-                        Ok(gas_price) => gas_price.max(min_gas_price) * 101 / 100,
+                    let min_gas_price = decrypted_payload.params.min_gas_price.unwrap_or_default().to();
+                    let prepared_tx = match prepare_evm_transaction(
+                        &rpc,
+                        chain_id,
+                        signer.address(),
+                        decrypted_payload.params.to,
+                        decrypted_payload.params.data.clone(),
+                        EvmGasPricePolicy {
+                            gas_price_buffer_bps: USER_TRANSACT_GAS_PRICE_BUFFER_BPS,
+                            min_gas_price: Some(min_gas_price),
+                            max_gas_price: None,
+                        },
+                    )
+                    .await
+                    {
+                        Ok(prepared_tx) => prepared_tx,
                         Err(error) => {
-                            warn!(
-                                %error,
-                                rpc = %provider_handle.url,
-                                "fetch gas price failed",
-                            );
-                            query_rpc_pool.mark_bad_provider(&provider_handle);
+                            match &error {
+                                PrepareEvmTransactionError::FetchGasPrice(_) => {
+                                    warn!(%error, rpc = %provider_handle.url, "fetch gas price failed");
+                                    query_rpc_pool.mark_bad_provider(&provider_handle);
+                                }
+                                PrepareEvmTransactionError::FetchNonce(_) => {
+                                    warn!(%error, rpc = %provider_handle.url, "fetch nonce failed");
+                                    query_rpc_pool.mark_bad_provider(&provider_handle);
+                                }
+                                PrepareEvmTransactionError::EstimateGas(_) => {
+                                    warn!(%error, rpc = %provider_handle.url, "estimate gas failed");
+                                }
+                                PrepareEvmTransactionError::MaxGasPrice { .. } => {
+                                    warn!(%error, rpc = %provider_handle.url, "gas price rejected");
+                                }
+                            }
                             continue;
                         }
                     };
-
-                    let tx_req = TransactionRequest::default()
-                        .with_chain_id(chain_id)
-                        .with_from(signer.address())
-                        .with_to(decrypted_payload.params.to)
-                        .with_input(decrypted_payload.params.data)
-                        .with_gas_price(gas_price)
-                        .with_nonce(match rpc.get_transaction_count(signer.address()).await {
-                            Ok(nonce) => nonce,
-                            Err(error) => {
-                                warn!(
-                                    %error,
-                                    rpc = %provider_handle.url,
-                                    "fetch nonce failed",
-                                );
-                                query_rpc_pool.mark_bad_provider(&provider_handle);
-                                continue;
-                            }
-                        });
-                    if let Ok(gas) = rpc
-                        .estimate_gas(tx_req.clone())
-                        .await
-                        .inspect_err(|error| {
-                            warn!(%error, rpc = %provider_handle.url, "estimate gas failed");
-                        })
                     {
-                        let gas = gas + 100_000;
-                        let tx_req = tx_req.with_gas_limit(gas);
-                        let cost = U256::from(gas * gas_price as u64);
+                        let PreparedEvmTransaction {
+                            tx_req,
+                            gas,
+                            gas_price,
+                            cost,
+                        } = prepared_tx;
                         let refund = fees_manager.convert_to_eth(&calldata).await;
 
                         info!(
                             gas,
+                            %gas_price,
                             cost = pretty_number(&cost, 18),
                             refund = pretty_number(&refund, 18),
                             "estimated gas"
@@ -780,22 +903,19 @@ impl BroadcasterService {
 
                         if refund < cost {
                             warn!("gas cost is too high, ignoring the transact request...");
-                            if let Ok(transact_response) = build_transact_response_error(
-                                None,
-                                &decrypted_payload.shared_key,
-                                "Gas cost is too high, please refresh and try again",
-                            )
+                            if let Ok(transact_response) =
+                                DecryptedTransactResponse::encrypted_error_message(
+                                    None,
+                                    &decrypted_payload.shared_key,
+                                    "Gas cost is too high, please refresh and try again",
+                                )
                                 .inspect_err(
                                     |error| error!(%error, "build error transact response failed"),
-                                ) && let Err(error) = client
-                                .publish(
-                                    PUBSUB_PATH,
-                                    &format!("/railgun/v2/0-{chain_id}-transact-response/json"),
-                                    &transact_response,
-                                )
-                                .await
-                            {
-                                error!(%error, "publish error transact response failed");
+                                 ) && let Err(error) = client
+                                 .publish(&transact_response_topic, &transact_response)
+                                 .await
+                             {
+                                 error!(%error, "publish error transact response failed");
                             }
                             continue;
                         }
@@ -825,27 +945,21 @@ impl BroadcasterService {
                                         tx_hash = %tx_hash,
                                         "persist fee-note assurance record failed"
                                     );
-                                    queue_fee_note_assurance_fallback(
-                                        pending_fee_note_assurance_fallback.as_ref(),
-                                        record,
-                                    );
+                                    pending_fee_note_assurance_fallback.insert(record);
                                 }
                             }
-                            if let Ok(transact_response) = build_transact_response_txhash(
-                                None,
-                                &decrypted_payload.shared_key,
-                                tx_hash,
-                            )
-                                .inspect_err(|error| error!(%error, "build transact response failed"))
-                                && let Err(error) = client
-                                .publish(
-                                    PUBSUB_PATH,
-                                    &format!("/railgun/v2/0-{chain_id}-transact-response/json"),
-                                    &transact_response,
+                            if let Ok(transact_response) =
+                                DecryptedTransactResponse::encrypted_tx_hash_message(
+                                    None,
+                                    &decrypted_payload.shared_key,
+                                    tx_hash,
                                 )
-                                .await
-                            {
-                                error!(%error, "publish transact response failed");
+                                  .inspect_err(|error| error!(%error, "build transact response failed"))
+                                  && let Err(error) = client
+                                  .publish(&transact_response_topic, &transact_response)
+                                 .await
+                             {
+                                 error!(%error, "publish transact response failed");
                             }
                         }
                     }
@@ -869,10 +983,8 @@ impl BroadcasterService {
 
         let db = self.db.clone();
         let pending_fee_note_assurance_fallback = self.pending_fee_note_assurance_fallback.clone();
-        let logged_fee_note_assurance_submissions =
-            self.logged_fee_note_assurance_submissions.clone();
-        let fee_note_assurance_submission_attempts =
-            self.fee_note_assurance_submission_attempts.clone();
+        let fee_note_assurance_submission_tracker =
+            self.fee_note_assurance_submission_tracker.clone();
         let query_rpc_pool = self.query_rpc_pool.clone();
         let chain_id = self.chain_id;
         let poll_interval = self.receipt_poll_interval;
@@ -882,11 +994,7 @@ impl BroadcasterService {
                 let mut interval = tokio::time::interval(poll_interval);
                 loop {
                     interval.tick().await;
-                    try_persist_fee_note_assurance_fallback(
-                        db.as_ref(),
-                        pending_fee_note_assurance_fallback.as_ref(),
-                        chain_id,
-                    );
+                    pending_fee_note_assurance_fallback.try_persist(db.as_ref(), chain_id);
 
                     let db_records = match db.list_pending_fee_note_assurance(chain_id) {
                         Ok(records) => records,
@@ -897,9 +1005,7 @@ impl BroadcasterService {
                     };
                     let records = collect_pending_fee_note_assurance_records(
                         db_records,
-                        snapshot_fee_note_assurance_fallback(
-                            pending_fee_note_assurance_fallback.as_ref(),
-                        ),
+                        pending_fee_note_assurance_fallback.snapshot(),
                     );
 
                     for (record, was_fallback_only) in records {
@@ -907,18 +1013,14 @@ impl BroadcasterService {
                             db.as_ref(),
                             query_rpc_pool.as_ref(),
                             poi.as_ref(),
-                            logged_fee_note_assurance_submissions.as_ref(),
-                            fee_note_assurance_submission_attempts.as_ref(),
+                            fee_note_assurance_submission_tracker.as_ref(),
                             railgun_contract,
                             finality_depth,
                             record.clone(),
                         )
                         .await;
                         if should_remove_fee_note_assurance_fallback(outcome, was_fallback_only) {
-                            remove_fee_note_assurance_fallback(
-                                pending_fee_note_assurance_fallback.as_ref(),
-                                &record.public_tx_hash,
-                            );
+                            pending_fee_note_assurance_fallback.remove(&record.public_tx_hash);
                         }
                     }
                 }
@@ -938,57 +1040,55 @@ impl BroadcasterService {
     }
 }
 
-fn queue_fee_note_assurance_fallback(
-    fallback: &Mutex<HashMap<FixedBytes<32>, PendingFeeNoteAssuranceRecord>>,
-    record: PendingFeeNoteAssuranceRecord,
-) {
-    let mut fallback = fallback
-        .lock()
-        .expect("fee-note assurance fallback poisoned");
-    fallback.insert(record.public_tx_hash, record);
+#[derive(Default)]
+struct FeeNoteAssuranceFallback {
+    records: Mutex<HashMap<FixedBytes<32>, PendingFeeNoteAssuranceRecord>>,
 }
 
-fn snapshot_fee_note_assurance_fallback(
-    fallback: &Mutex<HashMap<FixedBytes<32>, PendingFeeNoteAssuranceRecord>>,
-) -> Vec<PendingFeeNoteAssuranceRecord> {
-    let fallback = fallback
-        .lock()
-        .expect("fee-note assurance fallback poisoned");
-    fallback.values().cloned().collect()
-}
+impl FeeNoteAssuranceFallback {
+    fn insert(&self, record: PendingFeeNoteAssuranceRecord) {
+        let mut records = self
+            .records
+            .lock()
+            .expect("fee-note assurance fallback poisoned");
+        records.insert(record.public_tx_hash, record);
+    }
 
-fn remove_fee_note_assurance_fallback(
-    fallback: &Mutex<HashMap<FixedBytes<32>, PendingFeeNoteAssuranceRecord>>,
-    public_tx_hash: &FixedBytes<32>,
-) {
-    let mut fallback = fallback
-        .lock()
-        .expect("fee-note assurance fallback poisoned");
-    fallback.remove(public_tx_hash);
-}
+    fn snapshot(&self) -> Vec<PendingFeeNoteAssuranceRecord> {
+        let records = self
+            .records
+            .lock()
+            .expect("fee-note assurance fallback poisoned");
+        records.values().cloned().collect()
+    }
 
-fn try_persist_fee_note_assurance_fallback(
-    db: &DbStore,
-    fallback: &Mutex<HashMap<FixedBytes<32>, PendingFeeNoteAssuranceRecord>>,
-    chain_id: u64,
-) {
-    for record in snapshot_fee_note_assurance_fallback(fallback) {
-        match db.put_pending_fee_note_assurance(&record) {
-            Ok(()) => {
-                info!(
-                    chain_id,
-                    tx_hash = %record.public_tx_hash,
-                    "persisted fallback fee-note assurance record"
-                );
-                remove_fee_note_assurance_fallback(fallback, &record.public_tx_hash);
-            }
-            Err(error) => {
-                warn!(
-                    ?error,
-                    chain_id,
-                    tx_hash = %record.public_tx_hash,
-                    "persist fallback fee-note assurance record failed"
-                );
+    fn remove(&self, public_tx_hash: &FixedBytes<32>) {
+        let mut records = self
+            .records
+            .lock()
+            .expect("fee-note assurance fallback poisoned");
+        records.remove(public_tx_hash);
+    }
+
+    fn try_persist(&self, db: &DbStore, chain_id: u64) {
+        for record in self.snapshot() {
+            match db.put_pending_fee_note_assurance(&record) {
+                Ok(()) => {
+                    info!(
+                        chain_id,
+                        tx_hash = %record.public_tx_hash,
+                        "persisted fallback fee-note assurance record"
+                    );
+                    self.remove(&record.public_tx_hash);
+                }
+                Err(error) => {
+                    warn!(
+                        ?error,
+                        chain_id,
+                        tx_hash = %record.public_tx_hash,
+                        "persist fallback fee-note assurance record failed"
+                    );
+                }
             }
         }
     }
@@ -1022,16 +1122,15 @@ const fn should_remove_fee_note_assurance_fallback(
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_pending_fee_note_assurance_records, fee_note_assurance_required,
-        queue_fee_note_assurance_fallback, remove_fee_note_assurance_fallback,
-        should_remove_fee_note_assurance_fallback, snapshot_fee_note_assurance_fallback,
+        FeeNoteAssuranceFallback, collect_pending_fee_note_assurance_records,
+        fee_note_assurance_required, should_remove_fee_note_assurance_fallback,
     };
     use crate::fee_note_assurance::FeeNoteAssuranceRecordOutcome;
-    use alloy::primitives::{FixedBytes, U256};
+    use alloy::primitives::FixedBytes;
+    use alloy::uint;
     use broadcaster_core::transact::FeeNoteAssuranceContext;
     use local_db::PendingFeeNoteAssuranceRecord;
     use std::collections::{BTreeMap, HashMap};
-    use std::sync::Mutex;
 
     #[test]
     fn fee_note_assurance_is_not_required_without_poi() {
@@ -1068,7 +1167,7 @@ mod tests {
             context: FeeNoteAssuranceContext {
                 chain_type: 0,
                 txid_version: "V2_PoseidonMerkle".to_string(),
-                railgun_txid: U256::from(5_u8),
+                railgun_txid: uint!(5_U256),
                 utxo_tree_in: 9,
                 fee_commitment: FixedBytes::from([1u8; 32]),
                 fee_note_npk: FixedBytes::from([2u8; 32]),
@@ -1080,12 +1179,12 @@ mod tests {
 
     #[test]
     fn fallback_queue_roundtrips_records() {
-        let fallback = Mutex::new(HashMap::new());
+        let fallback = FeeNoteAssuranceFallback::default();
         let record = sample_record(1, [0x11; 32]);
 
-        queue_fee_note_assurance_fallback(&fallback, record.clone());
+        fallback.insert(record.clone());
 
-        let snapshot = snapshot_fee_note_assurance_fallback(&fallback);
+        let snapshot = fallback.snapshot();
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].public_tx_hash, record.public_tx_hash);
         assert_eq!(
@@ -1093,15 +1192,15 @@ mod tests {
             record.context.railgun_txid
         );
 
-        remove_fee_note_assurance_fallback(&fallback, &record.public_tx_hash);
-        assert!(snapshot_fee_note_assurance_fallback(&fallback).is_empty());
+        fallback.remove(&record.public_tx_hash);
+        assert!(fallback.snapshot().is_empty());
     }
 
     #[test]
     fn collect_pending_fee_note_assurance_records_prefers_db_record() {
         let fallback_record = sample_record(1, [0x22; 32]);
         let mut db_record = fallback_record.clone();
-        db_record.context.railgun_txid = U256::from(9_u8);
+        db_record.context.railgun_txid = uint!(9_U256);
 
         let records = collect_pending_fee_note_assurance_records(
             vec![db_record.clone()],
@@ -1175,14 +1274,14 @@ async fn submit_tx(
 }
 
 fn pretty_number(num: &U256, decimals: usize) -> String {
-    let div = U256::from(10).pow(U256::from(decimals));
+    let div = uint!(10_U256).pow(U256::from(decimals));
     let q = num / div;
     let mut r = num % div;
 
     let mut frac = Vec::with_capacity(decimals);
     for _ in 0..decimals {
-        let digit = (r * U256::from(10)) / div;
-        r = (r * U256::from(10)) % div;
+        let digit = (r * uint!(10_U256)) / div;
+        r = (r * uint!(10_U256)) % div;
         frac.push((digit.to::<u8>() + b'0') as char);
     }
 
@@ -1232,33 +1331,42 @@ impl BroadcasterManager {
 
     /// Subscribes to Waku and runs the message processing loop.
     pub async fn run(&self) -> Result<(), BroadcasterManagerError> {
-        let chain_ids: HashSet<ChainId> = self
+        let chain_ids: Vec<ChainId> = self
             .services
             .iter()
             .map(BroadcasterService::chain_id)
-            .collect();
-
-        let content_topics: Vec<String> = chain_ids
+            .collect::<HashSet<_>>()
             .into_iter()
-            .flat_map(|chain_id| {
-                vec![
-                    format!("/railgun/v2/0-{chain_id}-transact/json"),
-                    format!("/railgun/v2/0-{chain_id}-fees/json"),
-                ]
-            })
             .collect();
 
-        let mut msg_rx = self.waku.subscribe(PUBSUB_PATH, content_topics).await?;
+        let transact_content_topics: Vec<String> = chain_ids
+            .iter()
+            .map(|chain_id| ContentTopic::transact_topic(*chain_id))
+            .collect();
+        let fee_content_topics: Vec<String> = chain_ids
+            .iter()
+            .map(|chain_id| ContentTopic::fees_topic(*chain_id))
+            .collect();
+
+        let mut transact_rx = self.waku.subscribe(transact_content_topics).await?;
+        let mut fee_rx = self
+            .waku
+            .subscribe_with_fee_history(fee_content_topics)
+            .await?;
 
         loop {
-            let Some(msg) = msg_rx.recv().await else {
+            let msg = tokio::select! {
+                msg = transact_rx.recv() => msg,
+                msg = fee_rx.recv() => msg,
+            };
+            let Some(msg) = msg else {
                 warn!("get message failed, retrying...");
                 continue;
             };
 
             let topic = ContentTopic::from(msg.content_topic.clone());
             match topic {
-                ContentTopic::Pong | ContentTopic::TransactResponse() | ContentTopic::Noop => {}
+                ContentTopic::Pong | ContentTopic::TransactResponse | ContentTopic::Noop => {}
                 ContentTopic::Fees(chain_id) => {
                     match serde_json::from_slice::<fees::Payload>(&msg.payload) {
                         Ok(payload) => {

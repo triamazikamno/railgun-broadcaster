@@ -16,6 +16,7 @@ logs/
 config.yaml
 config-*.yaml
 !config.example.yaml
+config.poi-indexer.yaml
 
 # Secrets and keys
 secrets/
@@ -26,4 +27,5 @@ secrets/
 .env.*
 
 db/
-artifacts/
+wallet_db/
+.opencode/

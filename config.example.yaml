@@ -232,7 +232,7 @@ chains:
       # USDC
       0xaf88d065e77c8cc2239327c5edb3a432268e5831: !Oracle
         addr: 0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612
-        token_decimals: 18
+        token_decimals: 6
       # DAI
       0xda10009cbd5d07dd0cecc66161fc93d7c9000da1: !Oracle
         addr: 0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612
@@ -264,6 +264,10 @@ trusted_signers:
 # Optional override for local db root.
 #db_dir: ./db
 
+# Optional override for prover artifact cache root.
+# Defaults to <db_dir>/railgun/blobs/artifacts.
+#artifacts_cache_dir: ./db/railgun/blobs/artifacts
+
 # Optional admin API for online wallet resets.
 #admin:
 #  listen_addr: 127.0.0.1:3001
@@ -276,6 +280,9 @@ waku:
   # Waku cluster id
   cluster_id: 5
 
+  # Waku static shard id.
+  shard_id: 1
+
   # List of custom DNS-based enr trees to bootstrap the libp2p network.
   #  Leave commented out to use default bootstrap nodes.
   #  Use empty list to disable DNS bootstrap.
@@ -283,6 +290,10 @@ waku:
 
   # DNS-over-HTTPS endpoint to use for DNS resolution.
   doh_endpoint: "https://cloudflare-dns.com/dns-query"
+
+  # DNS-over-HTTPS fallback endpoints. In Tor network mode, the clearnet DoH
+  # endpoint is used as a fallback unless explicitly disabled.
+  #doh_fallback_endpoints: []
 
   # Maximum number of peers to maintain persistent connections with
   max_peers: 10
