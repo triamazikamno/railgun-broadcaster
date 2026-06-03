@@ -72,8 +72,27 @@ pub struct Chain {
     pub evm_wallets: Vec<Bytes>,
     pub identifier: Option<String>,
     #[serde(default)]
-    pub chain_scoped_railgun_address: bool,
+    pub advertised_railgun_address_scope: AdvertisedRailgunAddressScope,
     pub sync: Option<SyncChainConfig>,
+}
+
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AdvertisedRailgunAddressScope {
+    #[default]
+    AllChains,
+    Evm,
+    Chain,
+}
+
+impl AdvertisedRailgunAddressScope {
+    #[must_use]
+    pub const fn derivation_scope(self, chain_id: ChainId) -> Option<(u8, ChainId)> {
+        match self {
+            Self::AllChains => None,
+            Self::Evm => Some((0, 0)),
+            Self::Chain => Some((0, chain_id)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

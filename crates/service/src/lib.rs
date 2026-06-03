@@ -74,7 +74,6 @@ sol! {
 }
 
 pub const API_VERSION: &str = "8.2.3";
-const RAILGUN_EVM_CHAIN_TYPE: u8 = 0;
 
 const WAD: U256 = uint!(1_000_000_000_000_000_000_U256);
 const FEE_BONUS_BPS_DENOMINATOR: U256 = uint!(10_000_U256);
@@ -264,6 +263,7 @@ pub struct BroadcasterService {
     key: [u8; 32],
     master_public_key: U256,
     addr: RailgunAddress,
+    advertised_addr: RailgunAddress,
     tx: ResponseSender,
     rx: ResponseReceiver,
     broadcaster: Arc<TxBroadcaster>,
@@ -291,17 +291,6 @@ const fn fee_note_assurance_required(
     has_pending_jobs: bool,
 ) -> bool {
     poi_enabled && (!required_poi_list.is_empty() || has_pending_jobs)
-}
-
-const fn advertised_railgun_address_scope(
-    chain_scoped: bool,
-    chain_id: ChainId,
-) -> Option<(u8, ChainId)> {
-    if chain_scoped {
-        Some((RAILGUN_EVM_CHAIN_TYPE, chain_id))
-    } else {
-        None
-    }
 }
 
 impl BroadcasterService {
@@ -394,22 +383,23 @@ impl BroadcasterService {
             chain_cfg.wrapped_native_token,
             fees_ttl.saturating_mul(5),
         ));
-        let advertised_address_scope = advertised_railgun_address_scope(
-            chain_cfg.chain_scoped_railgun_address,
-            chain_cfg.chain_id,
-        );
+        let advertised_address_scope = chain_cfg
+            .advertised_railgun_address_scope
+            .derivation_scope(chain_cfg.chain_id);
 
-        let (key, master_public_key, addr) = match &chain_cfg.key {
+        let (key, master_public_key, addr, advertised_addr) = match &chain_cfg.key {
             Key::ViewingPrivkey(key) => {
                 let viewing_key: ShareableViewingKey = key.clone().into();
                 let viewing_key_data = viewing_key
                     .decode_viewing_key_data()
                     .map_err(|_| BroadcasterServiceError::InvalidViewingPrivkey)?;
-                let addr = viewing_key_data.derive_address(advertised_address_scope)?;
+                let addr = viewing_key_data.derive_address(None)?;
+                let advertised_addr = viewing_key_data.derive_address(advertised_address_scope)?;
                 (
                     viewing_key_data.viewing_private_key,
                     viewing_key_data.master_public_key,
                     addr,
+                    advertised_addr,
                 )
             }
             Key::Mnemonic(mnemonic) => {
@@ -424,7 +414,8 @@ impl BroadcasterService {
                 let wallet = WalletKeys::from_mnemonic(seed_phrase, 0)?;
                 let key = wallet.viewing.viewing_private_key;
                 let master_public_key = wallet.viewing.master_public_key;
-                let addr = wallet.viewing.derive_address(advertised_address_scope)?;
+                let addr = wallet.viewing.derive_address(None)?;
+                let advertised_addr = wallet.viewing.derive_address(advertised_address_scope)?;
                 let railgun_contract = resolved_railgun_contract
                     .ok_or(BroadcasterServiceError::RailgunContractMissing)?;
                 let finality_depth =
@@ -616,7 +607,7 @@ impl BroadcasterService {
                         .instrument(info_span!("utxo_consolidation")),
                     );
                 }
-                (key, master_public_key, addr)
+                (key, master_public_key, addr, advertised_addr)
             }
         };
 
@@ -628,6 +619,7 @@ impl BroadcasterService {
             key,
             master_public_key,
             addr,
+            advertised_addr,
             tx,
             rx,
             broadcaster,
@@ -660,6 +652,11 @@ impl BroadcasterService {
         &self.addr
     }
 
+    #[must_use]
+    pub const fn advertised_addr(&self) -> &RailgunAddress {
+        &self.advertised_addr
+    }
+
     pub async fn update_prices(&self) -> Result<(), FeesError> {
         self.fees_manager.update_prices().await
     }
@@ -672,7 +669,7 @@ impl BroadcasterService {
         let push_interval = self.fees_refresh_interval;
         let fee_ttl = self.fees_ttl;
         let required_poi_list = self.required_poi_list.clone();
-        let railgun_address = self.addr.clone();
+        let railgun_address = self.advertised_addr.clone();
         let relay_adapt = self.relay_adapt_contract;
         let relay_adapt_7702 = self.relay_adapt_7702_contract;
         let identifier = self.identifier.clone();
@@ -1125,9 +1122,8 @@ const fn should_remove_fee_note_assurance_fallback(
 #[cfg(test)]
 mod tests {
     use super::{
-        FeeNoteAssuranceFallback, advertised_railgun_address_scope,
-        collect_pending_fee_note_assurance_records, fee_note_assurance_required,
-        should_remove_fee_note_assurance_fallback,
+        FeeNoteAssuranceFallback, collect_pending_fee_note_assurance_records,
+        fee_note_assurance_required, should_remove_fee_note_assurance_fallback,
     };
     use crate::fee_note_assurance::FeeNoteAssuranceRecordOutcome;
     use alloy::primitives::FixedBytes;
@@ -1162,19 +1158,6 @@ mod tests {
     #[test]
     fn fee_note_assurance_is_required_with_pending_jobs() {
         assert!(fee_note_assurance_required(true, &[], true));
-    }
-
-    #[test]
-    fn advertised_railgun_address_scope_defaults_to_all_chains() {
-        assert_eq!(advertised_railgun_address_scope(false, 1), None);
-    }
-
-    #[test]
-    fn advertised_railgun_address_scope_uses_chain_id_when_enabled() {
-        assert_eq!(
-            advertised_railgun_address_scope(true, 42161),
-            Some((0, 42161))
-        );
     }
 
     fn sample_record(chain_id: u64, tx_hash: [u8; 32]) -> PendingFeeNoteAssuranceRecord {
