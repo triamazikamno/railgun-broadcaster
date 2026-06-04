@@ -308,6 +308,19 @@ waku:
 
 query_rpc_cooldown: 3m
 poi_rpc: https://ppoi.fdi.network
+
+# Optional POI artifact cache fast path for default active POI lists.
+# Disabled unless explicitly configured. `poi_rpc` is still required for
+# proxy fallback, non-default lists, and POI proof submissions.
+#poi_artifact_source:
+#  trusted_publisher_pubkey: 0x24b50dff3cd78a1f5f73b8c484eb4645207fdf00202f2e0f7baf17a11f6b24c9
+#  manifest_source: !IpnsName k51qzi5uqu5dh3iwtu0o3o5d014fmgwaslfkody932y6owxn19o0cmhwbsjzyh
+#  gateway_urls:
+#    - https://dweb.link
+#    - https://ipfs.filebase.io
+#    - https://ipfs.io
+#  max_manifest_age: 24h
+
 required_poi_list:
   # Chainalysis OFAC Sanctions API
   - efc6ddb59c098a13fb2b618fdae94c1c3a807abc8fb1837c93620c9143ee9e88

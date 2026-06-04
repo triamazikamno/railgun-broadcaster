@@ -1,5 +1,6 @@
 mod auto_refill;
 mod fee_note_assurance;
+mod poi_validation;
 mod utxo_consolidation;
 
 use alloy::eips::Encodable2718;
@@ -23,7 +24,7 @@ use broadcaster_core::transact_response::DecryptedTransactResponse;
 use config::{Chain, Key};
 use fees::{FeesError, Manager as FeesManager};
 use local_db::{DbStore, PendingFeeNoteAssuranceRecord};
-use poi::poi::Poi;
+use poi::poi::DEFAULT_WALLET_POI_RPC_URL;
 use rand::seq::IndexedRandom;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -40,6 +41,7 @@ use crate::fee_note_assurance::{
     FeeNoteAssuranceRecordOutcome, FeeNoteAssuranceSubmissionTracker,
     process_fee_note_assurance_record,
 };
+pub use crate::poi_validation::BroadcasterPoiValidator;
 use crate::utxo_consolidation::{UtxoConsolidationConfig, UtxoConsolidationService};
 use poi::error::PoiError;
 use railgun_wallet::wallet_cache::wallet_cache_key;
@@ -146,6 +148,8 @@ const GAS_PRICE_BPS_DENOMINATOR: u128 = 10_000;
 const USER_TRANSACT_GAS_PRICE_BUFFER_BPS: u128 = 10_100;
 const MAINTENANCE_GAS_PRICE_BUFFER_BPS: u128 = 10_500;
 const EVM_GAS_LIMIT_BUFFER: u64 = 100_000;
+const ESTIMATE_GAS_FAILED_RESPONSE_MESSAGE: &str =
+    "Estimate gas failed, please refresh and try again";
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct EvmGasPricePolicy {
@@ -272,7 +276,7 @@ pub struct BroadcasterService {
     count_transact_requests: Arc<AtomicU32>,
     count_txs_landed: Arc<AtomicU32>,
     client: Arc<Client>,
-    poi: Option<Arc<Poi>>,
+    poi: Option<Arc<BroadcasterPoiValidator>>,
     required_poi_list: Vec<FixedBytes<32>>,
     query_rpc_pool: Arc<QueryRpcPool>,
     railgun_contract: Option<Address>,
@@ -298,7 +302,8 @@ impl BroadcasterService {
         chain_cfg: Chain,
         db: Arc<DbStore>,
         client: Arc<Client>,
-        poi: Option<Arc<Poi>>,
+        poi: Option<Arc<BroadcasterPoiValidator>>,
+        configured_poi_rpc_url: Option<url::Url>,
         required_poi_list: Vec<FixedBytes<32>>,
         sync_manager: Arc<SyncManager>,
         prover: Arc<ProverService>,
@@ -529,6 +534,7 @@ impl BroadcasterService {
                     progress_tx: None,
                     cache_store: None,
                     poi_recovery_prover: Some((*poi_recovery_prover).clone()),
+                    poi_rpc_url: wallet_poi_rpc_url(configured_poi_rpc_url.as_ref()),
                     poi_read_source: PoiReadSource::PoiProxy,
                     local_poi_caches: None,
                     manage_local_poi_cache: false,
@@ -874,8 +880,16 @@ impl BroadcasterService {
                                     warn!(%error, rpc = %provider_handle.url, "fetch nonce failed");
                                     query_rpc_pool.mark_bad_provider(&provider_handle);
                                 }
-                                PrepareEvmTransactionError::EstimateGas(_) => {
+                                PrepareEvmTransactionError::EstimateGas(source) => {
+                                    let error_message = transact_estimate_gas_error_message(source);
                                     warn!(%error, rpc = %provider_handle.url, "estimate gas failed");
+                                    publish_transact_error_response(
+                                        &client,
+                                        &transact_response_topic,
+                                        &decrypted_payload.shared_key,
+                                        &error_message,
+                                    )
+                                    .await;
                                 }
                                 PrepareEvmTransactionError::MaxGasPrice { .. } => {
                                     warn!(%error, rpc = %provider_handle.url, "gas price rejected");
@@ -903,20 +917,13 @@ impl BroadcasterService {
 
                         if refund < cost {
                             warn!("gas cost is too high, ignoring the transact request...");
-                            if let Ok(transact_response) =
-                                DecryptedTransactResponse::encrypted_error_message(
-                                    None,
-                                    &decrypted_payload.shared_key,
-                                    "Gas cost is too high, please refresh and try again",
-                                )
-                                .inspect_err(
-                                    |error| error!(%error, "build error transact response failed"),
-                                 ) && let Err(error) = client
-                                 .publish(&transact_response_topic, &transact_response)
-                                 .await
-                             {
-                                 error!(%error, "publish error transact response failed");
-                            }
+                            publish_transact_error_response(
+                                &client,
+                                &transact_response_topic,
+                                &decrypted_payload.shared_key,
+                                "Gas cost is too high, please refresh and try again",
+                            )
+                            .await;
                             continue;
                         }
 
@@ -1040,6 +1047,56 @@ impl BroadcasterService {
     }
 }
 
+fn wallet_poi_rpc_url(configured_poi_rpc_url: Option<&url::Url>) -> url::Url {
+    configured_poi_rpc_url.cloned().unwrap_or_else(|| {
+        DEFAULT_WALLET_POI_RPC_URL
+            .parse()
+            .expect("default POI RPC URL is valid")
+    })
+}
+
+fn build_transact_error_response(
+    shared_key: &[u8; 32],
+    message: &str,
+) -> Result<Vec<u8>, broadcaster_core::transact_response::ResponseError> {
+    DecryptedTransactResponse::encrypted_error_message(None, shared_key, message)
+}
+
+fn transact_estimate_gas_error_message(
+    error: &alloy::transports::RpcError<TransportErrorKind>,
+) -> String {
+    let Some(payload) = error.as_error_resp() else {
+        return ESTIMATE_GAS_FAILED_RESPONSE_MESSAGE.to_owned();
+    };
+    if payload.message.is_empty() {
+        ESTIMATE_GAS_FAILED_RESPONSE_MESSAGE.to_owned()
+    } else {
+        format!("Estimate gas failed: {}", payload.message)
+    }
+}
+
+async fn publish_transact_error_response(
+    client: &Client,
+    transact_response_topic: &str,
+    shared_key: &[u8; 32],
+    message: &str,
+) {
+    let transact_response = match build_transact_error_response(shared_key, message) {
+        Ok(transact_response) => transact_response,
+        Err(error) => {
+            error!(%error, "build error transact response failed");
+            return;
+        }
+    };
+
+    if let Err(error) = client
+        .publish(transact_response_topic, &transact_response)
+        .await
+    {
+        error!(%error, "publish error transact response failed");
+    }
+}
+
 #[derive(Default)]
 struct FeeNoteAssuranceFallback {
     records: Mutex<HashMap<FixedBytes<32>, PendingFeeNoteAssuranceRecord>>,
@@ -1122,13 +1179,17 @@ const fn should_remove_fee_note_assurance_fallback(
 #[cfg(test)]
 mod tests {
     use super::{
-        FeeNoteAssuranceFallback, collect_pending_fee_note_assurance_records,
+        DEFAULT_WALLET_POI_RPC_URL, ESTIMATE_GAS_FAILED_RESPONSE_MESSAGE, FeeNoteAssuranceFallback,
+        build_transact_error_response, collect_pending_fee_note_assurance_records,
         fee_note_assurance_required, should_remove_fee_note_assurance_fallback,
+        transact_estimate_gas_error_message, wallet_poi_rpc_url,
     };
     use crate::fee_note_assurance::FeeNoteAssuranceRecordOutcome;
     use alloy::primitives::FixedBytes;
+    use alloy::transports::{RpcError, TransportErrorKind};
     use alloy::uint;
     use broadcaster_core::transact::FeeNoteAssuranceContext;
+    use broadcaster_core::transact_response::DecryptedTransactResponse;
     use local_db::PendingFeeNoteAssuranceRecord;
     use std::collections::{BTreeMap, HashMap};
 
@@ -1158,6 +1219,62 @@ mod tests {
     #[test]
     fn fee_note_assurance_is_required_with_pending_jobs() {
         assert!(fee_note_assurance_required(true, &[], true));
+    }
+
+    #[test]
+    fn wallet_poi_rpc_url_uses_configured_url() {
+        let configured = url::Url::parse("https://poi.example").expect("configured POI URL");
+
+        assert_eq!(wallet_poi_rpc_url(Some(&configured)), configured);
+    }
+
+    #[test]
+    fn wallet_poi_rpc_url_defaults_when_unconfigured() {
+        let default = url::Url::parse(DEFAULT_WALLET_POI_RPC_URL).expect("default POI URL");
+
+        assert_eq!(wallet_poi_rpc_url(None), default);
+    }
+
+    #[test]
+    fn transact_error_response_roundtrips_error_message() {
+        let shared_key = [7u8; 32];
+        let message = "estimate gas failed: RailgunSmartWallet: Gas price too low";
+
+        let encrypted =
+            build_transact_error_response(&shared_key, message).expect("build error response");
+        let decrypted = DecryptedTransactResponse::try_decrypt_message(&shared_key, &encrypted)
+            .expect("decrypt error response")
+            .expect("decrypted response payload");
+
+        assert_eq!(
+            decrypted,
+            DecryptedTransactResponse::Error(message.to_string())
+        );
+    }
+
+    #[test]
+    fn estimate_gas_response_uses_rpc_error_message() {
+        let parse_error = serde_json::from_str::<serde_json::Value>("{")
+            .expect_err("invalid JSON should fail to parse");
+        let error = RpcError::<TransportErrorKind>::deser_err(
+            parse_error,
+            r#"{"code":3,"message":"execution reverted: RailgunSmartWallet: Gas price too low"}"#,
+        );
+
+        assert_eq!(
+            transact_estimate_gas_error_message(&error),
+            "Estimate gas failed: execution reverted: RailgunSmartWallet: Gas price too low"
+        );
+    }
+
+    #[test]
+    fn estimate_gas_response_hides_transport_error_details() {
+        let error = TransportErrorKind::custom_str("network error contacting http://secret-rpc");
+
+        assert_eq!(
+            transact_estimate_gas_error_message(&error),
+            ESTIMATE_GAS_FAILED_RESPONSE_MESSAGE
+        );
     }
 
     fn sample_record(chain_id: u64, tx_hash: [u8; 32]) -> PendingFeeNoteAssuranceRecord {

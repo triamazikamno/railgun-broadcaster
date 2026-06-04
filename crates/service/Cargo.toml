@@ -14,6 +14,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
 tracing = { workspace = true }
+url = { workspace = true }
 
 broadcaster-core = { workspace = true }
 railgun-wallet = { workspace = true }

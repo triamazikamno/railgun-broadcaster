@@ -6,13 +6,15 @@ use broadcaster_core::crypto::poseidon::poseidon;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use broadcaster_core::tree::TREE_LEAF_COUNT_U256;
 use local_db::{DbStore, FeeNoteAssuranceTerminalOutcome, PendingFeeNoteAssuranceRecord};
-use poi::poi::{Poi, PoiStatus};
+use poi::poi::PoiStatus;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
+
+use crate::poi_validation::BroadcasterPoiValidator;
 
 const FEE_NOTE_ASSURANCE_SUBMIT_BACKOFF: Duration = Duration::from_secs(15 * 60);
 
@@ -109,7 +111,7 @@ pub(crate) enum FeeNoteAssuranceRecordOutcome {
 pub(crate) async fn process_fee_note_assurance_record(
     db: &DbStore,
     query_rpc_pool: &QueryRpcPool,
-    poi: &Poi,
+    poi: &BroadcasterPoiValidator,
     submission_tracker: &FeeNoteAssuranceSubmissionTracker,
     railgun_contract: Address,
     finality_depth: u64,

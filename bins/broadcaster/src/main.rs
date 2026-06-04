@@ -1,7 +1,7 @@
 use broadcaster_core::crypto::snark_proof::Prover;
 mod admin;
 
-use broadcaster_service::{BroadcasterManager, BroadcasterService};
+use broadcaster_service::{BroadcasterManager, BroadcasterPoiValidator, BroadcasterService};
 use config::Config;
 use eyre::{Result, WrapErr, bail, eyre};
 use local_db::{DbConfig, DbStore};
@@ -13,7 +13,9 @@ use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::sync::Arc;
 use structopt::StructOpt;
-use sync_service::SyncManager;
+use sync_service::{
+    PoiArtifactManifestSource, PoiArtifactSourceConfig, PoiCacheService, SyncManager,
+};
 use tracing::metadata::LevelFilter;
 use tracing::{Instrument, error, info};
 use tracing_subscriber::layer::SubscriberExt;
@@ -54,6 +56,25 @@ fn waku_client_config(cfg: &config::Waku) -> ClientConfig {
         peer_connection_timeout: cfg
             .peer_connection_timeout
             .map(|timeout| timeout.into_inner()),
+    }
+}
+
+fn poi_artifact_source_config(cfg: &config::PoiArtifactSource) -> PoiArtifactSourceConfig {
+    PoiArtifactSourceConfig {
+        trusted_publisher_pubkey: cfg.trusted_publisher_pubkey,
+        manifest_source: match &cfg.manifest_source {
+            config::PoiArtifactManifestSource::Url(url) => {
+                PoiArtifactManifestSource::Url(url.clone())
+            }
+            config::PoiArtifactManifestSource::Cid(cid) => {
+                PoiArtifactManifestSource::Cid(cid.clone())
+            }
+            config::PoiArtifactManifestSource::IpnsName(name) => {
+                PoiArtifactManifestSource::IpnsName(name.clone())
+            }
+        },
+        gateway_urls: cfg.gateway_urls.clone(),
+        max_manifest_age: cfg.max_manifest_age.clone().map(|age| age.into_inner()),
     }
 }
 
@@ -127,6 +148,7 @@ async fn main() -> Result<()> {
             bail!("unsupported config file format");
         }
     };
+    cfg.validate().wrap_err("validate config")?;
     let db_dir = cfg.db_dir.clone().unwrap_or_else(|| PathBuf::from("db"));
     let db = Arc::new(DbStore::open(DbConfig { root_dir: db_dir }).wrap_err("open local db")?);
     let sync_manager = Arc::new(SyncManager::new(db.clone()));
@@ -159,22 +181,49 @@ async fn main() -> Result<()> {
         Arc::new(Client::new(&waku_client_config(&cfg.waku)).wrap_err("create waku relay client")?);
     let snark_prover = Arc::new(Prover::new().await.wrap_err("create snark prover")?);
 
-    let poi_verifier = cfg.poi_rpc.as_ref().map(|poi_rpc| {
-        Arc::new(Poi::new(
-            PoiRpcClient::new(poi_rpc.clone()),
-            snark_prover.clone(),
-            cfg.required_poi_list.clone(),
-        ))
+    let poi_cache_service = cfg.poi_artifact_source.as_ref().map(|artifact_cfg| {
+        let poi_rpc = cfg
+            .poi_rpc
+            .clone()
+            .expect("config validation requires poi_rpc for artifact mode");
+        let artifact_source = poi_artifact_source_config(artifact_cfg);
+        info!(
+            gateway_count = artifact_source.gateway_urls.len(),
+            max_manifest_age_secs = artifact_source.max_manifest_age.map(|age| age.as_secs()),
+            "broadcaster POI artifact cache mode enabled"
+        );
+        Arc::new(PoiCacheService::new(db.clone(), artifact_source, None).with_poi_rpc_url(poi_rpc))
     });
     let mut services = Vec::with_capacity(cfg.chains.len());
     for chain_cfg in cfg.chains.clone() {
         let chain_id = chain_cfg.chain_id;
         info!(chain_id, "starting broadcaster service");
+        let local_poi_caches = if let Some(poi_cache_service) = poi_cache_service.as_ref() {
+            info!(chain_id, "starting broadcaster chain POI artifact cache");
+            Some(poi_cache_service.start_chain(chain_id).await)
+        } else {
+            None
+        };
+        let poi_verifier = cfg.poi_rpc.as_ref().map(|poi_rpc| {
+            let proxy = Arc::new(Poi::new(
+                PoiRpcClient::new(poi_rpc.clone()),
+                snark_prover.clone(),
+                cfg.required_poi_list.clone(),
+            ));
+            Arc::new(BroadcasterPoiValidator::new(
+                proxy,
+                PoiRpcClient::new(poi_rpc.clone()),
+                snark_prover.clone(),
+                cfg.required_poi_list.clone(),
+                local_poi_caches.clone(),
+            ))
+        });
         let service = BroadcasterService::new(
             chain_cfg,
             db.clone(),
             waku_client.clone(),
             poi_verifier.clone(),
+            cfg.poi_rpc.clone(),
             cfg.required_poi_list.clone(),
             sync_manager.clone(),
             prover.clone(),

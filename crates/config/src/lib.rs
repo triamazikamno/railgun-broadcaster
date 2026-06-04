@@ -2,6 +2,7 @@ use alloy::primitives::{Address, Bytes, ChainId, FixedBytes, U256};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer};
 use std::collections::{HashMap, HashSet};
+use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -17,11 +18,59 @@ pub struct Config {
     pub trusted_signers: HashSet<String>,
     pub required_poi_list: Vec<FixedBytes<32>>,
     pub poi_rpc: Option<Url>,
+    pub poi_artifact_source: Option<PoiArtifactSource>,
     pub waku: Waku,
     pub admin: Option<AdminConfig>,
     pub artifacts_metadata_dir: Option<PathBuf>,
     pub artifacts_cache_dir: Option<PathBuf>,
     pub db_dir: Option<PathBuf>,
+}
+
+impl Config {
+    /// Validate relationships that serde cannot express.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when dependent configuration is missing.
+    pub fn validate(&self) -> Result<(), ConfigValidationError> {
+        if self.poi_artifact_source.is_some() && self.poi_rpc.is_none() {
+            return Err(ConfigValidationError::PoiArtifactSourceRequiresPoiRpc);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigValidationError {
+    PoiArtifactSourceRequiresPoiRpc,
+}
+
+impl fmt::Display for ConfigValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PoiArtifactSourceRequiresPoiRpc => formatter.write_str(
+                "poi_artifact_source requires poi_rpc for fallback validation and proof submission",
+            ),
+        }
+    }
+}
+
+impl Error for ConfigValidationError {}
+
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct PoiArtifactSource {
+    pub trusted_publisher_pubkey: FixedBytes<32>,
+    pub manifest_source: PoiArtifactManifestSource,
+    pub gateway_urls: Vec<Url>,
+    pub max_manifest_age: Option<humantime_serde::Serde<Duration>>,
+}
+
+#[derive(Deserialize, Clone)]
+pub enum PoiArtifactManifestSource {
+    Url(Url),
+    Cid(String),
+    IpnsName(String),
 }
 
 #[derive(Deserialize)]
@@ -261,7 +310,7 @@ pub enum Rpc {
 mod tests {
     use serde::Deserialize;
 
-    use super::FeeBonusBps;
+    use super::{Config, ConfigValidationError, FeeBonusBps};
 
     #[derive(Debug, Deserialize)]
     struct FeeBonusFixture {
@@ -302,5 +351,55 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("non-negative"));
+    }
+
+    fn base_config_json() -> serde_json::Value {
+        serde_json::json!({
+            "chains": [],
+            "query_rpc_cooldown": "3m",
+            "trusted_signers": [],
+            "required_poi_list": [],
+            "poi_rpc": null,
+            "waku": {}
+        })
+    }
+
+    #[test]
+    fn validation_accepts_disabled_poi_artifact_source_without_proxy() {
+        let cfg =
+            serde_json::from_value::<Config>(base_config_json()).expect("config should parse");
+
+        cfg.validate().expect("disabled artifact mode is valid");
+    }
+
+    #[test]
+    fn validation_accepts_enabled_poi_artifact_source_with_proxy() {
+        let mut value = base_config_json();
+        value["poi_rpc"] = serde_json::json!("https://ppoi.example");
+        value["poi_artifact_source"] = serde_json::json!({
+            "trusted_publisher_pubkey": "0x24b50dff3cd78a1f5f73b8c484eb4645207fdf00202f2e0f7baf17a11f6b24c9",
+            "manifest_source": { "IpnsName": "k51qzi5uqu5dh3iwtu0o3o5d014fmgwaslfkody932y6owxn19o0cmhwbsjzyh" },
+            "gateway_urls": ["https://dweb.link", "https://ipfs.io"],
+            "max_manifest_age": "24h"
+        });
+        let cfg = serde_json::from_value::<Config>(value).expect("config should parse");
+
+        cfg.validate().expect("artifact mode with proxy is valid");
+    }
+
+    #[test]
+    fn validation_rejects_enabled_poi_artifact_source_without_proxy() {
+        let mut value = base_config_json();
+        value["poi_artifact_source"] = serde_json::json!({
+            "trusted_publisher_pubkey": "0x24b50dff3cd78a1f5f73b8c484eb4645207fdf00202f2e0f7baf17a11f6b24c9",
+            "manifest_source": { "IpnsName": "k51qzi5uqu5dh3iwtu0o3o5d014fmgwaslfkody932y6owxn19o0cmhwbsjzyh" },
+            "gateway_urls": ["https://dweb.link"]
+        });
+        let cfg = serde_json::from_value::<Config>(value).expect("config should parse");
+
+        assert_eq!(
+            cfg.validate().unwrap_err(),
+            ConfigValidationError::PoiArtifactSourceRequiresPoiRpc
+        );
     }
 }
