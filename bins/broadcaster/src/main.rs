@@ -192,7 +192,10 @@ async fn main() -> Result<()> {
             max_manifest_age_secs = artifact_source.max_manifest_age.map(|age| age.as_secs()),
             "broadcaster POI artifact cache mode enabled"
         );
-        Arc::new(PoiCacheService::new(db.clone(), artifact_source, None).with_poi_rpc_url(poi_rpc))
+        Arc::new(
+            PoiCacheService::new(db.clone(), artifact_source, Some(reqwest::Client::new()))
+                .with_poi_rpc_url(poi_rpc),
+        )
     });
     let mut services = Vec::with_capacity(cfg.chains.len());
     for chain_cfg in cfg.chains.clone() {

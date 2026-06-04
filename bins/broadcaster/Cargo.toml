@@ -25,3 +25,4 @@ broadcaster-service = { path = "../../crates/service" }
 railgun-wallet = { workspace = true }
 sync-service = { workspace = true }
 local-db = { workspace = true }
+reqwest = { workspace = true }
