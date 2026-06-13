@@ -510,7 +510,11 @@ mod tests {
         BroadcasterRawParamsTransact {
             chain_type: u64::from(EVM_CHAIN_TYPE),
             chain_id: CHAIN_ID,
+            transact_type: None,
             min_gas_price: None,
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            authorization: None,
             fees_id: None,
             to: Address::ZERO,
             data: Bytes::new(),

@@ -4,7 +4,10 @@ mod poi_validation;
 mod utxo_consolidation;
 
 use alloy::eips::Encodable2718;
-use alloy::network::{EthereumWallet, NetworkTransactionBuilder, TransactionBuilder};
+use alloy::eips::eip7702::{Authorization, SignedAuthorization};
+use alloy::network::{
+    EthereumWallet, NetworkTransactionBuilder, TransactionBuilder, TransactionBuilder7702,
+};
 use alloy::primitives::{Address, Bytes, ChainId, FixedBytes, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::TransactionRequest;
@@ -17,6 +20,7 @@ use broadcaster_core::crypto::railgun::{
 };
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use broadcaster_core::transact::{
+    BroadcasterAuthorization, BroadcasterRawParamsTransact, BroadcasterTransactRequestType,
     DecryptedTransact, ParsedTransactCalldata, TransactError, parse_transact_calldata,
     try_decrypt_transact_request,
 };
@@ -179,6 +183,31 @@ pub(crate) enum PrepareEvmTransactionError {
     FetchNonce(#[source] alloy::transports::RpcError<TransportErrorKind>),
     #[error("estimate gas failed: {0}")]
     EstimateGas(#[source] alloy::transports::RpcError<TransportErrorKind>),
+    #[error("missing tx7702 field: {field}")]
+    MissingTx7702Field { field: &'static str },
+    #[error("missing relay_adapt_7702_contract")]
+    MissingRelayAdapt7702Contract,
+    #[error("tx7702 field {field} value {value} exceeds u128")]
+    Tx7702FieldExceedsU128 { field: &'static str, value: U256 },
+    #[error("tx7702 authorization nonce {nonce} exceeds u64")]
+    Tx7702NonceExceedsU64 { nonce: U256 },
+    #[error("invalid tx7702 signature v: {v}")]
+    InvalidTx7702SignatureV { v: u64 },
+    #[error(
+        "tx7702 authorization chain_id {authorization_chain_id} is not 0 or chain_id {chain_id}"
+    )]
+    Tx7702AuthorizationChainIdMismatch {
+        authorization_chain_id: U256,
+        chain_id: ChainId,
+    },
+    #[error(
+        "tx7702 authorization address {actual} does not match relay_adapt_7702_contract {expected}"
+    )]
+    Tx7702AuthorizationAddressMismatch { actual: Address, expected: Address },
+    #[error("recover tx7702 authorization authority failed: {0}")]
+    Tx7702AuthorizationRecovery(#[source] alloy::eips::eip7702::Eip7702Error),
+    #[error("tx7702 authorization authority {actual} does not match request to {expected}")]
+    Tx7702AuthorizationAuthorityMismatch { actual: Address, expected: Address },
 }
 
 pub(crate) async fn prepare_evm_transaction(
@@ -229,6 +258,136 @@ pub(crate) async fn prepare_evm_transaction(
         tx_req,
         gas,
         gas_price,
+        cost,
+    })
+}
+
+const fn tx7702_y_parity(v: u64) -> Result<u8, PrepareEvmTransactionError> {
+    match v {
+        0 | 1 => Ok(v as u8),
+        27 | 28 => Ok((v - 27) as u8),
+        _ => Err(PrepareEvmTransactionError::InvalidTx7702SignatureV { v }),
+    }
+}
+
+fn signed_tx7702_authorization(
+    authorization: &BroadcasterAuthorization,
+) -> Result<SignedAuthorization, PrepareEvmTransactionError> {
+    let y_parity = tx7702_y_parity(authorization.signature.v)?;
+    let nonce = u64::try_from(authorization.nonce).map_err(|_| {
+        PrepareEvmTransactionError::Tx7702NonceExceedsU64 {
+            nonce: authorization.nonce,
+        }
+    })?;
+
+    Ok(SignedAuthorization::new_unchecked(
+        Authorization {
+            chain_id: authorization.chain_id,
+            address: authorization.address,
+            nonce,
+        },
+        y_parity,
+        authorization.signature.r,
+        authorization.signature.s,
+    ))
+}
+
+pub(crate) async fn prepare_evm_tx7702_transaction(
+    provider: &(impl Provider + Clone),
+    chain_id: ChainId,
+    from: Address,
+    params: &BroadcasterRawParamsTransact,
+    relay_adapt_7702_contract: Option<Address>,
+) -> Result<PreparedEvmTransaction, PrepareEvmTransactionError> {
+    let relay_adapt_7702_contract = relay_adapt_7702_contract
+        .ok_or(PrepareEvmTransactionError::MissingRelayAdapt7702Contract)?;
+    let authorization =
+        params
+            .authorization
+            .as_ref()
+            .ok_or(PrepareEvmTransactionError::MissingTx7702Field {
+                field: "authorization",
+            })?;
+    let max_fee_per_gas = params
+        .max_fee_per_gas
+        .ok_or(PrepareEvmTransactionError::MissingTx7702Field {
+            field: "maxFeePerGas",
+        })
+        .and_then(|value| {
+            u128::try_from(value).map_err(|_| PrepareEvmTransactionError::Tx7702FieldExceedsU128 {
+                field: "maxFeePerGas",
+                value,
+            })
+        })?;
+    let max_priority_fee_per_gas = params
+        .max_priority_fee_per_gas
+        .ok_or(PrepareEvmTransactionError::MissingTx7702Field {
+            field: "maxPriorityFeePerGas",
+        })
+        .and_then(|value| {
+            u128::try_from(value).map_err(|_| PrepareEvmTransactionError::Tx7702FieldExceedsU128 {
+                field: "maxPriorityFeePerGas",
+                value,
+            })
+        })?;
+
+    let authorization_chain_id = authorization.chain_id;
+    if authorization_chain_id != U256::ZERO && authorization_chain_id != U256::from(chain_id) {
+        return Err(
+            PrepareEvmTransactionError::Tx7702AuthorizationChainIdMismatch {
+                authorization_chain_id,
+                chain_id,
+            },
+        );
+    }
+
+    if authorization.address != relay_adapt_7702_contract {
+        return Err(
+            PrepareEvmTransactionError::Tx7702AuthorizationAddressMismatch {
+                actual: authorization.address,
+                expected: relay_adapt_7702_contract,
+            },
+        );
+    }
+
+    let signed_authorization = signed_tx7702_authorization(authorization)?;
+    let authority = signed_authorization
+        .recover_authority()
+        .map_err(PrepareEvmTransactionError::Tx7702AuthorizationRecovery)?;
+    if authority != params.to {
+        return Err(
+            PrepareEvmTransactionError::Tx7702AuthorizationAuthorityMismatch {
+                actual: authority,
+                expected: params.to,
+            },
+        );
+    }
+
+    let nonce = provider
+        .get_transaction_count(from)
+        .await
+        .map_err(PrepareEvmTransactionError::FetchNonce)?;
+    let tx_req = TransactionRequest::default()
+        .with_chain_id(chain_id)
+        .with_from(from)
+        .with_to(params.to)
+        .with_input(params.data.clone())
+        .with_max_fee_per_gas(max_fee_per_gas)
+        .with_max_priority_fee_per_gas(max_priority_fee_per_gas)
+        .with_nonce(nonce)
+        .with_authorization_list(vec![signed_authorization]);
+    let gas = provider
+        .estimate_gas(tx_req.clone())
+        .await
+        .map_err(PrepareEvmTransactionError::EstimateGas)?
+        + EVM_GAS_LIMIT_BUFFER;
+    let tx_req = tx_req.with_gas_limit(gas);
+    let cost = U256::from(gas) * U256::from(max_fee_per_gas);
+
+    Ok(PreparedEvmTransaction {
+        tx_req,
+        gas,
+        gas_price: max_fee_per_gas,
         cost,
     })
 }
@@ -783,6 +942,13 @@ impl BroadcasterService {
             self.master_public_key,
             req.params.txid_version.as_deref(),
         )
+        .inspect_err(|error| {
+            warn!(
+                ?error,
+                transact_request = ?req.params,
+                "failed to parse decoded transact request"
+            );
+        })
         .map_err(HandleTransactError::Parse)?;
 
         info!(
@@ -816,6 +982,7 @@ impl BroadcasterService {
         let evm_wallets = self.evm_wallets.clone();
         let broadcaster = self.broadcaster.clone();
         let client = self.client.clone();
+        let relay_adapt_7702_contract = self.relay_adapt_7702_contract;
         let transact_response_topic = ContentTopic::transact_response_topic(chain_id);
 
         tokio::spawn(async move {
@@ -826,7 +993,11 @@ impl BroadcasterService {
                     .inspect_err(|error| warn!(%error, "failed to receive transact request"))
                 {
                     if chain_id != decrypted_payload.params.chain_id {
-                        warn!(?decrypted_payload, "wrong chain_id");
+                        warn!(
+                            request_chain_id = decrypted_payload.params.chain_id,
+                            expected_chain_id = chain_id,
+                            "wrong chain_id"
+                        );
                         continue;
                     }
                     if decrypted_payload
@@ -854,21 +1025,43 @@ impl BroadcasterService {
                     };
                     let rpc = provider_handle.provider.clone();
 
-                    let min_gas_price = decrypted_payload.params.min_gas_price.unwrap_or_default().to();
-                    let prepared_tx = match prepare_evm_transaction(
-                        &rpc,
-                        chain_id,
-                        signer.address(),
-                        decrypted_payload.params.to,
-                        decrypted_payload.params.data.clone(),
-                        EvmGasPricePolicy {
-                            gas_price_buffer_bps: USER_TRANSACT_GAS_PRICE_BUFFER_BPS,
-                            min_gas_price: Some(min_gas_price),
-                            max_gas_price: None,
-                        },
-                    )
-                    .await
-                    {
+                    let transact_type = decrypted_payload
+                        .params
+                        .transact_type
+                        .unwrap_or(BroadcasterTransactRequestType::Common);
+                    let prepared_tx_result = match transact_type {
+                        BroadcasterTransactRequestType::Common => {
+                            let min_gas_price = decrypted_payload
+                                .params
+                                .min_gas_price
+                                .unwrap_or_default()
+                                .to();
+                            prepare_evm_transaction(
+                                &rpc,
+                                chain_id,
+                                signer.address(),
+                                decrypted_payload.params.to,
+                                decrypted_payload.params.data.clone(),
+                                EvmGasPricePolicy {
+                                    gas_price_buffer_bps: USER_TRANSACT_GAS_PRICE_BUFFER_BPS,
+                                    min_gas_price: Some(min_gas_price),
+                                    max_gas_price: None,
+                                },
+                            )
+                            .await
+                        }
+                        BroadcasterTransactRequestType::Tx7702 => {
+                            prepare_evm_tx7702_transaction(
+                                &rpc,
+                                chain_id,
+                                signer.address(),
+                                &decrypted_payload.params,
+                                relay_adapt_7702_contract,
+                            )
+                            .await
+                        }
+                    };
+                    let prepared_tx = match prepared_tx_result {
                         Ok(prepared_tx) => prepared_tx,
                         Err(error) => {
                             match &error {
@@ -893,6 +1086,33 @@ impl BroadcasterService {
                                 }
                                 PrepareEvmTransactionError::MaxGasPrice { .. } => {
                                     warn!(%error, rpc = %provider_handle.url, "gas price rejected");
+                                }
+                                PrepareEvmTransactionError::MissingRelayAdapt7702Contract => {
+                                    warn!(%error, rpc = %provider_handle.url, "tx7702 unsupported on this chain");
+                                    publish_transact_error_response(
+                                        &client,
+                                        &transact_response_topic,
+                                        &decrypted_payload.shared_key,
+                                        "Broadcaster is not configured for TX7702 on this chain",
+                                    )
+                                    .await;
+                                }
+                                PrepareEvmTransactionError::MissingTx7702Field { .. }
+                                | PrepareEvmTransactionError::Tx7702FieldExceedsU128 { .. }
+                                | PrepareEvmTransactionError::Tx7702NonceExceedsU64 { .. }
+                                | PrepareEvmTransactionError::InvalidTx7702SignatureV { .. }
+                                | PrepareEvmTransactionError::Tx7702AuthorizationChainIdMismatch { .. }
+                                | PrepareEvmTransactionError::Tx7702AuthorizationAddressMismatch { .. }
+                                | PrepareEvmTransactionError::Tx7702AuthorizationRecovery(_)
+                                | PrepareEvmTransactionError::Tx7702AuthorizationAuthorityMismatch { .. } => {
+                                    warn!(%error, rpc = %provider_handle.url, "invalid tx7702 request");
+                                    publish_transact_error_response(
+                                        &client,
+                                        &transact_response_topic,
+                                        &decrypted_payload.shared_key,
+                                        "Invalid TX7702 request, please refresh and try again",
+                                    )
+                                    .await;
                                 }
                             }
                             continue;
@@ -937,7 +1157,7 @@ impl BroadcasterService {
                                 .await
                                 .inspect_err(|error| error!(%error, "submit tx failed"))
                         {
-                            info!(?tx_hash, shared_key=%hex::encode(decrypted_payload.shared_key), "submitted tx");
+                            info!(?tx_hash, "submitted tx");
                             count_txs_landed.fetch_add(1, Ordering::Relaxed);
                             if let Some(context) = calldata.fee_note_assurance.as_ref() {
                                 let record = PendingFeeNoteAssuranceRecord {
@@ -1182,7 +1402,7 @@ mod tests {
         DEFAULT_WALLET_POI_RPC_URL, ESTIMATE_GAS_FAILED_RESPONSE_MESSAGE, FeeNoteAssuranceFallback,
         build_transact_error_response, collect_pending_fee_note_assurance_records,
         fee_note_assurance_required, should_remove_fee_note_assurance_fallback,
-        transact_estimate_gas_error_message, wallet_poi_rpc_url,
+        transact_estimate_gas_error_message, tx7702_y_parity, wallet_poi_rpc_url,
     };
     use crate::fee_note_assurance::FeeNoteAssuranceRecordOutcome;
     use alloy::primitives::FixedBytes;
@@ -1275,6 +1495,15 @@ mod tests {
             transact_estimate_gas_error_message(&error),
             ESTIMATE_GAS_FAILED_RESPONSE_MESSAGE
         );
+    }
+
+    #[test]
+    fn tx7702_y_parity_normalizes_ethers_v_values() {
+        assert_eq!(tx7702_y_parity(0).expect("v 0"), 0);
+        assert_eq!(tx7702_y_parity(1).expect("v 1"), 1);
+        assert_eq!(tx7702_y_parity(27).expect("v 27"), 0);
+        assert_eq!(tx7702_y_parity(28).expect("v 28"), 1);
+        assert!(tx7702_y_parity(29).is_err());
     }
 
     fn sample_record(chain_id: u64, tx_hash: [u8; 32]) -> PendingFeeNoteAssuranceRecord {

@@ -247,6 +247,26 @@ impl AutoRefillService {
                     warn!(%error, wallet = %wallet_address, rpc = %provider_handle.url, "estimate gas failed");
                     continue;
                 }
+                Err(
+                    error @ (PrepareEvmTransactionError::MissingTx7702Field { .. }
+                    | PrepareEvmTransactionError::MissingRelayAdapt7702Contract
+                    | PrepareEvmTransactionError::Tx7702FieldExceedsU128 { .. }
+                    | PrepareEvmTransactionError::Tx7702NonceExceedsU64 { .. }
+                    | PrepareEvmTransactionError::InvalidTx7702SignatureV { .. }
+                    | PrepareEvmTransactionError::Tx7702AuthorizationChainIdMismatch {
+                        ..
+                    }
+                    | PrepareEvmTransactionError::Tx7702AuthorizationAddressMismatch {
+                        ..
+                    }
+                    | PrepareEvmTransactionError::Tx7702AuthorizationRecovery(_)
+                    | PrepareEvmTransactionError::Tx7702AuthorizationAuthorityMismatch {
+                        ..
+                    }),
+                ) => {
+                    warn!(%error, wallet = %wallet_address, "unexpected tx7702 prepare error");
+                    continue;
+                }
             };
             let PreparedEvmTransaction {
                 tx_req,

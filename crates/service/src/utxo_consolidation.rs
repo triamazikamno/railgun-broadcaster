@@ -230,6 +230,26 @@ impl UtxoConsolidationService {
                     warn!(%error, rpc = %provider_handle.url, "estimate gas failed");
                     continue;
                 }
+                Err(
+                    error @ (PrepareEvmTransactionError::MissingTx7702Field { .. }
+                    | PrepareEvmTransactionError::MissingRelayAdapt7702Contract
+                    | PrepareEvmTransactionError::Tx7702FieldExceedsU128 { .. }
+                    | PrepareEvmTransactionError::Tx7702NonceExceedsU64 { .. }
+                    | PrepareEvmTransactionError::InvalidTx7702SignatureV { .. }
+                    | PrepareEvmTransactionError::Tx7702AuthorizationChainIdMismatch {
+                        ..
+                    }
+                    | PrepareEvmTransactionError::Tx7702AuthorizationAddressMismatch {
+                        ..
+                    }
+                    | PrepareEvmTransactionError::Tx7702AuthorizationRecovery(_)
+                    | PrepareEvmTransactionError::Tx7702AuthorizationAuthorityMismatch {
+                        ..
+                    }),
+                ) => {
+                    warn!(%error, "unexpected tx7702 prepare error");
+                    return;
+                }
             };
             let PreparedEvmTransaction {
                 tx_req,
