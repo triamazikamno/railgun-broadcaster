@@ -532,7 +532,7 @@ mod tests {
             list_key,
         ));
         cache
-            .apply_poi_leaves(0, &[alloy::hex::encode_prefixed(commitment)])
+            .apply_poi_leaves(0, &[U256::from_be_slice(commitment.as_slice())])
             .expect("apply POI leaf");
         cache.accept_current_roots();
         cache
