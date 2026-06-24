@@ -669,6 +669,7 @@ impl BroadcasterService {
                     poll_interval: receipt_poll_interval,
                     finality_depth,
                     quick_sync_endpoint: quick_sync_endpoint.clone(),
+                    indexed_artifact_source: None,
                     anchor_interval,
                     anchor_retention,
                     http_client: None,

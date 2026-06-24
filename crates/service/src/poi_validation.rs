@@ -275,7 +275,7 @@ fn log_proxy_fallback(
     debug!(
         chain_type,
         chain_id,
-        list_key = list_key.map(|key| hex::encode(key)),
+        list_key = list_key.map(hex::encode),
         fallback_reason = reason.as_str(),
         "{}",
         message
@@ -310,7 +310,7 @@ fn transaction_poi_for_validation<'a>(
     Ok(poi)
 }
 
-fn snark_validation_result(snark_ok: bool) -> Result<(), PoiError> {
+const fn snark_validation_result(snark_ok: bool) -> Result<(), PoiError> {
     if snark_ok {
         Ok(())
     } else {

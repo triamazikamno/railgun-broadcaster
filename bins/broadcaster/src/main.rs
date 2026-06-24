@@ -74,7 +74,7 @@ fn poi_artifact_source_config(cfg: &config::PoiArtifactSource) -> PoiArtifactSou
             }
         },
         gateway_urls: cfg.gateway_urls.clone(),
-        max_manifest_age: cfg.max_manifest_age.clone().map(|age| age.into_inner()),
+        max_manifest_age: cfg.max_manifest_age.map(|age| age.into_inner()),
     }
 }
 
@@ -179,7 +179,7 @@ async fn main() -> Result<()> {
 
     let waku_client =
         Arc::new(Client::new(&waku_client_config(&cfg.waku)).wrap_err("create waku relay client")?);
-    let snark_prover = Arc::new(Prover::new().await.wrap_err("create snark prover")?);
+    let snark_prover = Arc::new(Prover::new().wrap_err("create snark prover")?);
 
     let poi_cache_service = cfg.poi_artifact_source.as_ref().map(|artifact_cfg| {
         let poi_rpc = cfg

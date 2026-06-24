@@ -16,7 +16,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::poi_validation::BroadcasterPoiValidator;
 
-const FEE_NOTE_ASSURANCE_SUBMIT_BACKOFF: Duration = Duration::from_secs(15 * 60);
+const FEE_NOTE_ASSURANCE_SUBMIT_BACKOFF: Duration = Duration::from_mins(15);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DerivedFeeOutputPosition {
@@ -574,7 +574,7 @@ mod tests {
             &tracker,
             FixedBytes::from([0x11; 32]),
             Instant::now(),
-            Duration::from_secs(900),
+            Duration::from_mins(15),
         ));
     }
 
@@ -588,8 +588,8 @@ mod tests {
         assert!(!should_submit_fee_note_assurance(
             &tracker,
             tx_hash,
-            now + Duration::from_secs(60),
-            Duration::from_secs(900),
+            now + Duration::from_mins(1),
+            Duration::from_mins(15),
         ));
     }
 
@@ -604,7 +604,7 @@ mod tests {
             &tracker,
             tx_hash,
             now + Duration::from_secs(901),
-            Duration::from_secs(900),
+            Duration::from_mins(15),
         ));
     }
 }

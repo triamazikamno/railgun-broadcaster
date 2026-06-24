@@ -32,7 +32,7 @@ impl Config {
     /// # Errors
     ///
     /// Returns an error when dependent configuration is missing.
-    pub fn validate(&self) -> Result<(), ConfigValidationError> {
+    pub const fn validate(&self) -> Result<(), ConfigValidationError> {
         if self.poi_artifact_source.is_some() && self.poi_rpc.is_none() {
             return Err(ConfigValidationError::PoiArtifactSourceRequiresPoiRpc);
         }
