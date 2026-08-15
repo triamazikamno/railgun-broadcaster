@@ -6,12 +6,13 @@ use broadcaster_core::transact::{
     ParsedTransactTransaction, PreTxPoi, dummy_txid_root, railgun_txid_leaf_hash,
     txid_version_or_default,
 };
-use poi::cache::{PoiCache, PoiCacheRootValidation};
 use poi::error::PoiError;
 use poi::poi::{Poi, PoiRpcClient, PoiStatus, default_active_poi_list_keys};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use sync_service::LocalPoiCaches;
+use sync_service::{
+    LocalPoiQueryUnavailable, LocalPoiRootValidation, LocalPoiStatusLookup, PublicDataPlaneHandle,
+};
 use tracing::debug;
 
 const EVM_CHAIN_TYPE: u8 = 0;
@@ -22,7 +23,7 @@ pub struct BroadcasterPoiValidator {
     snark_prover: Arc<Prover>,
     required_poi_list: Vec<FixedBytes<32>>,
     default_list_keys: Vec<FixedBytes<32>>,
-    local_poi_caches: Option<LocalPoiCaches>,
+    local_poi_data_plane: Option<PublicDataPlaneHandle>,
 }
 
 impl BroadcasterPoiValidator {
@@ -32,7 +33,7 @@ impl BroadcasterPoiValidator {
         rpc_client: PoiRpcClient,
         snark_prover: Arc<Prover>,
         required_poi_list: Vec<FixedBytes<32>>,
-        local_poi_caches: Option<LocalPoiCaches>,
+        local_poi_data_plane: Option<PublicDataPlaneHandle>,
     ) -> Self {
         Self {
             proxy,
@@ -40,7 +41,7 @@ impl BroadcasterPoiValidator {
             snark_prover,
             required_poi_list,
             default_list_keys: default_active_poi_list_keys(),
-            local_poi_caches,
+            local_poi_data_plane,
         }
     }
 
@@ -71,7 +72,7 @@ impl BroadcasterPoiValidator {
         blinded_commitment: &FixedBytes<32>,
     ) -> Result<BTreeMap<FixedBytes<32>, PoiStatus>, PoiError> {
         match local_fee_note_status_outcome(
-            self.local_poi_caches.as_ref(),
+            self.local_poi_data_plane.as_ref(),
             &self.default_list_keys,
             chain_type,
             chain_id,
@@ -92,7 +93,7 @@ impl BroadcasterPoiValidator {
                 Ok(statuses)
             }
             FeeNoteStatusOutcome::ProxyFallback { list_key, reason } => {
-                if self.local_poi_caches.is_some() {
+                if self.local_poi_data_plane.is_some() {
                     log_proxy_fallback(
                         chain_type,
                         chain_id,
@@ -167,7 +168,7 @@ impl BroadcasterPoiValidator {
         poi_merkleroots: &[FixedBytes<32>],
     ) -> Result<(), PoiError> {
         match local_root_validation_outcome(
-            self.local_poi_caches.as_ref(),
+            self.local_poi_data_plane.as_ref(),
             &self.default_list_keys,
             chain_type,
             chain_id,
@@ -188,7 +189,7 @@ impl BroadcasterPoiValidator {
                 Ok(())
             }
             RootValidationOutcome::ProxyFallback(reason) => {
-                if self.local_poi_caches.is_some() {
+                if self.local_poi_data_plane.is_some() {
                     log_proxy_fallback(
                         chain_type,
                         chain_id,
@@ -319,7 +320,7 @@ const fn snark_validation_result(snark_ok: bool) -> Result<(), PoiError> {
 }
 
 async fn local_root_validation_outcome(
-    local_poi_caches: Option<&LocalPoiCaches>,
+    local_poi_data_plane: Option<&PublicDataPlaneHandle>,
     default_list_keys: &[FixedBytes<32>],
     chain_type: u8,
     chain_id: u64,
@@ -330,11 +331,14 @@ async fn local_root_validation_outcome(
     if !default_list_keys.contains(list_key) {
         return RootValidationOutcome::ProxyFallback(LocalPoiFallbackReason::NonDefaultListKey);
     }
-    let Some(local_poi_caches) = local_poi_caches else {
+    let Some(local_poi_data_plane) = local_poi_data_plane else {
         return RootValidationOutcome::ProxyFallback(LocalPoiFallbackReason::ArtifactModeDisabled);
     };
     if chain_type != EVM_CHAIN_TYPE {
         return RootValidationOutcome::ProxyFallback(LocalPoiFallbackReason::UnsupportedChainType);
+    }
+    if chain_id != local_poi_data_plane.chain_id() {
+        return RootValidationOutcome::ProxyFallback(LocalPoiFallbackReason::CacheIdentityMismatch);
     }
     if txid_version != DEFAULT_TXID_VERSION {
         return RootValidationOutcome::ProxyFallback(
@@ -345,18 +349,20 @@ async fn local_root_validation_outcome(
         return RootValidationOutcome::ProxyFallback(LocalPoiFallbackReason::SubmittedRootsEmpty);
     }
 
-    let caches = local_poi_caches.read().await;
-    let Some(cache) = caches.get(list_key) else {
-        return RootValidationOutcome::ProxyFallback(LocalPoiFallbackReason::CacheUnavailable);
-    };
-    if !cache_identity_matches(cache, chain_type, chain_id, txid_version, list_key) {
-        return RootValidationOutcome::ProxyFallback(LocalPoiFallbackReason::CacheIdentityMismatch);
+    match local_poi_data_plane
+        .validate_local_poi_roots(txid_version, *list_key, poi_merkleroots)
+        .await
+    {
+        Ok(LocalPoiRootValidation::Accepted) => RootValidationOutcome::LocalHit,
+        Ok(LocalPoiRootValidation::Unavailable(reason)) => {
+            RootValidationOutcome::ProxyFallback(local_query_fallback_reason(reason))
+        }
+        Err(_) => RootValidationOutcome::ProxyFallback(LocalPoiFallbackReason::CacheUnavailable),
     }
-    local_accepted_root_check(cache, poi_merkleroots)
 }
 
 async fn local_fee_note_status_outcome(
-    local_poi_caches: Option<&LocalPoiCaches>,
+    local_poi_data_plane: Option<&PublicDataPlaneHandle>,
     default_list_keys: &[FixedBytes<32>],
     chain_type: u8,
     chain_id: u64,
@@ -379,7 +385,7 @@ async fn local_fee_note_status_outcome(
             reason: LocalPoiFallbackReason::NonDefaultListKey,
         };
     }
-    let Some(local_poi_caches) = local_poi_caches else {
+    let Some(local_poi_data_plane) = local_poi_data_plane else {
         return FeeNoteStatusOutcome::ProxyFallback {
             list_key: required_poi_list_keys.first().copied(),
             reason: LocalPoiFallbackReason::ArtifactModeDisabled,
@@ -391,6 +397,12 @@ async fn local_fee_note_status_outcome(
             reason: LocalPoiFallbackReason::UnsupportedChainType,
         };
     }
+    if chain_id != local_poi_data_plane.chain_id() {
+        return FeeNoteStatusOutcome::ProxyFallback {
+            list_key: required_poi_list_keys.first().copied(),
+            reason: LocalPoiFallbackReason::CacheIdentityMismatch,
+        };
+    }
     if txid_version != DEFAULT_TXID_VERSION {
         return FeeNoteStatusOutcome::ProxyFallback {
             list_key: required_poi_list_keys.first().copied(),
@@ -398,76 +410,57 @@ async fn local_fee_note_status_outcome(
         };
     }
 
-    let caches = local_poi_caches.read().await;
-    let mut statuses = BTreeMap::new();
-    for list_key in required_poi_list_keys {
-        let Some(cache) = caches.get(list_key) else {
-            return FeeNoteStatusOutcome::ProxyFallback {
-                list_key: Some(*list_key),
-                reason: LocalPoiFallbackReason::CacheUnavailable,
-            };
-        };
-        if !cache_identity_matches(cache, chain_type, chain_id, txid_version, list_key) {
-            return FeeNoteStatusOutcome::ProxyFallback {
-                list_key: Some(*list_key),
-                reason: LocalPoiFallbackReason::CacheIdentityMismatch,
-            };
-        }
-        if !has_accepted_roots(cache) || cache.status(blinded_commitment) != PoiStatus::Valid {
-            return FeeNoteStatusOutcome::ProxyFallback {
-                list_key: Some(*list_key),
-                reason: LocalPoiFallbackReason::StatusUnresolved,
-            };
-        }
-        statuses.insert(*list_key, PoiStatus::Valid);
-    }
-
-    FeeNoteStatusOutcome::LocalValid(statuses)
-}
-
-fn local_accepted_root_check(
-    cache: &PoiCache,
-    poi_merkleroots: &[FixedBytes<32>],
-) -> RootValidationOutcome {
-    let PoiCacheRootValidation::Validated { roots } = &cache.progress().root_validation else {
-        return RootValidationOutcome::ProxyFallback(
-            LocalPoiFallbackReason::AcceptedRootsUnavailable,
-        );
-    };
-    if roots.is_empty() {
-        return RootValidationOutcome::ProxyFallback(
-            LocalPoiFallbackReason::AcceptedRootsUnavailable,
-        );
-    }
-    if poi_merkleroots
-        .iter()
-        .all(|submitted| roots.values().any(|accepted| accepted == submitted))
+    match local_poi_data_plane
+        .local_poi_statuses(txid_version, required_poi_list_keys, blinded_commitment)
+        .await
     {
-        RootValidationOutcome::LocalHit
-    } else {
-        RootValidationOutcome::ProxyFallback(LocalPoiFallbackReason::SubmittedRootAbsent)
+        Ok(LocalPoiStatusLookup::Valid(statuses)) => FeeNoteStatusOutcome::LocalValid(statuses),
+        Ok(LocalPoiStatusLookup::Unavailable(reason)) => FeeNoteStatusOutcome::ProxyFallback {
+            list_key: local_query_list_key(reason)
+                .or_else(|| required_poi_list_keys.first().copied()),
+            reason: local_query_fallback_reason(reason),
+        },
+        Err(_) => FeeNoteStatusOutcome::ProxyFallback {
+            list_key: required_poi_list_keys.first().copied(),
+            reason: LocalPoiFallbackReason::CacheUnavailable,
+        },
     }
 }
 
-fn has_accepted_roots(cache: &PoiCache) -> bool {
-    matches!(
-        &cache.progress().root_validation,
-        PoiCacheRootValidation::Validated { roots } if !roots.is_empty()
-    )
+const fn local_query_list_key(reason: LocalPoiQueryUnavailable) -> Option<FixedBytes<32>> {
+    match reason {
+        LocalPoiQueryUnavailable::ListUnavailable { list_key }
+        | LocalPoiQueryUnavailable::CacheIdentityMismatch { list_key }
+        | LocalPoiQueryUnavailable::AcceptedRootsUnavailable { list_key }
+        | LocalPoiQueryUnavailable::SubmittedRootAbsent { list_key }
+        | LocalPoiQueryUnavailable::StatusUnresolved { list_key } => Some(list_key),
+        LocalPoiQueryUnavailable::RequiredListsEmpty
+        | LocalPoiQueryUnavailable::SubmittedRootsEmpty => None,
+    }
 }
 
-fn cache_identity_matches(
-    cache: &PoiCache,
-    chain_type: u8,
-    chain_id: u64,
-    txid_version: &str,
-    list_key: &FixedBytes<32>,
-) -> bool {
-    let identity = cache.identity();
-    identity.chain_type == chain_type
-        && identity.chain_id == chain_id
-        && identity.txid_version == txid_version
-        && identity.list_key == *list_key
+const fn local_query_fallback_reason(reason: LocalPoiQueryUnavailable) -> LocalPoiFallbackReason {
+    match reason {
+        LocalPoiQueryUnavailable::RequiredListsEmpty => LocalPoiFallbackReason::RequiredListsEmpty,
+        LocalPoiQueryUnavailable::SubmittedRootsEmpty => {
+            LocalPoiFallbackReason::SubmittedRootsEmpty
+        }
+        LocalPoiQueryUnavailable::ListUnavailable { .. } => {
+            LocalPoiFallbackReason::CacheUnavailable
+        }
+        LocalPoiQueryUnavailable::CacheIdentityMismatch { .. } => {
+            LocalPoiFallbackReason::CacheIdentityMismatch
+        }
+        LocalPoiQueryUnavailable::AcceptedRootsUnavailable { .. } => {
+            LocalPoiFallbackReason::AcceptedRootsUnavailable
+        }
+        LocalPoiQueryUnavailable::SubmittedRootAbsent { .. } => {
+            LocalPoiFallbackReason::SubmittedRootAbsent
+        }
+        LocalPoiQueryUnavailable::StatusUnresolved { .. } => {
+            LocalPoiFallbackReason::StatusUnresolved
+        }
+    }
 }
 
 #[cfg(test)]
@@ -481,13 +474,9 @@ mod tests {
     use broadcaster_core::transact::{
         BroadcasterRawParamsTransact, DEFAULT_TXID_VERSION, ParsedTransactTransaction,
     };
-    use poi::cache::{PoiCache, PoiCacheIdentity};
     use poi::error::PoiError;
     use poi::poi::default_active_poi_list_key;
     use std::collections::BTreeMap;
-    use std::sync::Arc;
-    use sync_service::LocalPoiCaches;
-    use tokio::sync::RwLock;
 
     const CHAIN_ID: u64 = 1;
 
@@ -524,85 +513,14 @@ mod tests {
         }
     }
 
-    fn accepted_cache(list_key: FixedBytes<32>, commitment: FixedBytes<32>) -> PoiCache {
-        let mut cache = PoiCache::new(PoiCacheIdentity::new(
-            EVM_CHAIN_TYPE,
-            CHAIN_ID,
-            DEFAULT_TXID_VERSION,
-            list_key,
-        ));
-        cache
-            .apply_poi_leaves(0, &[U256::from_be_slice(commitment.as_slice())])
-            .expect("apply POI leaf");
-        cache.accept_current_roots();
-        cache
-    }
-
-    fn caches_with(list_key: FixedBytes<32>, cache: PoiCache) -> LocalPoiCaches {
-        Arc::new(RwLock::new(BTreeMap::from([(list_key, cache)])))
-    }
-
-    #[tokio::test]
-    async fn default_list_local_root_hit_uses_artifact_cache() {
-        let list_key = default_active_poi_list_key();
-        let cache = accepted_cache(list_key, FixedBytes::from([0x11; 32]));
-        let accepted_root = cache
-            .progress()
-            .root_validation
-            .clone()
-            .validated_roots()
-            .values()
-            .next()
-            .copied()
-            .expect("accepted root");
-        let caches = caches_with(list_key, cache);
-
-        assert_eq!(
-            local_root_validation_outcome(
-                Some(&caches),
-                &[list_key],
-                EVM_CHAIN_TYPE,
-                CHAIN_ID,
-                DEFAULT_TXID_VERSION,
-                &list_key,
-                &[accepted_root],
-            )
-            .await,
-            RootValidationOutcome::LocalHit
-        );
-    }
-
-    #[tokio::test]
-    async fn default_list_local_root_miss_falls_back_to_proxy() {
-        let list_key = default_active_poi_list_key();
-        let cache = accepted_cache(list_key, FixedBytes::from([0x11; 32]));
-        let caches = caches_with(list_key, cache);
-
-        assert_eq!(
-            local_root_validation_outcome(
-                Some(&caches),
-                &[list_key],
-                EVM_CHAIN_TYPE,
-                CHAIN_ID,
-                DEFAULT_TXID_VERSION,
-                &list_key,
-                &[FixedBytes::from([0x99; 32])],
-            )
-            .await,
-            RootValidationOutcome::ProxyFallback(LocalPoiFallbackReason::SubmittedRootAbsent)
-        );
-    }
-
     #[tokio::test]
     async fn non_default_list_uses_proxy_without_local_cache() {
         let default_list_key = default_active_poi_list_key();
         let non_default_list_key = FixedBytes::from([0x22; 32]);
-        let cache = accepted_cache(default_list_key, FixedBytes::from([0x11; 32]));
-        let caches = caches_with(default_list_key, cache);
 
         assert_eq!(
             local_root_validation_outcome(
-                Some(&caches),
+                None,
                 &[default_list_key],
                 EVM_CHAIN_TYPE,
                 CHAIN_ID,
@@ -634,65 +552,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fee_note_local_valid_status_completes_from_artifact_cache() {
-        let list_key = default_active_poi_list_key();
-        let fee_blinded_commitment = FixedBytes::from([0x33; 32]);
-        let cache = accepted_cache(list_key, fee_blinded_commitment);
-        let caches = caches_with(list_key, cache);
-
-        match local_fee_note_status_outcome(
-            Some(&caches),
-            &[list_key],
-            EVM_CHAIN_TYPE,
-            CHAIN_ID,
-            DEFAULT_TXID_VERSION,
-            &[list_key],
-            &fee_blinded_commitment,
-        )
-        .await
-        {
-            FeeNoteStatusOutcome::LocalValid(statuses) => {
-                assert_eq!(statuses.get(&list_key), Some(&poi::poi::PoiStatus::Valid));
-            }
-            FeeNoteStatusOutcome::ProxyFallback { reason, .. } => {
-                panic!("expected local valid status, got fallback reason {reason:?}");
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn fee_note_unresolved_status_falls_back_to_proxy() {
-        let list_key = default_active_poi_list_key();
-        let cache = accepted_cache(list_key, FixedBytes::from([0x11; 32]));
-        let caches = caches_with(list_key, cache);
-
-        match local_fee_note_status_outcome(
-            Some(&caches),
-            &[list_key],
-            EVM_CHAIN_TYPE,
-            CHAIN_ID,
-            DEFAULT_TXID_VERSION,
-            &[list_key],
-            &FixedBytes::from([0x44; 32]),
-        )
-        .await
-        {
-            FeeNoteStatusOutcome::LocalValid(_) => panic!("expected proxy fallback"),
-            FeeNoteStatusOutcome::ProxyFallback { reason, .. } => {
-                assert_eq!(reason, LocalPoiFallbackReason::StatusUnresolved);
-            }
-        }
-    }
-
-    #[tokio::test]
     async fn fee_note_non_default_list_falls_back_to_proxy() {
         let default_list_key = default_active_poi_list_key();
         let non_default_list_key = FixedBytes::from([0x22; 32]);
-        let cache = accepted_cache(default_list_key, FixedBytes::from([0x11; 32]));
-        let caches = caches_with(default_list_key, cache);
 
         match local_fee_note_status_outcome(
-            Some(&caches),
+            None,
             &[default_list_key],
             EVM_CHAIN_TYPE,
             CHAIN_ID,
@@ -705,19 +570,6 @@ mod tests {
             FeeNoteStatusOutcome::LocalValid(_) => panic!("expected proxy fallback"),
             FeeNoteStatusOutcome::ProxyFallback { reason, .. } => {
                 assert_eq!(reason, LocalPoiFallbackReason::NonDefaultListKey);
-            }
-        }
-    }
-
-    trait ValidatedRootsExt {
-        fn validated_roots(&self) -> &BTreeMap<u32, FixedBytes<32>>;
-    }
-
-    impl ValidatedRootsExt for poi::cache::PoiCacheRootValidation {
-        fn validated_roots(&self) -> &BTreeMap<u32, FixedBytes<32>> {
-            match self {
-                Self::Validated { roots } => roots,
-                _ => panic!("expected validated roots"),
             }
         }
     }

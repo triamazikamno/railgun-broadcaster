@@ -280,6 +280,18 @@ impl UtxoConsolidationService {
             .await
             {
                 Ok(tx_hash) => {
+                    let spent_utxos = plan
+                        .inputs
+                        .iter()
+                        .map(|input| input.utxo.clone())
+                        .collect::<Vec<_>>();
+                    if let Err(error) = self
+                        .wallet_handle
+                        .mark_pending_spent_utxos(&spent_utxos, Some(tx_hash))
+                        .await
+                    {
+                        warn!(token = %token, %error, ?tx_hash, "record consolidation pending inputs failed");
+                    }
                     tokio::time::sleep(Duration::from_secs(15)).await;
                     info!(token = %token, ?tx_hash, "utxo consolidation submitted");
                 }

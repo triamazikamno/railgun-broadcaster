@@ -297,6 +297,18 @@ impl AutoRefillService {
             .await
             {
                 Ok(tx_hash) => {
+                    let spent_utxos = plan
+                        .inputs
+                        .iter()
+                        .map(|input| input.utxo.clone())
+                        .collect::<Vec<_>>();
+                    if let Err(error) = self
+                        .wallet_handle
+                        .mark_pending_spent_utxos(&spent_utxos, Some(tx_hash))
+                        .await
+                    {
+                        warn!(wallet = %wallet_address, %error, ?tx_hash, "record auto-refill pending inputs failed");
+                    }
                     info!(wallet = %wallet_address, ?tx_hash, "auto-refill submitted");
                 }
                 Err(error) => {

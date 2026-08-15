@@ -18,6 +18,7 @@ use alloy::{hex, sol, uint};
 use broadcaster_core::crypto::railgun::{
     Address as RailgunAddress, RailgunError, ShareableViewingKey,
 };
+use broadcaster_core::crypto::snark_proof::Prover;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use broadcaster_core::transact::{
     BroadcasterAuthorization, BroadcasterRawParamsTransact, BroadcasterTransactRequestType,
@@ -27,8 +28,7 @@ use broadcaster_core::transact::{
 use broadcaster_core::transact_response::DecryptedTransactResponse;
 use config::{Chain, Key};
 use fees::{FeesError, Manager as FeesManager};
-use local_db::{DbStore, PendingFeeNoteAssuranceRecord};
-use poi::poi::DEFAULT_WALLET_POI_RPC_URL;
+use local_db::{DbStore, PendingFeeNoteAssuranceRecord, WalletCacheKey};
 use rand::seq::IndexedRandom;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -48,22 +48,34 @@ use crate::fee_note_assurance::{
 pub use crate::poi_validation::BroadcasterPoiValidator;
 use crate::utxo_consolidation::{UtxoConsolidationConfig, UtxoConsolidationService};
 use poi::error::PoiError;
-use railgun_wallet::wallet_cache::wallet_cache_key;
 use railgun_wallet::{ProverService, Utxo, WalletKeys};
 use serde::{Deserialize, Serialize};
 use sync_service::{
-    ChainConfig, ChainConfigDefaults, ChainKey, DEFAULT_INDEXED_WALLET_BLOCK_RANGE, PoiReadSource,
-    SyncManager, SyncManagerError, WalletConfig,
+    ChainConfig, ChainConfigDefaults, ChainKey, DEFAULT_INDEXED_WALLET_BLOCK_RANGE, SyncManager,
+    SyncManagerError, WalletConfig,
 };
 use waku_relay::msg::ContentTopic;
 
 async fn unspent_utxos(wallet_handle: &sync_service::WalletHandle) -> Vec<Utxo> {
-    wallet_handle
+    let Some(snapshot) = wallet_handle.current_snapshot() else {
+        return Vec::new();
+    };
+    snapshot
         .utxos
-        .read()
-        .await
         .iter()
-        .filter(|entry| !entry.is_spent())
+        .filter(|entry| {
+            !entry.is_spent()
+                && !snapshot
+                    .pending_overlay
+                    .pending_spent
+                    .iter()
+                    .any(|spent| spent.key() == (entry.utxo.tree, entry.utxo.position))
+                && !snapshot
+                    .pending_overlay
+                    .local_pending_spent
+                    .iter()
+                    .any(|spent| spent.matches_local_utxo(entry))
+        })
         .map(|entry| entry.utxo.clone())
         .collect()
 }
@@ -126,6 +138,8 @@ pub enum BroadcasterServiceError {
     RailgunContractMissing,
     #[error("finality_depth is not defined for this chain")]
     FinalityDepthMissing,
+    #[error("block_time is not defined for this chain")]
+    BlockTimeMissing,
     #[error("anchor_interval is not defined for this chain")]
     AnchorIntervalMissing,
     #[error("archive_until_block is not defined for this chain")]
@@ -448,21 +462,13 @@ pub struct BroadcasterService {
     fees_ttl: Duration,
 }
 
-const fn fee_note_assurance_required(
-    poi_enabled: bool,
-    required_poi_list: &[FixedBytes<32>],
-    has_pending_jobs: bool,
-) -> bool {
-    poi_enabled && (!required_poi_list.is_empty() || has_pending_jobs)
-}
-
 impl BroadcasterService {
     pub async fn new(
         chain_cfg: Chain,
         db: Arc<DbStore>,
         client: Arc<Client>,
-        poi: Option<Arc<BroadcasterPoiValidator>>,
         configured_poi_rpc_url: Option<url::Url>,
+        snark_prover: Arc<Prover>,
         required_poi_list: Vec<FixedBytes<32>>,
         sync_manager: Arc<SyncManager>,
         prover: Arc<ProverService>,
@@ -486,6 +492,13 @@ impl BroadcasterService {
             .as_ref()
             .and_then(|sync| sync.finality_depth)
             .or_else(|| defaults.as_ref().map(|config| config.finality_depth));
+        let block_time = chain_cfg
+            .sync
+            .as_ref()
+            .and_then(|sync| sync.block_time)
+            .map(|value| value.into_inner())
+            .or_else(|| defaults.as_ref().map(|config| config.block_time))
+            .ok_or(BroadcasterServiceError::BlockTimeMissing)?;
         #[allow(clippy::redundant_closure_for_method_calls)]
         let receipt_poll_interval = chain_cfg
             .sync
@@ -499,20 +512,6 @@ impl BroadcasterService {
         } else {
             vec![]
         };
-        let has_pending_fee_note_assurance = if poi.is_some() {
-            !db.list_pending_fee_note_assurance(chain_cfg.chain_id)?
-                .is_empty()
-        } else {
-            false
-        };
-        if fee_note_assurance_required(
-            poi.is_some(),
-            &required_poi_list,
-            has_pending_fee_note_assurance,
-        ) {
-            resolved_railgun_contract.ok_or(BroadcasterServiceError::RailgunContractMissing)?;
-            resolved_finality_depth.ok_or(BroadcasterServiceError::FinalityDepthMissing)?;
-        }
         let evm_wallets = chain_cfg
             .evm_wallets
             .iter()
@@ -529,6 +528,118 @@ impl BroadcasterService {
             chain_cfg.query_rpcs.clone(),
             query_rpc_cooldown,
         ));
+        let chain_id = chain_cfg.chain_id;
+        let railgun_contract =
+            resolved_railgun_contract.ok_or(BroadcasterServiceError::RailgunContractMissing)?;
+        let finality_depth =
+            resolved_finality_depth.ok_or(BroadcasterServiceError::FinalityDepthMissing)?;
+        let anchor_interval = chain_cfg
+            .sync
+            .as_ref()
+            .and_then(|sync| sync.anchor_interval)
+            .or_else(|| defaults.as_ref().map(|config| config.anchor_interval))
+            .ok_or(BroadcasterServiceError::AnchorIntervalMissing)?;
+        let anchor_retention = chain_cfg
+            .sync
+            .as_ref()
+            .and_then(|sync| sync.anchor_retention)
+            .or_else(|| defaults.as_ref().map(|config| config.anchor_retention))
+            .unwrap_or(5);
+        let archive_until_block = chain_cfg
+            .sync
+            .as_ref()
+            .and_then(|sync| sync.archive_until_block)
+            .or_else(|| defaults.as_ref().map(|config| config.archive_until_block))
+            .ok_or(BroadcasterServiceError::ArchiveUntilBlockMissing)?;
+        let v2_start_block = chain_cfg
+            .sync
+            .as_ref()
+            .and_then(|sync| sync.v2_start_block)
+            .or_else(|| defaults.as_ref().map(|config| config.v2_start_block))
+            .ok_or(BroadcasterServiceError::V2StartBlockMissing)?;
+        let legacy_shield_block = chain_cfg
+            .sync
+            .as_ref()
+            .and_then(|sync| sync.legacy_shield_block)
+            .or_else(|| defaults.as_ref().map(|config| config.legacy_shield_block))
+            .ok_or(BroadcasterServiceError::LegacyShieldBlockMissing)?;
+        let deployment_block = chain_cfg
+            .sync
+            .as_ref()
+            .and_then(|sync| sync.deployment_block)
+            .or_else(|| defaults.as_ref().map(|config| config.deployment_block))
+            .ok_or(BroadcasterServiceError::DeploymentBlockMissing)?;
+        let quick_sync_endpoint = if chain_cfg
+            .sync
+            .as_ref()
+            .is_some_and(|sync| sync.disable_quick_sync)
+        {
+            None
+        } else {
+            chain_cfg
+                .sync
+                .as_ref()
+                .and_then(|sync| sync.quick_sync_endpoint.clone())
+                .or_else(|| {
+                    defaults
+                        .as_ref()
+                        .and_then(|config| config.quick_sync_endpoint.clone())
+                })
+        };
+        let block_range = chain_cfg
+            .sync
+            .as_ref()
+            .and_then(|sync| sync.block_range)
+            .unwrap_or(500);
+        let indexed_wallet_block_range = chain_cfg
+            .sync
+            .as_ref()
+            .and_then(|sync| sync.indexed_wallet_block_range)
+            .or_else(|| {
+                defaults
+                    .as_ref()
+                    .map(|config| config.indexed_wallet_block_range)
+            })
+            .unwrap_or(DEFAULT_INDEXED_WALLET_BLOCK_RANGE);
+        let chain_config = ChainConfig {
+            chain_id,
+            contract: railgun_contract,
+            rpcs: query_rpc_pool.clone(),
+            archive_rpc_url: chain_cfg
+                .sync
+                .as_ref()
+                .and_then(|sync| sync.archive_rpc_url.clone()),
+            archive_until_block,
+            deployment_block,
+            v2_start_block,
+            legacy_shield_block,
+            block_range,
+            indexed_wallet_block_range,
+            block_time,
+            poll_interval: receipt_poll_interval,
+            finality_depth,
+            quick_sync_endpoint: quick_sync_endpoint.clone(),
+            indexed_artifact_source: None,
+            anchor_interval,
+            anchor_retention,
+            http_client: None,
+            progress_tx: None,
+        };
+        let chain_service = sync_manager.add_chain(chain_config).await?;
+        let poi = configured_poi_rpc_url.as_ref().map(|poi_rpc_url| {
+            let proxy = Arc::new(poi::poi::Poi::new(
+                poi::poi::PoiRpcClient::new(poi_rpc_url.clone()),
+                snark_prover.clone(),
+                required_poi_list.clone(),
+            ));
+            Arc::new(BroadcasterPoiValidator::new(
+                proxy,
+                poi::poi::PoiRpcClient::new(poi_rpc_url.clone()),
+                snark_prover.clone(),
+                required_poi_list.clone(),
+                Some(chain_service.public_data_plane()),
+            ))
+        });
         let broadcaster = Arc::new(TxBroadcaster::try_from((
             chain_cfg.clone(),
             query_rpc_pool.clone(),
@@ -580,109 +691,13 @@ impl BroadcasterService {
                 let master_public_key = wallet.viewing.master_public_key;
                 let addr = wallet.viewing.derive_address(None)?;
                 let advertised_addr = wallet.viewing.derive_address(advertised_address_scope)?;
-                let railgun_contract = resolved_railgun_contract
-                    .ok_or(BroadcasterServiceError::RailgunContractMissing)?;
-                let finality_depth =
-                    resolved_finality_depth.ok_or(BroadcasterServiceError::FinalityDepthMissing)?;
-                let anchor_interval = chain_cfg
-                    .sync
-                    .as_ref()
-                    .and_then(|sync| sync.anchor_interval)
-                    .or_else(|| defaults.as_ref().map(|config| config.anchor_interval))
-                    .ok_or(BroadcasterServiceError::AnchorIntervalMissing)?;
-                let anchor_retention = chain_cfg
-                    .sync
-                    .as_ref()
-                    .and_then(|sync| sync.anchor_retention)
-                    .or_else(|| defaults.as_ref().map(|config| config.anchor_retention))
-                    .unwrap_or(5);
-                let archive_until_block = chain_cfg
-                    .sync
-                    .as_ref()
-                    .and_then(|sync| sync.archive_until_block)
-                    .or_else(|| defaults.as_ref().map(|config| config.archive_until_block))
-                    .ok_or(BroadcasterServiceError::ArchiveUntilBlockMissing)?;
-                let v2_start_block = chain_cfg
-                    .sync
-                    .as_ref()
-                    .and_then(|sync| sync.v2_start_block)
-                    .or_else(|| defaults.as_ref().map(|config| config.v2_start_block))
-                    .ok_or(BroadcasterServiceError::V2StartBlockMissing)?;
-                let legacy_shield_block = chain_cfg
-                    .sync
-                    .as_ref()
-                    .and_then(|sync| sync.legacy_shield_block)
-                    .or_else(|| defaults.as_ref().map(|config| config.legacy_shield_block))
-                    .ok_or(BroadcasterServiceError::LegacyShieldBlockMissing)?;
-                let deployment_block = chain_cfg
-                    .sync
-                    .as_ref()
-                    .and_then(|sync| sync.deployment_block)
-                    .or_else(|| defaults.as_ref().map(|config| config.deployment_block))
-                    .ok_or(BroadcasterServiceError::DeploymentBlockMissing)?;
-                let quick_sync_endpoint = if chain_cfg
-                    .sync
-                    .as_ref()
-                    .is_some_and(|sync| sync.disable_quick_sync)
-                {
-                    None
-                } else {
-                    chain_cfg
-                        .sync
-                        .as_ref()
-                        .and_then(|sync| sync.quick_sync_endpoint.clone())
-                        .or_else(|| {
-                            defaults
-                                .as_ref()
-                                .and_then(|config| config.quick_sync_endpoint.clone())
-                        })
-                };
-                let block_range = chain_cfg
-                    .sync
-                    .as_ref()
-                    .and_then(|sync| sync.block_range)
-                    .unwrap_or(500);
-                let indexed_wallet_block_range = chain_cfg
-                    .sync
-                    .as_ref()
-                    .and_then(|sync| sync.indexed_wallet_block_range)
-                    .or_else(|| {
-                        defaults
-                            .as_ref()
-                            .map(|config| config.indexed_wallet_block_range)
-                    })
-                    .unwrap_or(DEFAULT_INDEXED_WALLET_BLOCK_RANGE);
-                let chain_config = ChainConfig {
-                    chain_id,
-                    contract: railgun_contract,
-                    rpcs: query_rpc_pool.clone(),
-                    archive_rpc_url: chain_cfg
-                        .sync
-                        .as_ref()
-                        .and_then(|sync| sync.archive_rpc_url.clone()),
-                    archive_until_block,
-                    deployment_block,
-                    v2_start_block,
-                    legacy_shield_block,
-                    block_range,
-                    indexed_wallet_block_range,
-                    poll_interval: receipt_poll_interval,
-                    finality_depth,
-                    quick_sync_endpoint: quick_sync_endpoint.clone(),
-                    indexed_artifact_source: None,
-                    anchor_interval,
-                    anchor_retention,
-                    http_client: None,
-                    progress_tx: None,
-                };
-                let chain_service = sync_manager.add_chain(chain_config).await?;
                 let chain_key = ChainKey {
                     chain_id,
                     contract: railgun_contract,
                 };
                 let scan_keys = wallet.viewing;
                 let wallet_id = wallet.viewing.derive_address(None)?;
-                let cache_key = wallet_cache_key(wallet_id.as_ref(), chain_id, railgun_contract);
+                let cache_key = WalletCacheKey::new(wallet_id.as_ref(), chain_id, railgun_contract);
                 let wallet_cfg = WalletConfig {
                     chain: chain_key,
                     cache_key: cache_key.clone(),
@@ -694,10 +709,6 @@ impl BroadcasterService {
                     progress_tx: None,
                     cache_store: None,
                     poi_recovery_prover: Some((*poi_recovery_prover).clone()),
-                    poi_rpc_url: wallet_poi_rpc_url(configured_poi_rpc_url.as_ref()),
-                    poi_read_source: PoiReadSource::PoiProxy,
-                    local_poi_caches: None,
-                    manage_local_poi_cache: false,
                     use_indexed_wallet_catch_up: true,
                 };
                 let handle = sync_manager.add_wallet(wallet_cfg).await?;
@@ -707,12 +718,17 @@ impl BroadcasterService {
                     let broadcaster = broadcaster.clone();
                     let prover = prover.clone();
                     let wallet = wallet.clone();
-                    let mut auto_refill_handle = handle.clone();
+                    let auto_refill_handle = handle.clone();
                     let cache_key = cache_key.clone();
                     let chain_handle = chain_service.handle();
                     tokio::spawn(
                         async move {
-                            auto_refill_handle.wait_until_ready().await;
+                            if let Err(error) =
+                                auto_refill_handle.wait_until_ready_or_shutdown().await
+                            {
+                                warn!(%error, %cache_key, "wallet sync unavailable for auto-refill");
+                                return;
+                            }
                             let cfg = AutoRefillConfig {
                                 chain_id,
                                 railgun_contract,
@@ -730,7 +746,7 @@ impl BroadcasterService {
                                 broadcaster,
                                 prover,
                             );
-                            info!(cache_key = cache_key, "wallet sync ready for auto-refill");
+                            info!(%cache_key, "wallet sync ready for auto-refill");
                             auto_refill_service.run().await;
                         }
                         .instrument(info_span!("auto_refill")),
@@ -742,12 +758,18 @@ impl BroadcasterService {
                     let broadcaster = broadcaster.clone();
                     let prover = prover.clone();
                     let wallet = wallet.clone();
-                    let mut consolidation_handle = handle;
+                    let consolidation_handle = handle;
                     let cache_key = cache_key.clone();
                     let chain_handle = chain_service.handle();
                     tokio::spawn(
                         async move {
-                            consolidation_handle.wait_until_ready().await;
+                            if let Err(error) = consolidation_handle
+                                .wait_until_ready_or_shutdown()
+                                .await
+                            {
+                                warn!(%error, %cache_key, "wallet sync unavailable for UTXO consolidation");
+                                return;
+                            }
                             let cfg = UtxoConsolidationConfig {
                                 chain_id,
                                 railgun_contract,
@@ -765,7 +787,7 @@ impl BroadcasterService {
                                 prover,
                             );
                             info!(
-                                cache_key = cache_key,
+                                %cache_key,
                                 "wallet sync ready for utxo consolidation"
                             );
                             consolidation_service.run().await;
@@ -1268,14 +1290,6 @@ impl BroadcasterService {
     }
 }
 
-fn wallet_poi_rpc_url(configured_poi_rpc_url: Option<&url::Url>) -> url::Url {
-    configured_poi_rpc_url.cloned().unwrap_or_else(|| {
-        DEFAULT_WALLET_POI_RPC_URL
-            .parse()
-            .expect("default POI RPC URL is valid")
-    })
-}
-
 fn build_transact_error_response(
     shared_key: &[u8; 32],
     message: &str,
@@ -1400,10 +1414,10 @@ const fn should_remove_fee_note_assurance_fallback(
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_WALLET_POI_RPC_URL, ESTIMATE_GAS_FAILED_RESPONSE_MESSAGE, FeeNoteAssuranceFallback,
+        ESTIMATE_GAS_FAILED_RESPONSE_MESSAGE, FeeNoteAssuranceFallback,
         build_transact_error_response, collect_pending_fee_note_assurance_records,
-        fee_note_assurance_required, should_remove_fee_note_assurance_fallback,
-        transact_estimate_gas_error_message, tx7702_y_parity, wallet_poi_rpc_url,
+        should_remove_fee_note_assurance_fallback, transact_estimate_gas_error_message,
+        tx7702_y_parity,
     };
     use crate::fee_note_assurance::FeeNoteAssuranceRecordOutcome;
     use alloy::primitives::FixedBytes;
@@ -1413,48 +1427,6 @@ mod tests {
     use broadcaster_core::transact_response::DecryptedTransactResponse;
     use local_db::PendingFeeNoteAssuranceRecord;
     use std::collections::{BTreeMap, HashMap};
-
-    #[test]
-    fn fee_note_assurance_is_not_required_without_poi() {
-        assert!(!fee_note_assurance_required(
-            false,
-            &[FixedBytes::from([0x11; 32])],
-            true,
-        ));
-    }
-
-    #[test]
-    fn fee_note_assurance_is_not_required_without_lists_or_pending_jobs() {
-        assert!(!fee_note_assurance_required(true, &[], false));
-    }
-
-    #[test]
-    fn fee_note_assurance_is_required_with_required_lists() {
-        assert!(fee_note_assurance_required(
-            true,
-            &[FixedBytes::from([0x11; 32])],
-            false,
-        ));
-    }
-
-    #[test]
-    fn fee_note_assurance_is_required_with_pending_jobs() {
-        assert!(fee_note_assurance_required(true, &[], true));
-    }
-
-    #[test]
-    fn wallet_poi_rpc_url_uses_configured_url() {
-        let configured = url::Url::parse("https://poi.example").expect("configured POI URL");
-
-        assert_eq!(wallet_poi_rpc_url(Some(&configured)), configured);
-    }
-
-    #[test]
-    fn wallet_poi_rpc_url_defaults_when_unconfigured() {
-        let default = url::Url::parse(DEFAULT_WALLET_POI_RPC_URL).expect("default POI URL");
-
-        assert_eq!(wallet_poi_rpc_url(None), default);
-    }
 
     #[test]
     fn transact_error_response_roundtrips_error_message() {
@@ -1744,6 +1716,9 @@ impl BroadcasterManager {
                     }
                 }
                 ContentTopic::Transact(chain_id) => {
+                    if msg.payload.len() < 64 {
+                        continue;
+                    }
                     match serde_json::from_slice::<TransactEnvelope>(msg.payload.as_slice()) {
                         Ok(payload) => {
                             if payload.method != "transact" {

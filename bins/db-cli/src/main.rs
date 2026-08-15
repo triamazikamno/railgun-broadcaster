@@ -3,7 +3,8 @@ use eyre::{Result, WrapErr, bail, eyre};
 use local_db::{
     BlobMeta, LOCAL_DB_TABLES, LocalDbTableDecodeKind, LocalDbTableInfo, MerkleForestMeta, Meta,
     OutputPoiRecoveryRecord, PendingFeeNoteAssuranceRecord, PendingOutputPoiContextRecord,
-    PoiArtifactCacheRecord, TerminalFeeNoteAssuranceRecord, WalletMeta, ZkeyMeta,
+    PoiArtifactCacheRecord, TerminalFeeNoteAssuranceRecord, WalletMeta, WalletSyncActorStateRecord,
+    ZkeyMeta,
 };
 use redb::{Builder, ReadOnlyDatabase, ReadableDatabase, TableDefinition};
 use serde::Serialize;
@@ -56,6 +57,11 @@ struct DesktopWalletVaultValue {
 
 #[derive(Serialize)]
 struct AppSettingsValue {
+    payload_len: usize,
+}
+
+#[derive(Serialize)]
+struct OpaqueValue {
     payload_len: usize,
 }
 
@@ -187,25 +193,40 @@ fn print_value(table: Option<LocalDbTableInfo>, key: &str, value: &[u8], raw: bo
         LocalDbTableDecodeKind::MerkleForestMeta => print_decoded::<MerkleForestMeta>(key, value),
         LocalDbTableDecodeKind::ZkeyMeta => print_decoded::<ZkeyMeta>(key, value),
         LocalDbTableDecodeKind::WalletMeta => print_decoded::<WalletMeta>(key, value),
+        LocalDbTableDecodeKind::WalletSyncActorState => {
+            print_decoded::<WalletSyncActorStateRecord>(key, value)
+        }
         LocalDbTableDecodeKind::PendingFeeNoteAssurance => {
             print_decoded::<PendingFeeNoteAssuranceRecord>(key, value)
         }
         LocalDbTableDecodeKind::TerminalFeeNoteAssurance => {
             print_decoded::<TerminalFeeNoteAssuranceRecord>(key, value)
         }
-        LocalDbTableDecodeKind::PendingOutputPoiContext => {
+        LocalDbTableDecodeKind::PendingOutputPoiContextV1 => {
             print_decoded::<PendingOutputPoiContextRecord>(key, value)
         }
-        LocalDbTableDecodeKind::OutputPoiRecovery => {
+        LocalDbTableDecodeKind::OutputPoiRecoveryV1 => {
             print_decoded::<OutputPoiRecoveryRecord>(key, value)
         }
+        LocalDbTableDecodeKind::OpaqueBytes => print_opaque(key, value),
         LocalDbTableDecodeKind::PoiArtifactCache => {
             print_decoded::<PoiArtifactCacheRecord>(key, value)
         }
+        LocalDbTableDecodeKind::PoiCorpusJournal => print_opaque(key, value),
         LocalDbTableDecodeKind::AppSettings => print_app_settings(key, value),
         LocalDbTableDecodeKind::WalletUtxo => print_wallet_utxo(key, value),
         LocalDbTableDecodeKind::DesktopWalletVault => print_desktop_wallet_vault(key, value),
     }
+}
+
+fn print_opaque(key: &str, value: &[u8]) -> Result<()> {
+    let entry = Entry {
+        key: key.to_string(),
+        value: OpaqueValue {
+            payload_len: value.len(),
+        },
+    };
+    print_json(&entry)
 }
 
 fn print_decoded<T>(key: &str, value: &[u8]) -> Result<()>

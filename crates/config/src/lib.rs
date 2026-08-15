@@ -32,9 +32,26 @@ impl Config {
     /// # Errors
     ///
     /// Returns an error when dependent configuration is missing.
-    pub const fn validate(&self) -> Result<(), ConfigValidationError> {
+    pub fn validate(&self) -> Result<(), ConfigValidationError> {
         if self.poi_artifact_source.is_some() && self.poi_rpc.is_none() {
             return Err(ConfigValidationError::PoiArtifactSourceRequiresPoiRpc);
+        }
+        if let Some(chain_id) = duplicate_mnemonic_chain_id(
+            self.chains
+                .iter()
+                .map(|chain| (chain.chain_id, matches!(&chain.key, Key::Mnemonic(_)))),
+        ) {
+            return Err(ConfigValidationError::MultipleMnemonicWallets { chain_id });
+        }
+        for (index, chain) in self.chains.iter().enumerate() {
+            if self.chains[index + 1..].iter().any(|other| {
+                chain.chain_id == other.chain_id
+                    && (chain.query_rpcs != other.query_rpcs || chain.sync != other.sync)
+            }) {
+                return Err(ConfigValidationError::ConflictingChainSyncConfig {
+                    chain_id: chain.chain_id,
+                });
+            }
         }
         Ok(())
     }
@@ -43,6 +60,8 @@ impl Config {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigValidationError {
     PoiArtifactSourceRequiresPoiRpc,
+    MultipleMnemonicWallets { chain_id: ChainId },
+    ConflictingChainSyncConfig { chain_id: ChainId },
 }
 
 impl fmt::Display for ConfigValidationError {
@@ -50,6 +69,14 @@ impl fmt::Display for ConfigValidationError {
         match self {
             Self::PoiArtifactSourceRequiresPoiRpc => formatter.write_str(
                 "poi_artifact_source requires poi_rpc for fallback validation and proof submission",
+            ),
+            Self::MultipleMnemonicWallets { chain_id } => write!(
+                formatter,
+                "chain {chain_id} may have at most one mnemonic sync wallet",
+            ),
+            Self::ConflictingChainSyncConfig { chain_id } => write!(
+                formatter,
+                "broadcaster entries for chain {chain_id} must use identical query_rpcs and sync settings",
             ),
         }
     }
@@ -266,7 +293,7 @@ pub struct UtxoConsolidationSettings {
     pub tokens: Vec<Address>,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SyncChainConfig {
     pub railgun_contract: Option<Address>,
@@ -282,6 +309,7 @@ pub struct SyncChainConfig {
     pub disable_quick_sync: bool,
     pub anchor_interval: Option<u64>,
     pub anchor_retention: Option<usize>,
+    pub block_time: Option<humantime_serde::Serde<Duration>>,
     pub poll_interval: Option<humantime_serde::Serde<Duration>>,
     pub block_range: Option<u64>,
     pub indexed_wallet_block_range: Option<u64>,
@@ -309,8 +337,11 @@ pub enum Rpc {
 #[cfg(test)]
 mod tests {
     use serde::Deserialize;
+    use std::time::Duration;
 
-    use super::{Config, ConfigValidationError, FeeBonusBps};
+    use super::{
+        Config, ConfigValidationError, FeeBonusBps, SyncChainConfig, duplicate_mnemonic_chain_id,
+    };
 
     #[derive(Debug, Deserialize)]
     struct FeeBonusFixture {
@@ -351,6 +382,19 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("non-negative"));
+    }
+
+    #[test]
+    fn sync_block_time_deserializes_as_duration() {
+        let sync = serde_json::from_value::<SyncChainConfig>(serde_json::json!({
+            "block_time": "12s",
+        }))
+        .expect("sync config should parse");
+
+        assert_eq!(
+            sync.block_time.map(|value| value.into_inner()),
+            Some(Duration::from_secs(12))
+        );
     }
 
     fn base_config_json() -> serde_json::Value {
@@ -402,4 +446,25 @@ mod tests {
             ConfigValidationError::PoiArtifactSourceRequiresPoiRpc
         );
     }
+
+    #[test]
+    fn mnemonic_wallet_relationship_rejects_duplicates_but_allows_view_only_entries() {
+        assert_eq!(
+            duplicate_mnemonic_chain_id([(1, true), (1, false), (1, true)]),
+            Some(1)
+        );
+        assert_eq!(
+            duplicate_mnemonic_chain_id([(1, true), (1, false), (1, false), (2, true)]),
+            None
+        );
+    }
+}
+
+fn duplicate_mnemonic_chain_id(
+    entries: impl IntoIterator<Item = (ChainId, bool)>,
+) -> Option<ChainId> {
+    let mut mnemonic_chain_ids = HashSet::new();
+    entries.into_iter().find_map(|(chain_id, is_mnemonic)| {
+        (is_mnemonic && !mnemonic_chain_ids.insert(chain_id)).then_some(chain_id)
+    })
 }
