@@ -334,6 +334,15 @@ pub enum Rpc {
     BloxrouteBackrunme { url: Url, api_key: String },
 }
 
+fn duplicate_mnemonic_chain_id(
+    entries: impl IntoIterator<Item = (ChainId, bool)>,
+) -> Option<ChainId> {
+    let mut mnemonic_chain_ids = HashSet::new();
+    entries.into_iter().find_map(|(chain_id, is_mnemonic)| {
+        (is_mnemonic && !mnemonic_chain_ids.insert(chain_id)).then_some(chain_id)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use serde::Deserialize;
@@ -392,7 +401,7 @@ mod tests {
         .expect("sync config should parse");
 
         assert_eq!(
-            sync.block_time.map(|value| value.into_inner()),
+            sync.block_time.map(|value| *value),
             Some(Duration::from_secs(12))
         );
     }
@@ -458,13 +467,4 @@ mod tests {
             None
         );
     }
-}
-
-fn duplicate_mnemonic_chain_id(
-    entries: impl IntoIterator<Item = (ChainId, bool)>,
-) -> Option<ChainId> {
-    let mut mnemonic_chain_ids = HashSet::new();
-    entries.into_iter().find_map(|(chain_id, is_mnemonic)| {
-        (is_mnemonic && !mnemonic_chain_ids.insert(chain_id)).then_some(chain_id)
-    })
 }

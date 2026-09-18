@@ -213,7 +213,7 @@ impl Manager {
             .await
             .get(&calldata.fee_token)
             .filter(|price| !price.is_zero())
-            .map_or(calldata.fee_amount, |price| {
+            .map_or(U256::ZERO, |price| {
                 calldata.fee_amount * self.fee_bonus / price
             })
     }

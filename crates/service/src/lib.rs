@@ -1,10 +1,12 @@
 mod auto_refill;
+#[cfg(test)]
+#[cfg(test)]
+mod executor_tests;
 mod fee_note_assurance;
 mod poi_validation;
 mod utxo_consolidation;
 
 use alloy::eips::Encodable2718;
-use alloy::eips::eip7702::{Authorization, SignedAuthorization};
 use alloy::network::{
     EthereumWallet, NetworkTransactionBuilder, TransactionBuilder, TransactionBuilder7702,
 };
@@ -21,9 +23,8 @@ use broadcaster_core::crypto::railgun::{
 use broadcaster_core::crypto::snark_proof::Prover;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use broadcaster_core::transact::{
-    BroadcasterAuthorization, BroadcasterRawParamsTransact, BroadcasterTransactRequestType,
-    DecryptedTransact, ParsedTransactCalldata, TransactError, parse_transact_calldata,
-    try_decrypt_transact_request,
+    BroadcasterRawParamsTransact, BroadcasterTransactRequestType, DecryptedTransact,
+    ParsedTransactCalldata, TransactError, parse_transact_calldata, try_decrypt_transact_request,
 };
 use broadcaster_core::transact_response::DecryptedTransactResponse;
 use config::{Chain, Key};
@@ -91,7 +92,7 @@ sol! {
     function transfer(address recipient, uint256 amount) external;
 }
 
-pub const API_VERSION: &str = "8.2.3";
+pub const API_VERSION: &str = "8.3.0";
 
 const WAD: U256 = uint!(1_000_000_000_000_000_000_U256);
 const FEE_BONUS_BPS_DENOMINATOR: U256 = uint!(10_000_U256);
@@ -203,10 +204,8 @@ pub(crate) enum PrepareEvmTransactionError {
     MissingRelayAdapt7702Contract,
     #[error("tx7702 field {field} value {value} exceeds u128")]
     Tx7702FieldExceedsU128 { field: &'static str, value: U256 },
-    #[error("tx7702 authorization nonce {nonce} exceeds u64")]
-    Tx7702NonceExceedsU64 { nonce: U256 },
-    #[error("invalid tx7702 signature v: {v}")]
-    InvalidTx7702SignatureV { v: u64 },
+    #[error("invalid tx7702 authorization: {0}")]
+    Tx7702Authorization(#[source] TransactError),
     #[error(
         "tx7702 authorization chain_id {authorization_chain_id} is not 0 or chain_id {chain_id}"
     )]
@@ -276,36 +275,6 @@ pub(crate) async fn prepare_evm_transaction(
     })
 }
 
-const fn tx7702_y_parity(v: u64) -> Result<u8, PrepareEvmTransactionError> {
-    match v {
-        0 | 1 => Ok(v as u8),
-        27 | 28 => Ok((v - 27) as u8),
-        _ => Err(PrepareEvmTransactionError::InvalidTx7702SignatureV { v }),
-    }
-}
-
-fn signed_tx7702_authorization(
-    authorization: &BroadcasterAuthorization,
-) -> Result<SignedAuthorization, PrepareEvmTransactionError> {
-    let y_parity = tx7702_y_parity(authorization.signature.v)?;
-    let nonce = u64::try_from(authorization.nonce).map_err(|_| {
-        PrepareEvmTransactionError::Tx7702NonceExceedsU64 {
-            nonce: authorization.nonce,
-        }
-    })?;
-
-    Ok(SignedAuthorization::new_unchecked(
-        Authorization {
-            chain_id: authorization.chain_id,
-            address: authorization.address,
-            nonce,
-        },
-        y_parity,
-        authorization.signature.r,
-        authorization.signature.s,
-    ))
-}
-
 pub(crate) async fn prepare_evm_tx7702_transaction(
     provider: &(impl Provider + Clone),
     chain_id: ChainId,
@@ -364,7 +333,9 @@ pub(crate) async fn prepare_evm_tx7702_transaction(
         );
     }
 
-    let signed_authorization = signed_tx7702_authorization(authorization)?;
+    let signed_authorization = authorization
+        .signed_authorization()
+        .map_err(PrepareEvmTransactionError::Tx7702Authorization)?;
     let authority = signed_authorization
         .recover_authority()
         .map_err(PrepareEvmTransactionError::Tx7702AuthorizationRecovery)?;
@@ -496,7 +467,7 @@ impl BroadcasterService {
             .sync
             .as_ref()
             .and_then(|sync| sync.block_time)
-            .map(|value| value.into_inner())
+            .map(|value| *value)
             .or_else(|| defaults.as_ref().map(|config| config.block_time))
             .ok_or(BroadcasterServiceError::BlockTimeMissing)?;
         #[allow(clippy::redundant_closure_for_method_calls)]
@@ -966,11 +937,7 @@ impl BroadcasterService {
             req.params.txid_version.as_deref(),
         )
         .inspect_err(|error| {
-            warn!(
-                ?error,
-                transact_request = ?req.params,
-                "failed to parse decoded transact request"
-            );
+            warn!(?error, "failed to parse decoded transact request");
         })
         .map_err(HandleTransactError::Parse)?;
 
@@ -1122,8 +1089,7 @@ impl BroadcasterService {
                                 }
                                 PrepareEvmTransactionError::MissingTx7702Field { .. }
                                 | PrepareEvmTransactionError::Tx7702FieldExceedsU128 { .. }
-                                | PrepareEvmTransactionError::Tx7702NonceExceedsU64 { .. }
-                                | PrepareEvmTransactionError::InvalidTx7702SignatureV { .. }
+                                | PrepareEvmTransactionError::Tx7702Authorization(_)
                                 | PrepareEvmTransactionError::Tx7702AuthorizationChainIdMismatch { .. }
                                 | PrepareEvmTransactionError::Tx7702AuthorizationAddressMismatch { .. }
                                 | PrepareEvmTransactionError::Tx7702AuthorizationRecovery(_)
@@ -1158,7 +1124,7 @@ impl BroadcasterService {
                             "estimated gas"
                         );
 
-                        if refund < cost {
+                        let Some(queue) = funded_submission_queue(&calldata, cost, refund) else {
                             warn!("gas cost is too high, ignoring the transact request...");
                             publish_transact_error_response(
                                 &client,
@@ -1168,13 +1134,8 @@ impl BroadcasterService {
                             )
                             .await;
                             continue;
-                        }
-
-                        let queue = if calldata.action_data.is_some() {
-                            Queue::Mev
-                        } else {
-                            Queue::Mempool
                         };
+
                         if let Ok(tx_hash) =
                             submit_tx(&broadcaster, signer.clone(), tx_req, None, queue)
                                 .await
@@ -1417,7 +1378,6 @@ mod tests {
         ESTIMATE_GAS_FAILED_RESPONSE_MESSAGE, FeeNoteAssuranceFallback,
         build_transact_error_response, collect_pending_fee_note_assurance_records,
         should_remove_fee_note_assurance_fallback, transact_estimate_gas_error_message,
-        tx7702_y_parity,
     };
     use crate::fee_note_assurance::FeeNoteAssuranceRecordOutcome;
     use alloy::primitives::FixedBytes;
@@ -1468,15 +1428,6 @@ mod tests {
             transact_estimate_gas_error_message(&error),
             ESTIMATE_GAS_FAILED_RESPONSE_MESSAGE
         );
-    }
-
-    #[test]
-    fn tx7702_y_parity_normalizes_ethers_v_values() {
-        assert_eq!(tx7702_y_parity(0).expect("v 0"), 0);
-        assert_eq!(tx7702_y_parity(1).expect("v 1"), 1);
-        assert_eq!(tx7702_y_parity(27).expect("v 27"), 0);
-        assert_eq!(tx7702_y_parity(28).expect("v 28"), 1);
-        assert!(tx7702_y_parity(29).is_err());
     }
 
     fn sample_record(chain_id: u64, tx_hash: [u8; 32]) -> PendingFeeNoteAssuranceRecord {
@@ -1573,6 +1524,21 @@ mod tests {
             false,
         ));
     }
+}
+
+fn funded_submission_queue(
+    calldata: &ParsedTransactCalldata,
+    cost: U256,
+    refund: U256,
+) -> Option<Queue> {
+    if refund < cost {
+        return None;
+    }
+    Some(if calldata.action_data.is_some() {
+        Queue::Mev
+    } else {
+        Queue::Mempool
+    })
 }
 
 async fn submit_tx(

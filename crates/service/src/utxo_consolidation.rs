@@ -234,8 +234,7 @@ impl UtxoConsolidationService {
                     error @ (PrepareEvmTransactionError::MissingTx7702Field { .. }
                     | PrepareEvmTransactionError::MissingRelayAdapt7702Contract
                     | PrepareEvmTransactionError::Tx7702FieldExceedsU128 { .. }
-                    | PrepareEvmTransactionError::Tx7702NonceExceedsU64 { .. }
-                    | PrepareEvmTransactionError::InvalidTx7702SignatureV { .. }
+                    | PrepareEvmTransactionError::Tx7702Authorization(_)
                     | PrepareEvmTransactionError::Tx7702AuthorizationChainIdMismatch {
                         ..
                     }

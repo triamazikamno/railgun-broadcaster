@@ -75,6 +75,7 @@ fn poi_artifact_source_config(cfg: &config::PoiArtifactSource) -> PoiArtifactSou
             }
         },
         gateway_urls: cfg.gateway_urls.iter().cloned().map(Into::into).collect(),
+        gateway_pool: None,
         max_manifest_age: cfg.max_manifest_age.map(|age| age.into_inner()),
     }
 }
