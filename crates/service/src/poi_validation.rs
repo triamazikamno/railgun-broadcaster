@@ -542,6 +542,7 @@ mod tests {
         use poi::poi::{Poi, PoiRpcClient};
         use std::sync::Arc;
 
+        // No calls: the setup shape, whose `execute` carries only the private fee.
         let (params, receiver, _) = crate::executor_tests::recovery_request(
             CHAIN_ID,
             Address::repeat_byte(0x23),
@@ -609,6 +610,18 @@ mod tests {
                     matches!(*source, PoiError::MissingProof { leaf_hex } if leaf_hex == expected)
                 ),
                 None => assert!(matches!(*source, PoiError::MissingListKey)),
+            }
+        }
+        // A complete map clears the proof-map stage for every fee transaction on every list.
+        let complete = params_with_poi_map(BTreeMap::from([
+            (lists[0], proofs.clone()),
+            (lists[1], proofs),
+        ]));
+        for list_key in &lists {
+            for transaction in &parsed.transactions {
+                assert!(
+                    super::transaction_poi_for_validation(transaction, &complete, list_key).is_ok()
+                );
             }
         }
     }

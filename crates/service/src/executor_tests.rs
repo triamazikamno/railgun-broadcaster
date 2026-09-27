@@ -37,7 +37,13 @@ pub(super) fn recovery_request(
     ViewingKeyData,
     PrivateKeySigner,
 ) {
-    recovery_request_with_authorization_chain(chain_id, U256::from(chain_id), delegate, nonce, calls)
+    recovery_request_with_authorization_chain(
+        chain_id,
+        U256::from(chain_id),
+        delegate,
+        nonce,
+        calls,
+    )
 }
 
 /// Like `recovery_request`, with the delegation authorization signed for
@@ -154,26 +160,22 @@ fn recovery_request_with_authorization_chain(
     (params, receiver, owner)
 }
 
-#[tokio::test]
-async fn execute_fee_outputs_cover_estimated_cost_before_recovery_queue_admission() {
-    let delegate = Address::repeat_byte(0x23);
-    let (params, receiver, _) = recovery_request(
-        1,
-        delegate,
-        U256::from(9),
+/// `execute` call lists for an action-bearing request and a setup request that
+/// carries only the private fee; admission must treat both the same.
+fn execute_call_shapes() -> [Vec<Call>; 2] {
+    [
         vec![Call {
             to: Address::repeat_byte(0x24),
             data: Bytes::new(),
             value: U256::from(11),
         }],
-    );
-    let current = RelayAdapt7702::executeCall::abi_decode(&params.data).unwrap();
-    let historical = executeCall {
-        _transactions: current._transactions.clone(),
-        _actionData: current._actionData.clone(),
-        _signature: current._signature,
-    }
-    .abi_encode();
+        Vec::new(),
+    ]
+}
+
+#[tokio::test]
+async fn execute_fee_outputs_cover_estimated_cost_before_recovery_queue_admission() {
+    let delegate = Address::repeat_byte(0x23);
     let fees = fees::Manager::new(
         &HashMap::new(),
         U256::from(10).pow(U256::from(18)),
@@ -182,55 +184,67 @@ async fn execute_fee_outputs_cover_estimated_cost_before_recovery_queue_admissio
         Address::repeat_byte(0x22),
         Duration::from_mins(1),
     );
-    for data in [params.data.as_ref(), historical.as_slice()] {
-        let mut parsed = parse_transact_calldata(
-            data,
-            &receiver.viewing_private_key,
-            receiver.master_public_key,
-            None,
-        )
-        .unwrap();
-        assert_eq!(parsed.transactions.len(), 2);
-        assert_ne!(
-            parsed.transactions[0].railgun_txid,
-            parsed.transactions[1].railgun_txid
-        );
-        let refund = fees.convert_to_eth(&parsed).await;
-        assert_eq!(refund, U256::from(1_000_000_000_000_000_u64));
-        for (estimated_gas, max_fee, accepted) in [
-            (300_000_u64, 1_000_000_000_u64, true),
-            (2_000_000, 1_000_000_000, false),
-            (300_000, 10_000_000_000, false),
-        ] {
-            let mut request: BroadcasterRawParamsTransact =
-                serde_json::from_value(serde_json::to_value(&params).unwrap()).unwrap();
-            request.max_fee_per_gas = Some(U256::from(max_fee));
-            let asserter = Asserter::new();
-            asserter.push_success(&"0x7");
-            asserter.push_success(&format!("0x{estimated_gas:x}"));
-            let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-            let prepared = prepare_evm_tx7702_transaction(
-                &provider,
-                1,
-                Address::repeat_byte(0x42),
-                &request,
-                Some(delegate),
-            )
-            .await
-            .unwrap();
-            assert_eq!(
-                matches!(
-                    funded_submission_queue(&parsed, prepared.cost, refund),
-                    Some(Queue::Mev)
-                ),
-                accepted
-            );
+    let requests =
+        execute_call_shapes().map(|calls| recovery_request(1, delegate, U256::from(9), calls));
+    for (params, receiver, _) in &requests {
+        let current = RelayAdapt7702::executeCall::abi_decode(&params.data).unwrap();
+        let historical = executeCall {
+            _transactions: current._transactions.clone(),
+            _actionData: current._actionData.clone(),
+            _signature: current._signature,
         }
-        // An unpriced token is not a native-token payment, regardless of its raw amount.
-        parsed.fee_token = Address::repeat_byte(0xff);
-        let unpriced_refund = fees.convert_to_eth(&parsed).await;
-        assert!(funded_submission_queue(&parsed, U256::ONE, unpriced_refund).is_none());
+        .abi_encode();
+        for data in [params.data.as_ref(), historical.as_slice()] {
+            let mut parsed = parse_transact_calldata(
+                data,
+                &receiver.viewing_private_key,
+                receiver.master_public_key,
+                None,
+            )
+            .unwrap();
+            assert_eq!(parsed.transactions.len(), 2);
+            assert_ne!(
+                parsed.transactions[0].railgun_txid,
+                parsed.transactions[1].railgun_txid
+            );
+            let refund = fees.convert_to_eth(&parsed).await;
+            assert_eq!(refund, U256::from(1_000_000_000_000_000_u64));
+            for (estimated_gas, max_fee, accepted) in [
+                (300_000_u64, 1_000_000_000_u64, true),
+                (2_000_000, 1_000_000_000, false),
+                (300_000, 10_000_000_000, false),
+            ] {
+                let mut request: BroadcasterRawParamsTransact =
+                    serde_json::from_value(serde_json::to_value(params).unwrap()).unwrap();
+                request.max_fee_per_gas = Some(U256::from(max_fee));
+                let asserter = Asserter::new();
+                asserter.push_success(&"0x7");
+                asserter.push_success(&format!("0x{estimated_gas:x}"));
+                let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+                let prepared = prepare_evm_tx7702_transaction(
+                    &provider,
+                    1,
+                    Address::repeat_byte(0x42),
+                    &request,
+                    Some(delegate),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    matches!(
+                        funded_submission_queue(&parsed, prepared.cost, refund),
+                        Some(Queue::Mev)
+                    ),
+                    accepted
+                );
+            }
+            // An unpriced token is not a native-token payment, regardless of its raw amount.
+            parsed.fee_token = Address::repeat_byte(0xff);
+            let unpriced_refund = fees.convert_to_eth(&parsed).await;
+            assert!(funded_submission_queue(&parsed, U256::ONE, unpriced_refund).is_none());
+        }
     }
+    let receiver = &requests[0].1;
     // Recovery multicalls carry no private fee notes and are never admitted.
     let multicall = RelayAdapt7702::multicallCall {
         _requireSuccess: true,

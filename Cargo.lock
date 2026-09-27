@@ -2020,6 +2020,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sync-service",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3799,12 +3800,14 @@ name = "fees"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "axum",
  "broadcaster-core",
  "config",
  "moka",
  "public-broadcaster-protocol",
  "rand 0.10.1",
  "ruint",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

@@ -26,5 +26,8 @@ waku-relay = { workspace = true }
 sync-service = { workspace = true }
 local-db = { workspace = true }
 
+[dev-dependencies]
+tempfile = "3"
+
 [lints]
 workspace = true

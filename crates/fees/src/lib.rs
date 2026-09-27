@@ -7,6 +7,7 @@ use broadcaster_core::transact::ParsedTransactCalldata;
 use config::FeeRate;
 use rand::RngExt;
 use rand::distr::Alphanumeric;
+use rand::seq::SliceRandom;
 use ruint::uint;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -133,57 +134,63 @@ impl Manager {
     }
 
     pub async fn update_prices(&self) -> Result<(), FeesError> {
-        let Some(rpc) = self.rpcs.random_provider() else {
-            return Err(FeesError::NoQueryRpc);
-        };
-        let mut multicall = rpc
-            .provider
-            .multicall()
-            .dynamic::<AggregatorInterface::latestAnswerCall>()
-            .address(self.multicall_addr);
-        for oracle in &self.oracle_instances {
-            multicall = multicall.add_call_dynamic(CallItem::new(
-                oracle.addr,
-                AggregatorInterface::latestAnswerCall {}.abi_encode().into(),
-            ));
-        }
-        match multicall.try_aggregate(false).await {
-            Ok(results) => {
-                for (oracle, res) in self.oracle_instances.iter().zip(results) {
-                    match res {
-                        Ok(val) => {
-                            let price =
-                                U256::try_from(val).map_err(|_| FeesError::InvalidPrice {
-                                    value: val.to_string(),
-                                })?;
-                            let val = if oracle.is_inversed {
-                                uint!(10_U256).pow(U256::from(oracle.token_decimals))
-                                    * self.fee_bonus
-                                    / price
-                            } else {
-                                price
-                                    * uint!(10_U256).pow(U256::from(10 + oracle.token_decimals))
-                                    * self.fee_bonus
-                                    / uint!(1000000000000000000000000000000000000_U256)
-                            };
-                            tracing::debug!(?oracle.token_addr, %val, "updating price");
-                            self.prices.write().await.insert(oracle.token_addr, val);
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                "failed to get price for {}: {error}",
-                                oracle.token_addr
-                            );
+        // Snapshot the available providers so each is tried at most once,
+        // including when the configured cooldown is zero.
+        let mut rpcs = self.rpcs.available_providers();
+        rpcs.shuffle(&mut rand::rng());
+        let mut last_error = FeesError::NoQueryRpc;
+        for rpc in rpcs {
+            let mut multicall = rpc
+                .provider
+                .multicall()
+                .dynamic::<AggregatorInterface::latestAnswerCall>()
+                .address(self.multicall_addr);
+            for oracle in &self.oracle_instances {
+                multicall = multicall.add_call_dynamic(CallItem::new(
+                    oracle.addr,
+                    AggregatorInterface::latestAnswerCall {}.abi_encode().into(),
+                ));
+            }
+            match multicall.try_aggregate(false).await {
+                Ok(results) => {
+                    for (oracle, res) in self.oracle_instances.iter().zip(results) {
+                        match res {
+                            Ok(val) => {
+                                let price =
+                                    U256::try_from(val).map_err(|_| FeesError::InvalidPrice {
+                                        value: val.to_string(),
+                                    })?;
+                                let val = if oracle.is_inversed {
+                                    uint!(10_U256).pow(U256::from(oracle.token_decimals))
+                                        * self.fee_bonus
+                                        / price
+                                } else {
+                                    price
+                                        * uint!(10_U256).pow(U256::from(10 + oracle.token_decimals))
+                                        * self.fee_bonus
+                                        / uint!(1000000000000000000000000000000000000_U256)
+                                };
+                                tracing::debug!(?oracle.token_addr, %val, "updating price");
+                                self.prices.write().await.insert(oracle.token_addr, val);
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    "failed to get price for {}: {error}",
+                                    oracle.token_addr
+                                );
+                            }
                         }
                     }
+                    return Ok(());
+                }
+                Err(error) => {
+                    tracing::warn!(%rpc.url, %error, "failed to get prices");
+                    self.rpcs.mark_bad_provider(&rpc);
+                    last_error = FeesError::Multicall(error);
                 }
             }
-            Err(error) => {
-                tracing::error!(%rpc.url, "failed to get prices: {error}");
-                return Err(FeesError::Multicall(error));
-            }
         }
-        Ok(())
+        Err(last_error)
     }
     pub async fn handle_trusted_signer_fees(
         &self,
@@ -222,6 +229,112 @@ impl Manager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::primitives::Bytes;
+    use alloy::sol_types::SolValue;
+    use axum::{Json, Router, extract::Path, routing::post};
+    use serde_json::{Value, json};
+    use std::sync::Mutex;
+
+    async fn price_rpc_pool(
+        second_response: Value,
+    ) -> (
+        Arc<QueryRpcPool>,
+        Arc<Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured_requests = requests.clone();
+        let app = Router::new().route(
+            "/{provider}",
+            post(
+                move |Path(provider): Path<String>, Json(request): Json<Value>| {
+                    let requests = captured_requests.clone();
+                    let second_response = second_response.clone();
+                    async move {
+                        assert_eq!(request["method"], "eth_call");
+                        let mut requests = requests.lock().unwrap();
+                        requests.push(provider);
+                        let mut response = if requests.len() == 1 {
+                            price_rpc_error()
+                        } else {
+                            second_response
+                        };
+                        response["jsonrpc"] = json!("2.0");
+                        response["id"] = request["id"].clone();
+                        Json(response)
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let pool = Arc::new(QueryRpcPool::new(
+            ["a", "b"]
+                .map(|name| format!("http://{addr}/{name}").parse().unwrap())
+                .to_vec(),
+            Duration::from_mins(1),
+        ));
+        (pool, requests, server)
+    }
+
+    fn price_rpc_error() -> Value {
+        json!({"error": {"code": -32602, "message": "request is too complex/large, try lesser input"}})
+    }
+
+    fn oracle_manager(pool: Arc<QueryRpcPool>) -> Manager {
+        Manager::new(
+            &HashMap::from([(
+                Address::repeat_byte(1),
+                FeeRate::Oracle {
+                    addr: Address::repeat_byte(2),
+                    token_decimals: 18,
+                    is_inversed: false,
+                },
+            )]),
+            uint!(1000000000000000000_U256),
+            pool,
+            Address::repeat_byte(3),
+            Address::ZERO,
+            Duration::from_mins(1),
+        )
+    }
+
+    #[tokio::test]
+    async fn price_refresh_falls_back_after_rpc_rejection() {
+        let result = vec![(true, Bytes::from(U256::from(200_000_000).abi_encode()))].abi_encode();
+        let (pool, requests, server) = price_rpc_pool(json!({"result": Bytes::from(result)})).await;
+        let manager = oracle_manager(pool.clone());
+
+        let refresh = manager.update_prices().await;
+        server.abort();
+        refresh.expect("price refresh should use the other RPC");
+
+        let (_, fees) = manager.create_fees().await;
+        assert_eq!(
+            fees[&Address::repeat_byte(1)],
+            uint!(2000000000000000000_U256)
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_ne!(requests[0], requests[1]);
+        assert_eq!(pool.available_providers().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn price_refresh_returns_error_when_all_rpcs_fail() {
+        let (pool, requests, server) = price_rpc_pool(price_rpc_error()).await;
+        let manager = oracle_manager(pool.clone());
+
+        let refresh = manager.update_prices().await;
+        server.abort();
+        assert!(matches!(refresh, Err(FeesError::Multicall(_))));
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_ne!(requests[0], requests[1]);
+        assert!(pool.available_providers().is_empty());
+    }
 
     #[tokio::test]
     async fn fee_id_cache_uses_configured_ttl() {

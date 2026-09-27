@@ -4,6 +4,8 @@ mod auto_refill;
 mod executor_tests;
 mod fee_note_assurance;
 mod poi_validation;
+#[cfg(test)]
+mod shutdown_tests;
 mod utxo_consolidation;
 
 use alloy::eips::Encodable2718;
@@ -976,202 +978,200 @@ impl BroadcasterService {
         let transact_response_topic = ContentTopic::transact_response_topic(chain_id);
 
         tokio::spawn(async move {
-            loop {
-                if let Ok((decrypted_payload, calldata)) = rx
-                    .recv()
-                    .await
-                    .inspect_err(|error| warn!(%error, "failed to receive transact request"))
+            while let Ok((decrypted_payload, calldata)) = rx
+                .recv()
+                .await
+                .inspect_err(|error| warn!(%error, "failed to receive transact request"))
+            {
+                if chain_id != decrypted_payload.params.chain_id {
+                    warn!(
+                        request_chain_id = decrypted_payload.params.chain_id,
+                        expected_chain_id = chain_id,
+                        "wrong chain_id"
+                    );
+                    continue;
+                }
+                if decrypted_payload
+                    .params
+                    .fees_id
+                    .as_ref()
+                    .is_none_or(|fees_id| !fees_manager.is_fees_id_valid(fees_id))
                 {
-                    if chain_id != decrypted_payload.params.chain_id {
-                        warn!(
-                            request_chain_id = decrypted_payload.params.chain_id,
-                            expected_chain_id = chain_id,
-                            "wrong chain_id"
-                        );
-                        continue;
+                    warn!(
+                        ?decrypted_payload.params.fees_id,
+                        "cached fees id not found"
+                    );
+                }
+
+                count_transact_requests.fetch_add(1, Ordering::Relaxed);
+
+                let Some((_wallet, signer)) = evm_wallets.choose(&mut rand::rng()) else {
+                    warn!("no wallets available");
+                    continue;
+                };
+
+                let Some(provider_handle) = query_rpc_pool.random_provider() else {
+                    warn!("no query rpc available");
+                    continue;
+                };
+                let rpc = provider_handle.provider.clone();
+
+                let transact_type = decrypted_payload
+                    .params
+                    .transact_type
+                    .unwrap_or(BroadcasterTransactRequestType::Common);
+                let prepared_tx_result = match transact_type {
+                    BroadcasterTransactRequestType::Common => {
+                        let min_gas_price = decrypted_payload
+                            .params
+                            .min_gas_price
+                            .unwrap_or_default()
+                            .to();
+                        prepare_evm_transaction(
+                            &rpc,
+                            chain_id,
+                            signer.address(),
+                            decrypted_payload.params.to,
+                            decrypted_payload.params.data.clone(),
+                            EvmGasPricePolicy {
+                                gas_price_buffer_bps: USER_TRANSACT_GAS_PRICE_BUFFER_BPS,
+                                min_gas_price: Some(min_gas_price),
+                                max_gas_price: None,
+                            },
+                        )
+                        .await
                     }
-                    if decrypted_payload
-                        .params
-                        .fees_id
-                        .as_ref()
-                        .is_none_or(|fees_id| !fees_manager.is_fees_id_valid(fees_id))
-                    {
-                        warn!(
-                            ?decrypted_payload.params.fees_id,
-                            "cached fees id not found"
-                        );
+                    BroadcasterTransactRequestType::Tx7702 => {
+                        prepare_evm_tx7702_transaction(
+                            &rpc,
+                            chain_id,
+                            signer.address(),
+                            &decrypted_payload.params,
+                            relay_adapt_7702_contract,
+                        )
+                        .await
                     }
-
-                    count_transact_requests.fetch_add(1, Ordering::Relaxed);
-
-                    let Some((_wallet, signer)) = evm_wallets.choose(&mut rand::rng()) else {
-                        warn!("no wallets available");
-                        continue;
-                    };
-
-                    let Some(provider_handle) = query_rpc_pool.random_provider() else {
-                        warn!("no query rpc available");
-                        continue;
-                    };
-                    let rpc = provider_handle.provider.clone();
-
-                    let transact_type = decrypted_payload
-                        .params
-                        .transact_type
-                        .unwrap_or(BroadcasterTransactRequestType::Common);
-                    let prepared_tx_result = match transact_type {
-                        BroadcasterTransactRequestType::Common => {
-                            let min_gas_price = decrypted_payload
-                                .params
-                                .min_gas_price
-                                .unwrap_or_default()
-                                .to();
-                            prepare_evm_transaction(
-                                &rpc,
-                                chain_id,
-                                signer.address(),
-                                decrypted_payload.params.to,
-                                decrypted_payload.params.data.clone(),
-                                EvmGasPricePolicy {
-                                    gas_price_buffer_bps: USER_TRANSACT_GAS_PRICE_BUFFER_BPS,
-                                    min_gas_price: Some(min_gas_price),
-                                    max_gas_price: None,
-                                },
-                            )
-                            .await
-                        }
-                        BroadcasterTransactRequestType::Tx7702 => {
-                            prepare_evm_tx7702_transaction(
-                                &rpc,
-                                chain_id,
-                                signer.address(),
-                                &decrypted_payload.params,
-                                relay_adapt_7702_contract,
-                            )
-                            .await
-                        }
-                    };
-                    let prepared_tx = match prepared_tx_result {
-                        Ok(prepared_tx) => prepared_tx,
-                        Err(error) => {
-                            match &error {
-                                PrepareEvmTransactionError::FetchGasPrice(_) => {
-                                    warn!(%error, rpc = %provider_handle.url, "fetch gas price failed");
-                                    query_rpc_pool.mark_bad_provider(&provider_handle);
-                                }
-                                PrepareEvmTransactionError::FetchNonce(_) => {
-                                    warn!(%error, rpc = %provider_handle.url, "fetch nonce failed");
-                                    query_rpc_pool.mark_bad_provider(&provider_handle);
-                                }
-                                PrepareEvmTransactionError::EstimateGas(source) => {
-                                    let error_message = transact_estimate_gas_error_message(source);
-                                    warn!(%error, rpc = %provider_handle.url, "estimate gas failed");
-                                    publish_transact_error_response(
-                                        &client,
-                                        &transact_response_topic,
-                                        &decrypted_payload.shared_key,
-                                        &error_message,
-                                    )
-                                    .await;
-                                }
-                                PrepareEvmTransactionError::MaxGasPrice { .. } => {
-                                    warn!(%error, rpc = %provider_handle.url, "gas price rejected");
-                                }
-                                PrepareEvmTransactionError::MissingRelayAdapt7702Contract => {
-                                    warn!(%error, rpc = %provider_handle.url, "tx7702 unsupported on this chain");
-                                    publish_transact_error_response(
-                                        &client,
-                                        &transact_response_topic,
-                                        &decrypted_payload.shared_key,
-                                        "Broadcaster is not configured for TX7702 on this chain",
-                                    )
-                                    .await;
-                                }
-                                PrepareEvmTransactionError::MissingTx7702Field { .. }
-                                | PrepareEvmTransactionError::Tx7702FieldExceedsU128 { .. }
-                                | PrepareEvmTransactionError::Tx7702Authorization(_)
-                                | PrepareEvmTransactionError::Tx7702AuthorizationChainIdMismatch { .. }
-                                | PrepareEvmTransactionError::Tx7702AuthorizationAddressMismatch { .. }
-                                | PrepareEvmTransactionError::Tx7702AuthorizationRecovery(_)
-                                | PrepareEvmTransactionError::Tx7702AuthorizationAuthorityMismatch { .. } => {
-                                    warn!(%error, rpc = %provider_handle.url, "invalid tx7702 request");
-                                    publish_transact_error_response(
-                                        &client,
-                                        &transact_response_topic,
-                                        &decrypted_payload.shared_key,
-                                        "Invalid TX7702 request, please refresh and try again",
-                                    )
-                                    .await;
-                                }
+                };
+                let prepared_tx = match prepared_tx_result {
+                    Ok(prepared_tx) => prepared_tx,
+                    Err(error) => {
+                        match &error {
+                            PrepareEvmTransactionError::FetchGasPrice(_) => {
+                                warn!(%error, rpc = %provider_handle.url, "fetch gas price failed");
+                                query_rpc_pool.mark_bad_provider(&provider_handle);
                             }
-                            continue;
-                        }
-                    };
-                    {
-                        let PreparedEvmTransaction {
-                            tx_req,
-                            gas,
-                            gas_price,
-                            cost,
-                        } = prepared_tx;
-                        let refund = fees_manager.convert_to_eth(&calldata).await;
-
-                        info!(
-                            gas,
-                            %gas_price,
-                            cost = pretty_number(&cost, 18),
-                            refund = pretty_number(&refund, 18),
-                            "estimated gas"
-                        );
-
-                        let Some(queue) = funded_submission_queue(&calldata, cost, refund) else {
-                            warn!("gas cost is too high, ignoring the transact request...");
-                            publish_transact_error_response(
-                                &client,
-                                &transact_response_topic,
-                                &decrypted_payload.shared_key,
-                                "Gas cost is too high, please refresh and try again",
-                            )
-                            .await;
-                            continue;
-                        };
-
-                        if let Ok(tx_hash) =
-                            submit_tx(&broadcaster, signer.clone(), tx_req, None, queue)
-                                .await
-                                .inspect_err(|error| error!(%error, "submit tx failed"))
-                        {
-                            info!(?tx_hash, "submitted tx");
-                            count_txs_landed.fetch_add(1, Ordering::Relaxed);
-                            if let Some(context) = calldata.fee_note_assurance.as_ref() {
-                                let record = PendingFeeNoteAssuranceRecord {
-                                    chain_id,
-                                    public_tx_hash: tx_hash,
-                                    context: context.clone(),
-                                };
-                                if let Err(error) = db.put_pending_fee_note_assurance(&record) {
-                                    error!(
-                                        ?error,
-                                        chain_id,
-                                        tx_hash = %tx_hash,
-                                        "persist fee-note assurance record failed"
-                                    );
-                                    pending_fee_note_assurance_fallback.insert(record);
-                                }
+                            PrepareEvmTransactionError::FetchNonce(_) => {
+                                warn!(%error, rpc = %provider_handle.url, "fetch nonce failed");
+                                query_rpc_pool.mark_bad_provider(&provider_handle);
                             }
-                            if let Ok(transact_response) =
-                                DecryptedTransactResponse::encrypted_tx_hash_message(
-                                    None,
+                            PrepareEvmTransactionError::EstimateGas(source) => {
+                                let error_message = transact_estimate_gas_error_message(source);
+                                warn!(%error, rpc = %provider_handle.url, "estimate gas failed");
+                                publish_transact_error_response(
+                                    &client,
+                                    &transact_response_topic,
                                     &decrypted_payload.shared_key,
-                                    tx_hash,
+                                    &error_message,
                                 )
-                                  .inspect_err(|error| error!(%error, "build transact response failed"))
-                                  && let Err(error) = client
-                                  .publish(&transact_response_topic, &transact_response)
-                                 .await
-                             {
-                                 error!(%error, "publish transact response failed");
+                                .await;
                             }
+                            PrepareEvmTransactionError::MaxGasPrice { .. } => {
+                                warn!(%error, rpc = %provider_handle.url, "gas price rejected");
+                            }
+                            PrepareEvmTransactionError::MissingRelayAdapt7702Contract => {
+                                warn!(%error, rpc = %provider_handle.url, "tx7702 unsupported on this chain");
+                                publish_transact_error_response(
+                                    &client,
+                                    &transact_response_topic,
+                                    &decrypted_payload.shared_key,
+                                    "Broadcaster is not configured for TX7702 on this chain",
+                                )
+                                .await;
+                            }
+                            PrepareEvmTransactionError::MissingTx7702Field { .. }
+                            | PrepareEvmTransactionError::Tx7702FieldExceedsU128 { .. }
+                            | PrepareEvmTransactionError::Tx7702Authorization(_)
+                            | PrepareEvmTransactionError::Tx7702AuthorizationChainIdMismatch { .. }
+                            | PrepareEvmTransactionError::Tx7702AuthorizationAddressMismatch { .. }
+                            | PrepareEvmTransactionError::Tx7702AuthorizationRecovery(_)
+                            | PrepareEvmTransactionError::Tx7702AuthorizationAuthorityMismatch { .. } => {
+                                warn!(%error, rpc = %provider_handle.url, "invalid tx7702 request");
+                                publish_transact_error_response(
+                                    &client,
+                                    &transact_response_topic,
+                                    &decrypted_payload.shared_key,
+                                    "Invalid TX7702 request, please refresh and try again",
+                                )
+                                .await;
+                            }
+                        }
+                        continue;
+                    }
+                };
+                {
+                    let PreparedEvmTransaction {
+                        tx_req,
+                        gas,
+                        gas_price,
+                        cost,
+                    } = prepared_tx;
+                    let refund = fees_manager.convert_to_eth(&calldata).await;
+
+                    info!(
+                        gas,
+                        %gas_price,
+                        cost = pretty_number(&cost, 18),
+                        refund = pretty_number(&refund, 18),
+                        "estimated gas"
+                    );
+
+                    let Some(queue) = funded_submission_queue(&calldata, cost, refund) else {
+                        warn!("gas cost is too high, ignoring the transact request...");
+                        publish_transact_error_response(
+                            &client,
+                            &transact_response_topic,
+                            &decrypted_payload.shared_key,
+                            "Gas cost is too high, please refresh and try again",
+                        )
+                        .await;
+                        continue;
+                    };
+
+                    if let Ok(tx_hash) =
+                        submit_tx(&broadcaster, signer.clone(), tx_req, None, queue)
+                            .await
+                            .inspect_err(|error| error!(%error, "submit tx failed"))
+                    {
+                        info!(?tx_hash, "submitted tx");
+                        count_txs_landed.fetch_add(1, Ordering::Relaxed);
+                        if let Some(context) = calldata.fee_note_assurance.as_ref() {
+                            let record = PendingFeeNoteAssuranceRecord {
+                                chain_id,
+                                public_tx_hash: tx_hash,
+                                context: context.clone(),
+                            };
+                            if let Err(error) = db.put_pending_fee_note_assurance(&record) {
+                                error!(
+                                    ?error,
+                                    chain_id,
+                                    tx_hash = %tx_hash,
+                                    "persist fee-note assurance record failed"
+                                );
+                                pending_fee_note_assurance_fallback.insert(record);
+                            }
+                        }
+                        if let Ok(transact_response) =
+                            DecryptedTransactResponse::encrypted_tx_hash_message(
+                                None,
+                                &decrypted_payload.shared_key,
+                                tx_hash,
+                            )
+                              .inspect_err(|error| error!(%error, "build transact response failed"))
+                              && let Err(error) = client
+                              .publish(&transact_response_topic, &transact_response)
+                             .await
+                         {
+                            error!(%error, "publish transact response failed");
                         }
                     }
                 }
