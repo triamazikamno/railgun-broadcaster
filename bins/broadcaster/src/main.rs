@@ -49,6 +49,7 @@ fn waku_client_config(cfg: &config::Waku) -> ClientConfig {
                 addrs: peer.addrs.clone(),
             })
             .collect(),
+        backup_peers: Vec::new(),
         dns_enr_trees: cfg.dns_enr_trees.clone(),
         doh_endpoint: cfg.doh_endpoint.clone(),
         doh_fallback_endpoints: cfg.doh_fallback_endpoints.clone(),

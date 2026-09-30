@@ -18,11 +18,13 @@ use alloy::rpc::types::TransactionRequest;
 use alloy::signers::k256::ecdsa::SigningKey;
 use alloy::signers::local::{LocalSigner, LocalSignerError, MnemonicBuilder, PrivateKeySigner};
 use alloy::transports::TransportErrorKind;
+use alloy::transports::http::Client as HttpClient;
 use alloy::{hex, sol, uint};
 use broadcaster_core::crypto::railgun::{
     Address as RailgunAddress, RailgunError, ShareableViewingKey,
 };
 use broadcaster_core::crypto::snark_proof::Prover;
+use broadcaster_core::deployment::RailgunDeployment;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use broadcaster_core::transact::{
     BroadcasterRawParamsTransact, BroadcasterTransactRequestType, DecryptedTransact,
@@ -54,7 +56,7 @@ use poi::error::PoiError;
 use railgun_wallet::{ProverService, Utxo, WalletKeys};
 use serde::{Deserialize, Serialize};
 use sync_service::{
-    ChainConfig, ChainConfigDefaults, ChainKey, DEFAULT_INDEXED_WALLET_BLOCK_RANGE, SyncManager,
+    ChainConfig, ChainKey, DEFAULT_INDEXED_WALLET_BLOCK_RANGE, RailgunSyncOptions, SyncManager,
     SyncManagerError, WalletConfig,
 };
 use waku_relay::msg::ContentTopic;
@@ -454,23 +456,30 @@ impl BroadcasterService {
             Arc::new(FeeNoteAssuranceSubmissionTracker::default());
         let count_transact_requests = Arc::new(AtomicU32::new(0));
         let count_txs_landed = Arc::new(AtomicU32::new(0));
-        let defaults = ChainConfigDefaults::for_chain(chain_cfg.chain_id);
+        let deployment_defaults = RailgunDeployment::for_chain(chain_cfg.chain_id);
+        let timing_defaults = match chain_cfg.chain_id {
+            1 => Some((Duration::from_secs(12), 12)),
+            56 => Some((Duration::from_millis(450), 15)),
+            137 => Some((Duration::from_secs(1), 256)),
+            42161 => Some((Duration::from_millis(250), 64)),
+            _ => None,
+        };
         let resolved_railgun_contract = chain_cfg
             .sync
             .as_ref()
             .and_then(|sync| sync.railgun_contract)
-            .or_else(|| defaults.as_ref().map(|config| config.contract));
+            .or_else(|| deployment_defaults.as_ref().map(|config| config.contract));
         let resolved_finality_depth = chain_cfg
             .sync
             .as_ref()
             .and_then(|sync| sync.finality_depth)
-            .or_else(|| defaults.as_ref().map(|config| config.finality_depth));
+            .or_else(|| timing_defaults.map(|(_, finality_depth)| finality_depth));
         let block_time = chain_cfg
             .sync
             .as_ref()
             .and_then(|sync| sync.block_time)
             .map(|value| *value)
-            .or_else(|| defaults.as_ref().map(|config| config.block_time))
+            .or_else(|| timing_defaults.map(|(block_time, _)| block_time))
             .ok_or(BroadcasterServiceError::BlockTimeMissing)?;
         #[allow(clippy::redundant_closure_for_method_calls)]
         let receipt_poll_interval = chain_cfg
@@ -506,6 +515,12 @@ impl BroadcasterService {
             resolved_railgun_contract.ok_or(BroadcasterServiceError::RailgunContractMissing)?;
         let finality_depth =
             resolved_finality_depth.ok_or(BroadcasterServiceError::FinalityDepthMissing)?;
+        let block_range = chain_cfg
+            .sync
+            .as_ref()
+            .and_then(|sync| sync.block_range)
+            .unwrap_or(500);
+        let defaults = RailgunSyncOptions::for_chain(chain_id, block_range, receipt_poll_interval);
         let anchor_interval = chain_cfg
             .sync
             .as_ref()
@@ -528,19 +543,31 @@ impl BroadcasterService {
             .sync
             .as_ref()
             .and_then(|sync| sync.v2_start_block)
-            .or_else(|| defaults.as_ref().map(|config| config.v2_start_block))
+            .or_else(|| {
+                deployment_defaults
+                    .as_ref()
+                    .map(|config| config.v2_start_block)
+            })
             .ok_or(BroadcasterServiceError::V2StartBlockMissing)?;
         let legacy_shield_block = chain_cfg
             .sync
             .as_ref()
             .and_then(|sync| sync.legacy_shield_block)
-            .or_else(|| defaults.as_ref().map(|config| config.legacy_shield_block))
+            .or_else(|| {
+                deployment_defaults
+                    .as_ref()
+                    .map(|config| config.legacy_shield_block)
+            })
             .ok_or(BroadcasterServiceError::LegacyShieldBlockMissing)?;
         let deployment_block = chain_cfg
             .sync
             .as_ref()
             .and_then(|sync| sync.deployment_block)
-            .or_else(|| defaults.as_ref().map(|config| config.deployment_block))
+            .or_else(|| {
+                deployment_defaults
+                    .as_ref()
+                    .map(|config| config.deployment_block)
+            })
             .ok_or(BroadcasterServiceError::DeploymentBlockMissing)?;
         let quick_sync_endpoint = if chain_cfg
             .sync
@@ -559,11 +586,6 @@ impl BroadcasterService {
                         .and_then(|config| config.quick_sync_endpoint.clone())
                 })
         };
-        let block_range = chain_cfg
-            .sync
-            .as_ref()
-            .and_then(|sync| sync.block_range)
-            .unwrap_or(500);
         let indexed_wallet_block_range = chain_cfg
             .sync
             .as_ref()
@@ -575,27 +597,36 @@ impl BroadcasterService {
             })
             .unwrap_or(DEFAULT_INDEXED_WALLET_BLOCK_RANGE);
         let chain_config = ChainConfig {
-            chain_id,
-            contract: railgun_contract,
+            deployment: RailgunDeployment {
+                chain_id,
+                contract: railgun_contract,
+                relay_adapt_contract: chain_cfg.relay_adapt_contract,
+                relay_adapt_7702_contract: chain_cfg
+                    .relay_adapt_7702_contract
+                    .or_else(|| deployment_defaults.map(|config| config.relay_adapt_7702_contract))
+                    .unwrap_or_default(),
+                deployment_block,
+                v2_start_block,
+                legacy_shield_block,
+            },
+            sync: RailgunSyncOptions {
+                archive_until_block,
+                block_range,
+                indexed_wallet_block_range,
+                poll_interval: receipt_poll_interval,
+                quick_sync_endpoint: quick_sync_endpoint.clone(),
+                indexed_artifact_source: None,
+                anchor_interval,
+                anchor_retention,
+            },
             rpcs: query_rpc_pool.clone(),
             archive_rpc_url: chain_cfg
                 .sync
                 .as_ref()
                 .and_then(|sync| sync.archive_rpc_url.clone()),
-            archive_until_block,
-            deployment_block,
-            v2_start_block,
-            legacy_shield_block,
-            block_range,
-            indexed_wallet_block_range,
             block_time,
-            poll_interval: receipt_poll_interval,
             finality_depth,
-            quick_sync_endpoint: quick_sync_endpoint.clone(),
-            indexed_artifact_source: None,
-            anchor_interval,
-            anchor_retention,
-            http_client: None,
+            http_client: HttpClient::default(),
             progress_tx: None,
         };
         let chain_service = sync_manager.add_chain(chain_config).await?;
