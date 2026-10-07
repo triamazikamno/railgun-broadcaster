@@ -42,13 +42,13 @@ tracing-appender = "0.2"
 tracing-subscriber = "0.3"
 url = "2"
 
-broadcaster-core = { git = "https://github.com/triamazikamno/railgun-rust", rev = "43f48dfdbd5685e8520e393de641fe580531caa0" }
-local-db = { git = "https://github.com/triamazikamno/railgun-rust", rev = "43f48dfdbd5685e8520e393de641fe580531caa0" }
-poi = { git = "https://github.com/triamazikamno/railgun-rust", rev = "43f48dfdbd5685e8520e393de641fe580531caa0" }
-public-broadcaster-protocol = { git = "https://github.com/triamazikamno/railgun-rust", rev = "43f48dfdbd5685e8520e393de641fe580531caa0" }
-railgun-wallet = { git = "https://github.com/triamazikamno/railgun-rust", rev = "43f48dfdbd5685e8520e393de641fe580531caa0" }
-sync-service = { git = "https://github.com/triamazikamno/railgun-rust", rev = "43f48dfdbd5685e8520e393de641fe580531caa0" }
-waku-relay = { git = "https://github.com/triamazikamno/railgun-rust", rev = "43f48dfdbd5685e8520e393de641fe580531caa0" }
+broadcaster-core = { git = "https://github.com/triamazikamno/railgun-rust", rev = "b602c7d516a3f58bd83911a0a704a53fa0dc0c47" }
+local-db = { git = "https://github.com/triamazikamno/railgun-rust", rev = "b602c7d516a3f58bd83911a0a704a53fa0dc0c47" }
+poi = { git = "https://github.com/triamazikamno/railgun-rust", rev = "b602c7d516a3f58bd83911a0a704a53fa0dc0c47" }
+public-broadcaster-protocol = { git = "https://github.com/triamazikamno/railgun-rust", rev = "b602c7d516a3f58bd83911a0a704a53fa0dc0c47" }
+railgun-wallet = { git = "https://github.com/triamazikamno/railgun-rust", rev = "b602c7d516a3f58bd83911a0a704a53fa0dc0c47" }
+sync-service = { git = "https://github.com/triamazikamno/railgun-rust", rev = "b602c7d516a3f58bd83911a0a704a53fa0dc0c47" }
+waku-relay = { git = "https://github.com/triamazikamno/railgun-rust", rev = "b602c7d516a3f58bd83911a0a704a53fa0dc0c47" }
 
 [profile.release]
 opt-level = 3

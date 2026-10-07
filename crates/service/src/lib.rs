@@ -605,6 +605,9 @@ impl BroadcasterService {
                     .relay_adapt_7702_contract
                     .or_else(|| deployment_defaults.map(|config| config.relay_adapt_7702_contract))
                     .unwrap_or_default(),
+                relay_adapt_history: deployment_defaults
+                    .as_ref()
+                    .map_or(&[], |config| config.relay_adapt_history),
                 deployment_block,
                 v2_start_block,
                 legacy_shield_block,
