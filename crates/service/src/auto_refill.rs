@@ -249,6 +249,8 @@ impl AutoRefillService {
                 }
                 Err(
                     error @ (PrepareEvmTransactionError::MissingTx7702Field { .. }
+                    | PrepareEvmTransactionError::Tx7702Simulation(_)
+                    | PrepareEvmTransactionError::Tx7702DelegationDecode(_)
                     | PrepareEvmTransactionError::MissingRelayAdapt7702Contract
                     | PrepareEvmTransactionError::Tx7702FieldExceedsU128 { .. }
                     | PrepareEvmTransactionError::Tx7702Authorization(_)

@@ -17,15 +17,17 @@ use alloy::providers::Provider;
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::k256::ecdsa::SigningKey;
 use alloy::signers::local::{LocalSigner, LocalSignerError, MnemonicBuilder, PrivateKeySigner};
+use alloy::sol_types::SolCall;
 use alloy::transports::TransportErrorKind;
 use alloy::transports::http::Client as HttpClient;
 use alloy::{hex, sol, uint};
+use broadcaster_core::contracts::railgun::RelayAdapt7702;
 use broadcaster_core::crypto::railgun::{
     Address as RailgunAddress, RailgunError, ShareableViewingKey,
 };
 use broadcaster_core::crypto::snark_proof::Prover;
 use broadcaster_core::deployment::RailgunDeployment;
-use broadcaster_core::query_rpc_pool::QueryRpcPool;
+use broadcaster_core::query_rpc_pool::{ProviderHandle, QueryRpcPool};
 use broadcaster_core::transact::{
     BroadcasterRawParamsTransact, BroadcasterTransactRequestType, DecryptedTransact,
     ParsedTransactCalldata, TransactError, parse_transact_calldata, try_decrypt_transact_request,
@@ -34,7 +36,7 @@ use broadcaster_core::transact_response::DecryptedTransactResponse;
 use config::{Chain, Key};
 use fees::{FeesError, Manager as FeesManager};
 use local_db::{DbStore, PendingFeeNoteAssuranceRecord, WalletCacheKey};
-use rand::seq::IndexedRandom;
+use rand::seq::{IndexedRandom, SliceRandom};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -202,6 +204,10 @@ pub(crate) enum PrepareEvmTransactionError {
     FetchNonce(#[source] alloy::transports::RpcError<TransportErrorKind>),
     #[error("estimate gas failed: {0}")]
     EstimateGas(#[source] alloy::transports::RpcError<TransportErrorKind>),
+    #[error("tx7702 simulation failed: {0}")]
+    Tx7702Simulation(#[source] alloy::transports::RpcError<TransportErrorKind>),
+    #[error("decode tx7702 delegated nonce failed: {0}")]
+    Tx7702DelegationDecode(#[source] alloy::sol_types::Error),
     #[error("missing tx7702 field: {field}")]
     MissingTx7702Field { field: &'static str },
     #[error("missing relay_adapt_7702_contract")]
@@ -365,11 +371,29 @@ pub(crate) async fn prepare_evm_tx7702_transaction(
         .with_max_priority_fee_per_gas(max_priority_fee_per_gas)
         .with_nonce(nonce)
         .with_authorization_list(vec![signed_authorization]);
+    // An RPC that ignores the authorization can report success without executing the delegate.
+    let delegation_result = provider
+        .call(
+            tx_req
+                .clone()
+                .with_input(RelayAdapt7702::nonceCall {}.abi_encode()),
+        )
+        .pending()
+        .await
+        .map_err(PrepareEvmTransactionError::Tx7702Simulation)?;
+    RelayAdapt7702::nonceCall::abi_decode_returns(&delegation_result)
+        .map_err(PrepareEvmTransactionError::Tx7702DelegationDecode)?;
     let gas = provider
         .estimate_gas(tx_req.clone())
         .await
-        .map_err(PrepareEvmTransactionError::EstimateGas)?
-        + EVM_GAS_LIMIT_BUFFER;
+        .map_err(PrepareEvmTransactionError::EstimateGas)?;
+    // Validate the raw estimate so the buffer cannot hide an RPC estimation failure.
+    provider
+        .call(tx_req.clone().with_gas_limit(gas))
+        .pending()
+        .await
+        .map_err(PrepareEvmTransactionError::Tx7702Simulation)?;
+    let gas = gas + EVM_GAS_LIMIT_BUFFER;
     let tx_req = tx_req.with_gas_limit(gas);
     let cost = U256::from(gas) * U256::from(max_fee_per_gas);
 
@@ -379,6 +403,45 @@ pub(crate) async fn prepare_evm_tx7702_transaction(
         gas_price: max_fee_per_gas,
         cost,
     })
+}
+
+async fn prepare_evm_tx7702_with_fallback(
+    provider_handle: &mut ProviderHandle,
+    query_rpc_pool: &QueryRpcPool,
+    chain_id: ChainId,
+    from: Address,
+    params: &BroadcasterRawParamsTransact,
+    relay_adapt_7702_contract: Option<Address>,
+) -> Result<PreparedEvmTransaction, PrepareEvmTransactionError> {
+    let mut remaining = query_rpc_pool.available_providers();
+    remaining.retain(|handle| handle.index != provider_handle.index);
+    remaining.shuffle(&mut rand::rng());
+    loop {
+        let result = prepare_evm_tx7702_transaction(
+            &provider_handle.provider,
+            chain_id,
+            from,
+            params,
+            relay_adapt_7702_contract,
+        )
+        .await;
+        match result {
+            Err(
+                error @ (PrepareEvmTransactionError::FetchNonce(_)
+                | PrepareEvmTransactionError::EstimateGas(_)
+                | PrepareEvmTransactionError::Tx7702Simulation(_)
+                | PrepareEvmTransactionError::Tx7702DelegationDecode(_)),
+            ) => {
+                let Some(next) = remaining.pop() else {
+                    return Err(error);
+                };
+                debug!(%error, rpc_index = provider_handle.index, "retry tx7702 preparation with another query rpc");
+                // Invalid or stale requests can also fail simulation; do not cool down the RPC.
+                *provider_handle = next;
+            }
+            result => return result,
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -1044,7 +1107,7 @@ impl BroadcasterService {
                     continue;
                 };
 
-                let Some(provider_handle) = query_rpc_pool.random_provider() else {
+                let Some(mut provider_handle) = query_rpc_pool.random_provider() else {
                     warn!("no query rpc available");
                     continue;
                 };
@@ -1076,8 +1139,9 @@ impl BroadcasterService {
                         .await
                     }
                     BroadcasterTransactRequestType::Tx7702 => {
-                        prepare_evm_tx7702_transaction(
-                            &rpc,
+                        prepare_evm_tx7702_with_fallback(
+                            &mut provider_handle,
+                            &query_rpc_pool,
                             chain_id,
                             signer.address(),
                             &decrypted_payload.params,
@@ -1106,6 +1170,17 @@ impl BroadcasterService {
                                     &transact_response_topic,
                                     &decrypted_payload.shared_key,
                                     &error_message,
+                                )
+                                .await;
+                            }
+                            PrepareEvmTransactionError::Tx7702Simulation(_)
+                            | PrepareEvmTransactionError::Tx7702DelegationDecode(_) => {
+                                warn!(%error, rpc_index = provider_handle.index, "tx7702 simulation failed");
+                                publish_transact_error_response(
+                                    &client,
+                                    &transact_response_topic,
+                                    &decrypted_payload.shared_key,
+                                    ESTIMATE_GAS_FAILED_RESPONSE_MESSAGE,
                                 )
                                 .await;
                             }

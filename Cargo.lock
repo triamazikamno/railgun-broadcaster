@@ -2009,6 +2009,7 @@ version = "0.1.0"
 dependencies = [
  "alloy",
  "alloy-rpc-types-eth",
+ "axum",
  "broadcaster-core",
  "config",
  "fees",

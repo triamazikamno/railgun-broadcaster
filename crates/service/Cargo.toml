@@ -27,6 +27,7 @@ sync-service = { workspace = true }
 local-db = { workspace = true }
 
 [dev-dependencies]
+axum = { workspace = true }
 tempfile = "3"
 
 [lints]
