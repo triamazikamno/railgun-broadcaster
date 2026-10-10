@@ -173,6 +173,8 @@ const GAS_PRICE_BPS_DENOMINATOR: u128 = 10_000;
 const USER_TRANSACT_GAS_PRICE_BUFFER_BPS: u128 = 10_100;
 const MAINTENANCE_GAS_PRICE_BUFFER_BPS: u128 = 10_500;
 const EVM_GAS_LIMIT_BUFFER: u64 = 100_000;
+// Covers intrinsic gas, one authorization and the delegated nonce getter.
+const TX7702_DELEGATION_PROBE_GAS_LIMIT: u64 = 100_000;
 const ESTIMATE_GAS_FAILED_RESPONSE_MESSAGE: &str =
     "Estimate gas failed, please refresh and try again";
 
@@ -372,10 +374,12 @@ pub(crate) async fn prepare_evm_tx7702_transaction(
         .with_nonce(nonce)
         .with_authorization_list(vec![signed_authorization]);
     // An RPC that ignores the authorization can report success without executing the delegate.
+    // Bound the fee-bearing probe so it cannot inherit an unlimited RPC gas cap.
     let delegation_result = provider
         .call(
             tx_req
                 .clone()
+                .with_gas_limit(TX7702_DELEGATION_PROBE_GAS_LIMIT)
                 .with_input(RelayAdapt7702::nonceCall {}.abi_encode()),
         )
         .pending()

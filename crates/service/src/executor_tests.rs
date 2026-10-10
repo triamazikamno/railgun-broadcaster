@@ -25,8 +25,8 @@ use std::time::Duration;
 use tx_submit::Queue;
 
 use super::{
-    EVM_GAS_LIMIT_BUFFER, PrepareEvmTransactionError, funded_submission_queue,
-    prepare_evm_tx7702_transaction, prepare_evm_tx7702_with_fallback,
+    EVM_GAS_LIMIT_BUFFER, PrepareEvmTransactionError, TX7702_DELEGATION_PROBE_GAS_LIMIT,
+    funded_submission_queue, prepare_evm_tx7702_transaction, prepare_evm_tx7702_with_fallback,
 };
 
 struct Tx7702RpcFixture {
@@ -84,6 +84,19 @@ async fn tx7702_rpc_response(
         "eth_call" => {
             let tx: TransactionRequest =
                 serde_json::from_value(request["params"][0].clone()).unwrap();
+            // Model an RPC with no gas cap and the finite sender balance from the BSC failure.
+            let gas = tx.gas.unwrap_or(u64::MAX);
+            let balance = U256::from(302_432_038_208_973_193_u64);
+            let cost = U256::from(gas) * U256::from(tx.max_fee_per_gas.unwrap());
+            if cost > balance {
+                return Json(serde_json::json!({
+                    "jsonrpc": "2.0", "id": request["id"],
+                    "error": {
+                        "code": -32000,
+                        "message": "insufficient funds for gas * price + value"
+                    }
+                }));
+            }
             let getter = RelayAdapt7702::nonceCall {}.abi_encode();
             if tx.input.input().unwrap().as_ref() == getter {
                 if state.executes_delegation {
@@ -504,7 +517,7 @@ async fn prepared_tx7702_request_carries_owner_authorization_and_estimated_cost(
             .collect();
         assert_eq!(calls.len(), 2);
         let mut expected_probe = prepared.tx_req.clone();
-        expected_probe.gas = None;
+        expected_probe.gas = Some(TX7702_DELEGATION_PROBE_GAS_LIMIT);
         expected_probe.input = RelayAdapt7702::nonceCall {}.abi_encode().into();
         let mut expected_execution = prepared.tx_req.clone();
         expected_execution.gas = Some(300_000);
