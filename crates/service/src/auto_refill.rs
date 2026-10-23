@@ -7,9 +7,14 @@ use alloy::primitives::{Address, ChainId, U256};
 use alloy::providers::Provider;
 use alloy::signers::k256::ecdsa::SigningKey;
 use alloy::signers::local::LocalSigner;
+use alloy::uint;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use config::AutoRefillSettings;
-use railgun_wallet::tx::{TransactionBuilder as RailgunTxBuilder, UnshieldMode, UnshieldRequest};
+use railgun_wallet::tx::{
+    CompositeAdapter, CompositeRelayAction, CompositeRelayActionToken, CompositeRelayActions,
+    CompositeUnshieldLeg, CompositeUnshieldLegRole, CompositeUnshieldRecipient,
+    CompositeUnshieldRequest, TransactionBuilder as RailgunTxBuilder, max_unshield_spendable,
+};
 use railgun_wallet::{ProverService, WalletKeys};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,6 +22,10 @@ use std::time::Duration;
 use sync_service::{ChainHandle, WalletHandle};
 use tracing::{info, warn};
 use tx_submit::{Queue, TxBroadcaster};
+
+/// Railgun's unshield fee, taken before the wrapped native reaches the `RelayAdapt`.
+const UNSHIELD_FEE_BPS: U256 = uint!(25_U256);
+const BPS_DENOMINATOR: U256 = uint!(10_000_U256);
 
 pub(crate) struct AutoRefillConfig {
     pub chain_id: ChainId,
@@ -31,6 +40,7 @@ pub(crate) struct AutoRefillConfig {
 
 pub(crate) struct AutoRefillService {
     tx_builder: RailgunTxBuilder,
+    relay_adapt_contract: Address,
     wallet: WalletKeys,
     wallet_handle: WalletHandle,
     chain_handle: ChainHandle,
@@ -58,8 +68,8 @@ impl AutoRefillService {
                 chain_type: 0,
                 chain_id: cfg.chain_id,
                 railgun_contract: cfg.railgun_contract,
-                relay_adapt_contract: cfg.relay_adapt_contract,
             },
+            relay_adapt_contract: cfg.relay_adapt_contract,
             wallet: cfg.wallet,
             wallet_handle: cfg.wallet_handle,
             chain_handle: cfg.chain_handle,
@@ -167,20 +177,38 @@ impl AutoRefillService {
             let mut forest = self.chain_handle.forest.read().await.clone();
             forest.compute_roots();
 
-            let request = UnshieldRequest {
-                token_address: self.wrapped_native_token,
-                amount: refill_amount,
-                recipient: wallet_address,
-                mode: UnshieldMode::UnwrapBase,
-                verify_proof: true,
-                spend_up_to: true,
+            // The relay actions fix the unwrapped amount up front, so spend-up-to is applied here.
+            let unshield_amount =
+                refill_amount.min(max_unshield_spendable(&utxos, self.wrapped_native_token));
+            let net_amount = unshield_amount - unshield_amount * UNSHIELD_FEE_BPS / BPS_DENOMINATOR;
+            let request = CompositeUnshieldRequest {
+                adapter: Some(CompositeAdapter::RelayAdapt(self.relay_adapt_contract)),
+                legs: vec![CompositeUnshieldLeg {
+                    token_address: self.wrapped_native_token,
+                    amount: unshield_amount,
+                    recipient: CompositeUnshieldRecipient::RelayAdapt,
+                    role: CompositeUnshieldLegRole::Primary,
+                }],
+                relay_actions: Some(CompositeRelayActions {
+                    min_gas_limit: U256::ZERO,
+                    calls: vec![
+                        CompositeRelayAction::UnwrapBase { amount: net_amount },
+                        CompositeRelayAction::Transfer {
+                            token: CompositeRelayActionToken::BaseNative,
+                            recipient: wallet_address,
+                            amount: net_amount,
+                        },
+                    ],
+                }),
                 broadcaster_fee: None,
                 min_gas_price: 0,
+                verify_proof: true,
+                spend_up_to: false,
             };
 
             let plan = match self
                 .tx_builder
-                .build_unshield_plan(&self.wallet, &forest, &utxos, request, &self.prover)
+                .build_composite_unshield_plan(&self.wallet, &forest, &utxos, request, &self.prover)
                 .await
             {
                 Ok(plan) => plan,
@@ -195,7 +223,6 @@ impl AutoRefillService {
                 }
             };
 
-            let unshield_amount = plan.unshield_amount();
             if unshield_amount < refill_amount {
                 info!(
                     wallet = %wallet_address,

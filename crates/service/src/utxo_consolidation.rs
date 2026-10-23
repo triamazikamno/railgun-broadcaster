@@ -21,7 +21,6 @@ use tx_submit::{Queue, TxBroadcaster};
 pub(crate) struct UtxoConsolidationConfig {
     pub chain_id: ChainId,
     pub railgun_contract: Address,
-    pub relay_adapt_contract: Address,
     pub wallet: WalletKeys,
     pub wallet_handle: WalletHandle,
     pub chain_handle: ChainHandle,
@@ -57,7 +56,6 @@ impl UtxoConsolidationService {
                 chain_type: 0,
                 chain_id: cfg.chain_id,
                 railgun_contract: cfg.railgun_contract,
-                relay_adapt_contract: cfg.relay_adapt_contract,
             },
             wallet: cfg.wallet,
             wallet_handle: cfg.wallet_handle,

@@ -382,15 +382,16 @@ dependencies = [
 
 [[package]]
 name = "alloy-primitives"
-version = "1.6.0"
+version = "1.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4885c1409b6936c4898e646ef58baf6ec54edaf6d8179f79df805a7b85b7cf3e"
+checksum = "d5e9dbd49258ac3ab893a481d46be29b58be7f734dcac46cd80b6b13ee36566c"
 dependencies = [
  "alloy-rlp",
  "bytes",
  "cfg-if",
  "const-hex",
  "derive_more 2.1.1",
+ "fixed-cache",
  "foldhash 0.2.0",
  "hashbrown 0.17.1",
  "indexmap 2.14.0",
@@ -1753,7 +1754,7 @@ dependencies = [
  "bitflags 2.13.0",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.12.1",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -1774,21 +1775,6 @@ dependencies = [
  "serde",
  "unicode-normalization",
 ]
-
-[[package]]
-name = "bit-set"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08807e080ed7f9d5433fa9b275196cfc35414f66a0c79d864dc51a0d825231a3"
-dependencies = [
- "bit-vec",
-]
-
-[[package]]
-name = "bit-vec"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
 
 [[package]]
 name = "bitcoin-consensus-encoding"
@@ -1972,7 +1958,7 @@ dependencies = [
 [[package]]
 name = "broadcaster-core"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=b602c7d516a3f58bd83911a0a704a53fa0dc0c47#b602c7d516a3f58bd83911a0a704a53fa0dc0c47"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=5bf96f25d30fc56abdf34301a121aeb6d8d3d342#5bf96f25d30fc56abdf34301a121aeb6d8d3d342"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1984,6 +1970,7 @@ dependencies = [
  "ark-ff 0.6.0",
  "ark-groth16",
  "bech32 0.12.0",
+ "ctr",
  "curve25519-dalek 5.0.0",
  "ed25519-dalek 3.0.0",
  "getrandom 0.4.3",
@@ -3123,7 +3110,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1747ed5fb4ab3a9f8253da3401efe7ca8f8e5ec373b2e700ff55c3304d84e31f"
 dependencies = [
  "heck 0.5.0",
- "indexmap 2.14.0",
+ "indexmap 1.9.3",
  "itertools 0.15.0",
  "proc-macro-crate",
  "proc-macro2",
@@ -3280,7 +3267,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3635,7 +3622,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3874,6 +3861,16 @@ name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+
+[[package]]
+name = "fixed-cache"
+version = "0.1.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57b811067c17dd16568d50c522f03fa65227c7f602c88f77d38e7842c51ba964"
+dependencies = [
+ "equivalent",
+ "rapidhash",
+]
 
 [[package]]
 name = "fixed-hash"
@@ -5684,7 +5681,7 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 [[package]]
 name = "local-db"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=b602c7d516a3f58bd83911a0a704a53fa0dc0c47#b602c7d516a3f58bd83911a0a704a53fa0dc0c47"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=5bf96f25d30fc56abdf34301a121aeb6d8d3d342#5bf96f25d30fc56abdf34301a121aeb6d8d3d342"
 dependencies = [
  "alloy",
  "broadcaster-core",
@@ -5894,7 +5891,7 @@ dependencies = [
 [[package]]
 name = "merkletree"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=b602c7d516a3f58bd83911a0a704a53fa0dc0c47#b602c7d516a3f58bd83911a0a704a53fa0dc0c47"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=5bf96f25d30fc56abdf34301a121aeb6d8d3d342#5bf96f25d30fc56abdf34301a121aeb6d8d3d342"
 dependencies = [
  "alloy",
  "alloy-rpc-types-eth",
@@ -6225,7 +6222,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6817,7 +6814,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 [[package]]
 name = "poi"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=b602c7d516a3f58bd83911a0a704a53fa0dc0c47#b602c7d516a3f58bd83911a0a704a53fa0dc0c47"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=5bf96f25d30fc56abdf34301a121aeb6d8d3d342#5bf96f25d30fc56abdf34301a121aeb6d8d3d342"
 dependencies = [
  "alloy",
  "broadcaster-core",
@@ -7078,16 +7075,12 @@ version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4b45fcc2344c680f5025fe57779faef368840d0bd1f42f216291f0dc4ace4744"
 dependencies = [
- "bit-set",
- "bit-vec",
  "bitflags 2.13.0",
  "num-traits",
  "rand 0.9.4",
  "rand_chacha 0.9.0",
  "rand_xorshift",
  "regex-syntax",
- "rusty-fork",
- "tempfile",
  "unarray",
 ]
 
@@ -7224,7 +7217,7 @@ dependencies = [
 [[package]]
 name = "public-broadcaster-protocol"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=b602c7d516a3f58bd83911a0a704a53fa0dc0c47#b602c7d516a3f58bd83911a0a704a53fa0dc0c47"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=5bf96f25d30fc56abdf34301a121aeb6d8d3d342#5bf96f25d30fc56abdf34301a121aeb6d8d3d342"
 dependencies = [
  "alloy",
  "broadcaster-core",
@@ -7245,12 +7238,6 @@ dependencies = [
  "paste",
  "thiserror 2.0.18",
 ]
-
-[[package]]
-name = "quick-error"
-version = "1.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quick-protobuf"
@@ -7388,7 +7375,7 @@ dependencies = [
 [[package]]
 name = "railgun-indexed-artifacts"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=b602c7d516a3f58bd83911a0a704a53fa0dc0c47#b602c7d516a3f58bd83911a0a704a53fa0dc0c47"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=5bf96f25d30fc56abdf34301a121aeb6d8d3d342#5bf96f25d30fc56abdf34301a121aeb6d8d3d342"
 dependencies = [
  "alloy-primitives",
  "ed25519-dalek 3.0.0",
@@ -7401,7 +7388,7 @@ dependencies = [
 [[package]]
 name = "railgun-wallet"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=b602c7d516a3f58bd83911a0a704a53fa0dc0c47#b602c7d516a3f58bd83911a0a704a53fa0dc0c47"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=5bf96f25d30fc56abdf34301a121aeb6d8d3d342#5bf96f25d30fc56abdf34301a121aeb6d8d3d342"
 dependencies = [
  "alloy",
  "alloy-rpc-types-eth",
@@ -8111,7 +8098,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -8169,7 +8156,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -8195,18 +8182,6 @@ name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
-
-[[package]]
-name = "rusty-fork"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc6bf79ff24e648f6da1f8d1f011e9cac26491b619e6b9280f2b47f1774e6ee2"
-dependencies = [
- "fnv",
- "quick-error",
- "tempfile",
- "wait-timeout",
-]
 
 [[package]]
 name = "ruzstd"
@@ -8913,7 +8888,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -9184,7 +9159,7 @@ dependencies = [
 [[package]]
 name = "sync-service"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=b602c7d516a3f58bd83911a0a704a53fa0dc0c47#b602c7d516a3f58bd83911a0a704a53fa0dc0c47"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=5bf96f25d30fc56abdf34301a121aeb6d8d3d342#5bf96f25d30fc56abdf34301a121aeb6d8d3d342"
 dependencies = [
  "alloy",
  "alloy-provider",
@@ -9312,7 +9287,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -10757,7 +10732,7 @@ dependencies = [
 [[package]]
 name = "trustless-artifacts"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=b602c7d516a3f58bd83911a0a704a53fa0dc0c47#b602c7d516a3f58bd83911a0a704a53fa0dc0c47"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=5bf96f25d30fc56abdf34301a121aeb6d8d3d342#5bf96f25d30fc56abdf34301a121aeb6d8d3d342"
 dependencies = [
  "blake2b_simd",
  "bytes",
@@ -11033,18 +11008,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a02e4885ed3bc0f2de90ea6dd45ebcbb66dacffe03547fadbb0eeae2770887d"
 
 [[package]]
-name = "wait-timeout"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09ac3b126d3914f9849036f826e054cbabdc8519970b8998ddaf3b5bd3c65f11"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "waku"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=b602c7d516a3f58bd83911a0a704a53fa0dc0c47#b602c7d516a3f58bd83911a0a704a53fa0dc0c47"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=5bf96f25d30fc56abdf34301a121aeb6d8d3d342#5bf96f25d30fc56abdf34301a121aeb6d8d3d342"
 dependencies = [
  "ahash",
  "alloy-rlp",
@@ -11081,7 +11047,7 @@ dependencies = [
 [[package]]
 name = "waku-relay"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=b602c7d516a3f58bd83911a0a704a53fa0dc0c47#b602c7d516a3f58bd83911a0a704a53fa0dc0c47"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=5bf96f25d30fc56abdf34301a121aeb6d8d3d342#5bf96f25d30fc56abdf34301a121aeb6d8d3d342"
 dependencies = [
  "alloy",
  "base64 0.22.1",
@@ -11513,7 +11479,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

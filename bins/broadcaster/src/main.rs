@@ -14,8 +14,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use structopt::StructOpt;
 use sync_service::{
-    GlobalPoiPolicy, PoiArtifactManifestSource, PoiArtifactSourceConfig, PoiProxyFallback,
-    SyncManager,
+    GlobalPoiPolicy, IndexedArtifactManifestReuse, IndexedArtifactManifestSource,
+    IndexedArtifactSourceConfig, PoiArtifactManifestSource, PoiArtifactSourceConfig,
+    PoiProxyFallback, SyncManager,
 };
 use tracing::metadata::LevelFilter;
 use tracing::{Instrument, error, info};
@@ -78,6 +79,33 @@ fn poi_artifact_source_config(cfg: &config::PoiArtifactSource) -> PoiArtifactSou
         gateway_urls: cfg.gateway_urls.iter().cloned().map(Into::into).collect(),
         gateway_pool: None,
         max_manifest_age: cfg.max_manifest_age.map(|age| age.into_inner()),
+    }
+}
+
+// Same download limits as the wallet's indexed artifact defaults.
+const INDEXED_ARTIFACT_CONCURRENCY: usize = 6;
+const INDEXED_ARTIFACT_MAX_IN_FLIGHT_BYTES: u64 = 64 * 1024 * 1024;
+
+fn indexed_artifact_source_config(cfg: &config::PoiArtifactSource) -> IndexedArtifactSourceConfig {
+    IndexedArtifactSourceConfig {
+        trusted_publisher_pubkey: cfg.trusted_publisher_pubkey,
+        manifest_source: match &cfg.manifest_source {
+            config::PoiArtifactManifestSource::Url(url) => {
+                IndexedArtifactManifestSource::Url(url.clone())
+            }
+            config::PoiArtifactManifestSource::Cid(cid) => {
+                IndexedArtifactManifestSource::Cid(cid.clone())
+            }
+            config::PoiArtifactManifestSource::IpnsName(name) => {
+                IndexedArtifactManifestSource::IpnsName(name.clone())
+            }
+        },
+        gateway_urls: cfg.gateway_urls.clone(),
+        gateway_pool: None,
+        manifest_reuse: IndexedArtifactManifestReuse::default(),
+        max_manifest_age: cfg.max_manifest_age.map(|age| age.into_inner()),
+        concurrency: INDEXED_ARTIFACT_CONCURRENCY,
+        max_in_flight_bytes: INDEXED_ARTIFACT_MAX_IN_FLIGHT_BYTES,
     }
 }
 
@@ -209,6 +237,10 @@ async fn main() -> Result<()> {
         Arc::new(Client::new(&waku_client_config(&cfg.waku)).wrap_err("create waku relay client")?);
     let snark_prover = Arc::new(Prover::new().wrap_err("create snark prover")?);
 
+    let indexed_artifact_source = cfg
+        .indexed_artifact_source
+        .as_ref()
+        .map(indexed_artifact_source_config);
     let mut services = Vec::with_capacity(cfg.chains.len());
     for chain_cfg in cfg.chains.clone() {
         let chain_id = chain_cfg.chain_id;
@@ -224,6 +256,7 @@ async fn main() -> Result<()> {
             prover.clone(),
             poi_recovery_prover.clone(),
             cfg.query_rpc_cooldown.into_inner(),
+            indexed_artifact_source.clone(),
         )
         .instrument(tracing::info_span!("service", chain_id))
         .await

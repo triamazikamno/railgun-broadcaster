@@ -89,7 +89,7 @@ fn tx_submitter_stops_when_service_is_dropped() {
             railgun_contract: None,
             finality_depth: None,
             receipt_poll_interval: Duration::from_secs(1),
-            relay_adapt_contract: Address::ZERO,
+            relay_adapt_contract: None,
             relay_adapt_7702_contract: None,
             identifier: None,
             fees_refresh_interval: Duration::from_secs(30),

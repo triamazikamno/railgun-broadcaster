@@ -58,8 +58,8 @@ use poi::error::PoiError;
 use railgun_wallet::{ProverService, Utxo, WalletKeys};
 use serde::{Deserialize, Serialize};
 use sync_service::{
-    ChainConfig, ChainKey, DEFAULT_INDEXED_WALLET_BLOCK_RANGE, RailgunSyncOptions, SyncManager,
-    SyncManagerError, WalletConfig,
+    ChainConfig, ChainKey, DEFAULT_INDEXED_WALLET_BLOCK_RANGE, IndexedArtifactSourceConfig,
+    RailgunSyncOptions, SyncManager, SyncManagerError, WalletConfig,
 };
 use waku_relay::msg::ContentTopic;
 
@@ -157,6 +157,8 @@ pub enum BroadcasterServiceError {
     LegacyShieldBlockMissing,
     #[error("deployment_block is not defined for this chain")]
     DeploymentBlockMissing,
+    #[error("auto_refill requires relay_adapt_contract, which is not defined for this chain")]
+    AutoRefillRequiresRelayAdapt,
 }
 
 #[derive(Debug, Error)]
@@ -471,6 +473,22 @@ fn derive_evm_wallet_keys(
         .collect()
 }
 
+/// Resolve the legacy `RelayAdapt`, which auto-refill needs to unwrap and send native funds.
+fn resolve_relay_adapt_contract(
+    chain_cfg: &Chain,
+    deployment_defaults: Option<&RailgunDeployment>,
+) -> Result<Option<Address>, BroadcasterServiceError> {
+    let relay_adapt_contract = chain_cfg
+        .relay_adapt_contract
+        .or_else(|| deployment_defaults.and_then(|config| config.relay_adapt_contract));
+    if relay_adapt_contract.is_none()
+        && matches!(&chain_cfg.key, Key::Mnemonic(mnemonic) if mnemonic.auto_refill.is_some())
+    {
+        return Err(BroadcasterServiceError::AutoRefillRequiresRelayAdapt);
+    }
+    Ok(relay_adapt_contract)
+}
+
 type ResponseSender = kanal::AsyncSender<(DecryptedTransact, ParsedTransactCalldata)>;
 type ResponseReceiver = kanal::AsyncReceiver<(DecryptedTransact, ParsedTransactCalldata)>;
 
@@ -497,7 +515,7 @@ pub struct BroadcasterService {
     railgun_contract: Option<Address>,
     finality_depth: Option<u64>,
     receipt_poll_interval: Duration,
-    relay_adapt_contract: Address,
+    relay_adapt_contract: Option<Address>,
     relay_adapt_7702_contract: Option<Address>,
     identifier: Option<String>,
     fees_refresh_interval: Duration,
@@ -516,6 +534,7 @@ impl BroadcasterService {
         prover: Arc<ProverService>,
         poi_recovery_prover: Arc<ProverService>,
         query_rpc_cooldown: Duration,
+        indexed_artifact_source: Option<IndexedArtifactSourceConfig>,
     ) -> Result<Self, BroadcasterServiceError> {
         let (tx, rx) = kanal::bounded_async::<(DecryptedTransact, ParsedTransactCalldata)>(20);
         let pending_fee_note_assurance_fallback = Arc::new(FeeNoteAssuranceFallback::default());
@@ -529,8 +548,14 @@ impl BroadcasterService {
             56 => Some((Duration::from_millis(450), 15)),
             137 => Some((Duration::from_secs(1), 256)),
             42161 => Some((Duration::from_millis(250), 64)),
+            8453 => Some((Duration::from_secs(2), 10)),
             _ => None,
         };
+        let relay_adapt_contract =
+            resolve_relay_adapt_contract(&chain_cfg, deployment_defaults.as_ref())?;
+        let relay_adapt_7702_contract = chain_cfg
+            .relay_adapt_7702_contract
+            .or_else(|| deployment_defaults.map(|config| config.relay_adapt_7702_contract));
         let resolved_railgun_contract = chain_cfg
             .sync
             .as_ref()
@@ -667,11 +692,11 @@ impl BroadcasterService {
             deployment: RailgunDeployment {
                 chain_id,
                 contract: railgun_contract,
-                relay_adapt_contract: chain_cfg.relay_adapt_contract,
-                relay_adapt_7702_contract: chain_cfg
-                    .relay_adapt_7702_contract
-                    .or_else(|| deployment_defaults.map(|config| config.relay_adapt_7702_contract))
-                    .unwrap_or_default(),
+                relay_adapt_contract,
+                relay_adapt_7702_contract: relay_adapt_7702_contract.unwrap_or_default(),
+                relay_adapt_7702_delegates: deployment_defaults
+                    .as_ref()
+                    .map_or(&[], |config| config.relay_adapt_7702_delegates),
                 relay_adapt_history: deployment_defaults
                     .as_ref()
                     .map_or(&[], |config| config.relay_adapt_history),
@@ -685,7 +710,7 @@ impl BroadcasterService {
                 indexed_wallet_block_range,
                 poll_interval: receipt_poll_interval,
                 quick_sync_endpoint: quick_sync_endpoint.clone(),
-                indexed_artifact_source: None,
+                indexed_artifact_source,
                 anchor_interval,
                 anchor_retention,
             },
@@ -786,7 +811,9 @@ impl BroadcasterService {
                     use_indexed_wallet_catch_up: true,
                 };
                 let handle = sync_manager.add_wallet(wallet_cfg).await?;
-                if let Some(auto_refill) = auto_refill.clone() {
+                if let Some(auto_refill) = auto_refill.clone()
+                    && let Some(relay_adapt_contract) = relay_adapt_contract
+                {
                     let query_rpc_pool = query_rpc_pool.clone();
                     let evm_wallets = evm_wallets.clone();
                     let broadcaster = broadcaster.clone();
@@ -806,7 +833,7 @@ impl BroadcasterService {
                             let cfg = AutoRefillConfig {
                                 chain_id,
                                 railgun_contract,
-                                relay_adapt_contract: chain_cfg.relay_adapt_contract,
+                                relay_adapt_contract,
                                 wrapped_native_token: chain_cfg.wrapped_native_token,
                                 wallet,
                                 wallet_handle: auto_refill_handle,
@@ -847,7 +874,6 @@ impl BroadcasterService {
                             let cfg = UtxoConsolidationConfig {
                                 chain_id,
                                 railgun_contract,
-                                relay_adapt_contract: chain_cfg.relay_adapt_contract,
                                 wallet,
                                 wallet_handle: consolidation_handle,
                                 chain_handle,
@@ -896,8 +922,8 @@ impl BroadcasterService {
             railgun_contract: resolved_railgun_contract,
             finality_depth: resolved_finality_depth,
             receipt_poll_interval,
-            relay_adapt_contract: chain_cfg.relay_adapt_contract,
-            relay_adapt_7702_contract: chain_cfg.relay_adapt_7702_contract,
+            relay_adapt_contract,
+            relay_adapt_7702_contract,
             identifier: chain_cfg.identifier,
             fees_refresh_interval: chain_cfg.fees_refresh_interval.into_inner(),
             fees_ttl,
@@ -932,7 +958,8 @@ impl BroadcasterService {
         let fee_ttl = self.fees_ttl;
         let required_poi_list = self.required_poi_list.clone();
         let railgun_address = self.advertised_addr.clone();
-        let relay_adapt = self.relay_adapt_contract;
+        // The zero address advertises that this chain has no legacy RelayAdapt.
+        let relay_adapt = self.relay_adapt_contract.unwrap_or_default();
         let relay_adapt_7702 = self.relay_adapt_7702_contract;
         let identifier = self.identifier.clone();
         let client = self.client.clone();
@@ -1488,16 +1515,19 @@ const fn should_remove_fee_note_assurance_fallback(
 #[cfg(test)]
 mod tests {
     use super::{
-        ESTIMATE_GAS_FAILED_RESPONSE_MESSAGE, FeeNoteAssuranceFallback,
+        BroadcasterServiceError, ESTIMATE_GAS_FAILED_RESPONSE_MESSAGE, FeeNoteAssuranceFallback,
         build_transact_error_response, collect_pending_fee_note_assurance_records,
-        should_remove_fee_note_assurance_fallback, transact_estimate_gas_error_message,
+        resolve_relay_adapt_contract, should_remove_fee_note_assurance_fallback,
+        transact_estimate_gas_error_message,
     };
     use crate::fee_note_assurance::FeeNoteAssuranceRecordOutcome;
-    use alloy::primitives::FixedBytes;
+    use alloy::primitives::{Address, FixedBytes};
     use alloy::transports::{RpcError, TransportErrorKind};
     use alloy::uint;
+    use broadcaster_core::deployment::RailgunDeployment;
     use broadcaster_core::transact::FeeNoteAssuranceContext;
     use broadcaster_core::transact_response::DecryptedTransactResponse;
+    use config::Chain;
     use local_db::PendingFeeNoteAssuranceRecord;
     use std::collections::{BTreeMap, HashMap};
 
@@ -1636,6 +1666,41 @@ mod tests {
             FeeNoteAssuranceRecordOutcome::Completed,
             false,
         ));
+    }
+
+    #[test]
+    fn auto_refill_requires_a_legacy_relay_adapt() {
+        let auto_refill_chain = |chain_id: u64| -> Chain {
+            serde_json::from_value(serde_json::json!({
+                "key": { "Mnemonic": {
+                    "seed_phrase": "test test test test test test test test test test test junk",
+                    "init_block_number": 0,
+                    "auto_refill": { "interval": "10m", "min_amount": 1, "target_amount": 2 }
+                } },
+                "chain_id": chain_id,
+                "fee_bonus": 0,
+                "fees_ttl": "60s",
+                "fees_refresh_interval": "30s",
+                "fees": {},
+                "query_rpcs": [],
+                "wrapped_native_token": Address::ZERO,
+                "submit_rpcs": [],
+                "evm_wallets": []
+            }))
+            .expect("chain config")
+        };
+
+        let base = RailgunDeployment::for_chain(8453);
+        assert!(matches!(
+            resolve_relay_adapt_contract(&auto_refill_chain(8453), base.as_ref()),
+            Err(BroadcasterServiceError::AutoRefillRequiresRelayAdapt)
+        ));
+        let ethereum = RailgunDeployment::for_chain(1).expect("ethereum deployment");
+        assert_eq!(
+            resolve_relay_adapt_contract(&auto_refill_chain(1), Some(&ethereum))
+                .expect("default relay adapt"),
+            ethereum.relay_adapt_contract
+        );
     }
 }
 

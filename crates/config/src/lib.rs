@@ -19,6 +19,8 @@ pub struct Config {
     pub required_poi_list: Vec<FixedBytes<32>>,
     pub poi_rpc: Option<Url>,
     pub poi_artifact_source: Option<PoiArtifactSource>,
+    /// Chain-indexed sync artifacts; same source shape as the POI artifacts.
+    pub indexed_artifact_source: Option<PoiArtifactSource>,
     pub waku: Waku,
     pub admin: Option<AdminConfig>,
     pub artifacts_metadata_dir: Option<PathBuf>,
@@ -143,7 +145,7 @@ pub struct Chain {
     pub wrapped_native_token: Address,
     pub submit_rpcs: Vec<Rpc>,
     pub multicall_contract: Option<Address>,
-    pub relay_adapt_contract: Address,
+    pub relay_adapt_contract: Option<Address>,
     pub relay_adapt_7702_contract: Option<Address>,
     pub evm_wallets: Vec<Bytes>,
     pub identifier: Option<String>,
