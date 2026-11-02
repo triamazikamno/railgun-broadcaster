@@ -129,7 +129,7 @@ fn main() -> Result<()> {
     if let Some(key) = opt.key.as_deref() {
         match table.get(key)? {
             Some(value) => print_value(table_info, key, value.value(), opt.raw)?,
-            None => bail!("key not found: {key}"),
+            None => return Err(eyre!("key not found: {key}")),
         }
         return Ok(());
     }

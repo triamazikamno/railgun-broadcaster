@@ -719,10 +719,12 @@ impl BroadcasterService {
                 .sync
                 .as_ref()
                 .and_then(|sync| sync.archive_rpc_url.clone()),
+            archive_rpc_http_client: None,
             block_time,
             finality_depth,
             http_client: HttpClient::default(),
             progress_tx: None,
+            poi_submission_routes: None,
         };
         let chain_service = sync_manager.add_chain(chain_config).await?;
         let poi = configured_poi_rpc_url.as_ref().map(|poi_rpc_url| {
@@ -958,8 +960,7 @@ impl BroadcasterService {
         let fee_ttl = self.fees_ttl;
         let required_poi_list = self.required_poi_list.clone();
         let railgun_address = self.advertised_addr.clone();
-        // The zero address advertises that this chain has no legacy RelayAdapt.
-        let relay_adapt = self.relay_adapt_contract.unwrap_or_default();
+        let relay_adapt = self.relay_adapt_contract;
         let relay_adapt_7702 = self.relay_adapt_7702_contract;
         let identifier = self.identifier.clone();
         let client = self.client.clone();
@@ -1850,7 +1851,12 @@ impl BroadcasterManager {
                                     }
                                 }
                                 Err(error) => {
-                                    warn!("Failed to deserialize fees message: {error}");
+                                    warn!(
+                                        %error,
+                                        chain_id,
+                                        payload = %String::from_utf8_lossy(payload.data.as_ref()),
+                                        "Failed to deserialize fees message",
+                                    );
                                 }
                             }
                         }
