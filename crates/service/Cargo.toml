@@ -9,6 +9,7 @@ alloy = { workspace = true }
 alloy-rpc-types-eth = { workspace = true }
 kanal = { version = "0.1", features = ["async"] }
 rand = { workspace = true }
+rmp-serde = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

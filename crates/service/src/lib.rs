@@ -3,6 +3,7 @@ mod auto_refill;
 #[cfg(test)]
 mod executor_tests;
 mod fee_note_assurance;
+mod fee_note_store;
 mod poi_validation;
 #[cfg(test)]
 mod shutdown_tests;
@@ -35,7 +36,7 @@ use broadcaster_core::transact::{
 use broadcaster_core::transact_response::DecryptedTransactResponse;
 use config::{Chain, Key};
 use fees::{FeesError, Manager as FeesManager};
-use local_db::{DbStore, PendingFeeNoteAssuranceRecord, WalletCacheKey};
+use local_db::{DbStore, WalletCacheKey};
 use rand::seq::{IndexedRandom, SliceRandom};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -52,6 +53,7 @@ use crate::fee_note_assurance::{
     FeeNoteAssuranceRecordOutcome, FeeNoteAssuranceSubmissionTracker,
     process_fee_note_assurance_record,
 };
+use crate::fee_note_store::{FeeNoteAssuranceDbExt, PendingFeeNoteAssuranceRecord};
 pub use crate::poi_validation::BroadcasterPoiValidator;
 use crate::utxo_consolidation::{UtxoConsolidationConfig, UtxoConsolidationService};
 use poi::error::PoiError;
@@ -1522,6 +1524,7 @@ mod tests {
         transact_estimate_gas_error_message,
     };
     use crate::fee_note_assurance::FeeNoteAssuranceRecordOutcome;
+    use crate::fee_note_store::PendingFeeNoteAssuranceRecord;
     use alloy::primitives::{Address, FixedBytes};
     use alloy::transports::{RpcError, TransportErrorKind};
     use alloy::uint;
@@ -1529,7 +1532,6 @@ mod tests {
     use broadcaster_core::transact::FeeNoteAssuranceContext;
     use broadcaster_core::transact_response::DecryptedTransactResponse;
     use config::Chain;
-    use local_db::PendingFeeNoteAssuranceRecord;
     use std::collections::{BTreeMap, HashMap};
 
     #[test]

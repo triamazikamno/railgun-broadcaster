@@ -1,7 +1,6 @@
 [workspace]
 members = [
     "bins/broadcaster",
-    "bins/db-cli",
     "bins/vanity-address",
     "crates/config",
     "crates/fees",
@@ -42,13 +41,13 @@ tracing-appender = "0.2"
 tracing-subscriber = "0.3"
 url = "2"
 
-broadcaster-core = { git = "https://github.com/triamazikamno/railgun-rust", rev = "e25a943bb1574b7b72efd9c0185d5e30d5b7b69b" }
-local-db = { git = "https://github.com/triamazikamno/railgun-rust", rev = "e25a943bb1574b7b72efd9c0185d5e30d5b7b69b" }
-poi = { git = "https://github.com/triamazikamno/railgun-rust", rev = "e25a943bb1574b7b72efd9c0185d5e30d5b7b69b" }
-public-broadcaster-protocol = { git = "https://github.com/triamazikamno/railgun-rust", rev = "e25a943bb1574b7b72efd9c0185d5e30d5b7b69b" }
-railgun-wallet = { git = "https://github.com/triamazikamno/railgun-rust", rev = "e25a943bb1574b7b72efd9c0185d5e30d5b7b69b" }
-sync-service = { git = "https://github.com/triamazikamno/railgun-rust", rev = "e25a943bb1574b7b72efd9c0185d5e30d5b7b69b" }
-waku-relay = { git = "https://github.com/triamazikamno/railgun-rust", rev = "e25a943bb1574b7b72efd9c0185d5e30d5b7b69b" }
+broadcaster-core = { git = "https://github.com/triamazikamno/railgun-rust", rev = "154f2ef5006c6bca442038b799d67cf67284d7d4" }
+local-db = { git = "https://github.com/triamazikamno/railgun-rust", rev = "154f2ef5006c6bca442038b799d67cf67284d7d4" }
+poi = { git = "https://github.com/triamazikamno/railgun-rust", rev = "154f2ef5006c6bca442038b799d67cf67284d7d4" }
+public-broadcaster-protocol = { git = "https://github.com/triamazikamno/railgun-rust", rev = "154f2ef5006c6bca442038b799d67cf67284d7d4" }
+railgun-wallet = { git = "https://github.com/triamazikamno/railgun-rust", rev = "154f2ef5006c6bca442038b799d67cf67284d7d4" }
+sync-service = { git = "https://github.com/triamazikamno/railgun-rust", rev = "154f2ef5006c6bca442038b799d67cf67284d7d4" }
+waku-relay = { git = "https://github.com/triamazikamno/railgun-rust", rev = "154f2ef5006c6bca442038b799d67cf67284d7d4" }
 
 [profile.release]
 opt-level = 3

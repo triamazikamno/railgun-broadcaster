@@ -5,7 +5,7 @@ use broadcaster_core::contracts::railgun::Transact;
 use broadcaster_core::crypto::poseidon::poseidon;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use broadcaster_core::tree::TREE_LEAF_COUNT_U256;
-use local_db::{DbStore, FeeNoteAssuranceTerminalOutcome, PendingFeeNoteAssuranceRecord};
+use local_db::DbStore;
 use poi::poi::PoiStatus;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -14,6 +14,9 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
+use crate::fee_note_store::{
+    FeeNoteAssuranceDbExt, FeeNoteAssuranceTerminalOutcome, PendingFeeNoteAssuranceRecord,
+};
 use crate::poi_validation::BroadcasterPoiValidator;
 
 const FEE_NOTE_ASSURANCE_SUBMIT_BACKOFF: Duration = Duration::from_mins(15);
@@ -391,13 +394,13 @@ mod tests {
         FeeNoteAssuranceSubmissionTracker, ReceiptEvaluation, ReceiptObservation,
         derive_fee_note_blinded_commitment, required_list_statuses_valid,
     };
+    use crate::fee_note_store::FeeNoteAssuranceTerminalOutcome;
     use alloy::hex;
     use alloy::primitives::{Address, Bytes, FixedBytes, Log as PrimitiveLog, U256};
     use alloy::sol_types::SolEvent;
     use alloy::uint;
     use alloy_rpc_types_eth::Log;
     use broadcaster_core::contracts::railgun::{CommitmentCiphertext, Transact};
-    use local_db::FeeNoteAssuranceTerminalOutcome;
     use poi::poi::PoiStatus;
     use std::collections::BTreeMap;
     use std::time::{Duration, Instant};
