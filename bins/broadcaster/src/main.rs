@@ -1,7 +1,7 @@
 use broadcaster_core::crypto::snark_proof::Prover;
 mod admin;
 
-use broadcaster_service::{BroadcasterManager, BroadcasterService};
+use broadcaster_service::{BroadcasterManager, BroadcasterService, BroadcasterServiceDeps};
 use config::Config;
 use eyre::{Result, WrapErr, bail, eyre};
 use local_db::{DbConfig, DbStore};
@@ -237,30 +237,29 @@ async fn main() -> Result<()> {
         Arc::new(Client::new(&waku_client_config(&cfg.waku)).wrap_err("create waku relay client")?);
     let snark_prover = Arc::new(Prover::new().wrap_err("create snark prover")?);
 
-    let indexed_artifact_source = cfg
-        .indexed_artifact_source
-        .as_ref()
-        .map(indexed_artifact_source_config);
+    let service_deps = BroadcasterServiceDeps {
+        db,
+        client: waku_client.clone(),
+        poi_rpc_url: cfg.poi_rpc,
+        snark_prover,
+        required_poi_list: cfg.required_poi_list,
+        sync_manager,
+        prover,
+        poi_recovery_prover,
+        query_rpc_cooldown: cfg.query_rpc_cooldown.into_inner(),
+        indexed_artifact_source: cfg
+            .indexed_artifact_source
+            .as_ref()
+            .map(indexed_artifact_source_config),
+    };
     let mut services = Vec::with_capacity(cfg.chains.len());
     for chain_cfg in cfg.chains.clone() {
         let chain_id = chain_cfg.chain_id;
         info!(chain_id, "starting broadcaster service");
-        let service = BroadcasterService::new(
-            chain_cfg,
-            db.clone(),
-            waku_client.clone(),
-            cfg.poi_rpc.clone(),
-            snark_prover.clone(),
-            cfg.required_poi_list.clone(),
-            sync_manager.clone(),
-            prover.clone(),
-            poi_recovery_prover.clone(),
-            cfg.query_rpc_cooldown.into_inner(),
-            indexed_artifact_source.clone(),
-        )
-        .instrument(tracing::info_span!("service", chain_id))
-        .await
-        .wrap_err(eyre!("init broadcaster service for chain={chain_id}"))?;
+        let service = BroadcasterService::new(chain_cfg, &service_deps)
+            .instrument(tracing::info_span!("service", chain_id))
+            .await
+            .wrap_err(eyre!("init broadcaster service for chain={chain_id}"))?;
         info!(address=%service.addr(), chain_id, "derived address");
 
         service

@@ -24,10 +24,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tx_submit::Queue;
 
-use super::{
+use crate::evm_tx::{
     EVM_GAS_LIMIT_BUFFER, PrepareEvmTransactionError, TX7702_DELEGATION_PROBE_GAS_LIMIT,
-    funded_submission_queue, prepare_evm_tx7702_transaction, prepare_evm_tx7702_with_fallback,
+    prepare_evm_tx7702_transaction, prepare_evm_tx7702_with_fallback,
 };
+use crate::transact_submitter::funded_submission_queue;
 
 struct Tx7702RpcFixture {
     url: url::Url,

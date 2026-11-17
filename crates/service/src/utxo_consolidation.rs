@@ -1,7 +1,8 @@
-use crate::{
+use crate::evm_tx::{
     EvmGasPricePolicy, MAINTENANCE_GAS_PRICE_BUFFER_BPS, PrepareEvmTransactionError,
-    PreparedEvmTransaction, prepare_evm_transaction, submit_tx, unspent_utxos,
+    PreparedEvmTransaction, prepare_evm_transaction, submit_tx,
 };
+use crate::unspent_utxos;
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, ChainId, U256};
 use alloy::signers::k256::ecdsa::SigningKey;
