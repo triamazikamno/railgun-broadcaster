@@ -201,7 +201,9 @@ impl SuffixMatcher {
     }
 
     fn ends_with(&self, suffix: &[u8]) -> bool {
-        if suffix.is_empty() || self.written < suffix.len() || suffix.len() != self.tail.len() {
+        let tail_unavailable =
+            suffix.is_empty() || self.written < suffix.len() || suffix.len() != self.tail.len();
+        if tail_unavailable {
             return false;
         }
 
